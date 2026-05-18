@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+
+      - name: Check shell syntax
+        run: bash -n spark install.sh tests/run.sh
+
+      - name: Run ShellCheck
+        run: shellcheck --exclude=SC2059,SC2015,SC2016 spark install.sh tests/run.sh
+
+      - name: Run tests
+        run: bash tests/run.sh
