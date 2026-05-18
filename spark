@@ -1,0 +1,1361 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# spark — CLI tool for serving LLMs with vLLM on NVIDIA DGX Spark
+# https://github.com/massimo92/spark
+
+# Ensure common user bin paths are in PATH
+for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+  [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
+done
+
+VERSION="0.0.1"
+
+# --- Color Output ---
+if [[ -t 1 ]]; then
+  RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[0;33m'
+  BLUE='\033[0;34m' BOLD='\033[1m' DIM='\033[2m' NC='\033[0m'
+else
+  RED='' GREEN='' YELLOW='' BLUE='' BOLD='' DIM='' NC=''
+fi
+
+# --- Constants ---
+SPARK_CONFIG_DIR="${HOME}/.config/spark"
+PROFILES_DIR="${SPARK_CONFIG_DIR}/profiles"
+UPDATE_FILE="${SPARK_CONFIG_DIR}/update.json"
+GITHUB_REPO="massimo92/spark"
+DEFAULT_PORT=8000
+HF_CACHE_DIR="${HOME}/.cache/huggingface"
+CONTAINER_NAME="spark-vllm"
+TOTAL_VRAM_GB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
+  | awk 'NR==1 {printf "%.0f", $1/1024}' || echo "128")
+[[ "$TOTAL_VRAM_GB" =~ ^[0-9]+$ && "$TOTAL_VRAM_GB" -gt 0 ]] || TOTAL_VRAM_GB=128
+
+# Detect the latest pulled NGC vLLM image
+detect_ngc_image() {
+  local images
+  images=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+    | awk '/^nvcr\.io\/nvidia\/vllm:/ {print}' || true)
+
+  [[ -z "$images" ]] && return 0
+
+  if sort -V </dev/null >/dev/null 2>&1; then
+    printf "%s\n" "$images" | sort -t: -k2 -rV | head -1
+  else
+    printf "%s\n" "$images" | sort -r | head -1
+  fi
+}
+
+# --- Helpers ---
+info()  { printf "  ${GREEN}✓${NC} %s\n" "$*"; }
+warn()  { printf "  ${YELLOW}⊘${NC} %s\n" "$*"; }
+err()   { printf "  ${RED}✗${NC} %s\n" "$*"; }
+
+die() {
+  err "$1"
+  [[ -n "${2:-}" ]] && printf "    %s\n" "$2"
+  exit 1
+}
+
+confirm() {
+  local prompt="${1:-Continue?}"
+  printf "  %s [y/N] " "$prompt"
+  read -r ans
+  [[ "$ans" =~ ^[Yy] ]]
+}
+
+is_positive_int() {
+  [[ "${1:-}" =~ ^[0-9]+$ && "$1" -gt 0 ]]
+}
+
+is_port() {
+  [[ "${1:-}" =~ ^[0-9]+$ && "$1" -ge 1 && "$1" -le 65535 ]]
+}
+
+is_mem_util() {
+  [[ "${1:-}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]
+}
+
+is_safe_model_ref() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]]
+}
+
+is_safe_ngc_tag() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9._+:-]+$ ]]
+}
+
+shell_join() {
+  local arg
+  for arg in "$@"; do
+    printf "%q " "$arg"
+  done
+  printf "\n"
+}
+
+setup_skip() {
+  SETUP_SKIPPED+=("$1")
+}
+
+setup_fail() {
+  SETUP_FAILED+=("$1")
+  err "$1"
+}
+
+local_tailscale() {
+  if command -v tailscale >/dev/null 2>&1; then
+    tailscale "$@"
+  elif [[ -x "/Applications/Tailscale.app/Contents/MacOS/Tailscale" ]]; then
+    /Applications/Tailscale.app/Contents/MacOS/Tailscale "$@"
+  else
+    return 1
+  fi
+}
+
+# --- Remote SSH ---
+REMOTE_USER=""
+REMOTE_HOST=""
+REMOTE_CONTROL=""
+
+remote() {
+  ssh -o ControlPath="$REMOTE_CONTROL" "${REMOTE_USER}@${REMOTE_HOST}" "$@"
+}
+
+remote_sudo() {
+  ssh -t -o ControlPath="$REMOTE_CONTROL" "${REMOTE_USER}@${REMOTE_HOST}" "sudo $*"
+}
+
+open_remote() {
+  local user="$1" host="$2"
+  REMOTE_USER="$user"
+  REMOTE_HOST="$host"
+  REMOTE_CONTROL="/tmp/spark-setup-${user}@${host}"
+
+  printf "  Connecting to %s@%s...\n" "$user" "$host"
+  ssh -o ControlMaster=yes \
+      -o ControlPath="$REMOTE_CONTROL" \
+      -o ControlPersist=600 \
+      -o ConnectTimeout=10 \
+      -o StrictHostKeyChecking=accept-new \
+      -fN "${user}@${host}" 2>/dev/null || return 1
+  info "Connected to ${host}"
+}
+
+close_remote() {
+  if [[ -n "$REMOTE_CONTROL" && -S "$REMOTE_CONTROL" ]]; then
+    ssh -o ControlPath="$REMOTE_CONTROL" -O exit "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null || true
+  fi
+}
+
+# --- Model Path Resolution ---
+resolve_model_path() {
+  local model="$1"
+  # HF cache uses models--Org--Name (double-dash separator)
+  local cache_path="${HF_CACHE_DIR}/hub/models--${model//\//-}"
+
+  local hf_path hf_path2
+  hf_path="${HF_CACHE_DIR}/hub/models--$(echo "$model" | sed 's/\//-/g')"
+  hf_path2="${HF_CACHE_DIR}/hub/models--$(echo "$model" | sed 's/\//--/g')"
+
+  for p in "$hf_path2" "$hf_path" "$cache_path"; do
+    if [[ -d "$p/snapshots" ]]; then
+      local snapshot
+      # shellcheck disable=SC2012
+      snapshot=$(ls -t "$p/snapshots" 2>/dev/null | head -1)
+      if [[ -n "$snapshot" ]]; then
+        echo "$p/snapshots/$snapshot"
+        return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
+# --- Auto-Profiler ---
+validate_profile_values() {
+  [[ "$REASONING_PARSER" =~ ^(qwen3|deepseek_r1)?$ ]] || die "Invalid profile value: reasoning_parser"
+  [[ "$TOOL_CALL_PARSER" =~ ^(qwen25)?$ ]] || die "Invalid profile value: tool_call_parser"
+  is_mem_util "$GPU_MEM_UTIL" || die "Invalid profile value: gpu_memory_utilization"
+  is_positive_int "$MAX_MODEL_LEN" || die "Invalid profile value: max_model_len"
+  [[ "$IS_MULTIMODAL" =~ ^(true|false)$ ]] || die "Invalid profile value: is_multimodal"
+  [[ "$MODEL_SIZE_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: model_size_gb"
+}
+
+load_profile() {
+  local profile_file="$1"
+
+  jq -e . "$profile_file" >/dev/null 2>&1 || die "Invalid profile JSON: $profile_file" "Regenerate with: spark run --regen-profile <model>"
+
+  REASONING_PARSER=$(jq -r '.reasoning_parser // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  TOOL_CALL_PARSER=$(jq -r '.tool_call_parser // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  GPU_MEM_UTIL=$(jq -r '.gpu_memory_utilization // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  MAX_MODEL_LEN=$(jq -r '.max_model_len // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  IS_MULTIMODAL=$(jq -r '.is_multimodal // "false"' "$profile_file") || die "Could not read profile: $profile_file"
+  MODEL_SIZE_GB=$(jq -r '.model_size_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
+
+  validate_profile_values
+}
+
+profile_model() {
+  local model="$1"
+  local model_path="$2"
+  local profile_file
+  profile_file="${PROFILES_DIR}/$(echo "$model" | sed 's/\//--/g').json"
+
+  command -v jq >/dev/null 2>&1 || die "jq is required for model profiling" "Run: spark setup"
+
+  # Return cached profile if exists and not regenerating
+  if [[ -f "$profile_file" && "${REGEN_PROFILE:-0}" != "1" ]]; then
+    load_profile "$profile_file"
+    return 0
+  fi
+
+  local config_json="${model_path}/config.json"
+  if [[ ! -f "$config_json" ]]; then
+    err "No config.json found at ${model_path}"
+    return 1
+  fi
+
+  # Read model config
+  local model_type arch_list
+  model_type=$(jq -r '.model_type // ""' "$config_json" 2>/dev/null || echo "")
+  arch_list=$(jq -r '.architectures // [] | join(",")' "$config_json" 2>/dev/null || echo "")
+
+  # Reasoning parser
+  REASONING_PARSER=""
+  case "$model_type" in
+    qwen3|qwen3_moe|qwen3_5_moe) REASONING_PARSER="qwen3" ;;
+    deepseek_v3) REASONING_PARSER="deepseek_r1" ;;
+  esac
+
+  # Tool-call parser
+  TOOL_CALL_PARSER=""
+  case "$model_type" in
+    qwen3|qwen3_moe|qwen3_5_moe) TOOL_CALL_PARSER="qwen25" ;;
+  esac
+
+  # Max context length
+  MAX_MODEL_LEN=$(jq -r '
+    .max_position_embeddings //
+    .max_sequence_length //
+    .seq_length //
+    32768' "$config_json" 2>/dev/null || echo "32768")
+  is_positive_int "$MAX_MODEL_LEN" || MAX_MODEL_LEN=32768
+
+  # Multimodal detection
+  IS_MULTIMODAL="false"
+  local has_vision
+  has_vision=$(jq -r 'has("vision_config") or has("visual")' "$config_json" 2>/dev/null || echo "false")
+  if [[ "$has_vision" == "true" ]] || echo "$arch_list" | grep -qi "VL\|Vision"; then
+    IS_MULTIMODAL="true"
+  fi
+
+  # Model size (sum of safetensors)
+  # -L follows symlinks (HF cache uses symlinks in snapshots/)
+  MODEL_SIZE_GB=$(find -L "$model_path" -name "*.safetensors" -exec stat -Lc%s {} + 2>/dev/null \
+    | awk '{s+=$1} END {printf "%.1f", s/1073741824}' 2>/dev/null || echo "0")
+
+  # macOS fallback: stat -f%z
+  if [[ "$MODEL_SIZE_GB" == "0" || -z "$MODEL_SIZE_GB" ]]; then
+    MODEL_SIZE_GB=$(find -L "$model_path" -name "*.safetensors" -exec stat -f%z {} + 2>/dev/null \
+      | awk '{s+=$1} END {printf "%.1f", s/1073741824}' 2>/dev/null || echo "0")
+  fi
+
+  if [[ "$MODEL_SIZE_GB" == "0" || "$MODEL_SIZE_GB" == "0.0" || -z "$MODEL_SIZE_GB" ]]; then
+    warn "Could not determine model size — memory calculation may be inaccurate"
+  fi
+
+  # GPU memory utilization calculation
+  local model_size_num="${MODEL_SIZE_GB:-0}"
+  local overhead=2
+  local min_kv_cache
+  min_kv_cache=$(awk "BEGIN {
+    a = $TOTAL_VRAM_GB * 0.15;
+    b = 10;
+    print (a > b) ? a : b
+  }")
+  GPU_MEM_UTIL=$(awk "BEGIN {
+    util = ($model_size_num + $overhead + $min_kv_cache) / $TOTAL_VRAM_GB;
+    if (util > 0.95) util = 0.95;
+    if (util < 0.50) util = 0.50;
+    printf \"%.2f\", util
+  }")
+
+  # Save profile
+  mkdir -p "$PROFILES_DIR"
+  validate_profile_values
+  jq -n \
+    --arg model "$model" \
+    --arg generated "$(date +%Y-%m-%d)" \
+    --arg reasoning_parser "$REASONING_PARSER" \
+    --arg tool_call_parser "$TOOL_CALL_PARSER" \
+    --arg gpu_memory_utilization "$GPU_MEM_UTIL" \
+    --argjson max_model_len "$MAX_MODEL_LEN" \
+    --argjson is_multimodal "$IS_MULTIMODAL" \
+    --arg model_size_gb "$MODEL_SIZE_GB" \
+    '{
+      model: $model,
+      generated: $generated,
+      reasoning_parser: $reasoning_parser,
+      tool_call_parser: $tool_call_parser,
+      gpu_memory_utilization: $gpu_memory_utilization,
+      max_model_len: $max_model_len,
+      is_multimodal: $is_multimodal,
+      model_size_gb: $model_size_gb
+    }' > "$profile_file"
+}
+
+# --- Commands ---
+
+cmd_run() {
+  local model="" port="$DEFAULT_PORT" mem="" max_len="" tools=0 text_only=0
+  local no_reasoning=0 dry_run=0 tail_logs=0 force=0 regen=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; shift 2 ;;
+      --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; shift 2 ;;
+      --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; shift 2 ;;
+      --tools)     tools=1; shift ;;
+      --text-only) text_only=1; shift ;;
+      --no-reasoning) no_reasoning=1; shift ;;
+      --dry-run)   dry_run=1; shift ;;
+      --tail)      tail_logs=1; shift ;;
+      --force)     force=1; shift ;;
+      --regen-profile) regen=1; shift ;;
+      -*)          die "Unknown flag: $1" "Run 'spark run --help' for usage" ;;
+      *)           [[ -z "$model" ]] || die "Only one model can be specified"; model="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
+  is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
+  is_port "$port" || die "Invalid --port value: $port" "Expected an integer from 1 to 65535"
+  [[ -z "$mem" ]] || is_mem_util "$mem" || die "Invalid --mem value: $mem" "Expected a number from 0.0 to 1.0"
+  [[ -z "$max_len" ]] || is_positive_int "$max_len" || die "Invalid --max-len value: $max_len" "Expected a positive integer"
+
+  # Check existing container
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    if [[ "$force" == "1" ]]; then
+      docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+      docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    else
+      err "Container '${CONTAINER_NAME}' is already running"
+      printf "    Stop it first with: spark stop\n"
+      printf "    Or use: spark run --force %s\n" "$model"
+      exit 1
+    fi
+  fi
+
+  # Remove stopped container with same name
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
+
+  # Resolve model path
+  local model_path
+  if ! model_path=$(resolve_model_path "$model"); then
+    err "Model '${model}' not found in HF cache"
+    printf "    Download it first: spark pull %s\n" "$model"
+    exit 1
+  fi
+
+  # Profile
+  REGEN_PROFILE="$regen"
+  profile_model "$model" "$model_path"
+
+  # Apply overrides
+  [[ -n "$mem" ]] && GPU_MEM_UTIL="$mem"
+  [[ -n "$max_len" ]] && MAX_MODEL_LEN="$max_len"
+  [[ "$no_reasoning" == "1" ]] && REASONING_PARSER=""
+
+  # Detect NGC image
+  local ngc_image
+  ngc_image=$(detect_ngc_image)
+  [[ -z "$ngc_image" ]] && die "No NGC vLLM container found" "Run: spark setup"
+
+  validate_profile_values
+
+  # Build vLLM flags
+  local vllm_args=(vllm serve "$model"
+    --gpu-memory-utilization "$GPU_MEM_UTIL"
+    --max-model-len "$MAX_MODEL_LEN"
+    --port "$port")
+
+  if [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]]; then
+    vllm_args+=(--reasoning-parser "$REASONING_PARSER")
+  fi
+
+  if [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]]; then
+    vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
+  fi
+
+  if [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]]; then
+    vllm_args+=(--limit-mm-per-prompt image=0)
+  fi
+
+  # Build Docker command
+  local docker_cmd=(docker run -d
+    --gpus all
+    --network host
+    --ipc=host
+    --ulimit memlock=-1
+    --ulimit stack=67108864
+    -v "${HF_CACHE_DIR}:/root/.cache/huggingface"
+    --name "$CONTAINER_NAME"
+    "$ngc_image")
+
+  if [[ "$dry_run" == "1" ]]; then
+    printf "\n${DIM}# Docker command that would be executed:${NC}\n"
+    shell_join "${docker_cmd[@]}" "${vllm_args[@]}"
+    printf "\n"
+    return 0
+  fi
+
+  # Execute
+  printf "\n"
+  local run_log
+  run_log=$(mktemp)
+  local run_exit=0
+  "${docker_cmd[@]}" "${vllm_args[@]}" >"$run_log" 2>&1 || run_exit=$?
+
+  if [[ "$run_exit" -ne 0 ]]; then
+    err "docker run failed (exit $run_exit)"
+    if docker logs "$CONTAINER_NAME" >/dev/null 2>&1; then
+      printf "    ${DIM}Last logs:${NC}\n"
+      docker logs --tail 10 "$CONTAINER_NAME" 2>&1 | sed 's/^/    /'
+    elif [[ -s "$run_log" ]]; then
+      printf "    ${DIM}Output:${NC}\n"
+      tail -10 "$run_log" | sed 's/^/    /'
+    fi
+    rm -f "$run_log"
+    exit 1
+  fi
+  rm -f "$run_log"
+
+  # Summary
+  local type_desc=""
+  if [[ "${IS_MULTIMODAL:-false}" == "true" ]]; then
+    type_desc="Multimodal"
+  else
+    type_desc="Text"
+  fi
+  [[ -n "${MODEL_SIZE_GB:-}" && "$MODEL_SIZE_GB" != "0" ]] && type_desc+=" · ${MODEL_SIZE_GB} GB"
+
+  printf "  ${BOLD}Model:${NC}    %s\n" "$model"
+  printf "  ${BOLD}Type:${NC}     %s\n" "$type_desc"
+  printf "  ${BOLD}Context:${NC}  %s tokens\n" "$MAX_MODEL_LEN"
+  printf "  ${BOLD}Memory:${NC}   %s GPU utilization\n" "$GPU_MEM_UTIL"
+  printf "  ${BOLD}API:${NC}      http://localhost:%s/v1\n" "$port"
+  [[ -n "$REASONING_PARSER" ]] && printf "  ${BOLD}Reasoning:${NC} %s parser enabled\n" "$REASONING_PARSER"
+  printf "\n"
+  printf "  Container started. Logs: ${BOLD}spark logs -f${NC}\n"
+  printf "  Test: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$port"
+
+  if [[ "$tail_logs" == "1" ]]; then
+    docker logs -f "$CONTAINER_NAME"
+  fi
+}
+
+cmd_stop() {
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    warn "No running container '${CONTAINER_NAME}'"
+    return 0
+  fi
+
+  docker stop "$CONTAINER_NAME" >/dev/null 2>&1
+  docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  info "Stopped and removed ${CONTAINER_NAME}"
+}
+
+cmd_pull() {
+  local model="${1:-}"
+  [[ -z "$model" ]] && die "No model specified" "Usage: spark pull <model>"
+  is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
+
+  printf "\n  Downloading %s...\n\n" "$model"
+  hf download "$model"
+  printf "\n"
+  info "Ready. Run: spark run ${model}"
+  printf "\n"
+}
+
+cmd_list() {
+  printf "\n"
+  local cache_dir="${HF_CACHE_DIR}/hub"
+
+  if [[ ! -d "$cache_dir" ]]; then
+    warn "No models downloaded yet"
+    printf "    Download one with: spark pull <model>\n\n"
+    return 0
+  fi
+
+  local total_size=0
+  local count=0
+
+  printf "  ${BOLD}%-45s %-10s %s${NC}\n" "MODEL" "SIZE" "DOWNLOADED"
+
+  for model_dir in "$cache_dir"/models--*; do
+    [[ -d "$model_dir" ]] || continue
+
+    local dirname
+    dirname=$(basename "$model_dir")
+    # Convert models--Org--Name to Org/Name
+    local model_name
+    model_name=$(echo "$dirname" | sed 's/^models--//' | sed 's/--/\//' )
+
+    # Get size
+    local size_bytes
+    size_bytes=$(du -sb "$model_dir" 2>/dev/null | awk '{print $1}' || \
+                 du -sk "$model_dir" 2>/dev/null | awk '{print $1 * 1024}')
+    local size_gb
+    size_gb=$(awk "BEGIN {printf \"%.1f GB\", ${size_bytes:-0}/1073741824}")
+
+    # Get modification time
+    local mod_time
+    mod_time=$(find "$model_dir" -maxdepth 2 -type f -printf '%T@\n' 2>/dev/null | sort -rn | head -1 || \
+               stat -f%m "$model_dir" 2>/dev/null || echo "0")
+
+    local age="unknown"
+    if [[ -n "$mod_time" && "$mod_time" != "0" ]]; then
+      local now
+      now=$(date +%s)
+      local diff=$(( now - ${mod_time%.*} ))
+      if (( diff < 86400 )); then
+        age="today"
+      elif (( diff < 172800 )); then
+        age="yesterday"
+      elif (( diff < 604800 )); then
+        age="$(( diff / 86400 )) days ago"
+      else
+        age="$(( diff / 604800 )) weeks ago"
+      fi
+    fi
+
+    printf "  %-45s %-10s %s\n" "$model_name" "$size_gb" "$age"
+    total_size=$(( total_size + ${size_bytes:-0} ))
+    count=$(( count + 1 ))
+  done
+
+  if [[ "$count" -eq 0 ]]; then
+    warn "No models downloaded yet"
+    printf "    Download one with: spark pull <model>\n"
+  else
+    local total_gb
+    total_gb=$(awk "BEGIN {printf \"%.1f\", ${total_size}/1073741824}")
+    printf "\n  Total: %s GB in %d model(s)\n" "$total_gb" "$count"
+  fi
+  printf "\n"
+}
+
+cmd_rm() {
+  local model="${1:-}"
+  [[ -z "$model" ]] && die "No model specified" "Usage: spark rm <model>"
+  is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
+
+  local cache_dir="${HF_CACHE_DIR}/hub"
+  local model_dir
+  model_dir="${cache_dir}/models--$(echo "$model" | sed 's/\//--/g')"
+
+  if [[ ! -d "$model_dir" ]]; then
+    die "Model '${model}' not found in cache"
+  fi
+
+  local size
+  size=$(du -sh "$model_dir" 2>/dev/null | awk '{print $1}')
+
+  if confirm "Remove ${model} (${size})? This cannot be undone."; then
+    rm -rf "$model_dir"
+    info "Removed ${model}"
+  else
+    warn "Cancelled"
+  fi
+}
+
+cmd_status() {
+  printf "\n"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    local model uptime
+
+    # Get model from container command
+    model=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null \
+      | sed -n 's/.*serve \([^ ]*\).*/\1/p' || echo "unknown")
+
+    # Get uptime
+    local started_at
+    started_at=$(docker inspect "$CONTAINER_NAME" --format '{{.State.StartedAt}}' 2>/dev/null)
+    if [[ -n "$started_at" ]]; then
+      local start_epoch now_epoch diff_s
+      start_epoch=$(date -d "$started_at" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%S" "${started_at%%.*}" +%s 2>/dev/null || echo "0")
+      now_epoch=$(date +%s)
+      diff_s=$(( now_epoch - start_epoch ))
+      local hours=$(( diff_s / 3600 ))
+      local mins=$(( (diff_s % 3600) / 60 ))
+      uptime="${hours}h ${mins}m"
+    else
+      uptime="unknown"
+    fi
+
+    # Get port from container
+    local port
+    port=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null \
+      | sed -n 's/.*--port \([0-9]*\).*/\1/p' || echo "8000")
+
+    printf "  ${GREEN}●${NC} vLLM running (${CONTAINER_NAME})\n"
+    printf "    Model:   %s\n" "$model"
+    printf "    Uptime:  %s\n" "$uptime"
+    printf "    API:     http://localhost:%s/v1\n" "$port"
+  else
+    printf "  ${DIM}○${NC} No model running. Start one with: ${BOLD}spark run <model>${NC}\n"
+  fi
+  printf "\n"
+}
+
+cmd_logs() {
+  local follow=0
+  [[ "${1:-}" == "-f" ]] && follow=1
+
+  if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    die "No container '${CONTAINER_NAME}' found"
+  fi
+
+  if [[ "$follow" == "1" ]]; then
+    docker logs -f "$CONTAINER_NAME"
+  else
+    docker logs "$CONTAINER_NAME"
+  fi
+}
+
+cmd_doctor() {
+  printf "\n"
+  local passed=0 total=0
+
+  # GPU
+  total=$((total + 1))
+  local gpu_info
+  if gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null); then
+    info "GPU: ${gpu_info}"
+    passed=$((passed + 1))
+  else
+    err "GPU: nvidia-smi not available or no GPU detected"
+  fi
+
+  # Docker
+  total=$((total + 1))
+  local docker_ver
+  if docker_ver=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
+    if docker info >/dev/null 2>&1; then
+      info "Docker: ${docker_ver}, running"
+      passed=$((passed + 1))
+    else
+      err "Docker: ${docker_ver} installed but not running"
+    fi
+  else
+    err "Docker: not installed"
+  fi
+
+  # Docker group
+  total=$((total + 1))
+  if groups 2>/dev/null | grep -q docker; then
+    info "Docker group: user $(whoami) in docker group"
+    passed=$((passed + 1))
+  else
+    err "Docker group: user $(whoami) not in docker group"
+  fi
+
+  # NGC
+  total=$((total + 1))
+  if [[ -f "${HOME}/.docker/config.json" ]] && grep -q "nvcr.io" "${HOME}/.docker/config.json" 2>/dev/null; then
+    info "NGC: authenticated (nvcr.io)"
+    passed=$((passed + 1))
+  else
+    err "NGC: not authenticated — run 'spark setup' phase 3"
+  fi
+
+  # HF CLI
+  total=$((total + 1))
+  if command -v hf >/dev/null 2>&1; then
+    local hf_ver
+    hf_ver=$(hf version 2>/dev/null || hf --version 2>/dev/null || echo "unknown")
+    info "HF CLI: ${hf_ver}"
+    passed=$((passed + 1))
+  else
+    err "HF CLI: not installed — run 'uv tool install huggingface-hub[cli]'"
+  fi
+
+  # NGC container
+  total=$((total + 1))
+  local ngc_image
+  ngc_image=$(detect_ngc_image)
+  if [[ -n "$ngc_image" ]]; then
+    info "NGC container: ${ngc_image}"
+    passed=$((passed + 1))
+  else
+    err "NGC container: vLLM image not pulled"
+  fi
+
+  # Models
+  total=$((total + 1))
+  local model_count=0
+  if [[ -d "${HF_CACHE_DIR}/hub" ]]; then
+    model_count=$(find "${HF_CACHE_DIR}/hub" -maxdepth 1 -name "models--*" -type d 2>/dev/null | wc -l | tr -d ' ')
+  fi
+  if [[ "$model_count" -gt 0 ]]; then
+    info "Models: ${model_count} downloaded"
+    passed=$((passed + 1))
+  else
+    if [[ -d "${HF_CACHE_DIR}/hub" ]]; then
+      err "No model downloaded yet — run 'spark pull <model>'"
+    else
+      err "HF cache not found at ${HF_CACHE_DIR} — run 'spark pull <model>' to initialize"
+    fi
+  fi
+
+  printf "\n  %d/%d checks passed." "$passed" "$total"
+  if [[ "$passed" -lt "$total" ]]; then
+    printf " Run '${BOLD}spark setup${NC}' to fix issues."
+  fi
+  printf "\n\n"
+}
+
+cmd_setup() {
+  local auto_yes=0 check_only=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes)    auto_yes=1; shift ;;
+      --check)  check_only=1; shift ;;
+      *)        die "Unknown flag: $1" ;;
+    esac
+  done
+
+  SETUP_SKIPPED=()
+  SETUP_FAILED=()
+
+  run_setup "$auto_yes" "$check_only"
+
+  # Summary
+  printf "\n"
+  if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
+    printf "  ${RED}${BOLD}Setup incomplete:${NC} %d issue(s) found\n" "${#SETUP_FAILED[@]}"
+    for step in "${SETUP_FAILED[@]}"; do
+      printf "    ${RED}✗${NC} %s\n" "$step"
+    done
+    printf "\n  Re-run with: ${BOLD}spark setup${NC} after fixing them.\n"
+    return 1
+  elif [[ ${#SETUP_SKIPPED[@]} -gt 0 ]]; then
+    printf "  ${YELLOW}${BOLD}Skipped steps:${NC}\n"
+    for step in "${SETUP_SKIPPED[@]}"; do
+      printf "    ${YELLOW}⊘${NC} %s\n" "$step"
+    done
+    printf "\n  Re-run with: ${BOLD}spark setup${NC} to complete them later.\n"
+  else
+    printf "  ${GREEN}${BOLD}Setup complete!${NC}\n"
+    printf "  Connect: ${BOLD}ssh %s@%s${NC}\n" "$REMOTE_USER" "$REMOTE_HOST"
+    printf "  Then:    ${BOLD}spark pull <model>${NC} and ${BOLD}spark run <model>${NC}\n"
+  fi
+  printf "\n"
+}
+
+run_setup() {
+  local auto_yes="$1" check_only="$2"
+
+  printf "\n  ${BOLD}spark setup${NC} — System configuration wizard\n\n"
+
+  trap close_remote EXIT
+
+  # --- Phase 0: Connect to DGX ---
+  printf "  ${BLUE}${BOLD}Phase 0: Connect to DGX Spark${NC}\n\n"
+
+  printf "  Before continuing, enable SSH on your DGX Spark:\n"
+  printf "    ${DIM}1. On the DGX Spark desktop, open Settings → System → Secure Shell${NC}\n"
+  printf "    ${DIM}2. Toggle SSH to ON${NC}\n"
+  printf "    ${DIM}3. Note the IP address shown on the network settings${NC}\n\n"
+
+  if [[ "$check_only" == "1" ]]; then
+    printf "  Enter DGX Spark IP/hostname (or 's' to skip remote checks): "
+  else
+    printf "  Enter DGX Spark IP or hostname: "
+  fi
+  read -r dgx_host || true
+  local has_remote=0
+  if [[ -z "$dgx_host" || "$dgx_host" == "s" ]]; then
+    if [[ "$check_only" == "1" ]]; then
+      warn "Skipping remote checks — only checking local setup"
+    else
+      die "DGX Spark address is required for setup"
+    fi
+  else
+    printf "  Enter username on the DGX Spark: "
+    read -r dgx_user || true
+    [[ -z "$dgx_user" ]] && die "Username is required"
+
+    if ! open_remote "$dgx_user" "$dgx_host"; then
+      die "Could not connect to ${dgx_user}@${dgx_host}" \
+        "Make sure SSH is enabled and the IP/credentials are correct"
+    fi
+    has_remote=1
+  fi
+
+  printf "\n"
+
+  # --- Phase 1: Client (local) ---
+  printf "  ${BLUE}${BOLD}Phase 1: Client Setup${NC}\n\n"
+
+  # Tailscale local
+  if local_tailscale status >/dev/null 2>&1; then
+    info "Tailscale installed and connected"
+  elif [[ "$check_only" != "1" ]]; then
+    local os_type
+    os_type=$(uname -s)
+    if [[ "$os_type" == "Darwin" ]]; then
+      setup_manual_step "Install Tailscale from the Mac App Store or https://tailscale.com/download" \
+        "tailscale-installed"
+    else
+      if [[ "$auto_yes" == "1" ]] || confirm "Install Tailscale?"; then
+        curl -fsSL https://tailscale.com/install.sh | sh
+        info "Installed Tailscale"
+      else
+        setup_skip "Tailscale (local)"
+        warn "Skipped Tailscale"
+      fi
+    fi
+    if ! local_tailscale status >/dev/null 2>&1; then
+      setup_manual_step "Connect Tailscale: run 'sudo tailscale up' (or open the app on macOS)" \
+        "tailscale-connected"
+    fi
+  else
+    setup_fail "Tailscale not installed/connected (local)"
+  fi
+
+  # SSH key local
+  if [[ -f "${HOME}/.ssh/id_ed25519.pub" ]] || [[ -f "${HOME}/.ssh/id_rsa.pub" ]]; then
+    info "SSH key pair exists"
+  elif [[ "$check_only" != "1" ]]; then
+    if [[ "$auto_yes" == "1" ]] || confirm "No SSH key found. Generate one?"; then
+      mkdir -p "${HOME}/.ssh"
+      ssh-keygen -t ed25519 -f "${HOME}/.ssh/id_ed25519" -N "" -q
+      info "Generated SSH key: ~/.ssh/id_ed25519"
+    else
+      setup_skip "SSH key generation"
+      warn "Skipped SSH key generation"
+    fi
+  else
+    setup_fail "No SSH key pair found"
+  fi
+
+  printf "\n"
+
+  if [[ "$has_remote" != "1" ]]; then
+    close_remote
+    trap - EXIT
+    return
+  fi
+
+  # --- Phase 2: DGX remote ---
+  printf "  ${BLUE}${BOLD}Phase 2: DGX Spark Setup (remote)${NC}\n\n"
+
+  # GPU
+  local gpu_info
+  if gpu_info=$(remote nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null); then
+    info "GPU: ${gpu_info}"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "No NVIDIA GPU detected on DGX"
+  else
+    die "No NVIDIA GPU detected on DGX Spark"
+  fi
+
+  # System updates
+  if [[ "$check_only" != "1" ]]; then
+    local upgradable
+    upgradable=$(remote "apt list --upgradable 2>/dev/null | grep -c upgradable" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    [[ "$upgradable" =~ ^[0-9]+$ ]] || upgradable=0
+    if [[ "$upgradable" -gt 0 ]]; then
+      if [[ "$auto_yes" == "1" ]] || confirm "DGX has ${upgradable} upgradable packages. Update?"; then
+        remote_sudo "apt update && sudo apt full-upgrade -y"
+        info "System updated"
+      else
+        setup_skip "System updates"
+        warn "Skipped system updates"
+      fi
+    else
+      info "System is up to date"
+    fi
+  fi
+
+  # Remove snap firmware-updater
+  if remote "snap list 2>/dev/null | grep -q firmware-updater" 2>/dev/null; then
+    if [[ "$check_only" != "1" ]]; then
+      remote_sudo "snap remove firmware-updater"
+      info "Removed snap firmware-updater"
+    else
+      warn "firmware-updater snap should be removed"
+    fi
+  else
+    info "No firmware-updater snap"
+  fi
+
+  # spark CLI
+  if remote "export PATH=\$HOME/.local/bin:\$PATH && command -v spark" >/dev/null 2>&1; then
+    info "spark CLI installed"
+  elif [[ "$check_only" != "1" ]]; then
+    # Copy the running script to the DGX (~/.local/bin, no sudo needed)
+    local self
+    self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
+    remote "mkdir -p ~/.local/bin"
+    remote "cat > ~/.local/bin/spark && chmod +x ~/.local/bin/spark" < "$self"
+    # Ensure ~/.local/bin is in PATH for non-login shells
+    if ! remote "grep -q 'local/bin' ~/.bashrc" 2>/dev/null; then
+      remote 'echo '\''export PATH="\$HOME/.local/bin:\$PATH"'\'' >> ~/.bashrc'
+    fi
+    info "Installed spark CLI to ~/.local/bin/spark"
+  else
+    setup_fail "spark CLI not installed"
+  fi
+
+  # uv
+  if remote "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && command -v uv" >/dev/null 2>&1; then
+    info "uv already installed"
+  elif [[ "$check_only" != "1" ]]; then
+    remote "curl -LsSf https://astral.sh/uv/install.sh | sh"
+    info "Installed uv"
+  else
+    setup_fail "uv not installed"
+  fi
+
+  # nvitop
+  if remote "export PATH=\$HOME/.local/bin:\$PATH && command -v nvitop" >/dev/null 2>&1; then
+    info "nvitop already installed"
+  elif [[ "$check_only" != "1" ]]; then
+    remote "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv tool install nvitop"
+    info "Installed nvitop"
+  else
+    setup_fail "nvitop not installed"
+  fi
+
+  # jq
+  if remote command -v jq >/dev/null 2>&1; then
+    info "jq installed"
+  elif [[ "$check_only" != "1" ]]; then
+    remote_sudo "apt install -y jq"
+    info "Installed jq"
+  else
+    setup_fail "jq not installed"
+  fi
+
+  # Tailscale on DGX
+  if remote "command -v tailscale && tailscale status" >/dev/null 2>&1; then
+    info "Tailscale installed and connected (DGX)"
+  elif [[ "$check_only" != "1" ]]; then
+    if [[ "$auto_yes" == "1" ]] || confirm "Install Tailscale on DGX?"; then
+      remote "curl -fsSL https://tailscale.com/install.sh | sh"
+      info "Installed Tailscale on DGX"
+      printf "    ${YELLOW}Run on the DGX: sudo tailscale up${NC}\n"
+      printf "    ${YELLOW}It will print a URL — open it in your browser to authenticate${NC}\n"
+      setup_manual_step "Tailscale: authenticate DGX via the URL printed above" \
+        "remote-tailscale-connected"
+    else
+      setup_skip "Tailscale (DGX)"
+      warn "Skipped Tailscale on DGX"
+    fi
+  else
+    setup_fail "Tailscale not installed/connected (DGX)"
+  fi
+
+  # Docker group
+  if remote "groups | grep -q docker" 2>/dev/null; then
+    info "User in docker group"
+  elif [[ "$check_only" != "1" ]]; then
+    remote_sudo "usermod -aG docker ${REMOTE_USER}"
+    warn "Added to docker group — some steps may need DGX re-login"
+  else
+    setup_fail "User not in docker group"
+  fi
+
+  # NGC login
+  if remote "test -f ~/.docker/config.json && grep -q nvcr.io ~/.docker/config.json" 2>/dev/null; then
+    info "NGC Docker login configured"
+  elif [[ "$check_only" != "1" ]]; then
+    setup_manual_step "Create NGC account at ngc.nvidia.com" ""
+    setup_manual_step "Generate API key: ngc.nvidia.com → Settings → API Keys → Generate Personal Key" ""
+
+    printf "  Enter your NGC API key (or 's' to skip): "
+    read -rs ngc_key
+    printf "\n"
+    if [[ "$ngc_key" != "s" && -n "$ngc_key" ]]; then
+      printf "%s" "$ngc_key" | remote "docker login nvcr.io -u \\\$oauthtoken --password-stdin"
+      info "NGC Docker login successful"
+    else
+      setup_skip "NGC Docker login"
+      warn "Skipped NGC login"
+    fi
+  else
+    setup_fail "NGC not authenticated"
+  fi
+
+  # HF CLI
+  if remote "export PATH=\$HOME/.local/bin:\$PATH && command -v hf" >/dev/null 2>&1; then
+    info "HuggingFace CLI installed"
+  elif [[ "$check_only" != "1" ]]; then
+    remote "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv tool install 'huggingface-hub[cli]'"
+    info "Installed HuggingFace CLI"
+  else
+    setup_fail "HuggingFace CLI not installed"
+  fi
+
+  # vLLM container
+  local remote_ngc
+  remote_ngc=$(remote "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep 'nvcr.io/nvidia/vllm' | head -1" 2>/dev/null || true)
+  if [[ -n "$remote_ngc" ]]; then
+    info "NGC vLLM container: ${remote_ngc}"
+  elif [[ "$check_only" != "1" ]]; then
+    printf "  No vLLM container found. Enter NGC tag to pull (e.g., 26.04-py3): "
+    read -r ngc_tag
+    if [[ -n "$ngc_tag" ]]; then
+      is_safe_ngc_tag "$ngc_tag" || die "Invalid NGC tag: $ngc_tag"
+      local pull_image="nvcr.io/nvidia/vllm:${ngc_tag}"
+      printf "  Pulling %s on DGX (this may take a while)...\n" "$pull_image"
+      remote "docker pull ${pull_image}"
+      info "Pulled ${pull_image}"
+    else
+      setup_skip "NGC vLLM container"
+      warn "Skipped vLLM container pull"
+    fi
+  else
+    setup_fail "NGC vLLM container not pulled"
+  fi
+
+  printf "\n"
+
+  # --- Phase 3: Link both machines ---
+  printf "  ${BLUE}${BOLD}Phase 3: Secure Connection${NC}\n\n"
+
+  # ssh-copy-id
+  local has_remote_key
+  has_remote_key=$(remote "test -s ~/.ssh/authorized_keys && echo yes" 2>/dev/null || echo "no")
+
+  if [[ "$has_remote_key" == "yes" ]]; then
+    info "SSH authorized_keys present on DGX"
+  elif [[ "$check_only" != "1" ]]; then
+    local pub_key=""
+    if [[ -f "${HOME}/.ssh/id_ed25519.pub" ]]; then
+      pub_key=$(cat "${HOME}/.ssh/id_ed25519.pub")
+    elif [[ -f "${HOME}/.ssh/id_rsa.pub" ]]; then
+      pub_key=$(cat "${HOME}/.ssh/id_rsa.pub")
+    fi
+
+    if [[ -n "$pub_key" ]]; then
+      remote "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+      printf "%s\n" "$pub_key" | remote "cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+      info "Copied SSH public key to DGX"
+    else
+      setup_skip "SSH key copy (no local key found)"
+      warn "No SSH public key to copy"
+    fi
+  else
+    setup_fail "No SSH authorized_keys on DGX"
+  fi
+
+  # Disable password SSH
+  if remote "grep -q '^PasswordAuthentication no' /etc/ssh/sshd_config" 2>/dev/null; then
+    info "Password SSH login disabled"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Password SSH login not disabled"
+  elif [[ "$check_only" != "1" ]]; then
+    if [[ "$auto_yes" == "1" ]] || confirm "Disable password SSH login on DGX?"; then
+      remote_sudo "sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config"
+      remote_sudo "systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true"
+      info "Disabled password SSH login"
+    else
+      setup_skip "Disable password SSH"
+      warn "Skipped disabling password SSH"
+    fi
+  fi
+
+  # NVIDIA Sync (macOS)
+  if [[ "$(uname -s)" == "Darwin" && "$check_only" != "1" ]]; then
+    setup_manual_step "Install NVIDIA Sync from nvidia.com/sync (optional, for file sync)" ""
+  fi
+
+  close_remote
+  trap - EXIT
+}
+
+manual_check_passed() {
+  case "${1:-}" in
+    "") return 0 ;;
+    tailscale-connected) local_tailscale status >/dev/null 2>&1 ;;
+    tailscale-installed) local_tailscale status >/dev/null 2>&1 || command -v tailscale >/dev/null 2>&1 ;;
+    remote-tailscale-connected) remote "tailscale status" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+setup_manual_step() {
+  local instruction="$1"
+  local check_key="${2:-}"
+
+  printf "\n  ${YELLOW}⊘${NC} %s\n" "$instruction"
+  printf "\n    [d] Done  [s] Skip  [?] More info\n"
+
+  while true; do
+    printf "    > "
+    read -r choice
+    case "$choice" in
+      d|D)
+        if [[ -n "$check_key" ]]; then
+          if manual_check_passed "$check_key"; then
+            info "Verified"
+            return 0
+          else
+            printf "    ${RED}Doesn't seem configured yet. Try again?${NC}\n"
+            continue
+          fi
+        else
+          info "Marked as done"
+          return 0
+        fi
+        ;;
+      s|S)
+        setup_skip "$instruction"
+        warn "Skipped"
+        return 0
+        ;;
+      \?)
+        printf "    ${DIM}See README for detailed instructions on this step.${NC}\n"
+        continue
+        ;;
+      *)
+        printf "    Enter d (done), s (skip), or ? (more info)\n"
+        ;;
+    esac
+  done
+}
+
+cmd_update() {
+  printf "\n"
+  local current
+  current=$(detect_ngc_image)
+  if [[ -n "$current" ]]; then
+    printf "  Current: %s\n" "$current"
+  else
+    printf "  No vLLM container found.\n"
+  fi
+
+  printf "  Enter new NGC vLLM tag (e.g., 26.05-py3): "
+  read -r new_tag
+
+  if [[ -z "$new_tag" ]]; then
+    warn "No tag entered, cancelled"
+    return 0
+  fi
+  is_safe_ngc_tag "$new_tag" || die "Invalid NGC tag: $new_tag" "Use a tag like 26.05-py3"
+
+  local new_image="nvcr.io/nvidia/vllm:${new_tag}"
+
+  printf "  Checking if image exists...\n"
+  if docker manifest inspect "$new_image" >/dev/null 2>&1; then
+    if confirm "Pull ${new_image}?"; then
+      docker pull "$new_image"
+      info "Pulled ${new_image}"
+      printf "  Next 'spark run' will use this version automatically.\n"
+    fi
+  else
+    err "Image ${new_image} not found on NGC"
+  fi
+  printf "\n"
+}
+
+cmd_help() {
+  cat <<EOF
+
+  ${BOLD}spark${NC} v${VERSION} — Serve LLMs with vLLM on NVIDIA DGX Spark
+
+  ${BOLD}Usage:${NC}
+    spark <command> [options]
+
+  ${BOLD}Commands:${NC}
+    setup          Configure DGX Spark from your laptop via SSH
+    doctor         Check all prerequisites (read-only)
+    run <model>    Start serving a model
+    stop           Stop the running model
+    pull <model>   Download a model from HuggingFace
+    list           List downloaded models
+    rm <model>     Remove a downloaded model
+    status         Show current serving status
+    logs [-f]      Show container logs (-f to follow)
+    update         Update the NGC vLLM container
+    config         Configure spark settings (e.g. auto-update)
+
+  ${BOLD}Run flags:${NC}
+    --mem <float>       GPU memory utilization (0.0-1.0)
+    --max-len <int>     Maximum context length
+    --port <int>        API port (default: 8000)
+    --tools             Enable tool calling
+    --text-only         Skip vision encoder
+    --no-reasoning      Disable reasoning parser
+    --dry-run           Print Docker command only
+    --tail              Follow logs after launch
+    --force             Stop existing container first
+    --regen-profile     Regenerate model profile
+
+  ${BOLD}Examples:${NC}
+    spark setup
+    spark pull RedHatAI/Qwen3.6-35B-A3B-NVFP4
+    spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
+    spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4 --tools --port 9000
+    spark run --dry-run Qwen/Qwen3-30B-A3B
+
+EOF
+}
+
+# --- Update Check ---
+get_update_config() {
+  local key="$1" default="${2:-}"
+  if [[ -f "$UPDATE_FILE" ]] && command -v jq >/dev/null 2>&1; then
+    jq -r --arg k "$key" --arg d "$default" '.[$k] // $d' "$UPDATE_FILE" 2>/dev/null || echo "$default"
+  else
+    echo "$default"
+  fi
+}
+
+save_update_config() {
+  mkdir -p "$SPARK_CONFIG_DIR"
+  local last_check="$1" auto_update="$2"
+  if command -v jq >/dev/null 2>&1; then
+    jq -n --arg lc "$last_check" --argjson au "$auto_update" \
+      '{last_check: $lc, auto_update: $au}' > "$UPDATE_FILE"
+  fi
+}
+
+check_for_updates() {
+  # Skip in non-interactive or if jq/curl missing
+  [[ ! -t 1 ]] && return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+
+  # Check at most once per day
+  local today
+  today=$(date +%Y-%m-%d)
+  local last_check
+  last_check=$(get_update_config "last_check" "")
+  [[ "$last_check" == "$today" ]] && return 0
+
+  local auto_update
+  auto_update=$(get_update_config "auto_update" "false")
+
+  local updates=()
+
+  # Check spark CLI version
+  local remote_version
+  remote_version=$(curl -fsSL --max-time 3 \
+    "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" 2>/dev/null \
+    | grep -m1 '^VERSION=' | sed 's/VERSION="//' | sed 's/"//' || true)
+  if [[ -n "$remote_version" && "$remote_version" != "$VERSION" ]]; then
+    updates+=("spark CLI: ${VERSION} → ${remote_version}")
+  fi
+
+  # Check NGC container
+  local current_ngc
+  current_ngc=$(detect_ngc_image)
+  if [[ -n "$current_ngc" ]]; then
+    local current_tag="${current_ngc##*:}"
+    # Check a few common next tags (monthly releases: YY.MM-py3)
+    local year month next_tag
+    year=$(date +%y)
+    month=$(date +%m)
+    next_tag="${year}.$(printf '%02d' "$month")-py3"
+    if [[ "$next_tag" != "$current_tag" ]]; then
+      if docker manifest inspect "nvcr.io/nvidia/vllm:${next_tag}" >/dev/null 2>&1; then
+        updates+=("NGC vLLM: ${current_tag} → ${next_tag}")
+      fi
+    fi
+  fi
+
+  # Save check timestamp
+  save_update_config "$today" "$auto_update"
+
+  [[ ${#updates[@]} -eq 0 ]] && return 0
+
+  if [[ "$auto_update" == "true" ]]; then
+    printf "\n  ${BLUE}${BOLD}Auto-updating...${NC}\n"
+    for u in "${updates[@]}"; do
+      if [[ "$u" == spark* ]]; then
+        local self
+        self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
+        curl -fsSL --max-time 10 \
+          "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" -o "${self}.tmp" 2>/dev/null
+        if [[ -s "${self}.tmp" ]] && bash -n "${self}.tmp" 2>/dev/null; then
+          chmod +x "${self}.tmp" && mv "${self}.tmp" "$self" \
+            && info "Updated $u" || { rm -f "${self}.tmp"; warn "Failed to update spark CLI"; }
+        else
+          rm -f "${self}.tmp"
+          warn "Failed to update spark CLI (invalid download)"
+        fi
+      elif [[ "$u" == NGC* ]]; then
+        local tag="${u##*→ }"
+        docker pull "nvcr.io/nvidia/vllm:${tag}" >/dev/null 2>&1 \
+          && info "Updated $u" || warn "Failed to update NGC container"
+      fi
+    done
+    printf "\n"
+  else
+    printf "\n  ${YELLOW}${BOLD}Updates available:${NC}\n"
+    for u in "${updates[@]}"; do
+      printf "    ${YELLOW}⊘${NC} %s\n" "$u"
+    done
+    printf "\n  Run ${BOLD}spark update${NC} to update, or enable auto-update:\n"
+    printf "    ${DIM}spark config auto-update on${NC}\n\n"
+  fi
+}
+
+cmd_config() {
+  local key="${1:-}" value="${2:-}"
+
+  if [[ -z "$key" ]]; then
+    printf "\n  ${BOLD}Configuration:${NC}\n"
+    printf "    auto-update: %s\n\n" "$(get_update_config "auto_update" "false")"
+    return 0
+  fi
+
+  case "$key" in
+    auto-update)
+      case "$value" in
+        on|true)
+          save_update_config "$(get_update_config "last_check" "")" "true"
+          info "Auto-update enabled"
+          ;;
+        off|false)
+          save_update_config "$(get_update_config "last_check" "")" "false"
+          info "Auto-update disabled"
+          ;;
+        *)
+          die "Usage: spark config auto-update on|off"
+          ;;
+      esac
+      ;;
+    *)
+      die "Unknown config key: $key" "Available: auto-update"
+      ;;
+  esac
+}
+
+# --- Main ---
+check_for_updates
+
+case "${1:-}" in
+  run)     shift; cmd_run "$@" ;;
+  stop)    cmd_stop ;;
+  pull)    shift; cmd_pull "$@" ;;
+  list)    cmd_list ;;
+  rm)      shift; cmd_rm "$@" ;;
+  status)  cmd_status ;;
+  logs)    shift; cmd_logs "$@" ;;
+  doctor)  cmd_doctor ;;
+  setup)   shift; cmd_setup "$@" ;;
+  update)  cmd_update ;;
+  config)  shift; cmd_config "$@" ;;
+  version) printf "spark v%s\n" "$VERSION" ;;
+  help|--help|-h|"") cmd_help ;;
+  *)       die "Unknown command: $1" "Run 'spark help' for usage" ;;
+esac
