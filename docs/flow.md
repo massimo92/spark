@@ -17,7 +17,8 @@ flowchart LR
     dispatch -->|logs| logs["cmd_logs :588"]
     dispatch -->|doctor| doctor["cmd_doctor :603"]
     dispatch -->|update| update["cmd_update :1108"]
-    dispatch -->|help| help["cmd_help :1142"]
+    dispatch -->|gateway| gateway["cmd_gateway"]
+    dispatch -->|help| help["cmd_help"]
 ```
 
 ## spark run (core path)
@@ -147,6 +148,13 @@ flowchart LR
         stop["spark stop :434\ndocker stop + rm"]
         status["spark status :549\ninspect: model, uptime, port"]
         logs["spark logs :588\ndocker logs [-f]"]
+    end
+
+    subgraph gateway_mgmt ["Gateway Management"]
+        gw_start["spark gateway start\nload config → generate yaml\n→ docker run litellm"]
+        gw_stop["spark gateway stop\ndocker stop + rm"]
+        gw_status["spark gateway status\nshow port, providers"]
+        gw_logs["spark gateway logs\ndocker logs [-f]"]
     end
 
     subgraph maintenance ["Maintenance"]
