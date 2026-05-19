@@ -27,6 +27,10 @@ GITHUB_REPO="massimo92/spark"
 DEFAULT_PORT=8000
 HF_CACHE_DIR="${HOME}/.cache/huggingface"
 CONTAINER_NAME="spark-vllm"
+GATEWAY_CONTAINER="spark-litellm"
+GATEWAY_CONFIG="${SPARK_CONFIG_DIR}/gateway.json"
+GATEWAY_PORT=4000
+LITELLM_IMAGE="ghcr.io/berriai/litellm:main-latest"
 TOTAL_VRAM_GB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
   | awk 'NR==1 {printf "%.0f", $1/1024}' || echo "128")
 [[ "$TOTAL_VRAM_GB" =~ ^[0-9]+$ && "$TOTAL_VRAM_GB" -gt 0 ]] || TOTAL_VRAM_GB=128
@@ -711,6 +715,21 @@ cmd_doctor() {
     fi
   fi
 
+  # Gateway
+  if [[ -f "$GATEWAY_CONFIG" ]]; then
+    local gw_enabled
+    gw_enabled=$(jq -r '.enabled // false' "$GATEWAY_CONFIG" 2>/dev/null || echo "false")
+    if [[ "$gw_enabled" == "true" ]]; then
+      total=$((total + 1))
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+        info "Gateway: LiteLLM running (${GATEWAY_CONTAINER})"
+        passed=$((passed + 1))
+      else
+        err "Gateway: LiteLLM configured but not running — run 'spark gateway start'"
+      fi
+    fi
+  fi
+
   printf "\n  %d/%d checks passed." "$passed" "$total"
   if [[ "$passed" -lt "$total" ]]; then
     printf " Run '${BOLD}spark setup${NC}' to fix issues."
@@ -800,9 +819,11 @@ run_setup() {
   printf "\n"
 
   # --- Phase 1: Client (local) ---
-  printf "  ${BLUE}${BOLD}Phase 1: Client Setup${NC}\n\n"
+  printf "  ${BLUE}${BOLD}Phase 1: Client Setup${NC}\n"
+  printf "  ${DIM}Prepares your laptop to talk to the DGX over a private network.${NC}\n\n"
 
   # Tailscale local
+  printf "  ${DIM}Tailscale creates a private VPN so you can reach the DGX from anywhere.${NC}\n"
   if local_tailscale status >/dev/null 2>&1; then
     info "Tailscale installed and connected"
   elif [[ "$check_only" != "1" ]]; then
@@ -829,6 +850,7 @@ run_setup() {
   fi
 
   # SSH key local
+  printf "  ${DIM}SSH keys let you connect to the DGX without typing a password each time.${NC}\n"
   if [[ -f "${HOME}/.ssh/id_ed25519.pub" ]] || [[ -f "${HOME}/.ssh/id_rsa.pub" ]]; then
     info "SSH key pair exists"
   elif [[ "$check_only" != "1" ]]; then
@@ -853,7 +875,8 @@ run_setup() {
   fi
 
   # --- Phase 2: DGX remote ---
-  printf "  ${BLUE}${BOLD}Phase 2: DGX Spark Setup (remote)${NC}\n\n"
+  printf "  ${BLUE}${BOLD}Phase 2: DGX Spark Setup (remote)${NC}\n"
+  printf "  ${DIM}Installs tools and containers on the DGX needed to serve models.${NC}\n\n"
 
   # GPU
   local gpu_info
@@ -944,6 +967,7 @@ run_setup() {
   fi
 
   # Tailscale on DGX
+  printf "  ${DIM}Tailscale on the DGX lets you reach it from anywhere without port-forwarding.${NC}\n"
   if remote "command -v tailscale && tailscale status" >/dev/null 2>&1; then
     info "Tailscale installed and connected (DGX)"
   elif [[ "$check_only" != "1" ]]; then
@@ -973,6 +997,7 @@ run_setup() {
   fi
 
   # NGC login
+  printf "  ${DIM}NGC is NVIDIA's container registry — needed to pull the vLLM serving image.${NC}\n"
   if remote "test -f ~/.docker/config.json && grep -q nvcr.io ~/.docker/config.json" 2>/dev/null; then
     info "NGC Docker login configured"
   elif [[ "$check_only" != "1" ]]; then
@@ -1004,6 +1029,7 @@ run_setup() {
   fi
 
   # vLLM container
+  printf "  ${DIM}vLLM is the inference engine that serves your models via an OpenAI-compatible API.${NC}\n"
   local remote_ngc
   remote_ngc=$(remote "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep 'nvcr.io/nvidia/vllm' | head -1" 2>/dev/null || true)
   if [[ -n "$remote_ngc" ]]; then
@@ -1025,10 +1051,142 @@ run_setup() {
     setup_fail "NGC vLLM container not pulled"
   fi
 
+  # LiteLLM gateway (optional)
+  printf "  ${DIM}LiteLLM is an API gateway that unifies local models (vLLM) and cloud providers${NC}\n"
+  printf "  ${DIM}(OpenRouter, Together, etc.) under a single endpoint. Your agents talk to LiteLLM${NC}\n"
+  printf "  ${DIM}without knowing if the model is local or cloud.${NC}\n"
+  if [[ "$check_only" != "1" ]]; then
+    printf "\n"
+    if [[ "$auto_yes" == "1" ]] || confirm "Install LiteLLM gateway? (unified API for local + cloud models)"; then
+      # Pull LiteLLM image
+      local litellm_exists
+      litellm_exists=$(remote "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -c 'ghcr.io/berriai/litellm' || true" 2>/dev/null | tr -d '[:space:]')
+      if [[ "${litellm_exists:-0}" -gt 0 ]]; then
+        info "LiteLLM image already pulled"
+      else
+        printf "  Pulling LiteLLM image on DGX...\n"
+        remote "docker pull ${LITELLM_IMAGE}"
+        info "Pulled ${LITELLM_IMAGE}"
+      fi
+
+      # Provider selection
+      printf "\n  ${BOLD}Select providers to enable:${NC}\n\n"
+      local gw_vllm=1 gw_openrouter=0 gw_ollama=0 gw_zen=0 gw_together=0
+
+      printf "  ${GREEN}✓${NC} vLLM (local, auto-configured from spark)\n"
+
+      if confirm "  Enable OpenRouter? (cloud, requires API key)"; then
+        gw_openrouter=1
+      fi
+      if confirm "  Enable Ollama? (local, requires ollama running on DGX)"; then
+        gw_ollama=1
+      fi
+      if confirm "  Enable Zen / OpenCode? (cloud, requires API key)"; then
+        gw_zen=1
+      fi
+      if confirm "  Enable Together AI? (cloud, requires API key)"; then
+        gw_together=1
+      fi
+
+      # Collect API keys
+      local openrouter_key="" zen_key="" together_key=""
+      if [[ "$gw_openrouter" == "1" ]]; then
+        printf "  Enter OpenRouter API key (or 's' to skip): "
+        read -rs openrouter_key; printf "\n"
+        if [[ "$openrouter_key" == "s" ]]; then openrouter_key=""; gw_openrouter=0; warn "Skipped OpenRouter"; fi
+      fi
+      if [[ "$gw_zen" == "1" ]]; then
+        printf "  Enter Zen (OpenCode) API key (or 's' to skip): "
+        read -rs zen_key; printf "\n"
+        if [[ "$zen_key" == "s" ]]; then zen_key=""; gw_zen=0; warn "Skipped Zen"; fi
+      fi
+      if [[ "$gw_together" == "1" ]]; then
+        printf "  Enter Together AI API key (or 's' to skip): "
+        read -rs together_key; printf "\n"
+        if [[ "$together_key" == "s" ]]; then together_key=""; gw_together=0; warn "Skipped Together AI"; fi
+      fi
+
+      # Build gateway.json
+      local gw_json
+      gw_json=$(jq -n \
+        --argjson enabled true \
+        --argjson port "$GATEWAY_PORT" \
+        --argjson vllm_enabled "$( [[ "$gw_vllm" == "1" ]] && echo true || echo false )" \
+        --argjson openrouter_enabled "$( [[ "$gw_openrouter" == "1" ]] && echo true || echo false )" \
+        --arg openrouter_key "$openrouter_key" \
+        --argjson ollama_enabled "$( [[ "$gw_ollama" == "1" ]] && echo true || echo false )" \
+        --argjson zen_enabled "$( [[ "$gw_zen" == "1" ]] && echo true || echo false )" \
+        --arg zen_key "$zen_key" \
+        --argjson together_enabled "$( [[ "$gw_together" == "1" ]] && echo true || echo false )" \
+        --arg together_key "$together_key" \
+        '{
+          enabled: $enabled,
+          port: $port,
+          providers: {
+            vllm: { enabled: $vllm_enabled, port: 8000 },
+            openrouter: { enabled: $openrouter_enabled, api_key: $openrouter_key },
+            ollama: { enabled: $ollama_enabled },
+            zen: { enabled: $zen_enabled, api_key: $zen_key },
+            together: { enabled: $together_enabled, api_key: $together_key }
+          }
+        }')
+
+      # Save config on DGX
+      remote "mkdir -p ~/.config/spark"
+      printf '%s\n' "$gw_json" | remote "cat > ~/.config/spark/gateway.json"
+      info "Gateway config saved"
+
+      # Generate litellm_config.yaml on DGX
+      gateway_save_config "$gw_json"
+      local litellm_yaml
+      litellm_yaml=$(gateway_generate_litellm_yaml)
+      if [[ -n "$litellm_yaml" ]]; then
+        printf '%s\n' "$litellm_yaml" | remote "cat > ~/.config/spark/litellm_config.yaml"
+        info "LiteLLM config generated"
+      fi
+
+      # Start gateway
+      local gw_env_args=()
+      [[ -n "$openrouter_key" ]] && gw_env_args+=("-e" "OPENROUTER_API_KEY=${openrouter_key}")
+      [[ -n "$zen_key" ]] && gw_env_args+=("-e" "ZEN_API_KEY=${zen_key}")
+      [[ -n "$together_key" ]] && gw_env_args+=("-e" "TOGETHER_API_KEY=${together_key}")
+
+      remote "docker rm -f ${GATEWAY_CONTAINER} 2>/dev/null || true"
+      # Build docker run command remotely
+      local env_flags=""
+      [[ -n "$openrouter_key" ]] && env_flags+=" -e OPENROUTER_API_KEY='${openrouter_key}'"
+      [[ -n "$zen_key" ]] && env_flags+=" -e ZEN_API_KEY='${zen_key}'"
+      [[ -n "$together_key" ]] && env_flags+=" -e TOGETHER_API_KEY='${together_key}'"
+
+      remote "docker run -d --network host \
+        -v ~/.config/spark/litellm_config.yaml:/app/config.yaml \
+        ${env_flags} \
+        --name ${GATEWAY_CONTAINER} \
+        --restart unless-stopped \
+        ${LITELLM_IMAGE} \
+        --config /app/config.yaml --port ${GATEWAY_PORT}"
+
+      info "LiteLLM gateway started on port ${GATEWAY_PORT}"
+      printf "    Test: ${DIM}curl localhost:${GATEWAY_PORT}/v1/models${NC}\n"
+    else
+      setup_skip "LiteLLM gateway"
+      warn "Skipped LiteLLM gateway"
+    fi
+  elif remote "docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^${GATEWAY_CONTAINER}$'" 2>/dev/null; then
+    info "LiteLLM gateway running"
+  else
+    local gw_config_exists
+    gw_config_exists=$(remote "test -f ~/.config/spark/gateway.json && echo yes" 2>/dev/null || echo "no")
+    if [[ "$gw_config_exists" == "yes" ]]; then
+      warn "LiteLLM gateway configured but not running"
+    fi
+  fi
+
   printf "\n"
 
   # --- Phase 3: Link both machines ---
-  printf "  ${BLUE}${BOLD}Phase 3: Secure Connection${NC}\n\n"
+  printf "  ${BLUE}${BOLD}Phase 3: Secure Connection${NC}\n"
+  printf "  ${DIM}Locks down SSH so only your laptop can connect to the DGX.${NC}\n\n"
 
   # ssh-copy-id
   local has_remote_key
@@ -1057,6 +1215,7 @@ run_setup() {
   fi
 
   # Disable password SSH
+  printf "  ${DIM}Disabling password login forces key-only auth — prevents brute-force attacks.${NC}\n"
   if remote "grep -q '^PasswordAuthentication no' /etc/ssh/sshd_config" 2>/dev/null; then
     info "Password SSH login disabled"
   elif [[ "$check_only" == "1" ]]; then
@@ -1074,6 +1233,7 @@ run_setup() {
 
   # NVIDIA Sync (macOS)
   if [[ "$(uname -s)" == "Darwin" && "$check_only" != "1" ]]; then
+    printf "  ${DIM}NVIDIA Sync keeps files in sync between your Mac and the DGX (like Dropbox for DGX).${NC}\n"
     setup_manual_step "Install NVIDIA Sync from nvidia.com/sync (optional, for file sync)" ""
   fi
 
@@ -1184,6 +1344,7 @@ cmd_help() {
     rm <model>     Remove a downloaded model
     status         Show current serving status
     logs [-f]      Show container logs (-f to follow)
+    gateway        Manage LiteLLM gateway (start|stop|status|logs)
     update         Update the NGC vLLM container
     config         Configure spark settings (e.g. auto-update)
 
@@ -1205,6 +1366,8 @@ cmd_help() {
     spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4 --tools --port 9000
     spark run --dry-run Qwen/Qwen3-30B-A3B
+    spark gateway start
+    spark gateway status
 
 EOF
 }
@@ -1226,6 +1389,112 @@ save_update_config() {
     jq -n --arg lc "$last_check" --argjson au "$auto_update" \
       '{last_check: $lc, auto_update: $au}' > "$UPDATE_FILE"
   fi
+}
+
+# --- Gateway Config ---
+gateway_load_config() {
+  if [[ -f "$GATEWAY_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
+    jq -r '.' "$GATEWAY_CONFIG" 2>/dev/null
+  else
+    echo '{}'
+  fi
+}
+
+gateway_save_config() {
+  mkdir -p "$SPARK_CONFIG_DIR"
+  printf '%s\n' "$1" > "$GATEWAY_CONFIG"
+}
+
+gateway_provider_enabled() {
+  local provider="$1"
+  local config
+  config=$(gateway_load_config)
+  echo "$config" | jq -r --arg p "$provider" '.providers[$p].enabled // false' 2>/dev/null
+}
+
+gateway_get_api_key() {
+  local provider="$1"
+  local config
+  config=$(gateway_load_config)
+  echo "$config" | jq -r --arg p "$provider" '.providers[$p].api_key // ""' 2>/dev/null
+}
+
+gateway_generate_litellm_yaml() {
+  local config
+  config=$(gateway_load_config)
+  local vllm_port
+  vllm_port=$(echo "$config" | jq -r '.providers.vllm.port // 8000' 2>/dev/null)
+
+  local yaml="model_list:"
+  local has_models=0
+
+  # vLLM — add all models currently served (wildcard passthrough)
+  if [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]]; then
+    yaml+="
+  - model_name: \"vllm/*\"
+    litellm_params:
+      model: \"openai/*\"
+      api_base: \"http://localhost:${vllm_port}/v1\""
+    has_models=1
+  fi
+
+  # OpenRouter
+  if [[ "$(echo "$config" | jq -r '.providers.openrouter.enabled // false')" == "true" ]]; then
+    yaml+="
+  - model_name: \"openrouter/*\"
+    litellm_params:
+      model: \"openrouter/*\"
+      api_key: \"os.environ/OPENROUTER_API_KEY\""
+    has_models=1
+  fi
+
+  # Ollama
+  if [[ "$(echo "$config" | jq -r '.providers.ollama.enabled // false')" == "true" ]]; then
+    yaml+="
+  - model_name: \"ollama/*\"
+    litellm_params:
+      model: \"ollama/*\"
+      api_base: \"http://localhost:11434\""
+    has_models=1
+  fi
+
+  # Zen (OpenCode)
+  if [[ "$(echo "$config" | jq -r '.providers.zen.enabled // false')" == "true" ]]; then
+    yaml+="
+  - model_name: \"zen/*\"
+    litellm_params:
+      model: \"openai/*\"
+      api_base: \"https://opencode.ai/zen/v1\"
+      api_key: \"os.environ/ZEN_API_KEY\""
+    has_models=1
+  fi
+
+  # Together AI
+  if [[ "$(echo "$config" | jq -r '.providers.together.enabled // false')" == "true" ]]; then
+    yaml+="
+  - model_name: \"together/*\"
+    litellm_params:
+      model: \"together_ai/*\"
+      api_key: \"os.environ/TOGETHER_API_KEY\""
+    has_models=1
+  fi
+
+  if [[ "$has_models" -eq 0 ]]; then
+    return 1
+  fi
+
+  local port
+  port=$(echo "$config" | jq -r '.port // 4000' 2>/dev/null)
+  yaml+="
+
+general_settings:
+  master_key: null
+
+litellm_settings:
+  drop_params: true
+  num_retries: 2"
+
+  printf '%s\n' "$yaml"
 }
 
 check_for_updates() {
@@ -1340,6 +1609,231 @@ cmd_config() {
   esac
 }
 
+# --- Gateway ---
+cmd_gateway() {
+  local subcmd="${1:-}"
+  [[ -z "$subcmd" ]] && {
+    printf "\n  ${BOLD}Usage:${NC} spark gateway <start|stop|status|logs>\n\n"
+    printf "  ${BOLD}Subcommands:${NC}\n"
+    printf "    start     Start LiteLLM gateway container\n"
+    printf "    stop      Stop LiteLLM gateway container\n"
+    printf "    status    Show gateway status and providers\n"
+    printf "    logs      Show gateway logs (-f to follow)\n"
+    printf "    add       Enable a provider (openrouter|ollama|zen|together)\n"
+    printf "    remove    Disable a provider\n"
+    printf "\n"
+    return 0
+  }
+  shift
+
+  case "$subcmd" in
+    start)  gateway_start ;;
+    stop)   gateway_stop ;;
+    status) gateway_status ;;
+    logs)   gateway_logs "$@" ;;
+    add)    gateway_add "$@" ;;
+    remove) gateway_remove "$@" ;;
+    *)      die "Unknown gateway command: $subcmd" "Run 'spark gateway' for usage" ;;
+  esac
+}
+
+gateway_start() {
+  local config
+  config=$(gateway_load_config)
+
+  if [[ "$config" == "{}" || "$(echo "$config" | jq -r '.enabled // false')" != "true" ]]; then
+    die "Gateway not configured" "Run 'spark setup' to configure LiteLLM gateway"
+  fi
+
+  # Check if already running
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    warn "Gateway already running"
+    printf "    Stop first: ${BOLD}spark gateway stop${NC}\n"
+    return 0
+  fi
+
+  # Remove stopped container
+  docker rm -f "$GATEWAY_CONTAINER" 2>/dev/null || true
+
+  # Generate config
+  local litellm_yaml
+  litellm_yaml=$(gateway_generate_litellm_yaml)
+  if [[ -z "$litellm_yaml" ]]; then
+    die "No providers enabled" "Run 'spark setup' to configure providers"
+  fi
+
+  local litellm_config_path="${SPARK_CONFIG_DIR}/litellm_config.yaml"
+  mkdir -p "$SPARK_CONFIG_DIR"
+  printf '%s\n' "$litellm_yaml" > "$litellm_config_path"
+
+  # Build env flags
+  local env_args=()
+  local key
+  key=$(gateway_get_api_key "openrouter")
+  [[ -n "$key" ]] && env_args+=("-e" "OPENROUTER_API_KEY=${key}")
+  key=$(gateway_get_api_key "zen")
+  [[ -n "$key" ]] && env_args+=("-e" "ZEN_API_KEY=${key}")
+  key=$(gateway_get_api_key "together")
+  [[ -n "$key" ]] && env_args+=("-e" "TOGETHER_API_KEY=${key}")
+
+  local port
+  port=$(echo "$config" | jq -r '.port // 4000' 2>/dev/null)
+
+  printf "\n"
+  docker run -d \
+    --network host \
+    -v "${litellm_config_path}:/app/config.yaml" \
+    "${env_args[@]}" \
+    --name "$GATEWAY_CONTAINER" \
+    --restart unless-stopped \
+    "$LITELLM_IMAGE" \
+    --config /app/config.yaml --port "$port" >/dev/null 2>&1 \
+    || die "Failed to start gateway container"
+
+  info "LiteLLM gateway started on port ${port}"
+  printf "    Test: ${DIM}curl localhost:${port}/v1/models${NC}\n\n"
+}
+
+gateway_stop() {
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    warn "No running gateway container"
+    return 0
+  fi
+
+  docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1
+  docker rm "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+  info "Stopped gateway"
+}
+
+gateway_status() {
+  printf "\n"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    local config
+    config=$(gateway_load_config)
+    local port
+    port=$(echo "$config" | jq -r '.port // 4000' 2>/dev/null)
+
+    printf "  ${GREEN}●${NC} LiteLLM gateway running (${GATEWAY_CONTAINER})\n"
+    printf "    Port:     %s\n" "$port"
+    printf "    API:      http://localhost:%s/v1\n" "$port"
+
+    printf "    Providers:"
+    local providers=()
+    [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]] && providers+=("vLLM")
+    [[ "$(echo "$config" | jq -r '.providers.openrouter.enabled // false')" == "true" ]] && providers+=("OpenRouter")
+    [[ "$(echo "$config" | jq -r '.providers.ollama.enabled // false')" == "true" ]] && providers+=("Ollama")
+    [[ "$(echo "$config" | jq -r '.providers.zen.enabled // false')" == "true" ]] && providers+=("Zen")
+    [[ "$(echo "$config" | jq -r '.providers.together.enabled // false')" == "true" ]] && providers+=("Together")
+
+    if [[ ${#providers[@]} -gt 0 ]]; then
+      printf " %s\n" "$(IFS=', '; echo "${providers[*]}")"
+    else
+      printf " none\n"
+    fi
+  else
+    printf "  ${DIM}○${NC} Gateway not running. Start with: ${BOLD}spark gateway start${NC}\n"
+  fi
+  printf "\n"
+}
+
+gateway_logs() {
+  local follow=0
+  [[ "${1:-}" == "-f" ]] && follow=1
+
+  if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    die "No gateway container found"
+  fi
+
+  if [[ "$follow" == "1" ]]; then
+    docker logs -f "$GATEWAY_CONTAINER"
+  else
+    docker logs "$GATEWAY_CONTAINER"
+  fi
+}
+
+gateway_add() {
+  local provider="${1:-}"
+  local valid_providers="openrouter ollama zen together"
+
+  if [[ -z "$provider" ]]; then
+    printf "\n  ${BOLD}Usage:${NC} spark gateway add <provider>\n\n"
+    printf "  ${BOLD}Available providers:${NC}\n"
+    printf "    openrouter   Cloud LLM gateway (requires API key)\n"
+    printf "    ollama       Local model runner (requires ollama on DGX)\n"
+    printf "    zen          OpenCode Zen cloud gateway (requires API key)\n"
+    printf "    together     Together AI cloud inference (requires API key)\n"
+    printf "\n"
+    return 0
+  fi
+
+  # shellcheck disable=SC2076
+  [[ " $valid_providers " =~ " $provider " ]] || die "Unknown provider: $provider" "Available: ${valid_providers// /, }"
+
+  local config
+  config=$(gateway_load_config)
+  if [[ "$config" == "{}" ]]; then
+    die "Gateway not configured" "Run 'spark setup' first to install the gateway"
+  fi
+
+  local already_enabled
+  already_enabled=$(echo "$config" | jq -r --arg p "$provider" '.providers[$p].enabled // false' 2>/dev/null)
+  if [[ "$already_enabled" == "true" ]]; then
+    warn "${provider} is already enabled"
+    return 0
+  fi
+
+  local api_key=""
+  if [[ "$provider" == "openrouter" || "$provider" == "zen" || "$provider" == "together" ]]; then
+    printf "  Enter %s API key: " "$provider"
+    read -rs api_key; printf "\n"
+    [[ -z "$api_key" ]] && die "API key is required for ${provider}"
+  fi
+
+  if [[ -n "$api_key" ]]; then
+    config=$(echo "$config" | jq --arg p "$provider" --arg k "$api_key" \
+      '.providers[$p].enabled = true | .providers[$p].api_key = $k')
+  else
+    config=$(echo "$config" | jq --arg p "$provider" '.providers[$p].enabled = true')
+  fi
+
+  gateway_save_config "$config"
+  info "Enabled ${provider}"
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    printf "  Restart gateway to apply: ${BOLD}spark gateway stop && spark gateway start${NC}\n"
+  fi
+}
+
+gateway_remove() {
+  local provider="${1:-}"
+  local valid_providers="openrouter ollama zen together"
+
+  if [[ -z "$provider" ]]; then
+    printf "\n  ${BOLD}Usage:${NC} spark gateway remove <provider>\n\n"
+    return 0
+  fi
+
+  # shellcheck disable=SC2076
+  [[ " $valid_providers " =~ " $provider " ]] || die "Unknown provider: $provider" "Available: ${valid_providers// /, }"
+  [[ "$provider" == "vllm" ]] && die "Cannot remove vLLM — it is the core local provider"
+
+  local config
+  config=$(gateway_load_config)
+  if [[ "$config" == "{}" ]]; then
+    die "Gateway not configured"
+  fi
+
+  config=$(echo "$config" | jq --arg p "$provider" \
+    '.providers[$p].enabled = false | .providers[$p].api_key = ""')
+
+  gateway_save_config "$config"
+  info "Disabled ${provider}"
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    printf "  Restart gateway to apply: ${BOLD}spark gateway stop && spark gateway start${NC}\n"
+  fi
+}
+
 # --- Main ---
 check_for_updates
 
@@ -1354,6 +1848,7 @@ case "${1:-}" in
   doctor)  cmd_doctor ;;
   setup)   shift; cmd_setup "$@" ;;
   update)  cmd_update ;;
+  gateway) shift; cmd_gateway "$@" ;;
   config)  shift; cmd_config "$@" ;;
   version) printf "spark v%s\n" "$VERSION" ;;
   help|--help|-h|"") cmd_help ;;
