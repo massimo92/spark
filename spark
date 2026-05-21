@@ -382,6 +382,7 @@ cmd_run() {
 
   # Build vLLM flags
   local vllm_args=(vllm serve "$model"
+    --trust-remote-code
     --gpu-memory-utilization "$GPU_MEM_UTIL"
     --max-model-len "$MAX_MODEL_LEN"
     --port "$port")
