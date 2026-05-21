@@ -1295,34 +1295,82 @@ setup_manual_step() {
 
 cmd_update() {
   printf "\n"
-  local current
-  current=$(detect_ngc_image)
-  if [[ -n "$current" ]]; then
-    printf "  Current: %s\n" "$current"
+  command -v curl >/dev/null 2>&1 || die "curl is required for updates"
+
+  local did_update=0
+
+  # --- spark CLI ---
+  printf "  Checking spark CLI...\n"
+  local remote_version
+  remote_version=$(curl -fsSL --max-time 5 \
+    "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" 2>/dev/null \
+    | grep -m1 '^VERSION=' | sed 's/VERSION="//' | sed 's/"//' || true)
+
+  if [[ -z "$remote_version" ]]; then
+    warn "Could not check latest spark version"
+  elif [[ "$remote_version" == "$VERSION" ]]; then
+    info "spark CLI is up to date (v${VERSION})"
   else
-    printf "  No vLLM container found.\n"
-  fi
-
-  printf "  Enter new NGC vLLM tag (e.g., 26.05-py3): "
-  read -r new_tag
-
-  if [[ -z "$new_tag" ]]; then
-    warn "No tag entered, cancelled"
-    return 0
-  fi
-  is_safe_ngc_tag "$new_tag" || die "Invalid NGC tag: $new_tag" "Use a tag like 26.05-py3"
-
-  local new_image="nvcr.io/nvidia/vllm:${new_tag}"
-
-  printf "  Checking if image exists...\n"
-  if docker manifest inspect "$new_image" >/dev/null 2>&1; then
-    if confirm "Pull ${new_image}?"; then
-      docker pull "$new_image"
-      info "Pulled ${new_image}"
-      printf "  Next 'spark run' will use this version automatically.\n"
+    printf "  spark CLI: v${VERSION} → v${remote_version}\n"
+    if confirm "Update spark CLI?"; then
+      local self
+      self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
+      curl -fsSL --max-time 10 \
+        "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" -o "${self}.tmp" 2>/dev/null
+      if [[ -s "${self}.tmp" ]] && bash -n "${self}.tmp" 2>/dev/null; then
+        chmod +x "${self}.tmp" && mv "${self}.tmp" "$self" \
+          && info "Updated spark CLI to v${remote_version}" \
+          || { rm -f "${self}.tmp"; err "Failed to replace spark binary"; }
+      else
+        rm -f "${self}.tmp"
+        err "Downloaded file is invalid, skipping"
+      fi
+      did_update=1
     fi
+  fi
+
+  # --- NGC vLLM container ---
+  printf "  Checking NGC vLLM container...\n"
+  local current_ngc
+  current_ngc=$(detect_ngc_image)
+
+  local current_tag=""
+  [[ -n "$current_ngc" ]] && current_tag="${current_ngc##*:}"
+
+  local latest_tag="" year month
+  year=$(date +%y)
+  month=$(date +%m)
+  # Probe current month and previous month tags
+  for m in "$month" "$(printf '%02d' $(( 10#$month - 1 )))"; do
+    [[ "$m" == "00" ]] && continue
+    local candidate="${year}.${m}-py3"
+    if [[ "$candidate" != "$current_tag" ]] && \
+       docker manifest inspect "nvcr.io/nvidia/vllm:${candidate}" >/dev/null 2>&1; then
+      latest_tag="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$current_ngc" && -z "$latest_tag" ]]; then
+    warn "No vLLM container found and could not detect latest"
+  elif [[ -z "$latest_tag" ]]; then
+    info "NGC vLLM is up to date (${current_tag})"
   else
-    err "Image ${new_image} not found on NGC"
+    if [[ -n "$current_tag" ]]; then
+      printf "  NGC vLLM: ${current_tag} → ${latest_tag}\n"
+    else
+      printf "  NGC vLLM: ${latest_tag} available\n"
+    fi
+    if confirm "Pull nvcr.io/nvidia/vllm:${latest_tag}?"; then
+      docker pull "nvcr.io/nvidia/vllm:${latest_tag}" \
+        && info "Pulled nvcr.io/nvidia/vllm:${latest_tag}" \
+        || err "Failed to pull NGC container"
+      did_update=1
+    fi
+  fi
+
+  if [[ "$did_update" -eq 0 ]]; then
+    printf "  No updates applied.\n"
   fi
   printf "\n"
 }
@@ -1346,7 +1394,7 @@ cmd_help() {
     status         Show current serving status
     logs [-f]      Show container logs (-f to follow)
     gateway        Manage LiteLLM gateway (start|stop|status|logs)
-    update         Update the NGC vLLM container
+    update         Update spark CLI and NGC vLLM container
     config         Configure spark settings (e.g. auto-update)
 
   ${BOLD}Run flags:${NC}
