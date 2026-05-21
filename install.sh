@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# spark installer — downloads the spark script to /usr/local/bin
+# spark installer — downloads the spark script to ~/.local/bin
 
 REPO="massimo92/spark"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${HOME}/.local/bin"
 BINARY="spark"
 
 printf "Installing spark...\n"
@@ -23,12 +23,35 @@ fi
 chmod +x "$tmp_file"
 
 # Install
-if [[ -w "$INSTALL_DIR" ]]; then
-  mv "$tmp_file" "${INSTALL_DIR}/${BINARY}"
-else
-  sudo mv "$tmp_file" "${INSTALL_DIR}/${BINARY}"
-fi
+mkdir -p "$INSTALL_DIR"
+mv "$tmp_file" "${INSTALL_DIR}/${BINARY}"
 trap - EXIT
+
+# Ensure ~/.local/bin is in PATH
+if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
+  shell_rc="${HOME}/.bashrc"
+  [[ -n "${ZSH_VERSION:-}" ]] && shell_rc="${HOME}/.zshrc"
+  if ! grep -q '.local/bin' "$shell_rc" 2>/dev/null; then
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$shell_rc"
+    printf "  Added ~/.local/bin to PATH in %s\n" "$(basename "$shell_rc")"
+  fi
+  export PATH="${INSTALL_DIR}:${PATH}"
+fi
+
+# Clean up old system-level install if it exists
+if [[ -f "/usr/local/bin/${BINARY}" ]]; then
+  printf "  Found old install at /usr/local/bin/%s\n" "$BINARY"
+  if [[ -w "/usr/local/bin/${BINARY}" ]]; then
+    rm -f "/usr/local/bin/${BINARY}"
+    printf "  Removed /usr/local/bin/%s\n" "$BINARY"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo rm -f "/usr/local/bin/${BINARY}" 2>/dev/null \
+      && printf "  Removed /usr/local/bin/%s\n" "$BINARY" \
+      || printf "  Could not remove /usr/local/bin/%s — remove it manually\n" "$BINARY"
+  else
+    printf "  Could not remove /usr/local/bin/%s — remove it manually\n" "$BINARY"
+  fi
+fi
 
 printf "✓ spark installed to %s/%s\n" "$INSTALL_DIR" "$BINARY"
 printf "  Run: spark setup\n"

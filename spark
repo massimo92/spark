@@ -919,20 +919,23 @@ run_setup() {
     info "No firmware-updater snap"
   fi
 
-  # spark CLI
-  if remote "export PATH=\$HOME/.local/bin:\$PATH && command -v spark" >/dev/null 2>&1; then
-    info "spark CLI installed"
-  elif [[ "$check_only" != "1" ]]; then
-    # Copy the running script to the DGX (~/.local/bin, no sudo needed)
+  # spark CLI — canonical location is ~/.local/bin/spark
+  if [[ "$check_only" != "1" ]]; then
     local self
     self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
     remote "mkdir -p ~/.local/bin"
     remote "cat > ~/.local/bin/spark && chmod +x ~/.local/bin/spark" < "$self"
-    # Ensure ~/.local/bin is in PATH for non-login shells
+    # Ensure ~/.local/bin is in PATH
     if ! remote "grep -q 'local/bin' ~/.bashrc" 2>/dev/null; then
       remote 'echo '\''export PATH="\$HOME/.local/bin:\$PATH"'\'' >> ~/.bashrc'
     fi
+    # Remove stale copies that shadow ~/.local/bin/spark
+    for stale_path in "/usr/local/bin/spark" "\$HOME/spark"; do
+      remote "test -f $stale_path && rm -f $stale_path 2>/dev/null && echo 'removed $stale_path'" 2>/dev/null || true
+    done
     info "Installed spark CLI to ~/.local/bin/spark"
+  elif remote "export PATH=\$HOME/.local/bin:\$PATH && command -v spark" >/dev/null 2>&1; then
+    info "spark CLI installed"
   else
     setup_fail "spark CLI not installed"
   fi
