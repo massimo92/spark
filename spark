@@ -177,8 +177,8 @@ resolve_model_path() {
 
 # --- Auto-Profiler ---
 validate_profile_values() {
-  [[ "$REASONING_PARSER" =~ ^(qwen3|deepseek_r1)?$ ]] || die "Invalid profile value: reasoning_parser"
-  [[ "$TOOL_CALL_PARSER" =~ ^(qwen25)?$ ]] || die "Invalid profile value: tool_call_parser"
+  [[ -z "$REASONING_PARSER" || "$REASONING_PARSER" =~ ^[a-z0-9_]+$ ]] || die "Invalid profile value: reasoning_parser"
+  [[ -z "$TOOL_CALL_PARSER" || "$TOOL_CALL_PARSER" =~ ^[a-z0-9_]+$ ]] || die "Invalid profile value: tool_call_parser"
   is_mem_util "$GPU_MEM_UTIL" || die "Invalid profile value: gpu_memory_utilization"
   is_positive_int "$MAX_MODEL_LEN" || die "Invalid profile value: max_model_len"
   [[ "$IS_MULTIMODAL" =~ ^(true|false)$ ]] || die "Invalid profile value: is_multimodal"
@@ -228,15 +228,20 @@ profile_model() {
   # Reasoning parser
   REASONING_PARSER=""
   case "$model_type" in
-    qwen3|qwen3_moe|qwen3_5_moe) REASONING_PARSER="qwen3" ;;
+    qwen3*) REASONING_PARSER="qwen3" ;;
     deepseek_v3) REASONING_PARSER="deepseek_r1" ;;
   esac
 
   # Tool-call parser
   TOOL_CALL_PARSER=""
   case "$model_type" in
-    qwen3|qwen3_moe|qwen3_5_moe) TOOL_CALL_PARSER="qwen25" ;;
+    qwen3*) TOOL_CALL_PARSER="qwen3_coder" ;;
   esac
+
+  # Warn if model_type is unrecognized
+  if [[ -n "$model_type" && -z "$REASONING_PARSER" && -z "$TOOL_CALL_PARSER" ]]; then
+    warn "Unknown model_type '${model_type}' — reasoning and tool-call parsers not configured"
+  fi
 
   # Max context length
   MAX_MODEL_LEN=$(jq -r '
