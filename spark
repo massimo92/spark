@@ -228,14 +228,14 @@ profile_model() {
   # Reasoning parser
   REASONING_PARSER=""
   case "$model_type" in
-    qwen3|qwen3_moe|qwen3_5_moe|qwen3_*) REASONING_PARSER="qwen3" ;;
+    qwen3*) REASONING_PARSER="qwen3" ;;
     deepseek_v3) REASONING_PARSER="deepseek_r1" ;;
   esac
 
   # Tool-call parser
   TOOL_CALL_PARSER=""
   case "$model_type" in
-    qwen3|qwen3_moe|qwen3_5_moe|qwen3_*) TOOL_CALL_PARSER="qwen3_coder" ;;
+    qwen3*) TOOL_CALL_PARSER="qwen3_coder" ;;
   esac
 
   # Warn if model_type is unrecognized
