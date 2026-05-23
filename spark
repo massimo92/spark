@@ -462,6 +462,11 @@ cmd_run() {
   printf "  Container started. Logs: ${BOLD}spark logs -f${NC}\n"
   printf "  Test: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$port"
 
+  # Auto-restart gateway if running so it picks up the new model
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    gateway_restart
+  fi
+
   if [[ "$tail_logs" == "1" ]]; then
     docker logs -f "$CONTAINER_NAME"
   fi
@@ -1693,6 +1698,12 @@ cmd_gateway() {
     remove) gateway_remove "$@" ;;
     *)      die "Unknown gateway command: $subcmd" "Run 'spark gateway' for usage" ;;
   esac
+}
+
+gateway_restart() {
+  docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1
+  docker rm "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+  gateway_start
 }
 
 gateway_start() {
