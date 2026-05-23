@@ -1486,7 +1486,8 @@ gateway_generate_litellm_yaml() {
   - model_name: \"vllm/*\"
     litellm_params:
       model: \"openai/*\"
-      api_base: \"http://localhost:${vllm_port}/v1\""
+      api_base: \"http://localhost:${vllm_port}/v1\"
+      api_key: \"dummy\""
     has_models=1
   fi
 
