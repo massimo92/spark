@@ -2787,16 +2787,15 @@ gateway_start() {
   local net_args=()
   while IFS= read -r _na; do net_args+=("$_na"); done < <(gateway_net_args "$port")
 
+  # Assemble one args array (bash 3.2 on macOS errors on "${empty[@]}" under set -u,
+  # so only splice env_args in when it is non-empty).
+  local run_args=(docker run -d "${net_args[@]}" -v "${litellm_config_path}:/app/config.yaml")
+  [[ ${#env_args[@]} -gt 0 ]] && run_args+=("${env_args[@]}")
+  run_args+=(--name "$GATEWAY_CONTAINER" --restart unless-stopped "$LITELLM_IMAGE"
+    --config /app/config.yaml --port "$port")
+
   printf "\n"
-  docker run -d \
-    "${net_args[@]}" \
-    -v "${litellm_config_path}:/app/config.yaml" \
-    "${env_args[@]}" \
-    --name "$GATEWAY_CONTAINER" \
-    --restart unless-stopped \
-    "$LITELLM_IMAGE" \
-    --config /app/config.yaml --port "$port" >/dev/null 2>&1 \
-    || die "Failed to start gateway container"
+  "${run_args[@]}" >/dev/null 2>&1 || die "Failed to start gateway container"
 
   info "LiteLLM gateway started on port ${port}"
   printf "    Test: ${DIM}curl localhost:${port}/v1/models${NC}\n\n"
