@@ -41,6 +41,14 @@ detect_total_mem_gb() {
   if [[ -n "${SPARK_TOTAL_MEM_GB:-}" && "${SPARK_TOTAL_MEM_GB}" =~ ^[0-9]+$ ]]; then
     printf '%s\n' "$SPARK_TOTAL_MEM_GB"; return 0
   fi
+  # Discrete NVIDIA GPU: the memory pool vLLM reserves from is VRAM, not system RAM.
+  if [[ "${ACCEL:-}" == "cuda-discrete" ]]; then
+    local vram
+    vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)
+    if [[ "$vram" =~ ^[0-9]+$ && "$vram" -gt 0 ]]; then
+      printf '%s\n' $(( vram / 1024 )); return 0
+    fi
+  fi
   if [[ -r /proc/meminfo ]]; then
     local kb
     kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo "")
@@ -58,8 +66,60 @@ detect_total_mem_gb() {
   printf '%s\n' "$gb"
 }
 
+# --- Platform & accelerator detection ---
+# ACCEL is one of:
+#   cuda-unified   NVIDIA SoC with unified memory (GB10/GX10, Jetson, Thor, Grace) — arm64
+#   cuda-discrete  NVIDIA GPU with its own VRAM — typically x86_64
+#   metal          Apple Silicon (Metal GPU, unified memory)
+#   cpu            no supported GPU (Intel Mac, Linux without NVIDIA, AMD)
+_classify_accel() {
+  # No usable NVIDIA GPU → Apple Silicon (metal) or plain CPU.
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+    [[ "$SPARK_OS" == "Darwin" && "$SPARK_ARCH" == "arm64" ]] && { printf 'metal\n'; return 0; }
+    printf 'cpu\n'; return 0
+  fi
+  # NVIDIA present. arm64 NVIDIA == unified-memory SoC (GB10/Thor/Orin/Jetson/Grace).
+  case "$SPARK_ARCH" in
+    aarch64|arm64) printf 'cuda-unified\n'; return 0 ;;
+  esac
+  # x86_64 + NVIDIA: usually discrete, but confirm against SoC signals first.
+  if [[ -r /proc/device-tree/model ]] && grep -qiE 'jetson|orin|thor|grace|gb10' /proc/device-tree/model 2>/dev/null; then
+    printf 'cuda-unified\n'; return 0
+  fi
+  [[ -r /etc/nv_tegra_release ]] && { printf 'cuda-unified\n'; return 0; }
+  local gname
+  gname=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
+  printf '%s' "$gname" | grep -qiE 'GB10|GB200|GH200|Orin|Thor|Grace' && { printf 'cuda-unified\n'; return 0; }
+  # memory.total reported as N/A / [Not Supported] / blank → unified; a real number → discrete.
+  local mt
+  mt=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)
+  [[ -z "$mt" || ! "$mt" =~ ^[0-9]+$ ]] && { printf 'cuda-unified\n'; return 0; }
+  printf 'cuda-discrete\n'
+}
+
+# Detect OS, CPU arch, accelerator class and the inference backend to use.
+# Override for tests / edge cases: SPARK_OS_OVERRIDE, SPARK_ARCH_OVERRIDE, SPARK_ACCEL, SPARK_BACKEND.
+detect_platform() {
+  SPARK_OS="${SPARK_OS_OVERRIDE:-$(uname -s)}"     # Darwin | Linux
+  SPARK_ARCH="${SPARK_ARCH_OVERRIDE:-$(uname -m)}" # arm64/aarch64 | x86_64
+  ACCEL="${SPARK_ACCEL:-$(_classify_accel)}"
+  if [[ -n "${SPARK_BACKEND:-}" ]]; then
+    BACKEND="$SPARK_BACKEND"
+  else
+    case "$ACCEL" in
+      cuda-unified|cuda-discrete) BACKEND="vllm" ;;
+      *)                          BACKEND="ollama" ;;
+    esac
+  fi
+}
+detect_platform
+
 TOTAL_MEM_GB=$(detect_total_mem_gb)
-OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-10}"          # memory left for OS + desktop
+if [[ "$ACCEL" == "cuda-discrete" ]]; then
+  OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-2}"         # small VRAM headroom (OS runs in system RAM)
+else
+  OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-10}"        # OS + desktop share unified memory
+fi
 MEM_HEADROOM_PCT="${SPARK_MEM_HEADROOM_PCT:-8}"     # per-model cushion (activations/fragmentation)
 BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))       # memory available to models
 
@@ -806,8 +866,13 @@ print_memory_plan() {
   printf "    ${BOLD}Need:${NC}      %s GB  →  --gpu-memory-utilization %s\n" "$NEED_GB" "$GPU_MEM_UTIL"
   printf "    API:       http://localhost:%s/v1\n" "$port"
   [[ -n "$REASONING_PARSER" ]] && printf "    Reasoning: %s parser\n" "$REASONING_PARSER"
-  printf "    ${DIM}Machine:   %s GB total · %s OS-reserved · %s reserved by models · %s free${NC}\n" \
-    "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  if [[ "$ACCEL" == "cuda-discrete" ]]; then
+    printf "    ${DIM}GPU:       %s GB VRAM · %s headroom · %s reserved by models · %s free${NC}\n" \
+      "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  else
+    printf "    ${DIM}Machine:   %s GB total · %s OS-reserved · %s reserved by models · %s free${NC}\n" \
+      "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  fi
   if [[ "$MEM_DETECT_FALLBACK" == "1" ]]; then
     warn "Could not read system memory — using fallback ${TOTAL_MEM_GB} GB (set SPARK_TOTAL_MEM_GB to correct)"
   fi
@@ -1057,8 +1122,10 @@ cmd_status() {
 
   local free
   free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{printf "%.1f", b-r}')
-  printf "\n  ${DIM}Memory (GB): %s total · %s OS · %s reserved · %s free${NC}\n" \
-    "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  local mem_label="Memory (GB):" os_label="OS"
+  if [[ "$ACCEL" == "cuda-discrete" ]]; then mem_label="VRAM (GB):  "; os_label="headroom"; fi
+  printf "\n  ${DIM}%s %s total · %s %s · %s reserved · %s free${NC}\n" \
+    "$mem_label" "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$os_label" "$reserved" "$free"
   printf "  ${DIM}Direct API: http://localhost:<port>/v1${NC}\n"
   if [[ "$gw_running" -eq 1 && "$gw_vllm" -eq 1 ]]; then
     printf "  ${DIM}Gateway (✓): http://localhost:%s/v1 — call a model as ${NC}${BOLD}vllm/<model>${NC}\n" "$gw_port"
@@ -2404,6 +2471,7 @@ case "${1:-}" in
   gateway) shift; cmd_gateway "$@" ;;
   config)  shift; cmd_config "$@" ;;
   version) printf "spark v%s\n" "$VERSION" ;;
+  __detect) printf 'os=%s arch=%s accel=%s backend=%s\n' "$SPARK_OS" "$SPARK_ARCH" "$ACCEL" "$BACKEND" ;;
   help|--help|-h|"") cmd_help ;;
   *)       die "Unknown command: $1" "Run 'spark help' for usage" ;;
 esac
