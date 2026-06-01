@@ -686,6 +686,30 @@ test_ollama_run_pulls_and_enables_gateway() {
   [[ "$pulls" == *"qwen3:30b"* ]] && [[ "$cfg" == "true" ]] && [[ "$out" == *"ready via Ollama"* ]]
 }
 
+# --- spark host (local setup) ---
+test_host_check_ollama_ready() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_ACCEL=metal \
+    SPARK_OS_OVERRIDE=Darwin FAKE_OLLAMA_UP=1 FAKE_DOCKER_INFO_EXIT=0 \
+    "$SPARK" host --check 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"backend ollama"* ]] && [[ "$out" == *"Ollama: installed"* ]] &&
+    [[ "$out" == *"ready to serve"* ]]
+}
+
+test_host_check_vllm_no_gpu() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_NVIDIA_SMI_EXIT=1 \
+    "$SPARK" host --check 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"backend vllm"* ]] && [[ "$out" == *"No NVIDIA GPU detected"* ]] &&
+    [[ "$out" == *"incomplete"* ]]
+}
+
 # --- Doctor per backend ---
 test_doctor_ollama_backend() {
   local tmp fake_bin out
@@ -791,6 +815,8 @@ run_test "vllm backend blocks ollama-style tag" test_vllm_blocks_ollama_tag
 run_test "gateway routes Ollama via host.docker.internal on macOS" test_gateway_ollama_route_mac
 run_test "gateway routes Ollama via localhost on Linux" test_gateway_ollama_route_linux
 run_test "doctor runs Ollama checks on the ollama backend" test_doctor_ollama_backend
+run_test "host --check (ollama) reports ready" test_host_check_ollama_ready
+run_test "host --check (vllm) flags a missing GPU" test_host_check_vllm_no_gpu
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]

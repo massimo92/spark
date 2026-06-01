@@ -1540,6 +1540,213 @@ cmd_doctor() {
   printf "\n\n"
 }
 
+# --- spark host: configure THIS machine as a model server (local, no SSH) ---
+
+# NVIDIA/vLLM prerequisites on the local machine. In --check mode nothing is installed
+# and missing pieces are recorded as failures (never prompts).
+host_setup_vllm() {
+  local auto_yes="$1" check_only="$2" tag
+
+  if nvidia-smi -L >/dev/null 2>&1; then
+    info "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+  else
+    setup_fail "No NVIDIA GPU detected (nvidia-smi)"
+  fi
+
+  if docker info >/dev/null 2>&1; then
+    info "Docker: running"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Docker not installed or not running"
+  else
+    setup_manual_step "Install Docker and start it: https://docs.docker.com/engine/install/"
+  fi
+
+  if groups 2>/dev/null | grep -q docker; then
+    info "Docker group: $(whoami) in docker group"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "$(whoami) not in the docker group"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Add $(whoami) to the docker group?"; then
+    if sudo usermod -aG docker "$(whoami)"; then warn "Added to docker group — log out/in to apply"; else setup_fail "Could not add to docker group"; fi
+  else
+    setup_skip "docker group membership"
+  fi
+
+  if docker info 2>/dev/null | grep -qi nvidia || command -v nvidia-ctk >/dev/null 2>&1; then
+    info "NVIDIA Container Toolkit: present"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "NVIDIA Container Toolkit not detected"
+  else
+    setup_manual_step "Install the NVIDIA Container Toolkit (enables 'docker run --gpus'): https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
+  fi
+
+  if [[ -f "${HOME}/.docker/config.json" ]] && grep -q "nvcr.io" "${HOME}/.docker/config.json" 2>/dev/null; then
+    info "NGC: authenticated"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "NGC not authenticated (docker login nvcr.io)"
+  else
+    setup_manual_step "Log in to NGC: docker login nvcr.io (user \$oauthtoken, password = API key from ngc.nvidia.com)"
+  fi
+
+  if [[ -n "$(detect_ngc_image)" ]]; then
+    info "vLLM image: $(detect_ngc_image)"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "vLLM NGC image not pulled"
+  elif [[ "$auto_yes" != "1" ]]; then
+    printf "  Enter an NGC vLLM tag to pull (e.g. 26.04-py3), blank to skip: "
+    read -r tag
+    if [[ -n "$tag" ]]; then
+      is_safe_ngc_tag "$tag" || die "Invalid NGC tag: $tag"
+      if docker pull "nvcr.io/nvidia/vllm:${tag}"; then info "Pulled vLLM image"; else setup_fail "Image pull failed"; fi
+    else
+      setup_skip "vLLM image pull"
+    fi
+  else
+    setup_skip "vLLM image pull"
+  fi
+
+  if command -v hf >/dev/null 2>&1; then
+    info "HF CLI: installed"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_skip "HuggingFace CLI"
+  elif command -v uv >/dev/null 2>&1 && { [[ "$auto_yes" == "1" ]] || confirm "Install the HuggingFace CLI?"; }; then
+    if uv tool install "huggingface-hub[cli]"; then info "Installed HF CLI"; else setup_fail "HF CLI install failed"; fi
+  else
+    setup_skip "HuggingFace CLI (needs uv)"
+  fi
+}
+
+# Ollama prerequisites on the local machine (Apple Silicon / CPU).
+host_setup_ollama() {
+  local auto_yes="$1" check_only="$2"
+
+  if command -v ollama >/dev/null 2>&1; then
+    info "Ollama: installed"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Ollama not installed"
+  elif [[ "$SPARK_OS" == "Darwin" ]]; then
+    if command -v brew >/dev/null 2>&1 && { [[ "$auto_yes" == "1" ]] || confirm "Install Ollama with Homebrew?"; }; then
+      if brew install ollama; then info "Installed Ollama"; else setup_fail "Ollama install failed"; fi
+    else
+      setup_manual_step "Install Ollama from https://ollama.com/download, then open it once to start the service"
+    fi
+  elif [[ "$auto_yes" == "1" ]] || confirm "Install Ollama (curl https://ollama.com/install.sh | sh)?"; then
+    if curl -fsSL https://ollama.com/install.sh | sh; then info "Installed Ollama"; else setup_fail "Ollama install failed"; fi
+  else
+    setup_skip "Ollama install"
+  fi
+
+  command -v ollama >/dev/null 2>&1 || return 0
+  if ollama_reachable; then
+    info "Ollama service: reachable on :11434"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Ollama service not running on :11434"
+  elif [[ "$SPARK_OS" == "Darwin" ]]; then
+    setup_manual_step "Start Ollama (open the app; it lives in the menu bar)"
+  else
+    info "Ollama runs as a systemd service (started by the installer)"
+  fi
+}
+
+# The LiteLLM gateway runs in Docker on both backends; ensure Docker, enable the
+# provider for this backend, and (re)start it.
+host_setup_gateway() {
+  local check_only="$1" config provider
+  if docker info >/dev/null 2>&1; then
+    info "Docker: available for the gateway"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Docker not available — the LiteLLM gateway needs it"
+    return 0
+  elif [[ "$SPARK_OS" == "Darwin" ]]; then
+    setup_manual_step "Install Docker Desktop (the LiteLLM gateway runs in a container): https://docs.docker.com/desktop/"
+    return 0
+  else
+    setup_fail "Docker not running — needed for the gateway"
+    return 0
+  fi
+
+  [[ "$check_only" == "1" ]] && return 0
+
+  provider="vllm"; [[ "$BACKEND" == "ollama" ]] && provider="ollama"
+  local newcfg
+  config=$(gateway_load_config)
+  newcfg=$(printf '%s' "$config" | jq --arg p "$provider" \
+    '.enabled = true | .port = (.port // 4000) | .providers[$p].enabled = true' 2>/dev/null || true)
+  [[ -n "$newcfg" ]] && config="$newcfg"
+  gateway_save_config "$config"
+  info "Gateway: ${provider} provider enabled"
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    ( gateway_restart ) >/dev/null 2>&1 && info "Gateway restarted" || warn "Could not restart the gateway"
+  else
+    ( gateway_start ) || warn "Start the gateway later with: spark gateway start"
+  fi
+}
+
+# Optional: connect this machine to a tailnet for secure remote access.
+host_setup_tailscale() {
+  if command -v tailscale >/dev/null 2>&1; then
+    setup_manual_step "Connect this machine to your tailnet: sudo tailscale up" "tailscale-connected"
+  elif [[ "$SPARK_OS" == "Darwin" ]]; then
+    setup_manual_step "Install Tailscale from the Mac App Store, then run it" "tailscale-installed"
+  elif confirm "Install Tailscale (curl https://tailscale.com/install.sh | sh)?"; then
+    curl -fsSL https://tailscale.com/install.sh | sh || setup_fail "Tailscale install failed"
+    setup_manual_step "Connect: sudo tailscale up" "tailscale-connected"
+  else
+    setup_skip "Tailscale"
+  fi
+}
+
+cmd_host() {
+  local auto_yes=0 check_only=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes)   auto_yes=1; shift ;;
+      --check) check_only=1; shift ;;
+      *)       die "Unknown flag: $1" "Usage: spark host [--yes] [--check]" ;;
+    esac
+  done
+
+  SETUP_SKIPPED=()
+  SETUP_FAILED=()
+
+  printf "\n  ${BOLD}spark host${NC} — set up this machine as a model server\n\n"
+  info "Detected: ${SPARK_OS}/${SPARK_ARCH} · accelerator ${ACCEL} · backend ${BACKEND}"
+  printf "\n"
+
+  if [[ "$BACKEND" == "ollama" ]]; then
+    host_setup_ollama "$auto_yes" "$check_only"
+  else
+    host_setup_vllm "$auto_yes" "$check_only"
+  fi
+  host_setup_gateway "$check_only"
+
+  if [[ "$check_only" != "1" ]]; then
+    if command -v tailscale >/dev/null 2>&1 && local_tailscale status >/dev/null 2>&1; then
+      info "Tailscale: connected (remote access ready)"
+    elif [[ "$auto_yes" == "1" ]] || confirm "Set up Tailscale for secure remote access?"; then
+      host_setup_tailscale
+    fi
+    printf "\n  ${DIM}Running doctor...${NC}\n"
+    cmd_doctor || true
+  fi
+
+  printf "\n"
+  if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
+    printf "  ${RED}${BOLD}Host setup incomplete:${NC} %d issue(s)\n" "${#SETUP_FAILED[@]}"
+    for step in "${SETUP_FAILED[@]}"; do printf "    ${RED}✗${NC} %s\n" "$step"; done
+    printf "\n  Fix them and re-run: ${BOLD}spark host${NC}\n\n"
+    return 1
+  elif [[ ${#SETUP_SKIPPED[@]} -gt 0 ]]; then
+    printf "  ${YELLOW}${BOLD}Skipped steps:${NC}\n"
+    for step in "${SETUP_SKIPPED[@]}"; do printf "    ${YELLOW}⊘${NC} %s\n" "$step"; done
+    printf "\n  Re-run ${BOLD}spark host${NC} to complete them later.\n\n"
+  else
+    printf "  ${GREEN}${BOLD}This machine is ready to serve models!${NC}\n"
+    printf "  Start one:  ${BOLD}spark run <model>${NC}\n"
+    printf "  Gateway:    ${BOLD}http://localhost:%s/v1${NC}\n\n" "$GATEWAY_PORT"
+  fi
+}
+
 cmd_setup() {
   local auto_yes=0 check_only=0
 
@@ -2183,13 +2390,14 @@ cmd_update() {
 cmd_help() {
   cat <<EOF
 
-  ${BOLD}spark${NC} v${VERSION} — Serve LLMs with vLLM on NVIDIA DGX Spark
+  ${BOLD}spark${NC} v${VERSION} — Serve LLMs on NVIDIA, Apple Silicon, or CPU behind one gateway
 
   ${BOLD}Usage:${NC}
     spark <command> [options]
 
   ${BOLD}Commands:${NC}
-    setup            Configure DGX Spark from your laptop via SSH
+    host             Set up THIS machine as a model server (macOS or Linux)
+    setup            Configure a remote DGX Spark from your laptop via SSH
     doctor           Check all prerequisites (read-only)
     run <model>      Start serving a model (can run several at once)
     stop [<model>]   Stop a model (no arg: the only one; --all: every one)
@@ -2217,7 +2425,8 @@ cmd_help() {
     --regen-profile        Regenerate model profile
 
   ${BOLD}Examples:${NC}
-    spark setup
+    spark host                                             # set up this machine
+    spark host --check                                     # just report what's missing
     spark pull RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4   # second model, co-resident
@@ -2745,6 +2954,7 @@ case "${1:-}" in
   status)  cmd_status ;;
   logs)    shift; cmd_logs "$@" ;;
   doctor)  cmd_doctor ;;
+  host)    shift; cmd_host "$@" ;;
   setup)   shift; cmd_setup "$@" ;;
   update)  cmd_update ;;
   gateway) shift; cmd_gateway "$@" ;;
