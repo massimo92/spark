@@ -42,22 +42,25 @@ flowchart TD
         p_cached{"cached JSON\nprofile?"}
         p_cached -->|yes + no --regen| p_load["load_profile :179\njq → global vars\n+ validate_profile_values"]
         p_cached -->|no or --regen| p_read["read config.json :208"]
-        p_read --> p_detect["detect:\n- reasoning_parser (qwen3/deepseek_r1)\n- tool_call_parser (qwen25)\n- max_position_embeddings\n- multimodal (vision_config)\n- model_size (sum .safetensors)"]
-        p_detect --> p_calc["calc gpu_memory_utilization\n(size + 2GB + kv_cache) / 128GB\nclamp 0.50 - 0.95"]
+        p_read --> p_detect["detect:\n- reasoning_parser (qwen3/deepseek_r1)\n- tool_call_parser (qwen3_coder)\n- max_model_len (128K, capped to model)\n- multimodal (vision_config)\n- weights (sum .safetensors)"]
+        p_detect --> p_calc["need = (weights + KV) x 1.08\nKV = 2 x layers x kv_heads x head_dim x bytes x ctx\ngpu_memory_utilization = need / total_system_mem"]
         p_calc --> p_save["validate + save JSON\n~/.config/spark/profiles/"]
     end
 
-    profile --> override["apply CLI overrides\n--mem, --max-len, --no-reasoning\n:358"]
-    override --> ngc["detect_ngc_image :365\ndocker images | grep vllm"]
-    ngc --> build["build arrays :370\nvllm_args: serve, model, flags\ndocker_cmd: gpus, network, ipc, ulimits, volume"]
+    profile --> override["apply CLI overrides + recompute\n--mem, --max-len, --kv-cache-dtype"]
+    override --> verify["verify_capacity\nreserved + need <= total - OS reserve\nelse abort (untouched)"]
+    verify --> port["assign port (auto 8000+)\nname spark-vllm-<slug>"]
+    port --> ngc["detect_ngc_image\ndocker images | grep vllm"]
+    ngc --> build["build arrays\nvllm_args: serve, model, flags\ndocker_cmd: gpus, network, ipc, ulimits, volume, spark.* labels"]
 
-    build --> dry{"--dry-run?"}
-    dry -->|yes| print["shell_join + print\n:399"]
-    dry -->|no| exec["docker run :420"]
+    build --> plan["print memory plan\nweights, KV, need, fraction, free"]
+    plan --> dry{"--dry-run?"}
+    dry -->|yes| print["shell_join + print"]
+    dry -->|no| exec["docker run"]
 
     exec --> check{"exit 0?"}
-    check -->|no| fail["err: docker run failed\nshow last 10 log lines\n:410"]
-    check -->|yes| summary["print summary :427\nmodel, type, context,\nmemory, API URL"]
+    check -->|no| fail["err: docker run failed\nshow last 10 log lines"]
+    check -->|yes| summary["print container + API URL\nauto-restart gateway"]
 
     summary --> tail{"--tail?"}
     tail -->|yes| logs["docker logs -f"]

@@ -72,39 +72,54 @@ spark setup --yes      # Auto-confirm install/update prompts; secrets and hostna
 
 ### spark run
 
-The core command. Auto-profiles the model and launches vLLM.
+The core command. Auto-profiles the model, reserves the memory it needs, and launches vLLM.
+You can run **several models at once** — each gets its own container and port, and the
+gateway routes to all of them (see [Multiple models](#multiple-models)).
+
+If the model isn't downloaded yet, `spark run` fetches just its metadata first to size it
+and check it fits:
+
+- **Fits** → asks to download the full weights and start.
+- **Doesn't fit** → warns and offers to download it anyway (without starting), so you can
+  free memory and launch it later.
+
+Use `--no-pull` to skip this and just error on a missing model (e.g. in scripts).
 
 ```bash
 spark run <model> [flags]
 
 # Examples
 spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
-spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4 --tools --port 9000
-spark run Qwen/Qwen3-30B-A3B --dry-run
-spark run nvidia/Llama-3.1-8B-Instruct --tail
+spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4   # second model, co-resident
+spark run Qwen/Qwen3-30B-A3B --dry-run                  # show the memory plan, don't launch
+spark run nvidia/Llama-3.1-8B-Instruct --kv-cache-dtype fp8   # halve KV cache memory
 ```
 
 **Flags:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--mem <float>` | Auto | GPU memory utilization (0.0–1.0) |
-| `--max-len <int>` | Auto | Maximum context length |
-| `--port <int>` | 8000 | API port |
+| `--mem <float>` | Auto | GPU memory utilization (0.0–1.0), overrides auto-sizing |
+| `--max-len <int>` | 128K | Context length (capped to the model's maximum) |
+| `--kv-cache-dtype fp8` | auto | Store the KV cache in fp8 (halves its memory) |
+| `--port <int>` | Auto (8000+) | API port; auto-assigned to the next free one |
 | `--tools` | off | Enable tool calling |
 | `--text-only` | off | Skip vision encoder |
 | `--no-reasoning` | off | Disable reasoning parser |
-| `--dry-run` | off | Print Docker command only |
+| `--no-pull` | off | Don't offer to download a missing model; just error |
+| `--dry-run` | off | Print the memory plan and Docker command only |
 | `--tail` | off | Follow logs after launch |
-| `--force` | off | Stop existing container first |
+| `--force` | off | Replace this model if it is already running |
 | `--regen-profile` | off | Regenerate model profile |
 
 ### spark stop
 
-Stops and removes the running vLLM container.
+Stops and removes a running model and frees its memory budget.
 
 ```bash
-spark stop
+spark stop                  # the only running model
+spark stop <model>          # a specific model
+spark stop --all            # every running model
 ```
 
 ### spark pull / list / rm
@@ -118,9 +133,24 @@ spark rm <model>     # Remove a model (with confirmation)
 ### spark status / logs
 
 ```bash
-spark status         # Show what's running
-spark logs           # Show container logs
-spark logs -f        # Follow logs
+spark status         # All running models, their reservation, and free memory
+spark logs           # Logs of the only running model
+spark logs <model>   # Logs of a specific model
+spark logs <model> -f  # Follow logs
+```
+
+`spark status` prints a table of running models — the memory each reserves (need = weights + KV
+cache, in GB), its port, uptime, and a `GW` column (✓ = routed through the gateway). It ends with
+a machine memory summary and the endpoints (direct `http://localhost:<port>/v1`, and the gateway
+where you call a model as `vllm/<model>`):
+
+```
+  MODEL                                          NEED  WEIGHTS      KV   PORT  UP        GW
+  RedHatAI/Qwen3.6-35B-A3B-NVFP4                 28.1     14.0    12.0   8000  2h 10m    ✓
+  nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4    67.8     50.8    12.0   8001  2h 10m    ✓
+
+  Memory (GB): 121 total · 10 OS · 95.9 reserved · 15.1 free
+  Gateway (✓): http://localhost:4000/v1 — call a model as vllm/<model>
 ```
 
 ### spark doctor
@@ -202,12 +232,44 @@ When you run `spark run <model>`, the profiler reads the model's `config.json` a
 |-----------|--------|--------|
 | Reasoning parser | `model_type` field | `--reasoning-parser qwen3` or `deepseek_r1` |
 | Tool-call parser | `model_type` field (with `--tools`) | `--tool-call-parser qwen25` |
-| Context length | `max_position_embeddings` | `--max-model-len <value>` |
-| Architecture | `num_experts` field | Affects memory calculation |
+| Context length | `max_position_embeddings` | `--max-model-len` (default 128K, capped to model max) |
 | Multimodal | `vision_config` or "VL" in arch | Suggests `--text-only` |
-| Model size | Sum of .safetensors files | Calculates `--gpu-memory-utilization` |
+| Weights | Sum of .safetensors on disk | Part of the memory reservation |
+| KV cache | `num_hidden_layers`, `num_key_value_heads`, `head_dim` | Part of the memory reservation |
 
 Profiles are cached as JSON at `~/.config/spark/profiles/` and can be edited manually.
+
+### Memory: reserved by need, not by free space
+
+spark reserves the memory each model **needs**, independent of how much is free:
+
+- **Weights** — measured from the on-disk model size (falls back to params × bytes/param:
+  NVFP4 ≈ 0.5, FP8 ≈ 1, BF16 ≈ 2).
+- **KV cache** — `2 × layers × kv_heads × head_dim × bytes × context`, at 128K context by
+  default. `--kv-cache-dtype fp8` halves it.
+- **Need** = (weights + KV) + ~8 % cushion. The vLLM fraction is `need ÷ total system memory`,
+  so every model gets its own `--gpu-memory-utilization`.
+
+Total memory is read from the **system** (`/proc/meminfo`), not `nvidia-smi` — the DGX Spark
+(GB10) uses unified memory, where `nvidia-smi` reports N/A. Override with `SPARK_TOTAL_MEM_GB`,
+`SPARK_OS_RESERVE_GB` (default 10), or `SPARK_MEM_HEADROOM_PCT` (default 8) if needed.
+
+### Multiple models
+
+Run several models at once; each lands in its own container (`spark-vllm-<name>-<size>`) on its
+own port, and the LiteLLM gateway registers one route per model plus the `vllm/*` wildcard.
+
+Before launching, spark checks the new model fits: `sum(reserved by live models) + new need`
+must not exceed `total − OS reserve`. If it doesn't fit, spark aborts with a clear message and
+**leaves the running models untouched**.
+
+```bash
+spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4              # worker
+spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4 # evaluator, co-resident
+spark status                                          # see both + free memory
+# Both answer via the gateway:
+curl localhost:4000/v1/models
+```
 
 ## Configuration
 
@@ -235,7 +297,10 @@ Per-model profiles are cached at `~/.config/spark/profiles/` as JSON. To regener
 A: Ollama lacks continuous batching, PagedAttention, and NGC-optimized CUDA kernels. For single-user chat it's fine; for multi-agent serving, vLLM is significantly better.
 
 **Q: Can I run multiple models?**
-A: Not in v0.0. Use `spark stop` then `spark run <other-model>`.
+A: Yes. `spark run` starts each model in its own container and port, and the gateway routes to
+all of them. spark checks the new model fits in memory before launching and aborts (without
+touching running models) if it doesn't. See [Multiple models](#multiple-models). To stop one:
+`spark stop <model>`.
 
 **Q: Where are models stored?**
 A: Standard HuggingFace cache at `~/.cache/huggingface`. Use `hf scan-cache` and `hf delete-cache` normally.
