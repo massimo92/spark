@@ -172,6 +172,34 @@ is_safe_model_ref() {
   [[ "${1:-}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]]
 }
 
+# An Ollama model ref: 'name', 'name:tag', 'namespace/name:tag', or 'hf.co/<repo>:QUANT'.
+is_ollama_ref() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9._/-]+(:[A-Za-z0-9._-]+)?$ ]]
+}
+
+# Block obviously-incompatible model/backend combinations (no catalog — just stop
+# the impossible cases with an actionable hint). Called before the backend runs.
+validate_model_ref_for_backend() {
+  local ref="$1"
+  case "$BACKEND" in
+    ollama)
+      # NVFP4/FP8/quantized vLLM-format HF repos cannot run on Ollama (GGUF/MLX/llama.cpp).
+      if [[ "$ref" == */* && ! "$ref" =~ ^hf\.co/ ]] \
+         && printf '%s' "$ref" | grep -qiE 'nvfp4|-fp4|-fp8|-awq|-gptq|w4a16|w8a16'; then
+        die "'${ref}' looks like a vLLM-only (NVFP4/FP8/quantized) HuggingFace repo" \
+            "This machine uses the Ollama backend — pass a GGUF/Ollama model like 'qwen3:30b' or 'hf.co/<repo>:Q4_K_M'"
+      fi
+      ;;
+    vllm)
+      # An Ollama-style tag (e.g. qwen3:30b, hf.co/...:Q4) is not a HuggingFace repo.
+      if [[ "$ref" == *:* && ! "$ref" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+        die "'${ref}' looks like an Ollama model tag" \
+            "This machine uses the vLLM backend — pass a HuggingFace repo like 'org/name'"
+      fi
+      ;;
+  esac
+}
+
 is_safe_ngc_tag() {
   [[ "${1:-}" =~ ^[A-Za-z0-9._+:-]+$ ]]
 }
@@ -647,6 +675,19 @@ cmd_run() {
   done
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
+  validate_model_ref_for_backend "$model"
+
+  # Pick the engine from the detected hardware (vLLM on NVIDIA, Ollama elsewhere).
+  # cmd_run's flag locals are visible to the backend functions via dynamic scoping.
+  case "$BACKEND" in
+    vllm)   run_backend_vllm ;;
+    ollama) run_backend_ollama ;;
+    *)      die "Unknown backend: $BACKEND" "Set SPARK_BACKEND to 'vllm' or 'ollama'" ;;
+  esac
+}
+
+# vLLM in a Docker container with NVIDIA GPUs. Reads cmd_run's flag locals.
+run_backend_vllm() {
   is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
   [[ -z "$port" ]] || is_port "$port" || die "Invalid --port value: $port" "Expected an integer from 1 to 65535"
   [[ -z "$mem" ]] || is_mem_util "$mem" || die "Invalid --mem value: $mem" "Expected a number from 0.0 to 1.0"
@@ -850,6 +891,83 @@ cmd_run() {
   fi
 }
 
+# Is the local Ollama service answering on :11434?
+ollama_reachable() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 2 http://localhost:11434/api/version >/dev/null 2>&1
+  else
+    ollama list >/dev/null 2>&1
+  fi
+}
+
+# Best-effort human-readable size of a pulled Ollama model (advisory only).
+ollama_model_size() {
+  ollama list 2>/dev/null | awk -v m="$1" 'NR>1 && $1==m {print $3" "$4; exit}'
+}
+
+# Enable the Ollama provider in the gateway config and refresh it if running.
+gateway_enable_ollama() {
+  local config
+  config=$(gateway_load_config)
+  config=$(printf '%s' "$config" | jq '.providers.ollama.enabled = true' 2>/dev/null) || return 0
+  gateway_save_config "$config"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    gateway_restart
+  fi
+}
+
+# Ollama (native) — used on Apple Silicon and CPU hosts. Reads cmd_run's flag locals.
+# Ollama multiplexes models on one port (11434) and loads them on demand, so there is
+# no per-model container, port, or GPU-memory fraction; it manages memory itself.
+run_backend_ollama() {
+  is_ollama_ref "$model" || die "Invalid model reference: $model" "Use an Ollama model like 'qwen3:30b' or 'hf.co/<repo>:Q4_K_M'"
+
+  # vLLM-only flags don't apply here — warn instead of silently ignoring them.
+  local ignored=()
+  [[ -n "$mem" ]]      && ignored+=(--mem)
+  [[ -n "$max_len" ]]  && ignored+=(--max-len)
+  [[ -n "$kv_dtype" ]] && ignored+=(--kv-cache-dtype)
+  [[ -n "$port" ]]     && ignored+=(--port)
+  [[ ${#ignored[@]} -gt 0 ]] && warn "Ignoring vLLM-only flag(s) on the Ollama backend: ${ignored[*]}"
+
+  if [[ "$dry_run" == "1" ]]; then
+    printf "\n  ${BOLD}%s${NC}  ${DIM}(ollama)${NC}\n" "$model"
+    printf "    Engine:    Ollama (manages memory automatically; %s GB total)\n" "$TOTAL_MEM_GB"
+    printf "    Route:     gateway ${BOLD}ollama_chat/%s${NC} → http://localhost:11434\n" "$model"
+    printf "${DIM}# Commands that would run:${NC}\n"
+    printf "ollama pull %s\n" "$model"
+    printf "spark gateway add ollama\n\n"
+    return 0
+  fi
+
+  command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark host"
+  ollama_reachable || warn "Ollama service not reachable on :11434 — is it running? (try: ollama serve)"
+
+  # Pull unless already present (or --no-pull).
+  if ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    info "Model '${model}' already pulled"
+  elif [[ "$no_pull" == "1" ]]; then
+    die "Model '${model}' is not pulled" "Remove --no-pull, or run: ollama pull ${model}"
+  else
+    printf "  Pulling ${BOLD}%s${NC} with Ollama...\n" "$model"
+    ollama pull "$model" || die "ollama pull failed for ${model}"
+  fi
+
+  local osize
+  osize=$(ollama_model_size "$model")
+  [[ -n "$osize" ]] && printf "  ${DIM}Size: %s (Ollama loads on demand)${NC}\n" "$osize"
+
+  # Route it through the gateway (enable provider + refresh if running).
+  gateway_enable_ollama
+
+  printf "\n"
+  printf "  Model ${BOLD}%s${NC} ready via Ollama.\n" "$model"
+  printf "  Gateway: ${DIM}call it as ${NC}${BOLD}ollama_chat/%s${NC}${DIM} on http://localhost:%s/v1${NC}\n\n" "$model" "$GATEWAY_PORT"
+
+  [[ "$tail_logs" == "1" ]] && warn "--tail has no effect on the Ollama backend (Ollama runs as a shared service)"
+  return 0
+}
+
 # Print the per-model memory accounting + machine-level totals.
 print_memory_plan() {
   local model="$1" cname="$2" port="$3" reserved="$4" free="$5"
@@ -894,8 +1012,35 @@ stop_one_container() {
 }
 
 # spark stop [<model>|--all] — no arg stops the only running model (legacy behavior).
+# spark stop on the Ollama backend: unload models from memory (Ollama keeps them on disk).
+cmd_stop_ollama() {
+  local target="$1" m loaded=()
+  command -v ollama >/dev/null 2>&1 || die "Ollama is not installed"
+  while read -r m; do [[ -n "$m" ]] && loaded+=("$m"); done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}')
+
+  if [[ "$target" == "--all" ]]; then
+    [[ ${#loaded[@]} -eq 0 ]] && { warn "No models loaded"; return 0; }
+    for m in "${loaded[@]}"; do ollama stop "$m" >/dev/null 2>&1 && info "Unloaded ${m}"; done
+  elif [[ -n "$target" ]]; then
+    if ollama stop "$target" >/dev/null 2>&1; then info "Unloaded ${target}"; else warn "Model '${target}' was not loaded"; fi
+  elif [[ ${#loaded[@]} -eq 0 ]]; then
+    warn "No models loaded"
+  elif [[ ${#loaded[@]} -gt 1 ]]; then
+    err "Multiple models loaded — specify which to stop"
+    printf "    %s\n" "$(IFS=', '; echo "${loaded[*]}")"
+    exit 1
+  else
+    ollama stop "${loaded[0]}" >/dev/null 2>&1 && info "Unloaded ${loaded[0]}"
+  fi
+}
+
 cmd_stop() {
   local target="${1:-}"
+
+  if [[ "$BACKEND" == "ollama" ]]; then
+    cmd_stop_ollama "$target"
+    return
+  fi
 
   # Collect running managed containers.
   local names=()
@@ -951,8 +1096,20 @@ cmd_stop() {
 cmd_pull() {
   local model="${1:-}"
   [[ -z "$model" ]] && die "No model specified" "Usage: spark pull <model>"
-  is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
+  validate_model_ref_for_backend "$model"
 
+  if [[ "$BACKEND" == "ollama" ]]; then
+    is_ollama_ref "$model" || die "Invalid model reference: $model" "Use an Ollama model like 'qwen3:30b'"
+    command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark host"
+    printf "\n  Pulling %s with Ollama...\n\n" "$model"
+    ollama pull "$model"
+    printf "\n"
+    info "Ready. Run: spark run ${model}"
+    printf "\n"
+    return 0
+  fi
+
+  is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
   printf "\n  Downloading %s...\n\n" "$model"
   hf download "$model"
   printf "\n"
@@ -1067,8 +1224,48 @@ container_uptime() {
   fi
 }
 
+# spark status on the Ollama backend: list pulled + loaded models and the gateway route.
+cmd_status_ollama() {
+  local gw_running=0 gw_port="$GATEWAY_PORT"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    gw_running=1
+    gw_port=$(gateway_load_config | jq -r '.port // 4000' 2>/dev/null)
+  fi
+
+  if ! command -v ollama >/dev/null 2>&1; then
+    printf "  ${DIM}○${NC} Ollama not installed. Set up this machine: ${BOLD}spark host${NC}\n\n"
+    return 0
+  fi
+
+  local rows
+  rows=$(ollama list 2>/dev/null | awk 'NR>1{printf "  %-32s %s %s\n", $1, $3, $4}')
+  if [[ -z "$rows" ]]; then
+    printf "  ${DIM}○${NC} No models pulled. Get one with: ${BOLD}spark run <model>${NC}\n"
+  else
+    printf "  ${DIM}%-32s %s${NC}\n" "MODEL" "SIZE"
+    printf "%s\n" "$rows"
+  fi
+
+  local loaded
+  loaded=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}' | tr '\n' ' ')
+  [[ -n "${loaded// /}" ]] && printf "\n  ${DIM}Loaded now: %s${NC}\n" "$loaded"
+
+  printf "\n  ${DIM}Engine: Ollama (%s) · %s GB unified memory${NC}\n" "$ACCEL" "$TOTAL_MEM_GB"
+  if [[ "$gw_running" -eq 1 ]]; then
+    printf "  ${DIM}Gateway (✓): http://localhost:%s/v1 — call a model as ${NC}${BOLD}ollama_chat/<model>${NC}\n" "$gw_port"
+  else
+    printf "  ${DIM}Gateway: not running — start it with ${NC}${BOLD}spark gateway start${NC}\n"
+  fi
+  printf "\n"
+}
+
 cmd_status() {
   printf "\n"
+
+  if [[ "$BACKEND" == "ollama" ]]; then
+    cmd_status_ollama
+    return
+  fi
 
   # Gateway routing state (computed once): is the gateway up and routing vLLM?
   local gw_running=0 gw_port=4000 gw_vllm=0
@@ -1142,6 +1339,13 @@ cmd_logs() {
       *)  target="$1"; shift ;;
     esac
   done
+
+  if [[ "$BACKEND" == "ollama" ]]; then
+    warn "Ollama runs as a shared service — spark has no per-model logs for it."
+    printf "    macOS: open the Ollama app, or run ${BOLD}ollama serve${NC} in a terminal.\n"
+    printf "    Linux: ${BOLD}journalctl -u ollama -f${NC}\n"
+    return 0
+  fi
 
   local name=""
   if [[ -n "$target" ]]; then
