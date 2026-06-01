@@ -139,10 +139,19 @@ spark logs <model>   # Logs of a specific model
 spark logs <model> -f  # Follow logs
 ```
 
-`spark status` lists each running model with the memory it reserves (need = weights + KV cache),
-its direct API port, and — when the gateway is up — its LiteLLM route (`vllm/<model>` via
-`http://localhost:4000/v1`). It ends with a machine summary: total · OS-reserved · reserved by
-models · free.
+`spark status` prints a table of running models — the memory each reserves (need = weights + KV
+cache, in GB), its port, uptime, and a `GW` column (✓ = routed through the gateway). It ends with
+a machine memory summary and the endpoints (direct `http://localhost:<port>/v1`, and the gateway
+where you call a model as `vllm/<model>`):
+
+```
+  MODEL                                          NEED  WEIGHTS      KV   PORT  UP        GW
+  RedHatAI/Qwen3.6-35B-A3B-NVFP4                 28.1     14.0    12.0   8000  2h 10m    ✓
+  nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4    67.8     50.8    12.0   8001  2h 10m    ✓
+
+  Memory (GB): 121 total · 10 OS · 95.9 reserved · 15.1 free
+  Gateway (✓): http://localhost:4000/v1 — call a model as vllm/<model>
+```
 
 ### spark doctor
 

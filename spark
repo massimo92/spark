@@ -1015,46 +1015,54 @@ cmd_status() {
     [[ "$(echo "$gcfg" | jq -r '.providers.vllm.enabled // false')" == "true" ]] && gw_vllm=1
   fi
 
-  local rows=0 reserved=0
-  while IFS=$'\t' read -r name model port need weights kv; do
+  # Collect rows first so the MODEL column width fits the longest name.
+  local models=() needs=() wts=() kvs=() ports=() ups=() routed=()
+  local reserved=0 maxw=5   # len("MODEL")
+  local name model port need wt kv
+  while IFS=$'\t' read -r name model port need wt kv; do
     [[ -z "$name" ]] && continue
-    rows=$((rows + 1))
-    local up
-    up=$(container_uptime "$name")
-    printf "  ${GREEN}●${NC} ${BOLD}%s${NC}\n" "${model:-unknown}"
-    printf "      Need: %s GB  ·  Weights: %s GB  ·  KV: %s GB  ·  Port: %s  ·  Up: %s\n" \
-      "${need:-?}" "${weights:-?}" "${kv:-?}" "${port:-?}" "$up"
-    printf "      API:      http://localhost:%s/v1\n" "${port:-?}"
-    if [[ "$gw_running" -eq 1 && "$gw_vllm" -eq 1 && -n "$model" ]]; then
-      printf "      Gateway:  ${BOLD}vllm/%s${NC}  via http://localhost:%s/v1\n" "$model" "$gw_port"
-    fi
+    model="${model:-unknown}"
+    models+=("$model"); needs+=("${need:-?}"); wts+=("${wt:-?}"); kvs+=("${kv:-?}")
+    ports+=("${port:-?}"); ups+=("$(container_uptime "$name")")
+    if [[ "$gw_running" -eq 1 && "$gw_vllm" -eq 1 ]]; then routed+=("yes"); else routed+=("no"); fi
     [[ "${need:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] && reserved=$(awk -v a="$reserved" -v b="$need" 'BEGIN{printf "%.1f", a+b}')
+    [[ ${#model} -gt $maxw ]] && maxw=${#model}
   done < <(list_managed_containers)
 
   # Include a legacy/unlabelled spark-vllm container if present.
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$" \
      && ! list_managed_containers | grep -q "^${CONTAINER_NAME}	"; then
-    rows=$((rows + 1))
     local lmodel lport
     lmodel=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null | sed -n 's/.*serve \([^ ]*\).*/\1/p' || echo "unknown")
     lport=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null | sed -n 's/.*--port \([0-9]*\).*/\1/p' || echo "8000")
-    printf "  ${GREEN}●${NC} ${BOLD}%s${NC}  ${DIM}(unmanaged)${NC}\n" "$lmodel"
-    printf "      Need: ?  ·  Port: %s  ·  Up: %s\n" "$lport" "$(container_uptime "$CONTAINER_NAME")"
-    printf "      API:      http://localhost:%s/v1\n" "$lport"
-    if [[ "$gw_running" -eq 1 && "$gw_vllm" -eq 1 && -n "$lmodel" && "$lmodel" != "unknown" ]]; then
-      printf "      Gateway:  ${BOLD}vllm/%s${NC}  via http://localhost:%s/v1\n" "$lmodel" "$gw_port"
-    fi
+    models+=("$lmodel"); needs+=("?"); wts+=("?"); kvs+=("?"); ports+=("$lport")
+    ups+=("$(container_uptime "$CONTAINER_NAME")"); routed+=("no")
+    [[ ${#lmodel} -gt $maxw ]] && maxw=${#lmodel}
   fi
 
-  if [[ "$rows" -eq 0 ]]; then
+  if [[ ${#models[@]} -eq 0 ]]; then
     printf "  ${DIM}○${NC} No model running. Start one with: ${BOLD}spark run <model>${NC}\n\n"
     return 0
   fi
 
+  # Table
+  printf "  ${DIM}%-${maxw}s  %6s  %7s  %6s  %5s  %-8s  %2s${NC}\n" \
+    "MODEL" "NEED" "WEIGHTS" "KV" "PORT" "UP" "GW"
+  local i gwmark
+  for i in "${!models[@]}"; do
+    if [[ "${routed[$i]}" == "yes" ]]; then gwmark="${GREEN}✓${NC}"; else gwmark="${DIM}·${NC}"; fi
+    printf "  %-${maxw}s  %6s  %7s  %6s  %5s  %-8s  %b\n" \
+      "${models[$i]}" "${needs[$i]}" "${wts[$i]}" "${kvs[$i]}" "${ports[$i]}" "${ups[$i]}" "$gwmark"
+  done
+
   local free
   free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{printf "%.1f", b-r}')
-  printf "\n  ${DIM}Machine: %s GB total · %s OS-reserved · %s reserved by models · %s free${NC}\n" \
+  printf "\n  ${DIM}Memory (GB): %s total · %s OS · %s reserved · %s free${NC}\n" \
     "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  printf "  ${DIM}Direct API: http://localhost:<port>/v1${NC}\n"
+  if [[ "$gw_running" -eq 1 && "$gw_vllm" -eq 1 ]]; then
+    printf "  ${DIM}Gateway (✓): http://localhost:%s/v1 — call a model as ${NC}${BOLD}vllm/<model>${NC}\n" "$gw_port"
+  fi
   printf "\n"
 }
 
