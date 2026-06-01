@@ -168,7 +168,8 @@ test_dry_run_uses_json_profile_safely() {
 }
 EOF
 
-  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     "$SPARK" run Org/Model --dry-run 2>&1)
   local status=$?
   local marker_missing=0
@@ -199,7 +200,7 @@ test_docker_run_failure_shows_error() {
 EOF
 
   set +e
-  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_RUN_EXIT=1 \
     "$SPARK" run Org/Model 2>&1)
   status=$?
@@ -251,6 +252,24 @@ KV_CONFIG='{ "model_type":"qwen3", "architectures":["Qwen3ForCausalLM"],
   "num_hidden_layers":48, "num_key_value_heads":4, "num_attention_heads":32,
   "head_dim":128, "hidden_size":2048, "max_position_embeddings":262144,
   "quantization_config":{"quant_method":"nvfp4"}, "num_parameters":30000000000 }'
+
+test_total_mem_detection_positive() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output mem
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  # Bare config → need ~0, so it fits as long as detection yields a positive total.
+  make_model "${tmp}/home" "Org/Bare" '{ "model_type":"qwen3", "max_position_embeddings":4096 }'
+
+  # Do NOT pin SPARK_TOTAL_MEM_GB — this exercises real detection (/proc or sysctl).
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_RESERVE_GB=0 \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/Bare --dry-run 2>&1)
+  mem=$(printf '%s\n' "$output" | sed -n 's/.*Machine:[[:space:]]*\([0-9][0-9]*\) GB total.*/\1/p')
+  rm -rf "$tmp"
+
+  [[ "$mem" =~ ^[0-9]+$ ]] && [[ "$mem" -gt 0 ]]
+}
 
 test_need_based_fraction() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
@@ -546,6 +565,7 @@ run_test "invalid --port fails during validation" test_invalid_port_fails_before
 run_test "dry-run uses JSON profiles without executing model data" test_dry_run_uses_json_profile_safely
 run_test "docker run failure shows actionable error" test_docker_run_failure_shows_error
 run_test "corrupt profile JSON reports error" test_corrupt_profile_reports_error
+run_test "total memory detection returns a positive value" test_total_mem_detection_positive
 run_test "memory reserved by need (weights + KV) → fraction" test_need_based_fraction
 run_test "kv-cache-dtype fp8 halves KV cache" test_fp8_halves_kv
 run_test "KV cache read from nested text_config" test_text_config_nested
