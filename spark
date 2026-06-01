@@ -1377,32 +1377,25 @@ cmd_logs() {
   fi
 }
 
-cmd_doctor() {
-  printf "\n"
-  local passed=0 total=0
-
+# vLLM/NVIDIA health checks. Updates cmd_doctor's passed/total via dynamic scope.
+doctor_checks_vllm() {
   # GPU
   total=$((total + 1))
   local gpu_info
-  if gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null); then
+  if gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null) && [[ -n "$gpu_info" ]]; then
     info "GPU: ${gpu_info}"
     passed=$((passed + 1))
   else
     err "GPU: nvidia-smi not available or no GPU detected"
   fi
 
-  # Docker
+  # NVIDIA Container Toolkit (lets Docker use the GPU with --gpus all)
   total=$((total + 1))
-  local docker_ver
-  if docker_ver=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
-    if docker info >/dev/null 2>&1; then
-      info "Docker: ${docker_ver}, running"
-      passed=$((passed + 1))
-    else
-      err "Docker: ${docker_ver} installed but not running"
-    fi
+  if docker info 2>/dev/null | grep -qi nvidia || command -v nvidia-ctk >/dev/null 2>&1; then
+    info "NVIDIA Container Toolkit: present"
+    passed=$((passed + 1))
   else
-    err "Docker: not installed"
+    err "NVIDIA Container Toolkit: not detected — needed for 'docker run --gpus all'"
   fi
 
   # Docker group
@@ -1460,6 +1453,69 @@ cmd_doctor() {
     else
       err "HF cache not found at ${HF_CACHE_DIR} — run 'spark pull <model>' to initialize"
     fi
+  fi
+}
+
+# Ollama health checks. Updates cmd_doctor's passed/total via dynamic scope.
+doctor_checks_ollama() {
+  # Ollama installed
+  total=$((total + 1))
+  if command -v ollama >/dev/null 2>&1; then
+    info "Ollama: $(ollama --version 2>/dev/null | head -1 || echo installed)"
+    passed=$((passed + 1))
+  else
+    err "Ollama: not installed — run 'spark host' to set it up"
+  fi
+
+  # Ollama service reachable
+  total=$((total + 1))
+  if ollama_reachable; then
+    info "Ollama service: reachable on :11434"
+    passed=$((passed + 1))
+  else
+    err "Ollama service: not reachable on :11434 — start it (ollama serve / Ollama app)"
+  fi
+
+  # Models pulled
+  total=$((total + 1))
+  local n=0
+  command -v ollama >/dev/null 2>&1 && n=$(ollama list 2>/dev/null | awk 'NR>1 && NF>0' | wc -l | tr -d ' ')
+  if [[ "${n:-0}" -gt 0 ]]; then
+    info "Models: ${n} pulled"
+    passed=$((passed + 1))
+  else
+    err "No models pulled yet — run 'spark run <model>'"
+  fi
+
+  # Apple Silicon advisory (MLX engages on 32 GB+ unified memory).
+  [[ "$ACCEL" == "metal" ]] && info "Apple Silicon: Ollama uses MLX on 32 GB+ unified memory (have ${TOTAL_MEM_GB} GB)"
+}
+
+cmd_doctor() {
+  printf "\n"
+  local passed=0 total=0
+
+  # Detected hardware (informational).
+  info "Detected: ${SPARK_OS}/${SPARK_ARCH} · accelerator ${ACCEL} · backend ${BACKEND}"
+
+  # Docker — the LiteLLM gateway runs in a container on both backends.
+  total=$((total + 1))
+  local docker_ver
+  if docker_ver=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
+    if docker info >/dev/null 2>&1; then
+      info "Docker: ${docker_ver}, running"
+      passed=$((passed + 1))
+    else
+      err "Docker: ${docker_ver} installed but not running"
+    fi
+  else
+    err "Docker: not installed"
+  fi
+
+  if [[ "$BACKEND" == "ollama" ]]; then
+    doctor_checks_ollama
+  else
+    doctor_checks_vllm
   fi
 
   # Gateway

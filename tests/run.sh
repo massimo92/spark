@@ -686,6 +686,18 @@ test_ollama_run_pulls_and_enables_gateway() {
   [[ "$pulls" == *"qwen3:30b"* ]] && [[ "$cfg" == "true" ]] && [[ "$out" == *"ready via Ollama"* ]]
 }
 
+# --- Doctor per backend ---
+test_doctor_ollama_backend() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_ACCEL=metal \
+    FAKE_OLLAMA_UP=1 FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMOD\nqwen3:30b\tabc\t18\tGB\n" \
+    "$SPARK" doctor 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"backend ollama"* ]] && [[ "$out" == *"Ollama service: reachable"* ]] &&
+    [[ "$out" == *"Models: 1 pulled"* ]] && [[ "$out" != *"NGC"* ]]
+}
+
 # --- Gateway networking per OS ---
 # Write a minimal gateway config with the Ollama provider enabled.
 write_ollama_gateway_config() {
@@ -778,6 +790,7 @@ run_test "ollama backend blocks vLLM-only model" test_ollama_blocks_vllm_only_mo
 run_test "vllm backend blocks ollama-style tag" test_vllm_blocks_ollama_tag
 run_test "gateway routes Ollama via host.docker.internal on macOS" test_gateway_ollama_route_mac
 run_test "gateway routes Ollama via localhost on Linux" test_gateway_ollama_route_linux
+run_test "doctor runs Ollama checks on the ollama backend" test_doctor_ollama_backend
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]
