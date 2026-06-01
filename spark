@@ -693,7 +693,7 @@ cmd_run() {
 
   # Assign a port (auto unless --port given). Reject collisions with live models.
   if [[ -z "$port" ]]; then
-    port=$(next_free_port)
+    port=$(next_free_port "$DEFAULT_PORT")
   elif list_managed_containers | awk -F'\t' -v p="$port" '$3 == p {exit 0} END {exit 1}'; then
     die "Port ${port} is already used by another model" "Pick a free port or omit --port to auto-assign"
   fi
