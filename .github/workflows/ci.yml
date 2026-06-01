@@ -6,12 +6,21 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install tools (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+
+      - name: Install tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install jq shellcheck
 
       - name: Check shell syntax
         run: bash -n spark install.sh tests/run.sh

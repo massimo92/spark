@@ -468,6 +468,78 @@ test_autopull_no_fit_download_only() {
     [[ "$output" != *"started"* ]]
 }
 
+TWO_MODELS='spark-vllm-a\torg/Alpha\t8000\t40.0\t30.0\t10.0\nspark-vllm-b\torg/Beta\t8001\t60.0\t55.0\t5.0\n'
+
+test_stop_specific_model() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
+  set +e
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$TWO_MODELS" \
+    "$SPARK" stop org/Beta 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ "$output" == *"Stopped spark-vllm-b"* ]] && [[ "$output" != *"spark-vllm-a"* ]]
+}
+
+test_stop_all() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
+  set +e
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$TWO_MODELS" \
+    "$SPARK" stop --all 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ "$output" == *"spark-vllm-a"* ]] && [[ "$output" == *"spark-vllm-b"* ]]
+}
+
+test_stop_ambiguous_requires_target() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
+  set +e
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$TWO_MODELS" \
+    "$SPARK" stop 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] && [[ "$output" == *"Multiple models running"* ]]
+}
+
+test_status_renders_table() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_MANAGED="$TWO_MODELS" \
+    "$SPARK" status 2>&1)
+  rm -rf "$tmp"
+  [[ "$output" == *"MODEL"* ]] && [[ "$output" == *"NEED"* ]] && [[ "$output" == *"WEIGHTS"* ]] &&
+    [[ "$output" == *"org/Alpha"* ]] && [[ "$output" == *"Memory (GB):"* ]]
+}
+
+test_gateway_add_remove_provider() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin add_out rm_out enabled disabled
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  cat > "${tmp}/home/.config/spark/gateway.json" <<'EOF'
+{ "enabled": true, "port": 4000, "providers": {
+  "vllm": { "enabled": true, "port": 8000 }, "openrouter": { "enabled": false },
+  "ollama": { "enabled": false }, "zen": { "enabled": false }, "together": { "enabled": false } } }
+EOF
+  # ollama needs no API key, so add/remove are non-interactive.
+  add_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" gateway add ollama 2>&1)
+  enabled=$(jq -r '.providers.ollama.enabled' "${tmp}/home/.config/spark/gateway.json")
+  rm_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" gateway remove ollama 2>&1)
+  disabled=$(jq -r '.providers.ollama.enabled' "${tmp}/home/.config/spark/gateway.json")
+  rm -rf "$tmp"
+  [[ "$add_out" == *"Enabled ollama"* ]] && [[ "$enabled" == "true" ]] &&
+    [[ "$rm_out" == *"Disabled ollama"* ]] && [[ "$disabled" == "false" ]]
+}
+
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
@@ -485,6 +557,11 @@ run_test "missing model with --no-pull errors clearly" test_missing_model_no_pul
 run_test "missing model with --dry-run errors clearly" test_missing_model_dry_run_errors
 run_test "auto-pull: fits → downloads and starts" test_autopull_fits_downloads_and_starts
 run_test "auto-pull: does not fit → downloads without starting" test_autopull_no_fit_download_only
+run_test "stop <model> stops only that model" test_stop_specific_model
+run_test "stop --all stops every model" test_stop_all
+run_test "stop with no arg and many models asks which" test_stop_ambiguous_requires_target
+run_test "status renders a table" test_status_renders_table
+run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]
