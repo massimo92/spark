@@ -26,14 +26,42 @@ UPDATE_FILE="${SPARK_CONFIG_DIR}/update.json"
 GITHUB_REPO="massimo92/spark"
 DEFAULT_PORT=8000
 HF_CACHE_DIR="${HOME}/.cache/huggingface"
-CONTAINER_NAME="spark-vllm"
+CONTAINER_NAME="spark-vllm"          # name prefix; per-model containers are spark-vllm-<short>-<size>
 GATEWAY_CONTAINER="spark-litellm"
 GATEWAY_CONFIG="${SPARK_CONFIG_DIR}/gateway.json"
 GATEWAY_PORT=4000
 LITELLM_IMAGE="ghcr.io/berriai/litellm:main-latest"
-TOTAL_VRAM_GB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
-  | awk 'NR==1 {printf "%.0f", $1/1024}' || echo "128")
-[[ "$TOTAL_VRAM_GB" =~ ^[0-9]+$ && "$TOTAL_VRAM_GB" -gt 0 ]] || TOTAL_VRAM_GB=128
+
+# Detect total system memory in GiB. On the GB10 (unified memory) nvidia-smi reports
+# N/A, so read the system memory instead: /proc/meminfo (Linux), sysctl (macOS).
+# Overridable with SPARK_TOTAL_MEM_GB for testing or manual correction.
+MEM_DETECT_FALLBACK=0
+detect_total_mem_gb() {
+  local gb=""
+  if [[ -n "${SPARK_TOTAL_MEM_GB:-}" && "${SPARK_TOTAL_MEM_GB}" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$SPARK_TOTAL_MEM_GB"; return 0
+  fi
+  if [[ -r /proc/meminfo ]]; then
+    local kb
+    kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo "")
+    [[ "$kb" =~ ^[0-9]+$ ]] && gb=$(( kb / 1048576 ))
+  fi
+  if [[ -z "$gb" || "$gb" -le 0 ]]; then
+    local bytes
+    bytes=$(sysctl -n hw.memsize 2>/dev/null || echo "")
+    [[ "$bytes" =~ ^[0-9]+$ ]] && gb=$(( bytes / 1073741824 ))
+  fi
+  if [[ ! "${gb:-0}" =~ ^[0-9]+$ || "${gb:-0}" -le 0 ]]; then
+    gb=128
+    MEM_DETECT_FALLBACK=1
+  fi
+  printf '%s\n' "$gb"
+}
+
+TOTAL_MEM_GB=$(detect_total_mem_gb)
+OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-10}"          # memory left for OS + desktop
+MEM_HEADROOM_PCT="${SPARK_MEM_HEADROOM_PCT:-8}"     # per-model cushion (activations/fragmentation)
+BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))       # memory available to models
 
 # Detect the latest pulled NGC vLLM image
 detect_ngc_image() {
@@ -183,6 +211,10 @@ validate_profile_values() {
   is_positive_int "$MAX_MODEL_LEN" || die "Invalid profile value: max_model_len"
   [[ "$IS_MULTIMODAL" =~ ^(true|false)$ ]] || die "Invalid profile value: is_multimodal"
   [[ "$MODEL_SIZE_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: model_size_gb"
+  [[ "$WEIGHTS_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: weights_gb"
+  [[ "$KV_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: kv_gb"
+  [[ "$NEED_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: need_gb"
+  [[ -z "$KV_CACHE_DTYPE" || "$KV_CACHE_DTYPE" =~ ^(auto|fp8)$ ]] || die "Invalid profile value: kv_cache_dtype"
 }
 
 load_profile() {
@@ -196,8 +228,78 @@ load_profile() {
   MAX_MODEL_LEN=$(jq -r '.max_model_len // ""' "$profile_file") || die "Could not read profile: $profile_file"
   IS_MULTIMODAL=$(jq -r '.is_multimodal // "false"' "$profile_file") || die "Could not read profile: $profile_file"
   MODEL_SIZE_GB=$(jq -r '.model_size_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
+  WEIGHTS_GB=$(jq -r '.weights_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
+  KV_GB=$(jq -r '.kv_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
+  NEED_GB=$(jq -r '.need_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
+  KV_CACHE_DTYPE=$(jq -r '.kv_cache_dtype // "auto"' "$profile_file") || die "Could not read profile: $profile_file"
 
   validate_profile_values
+}
+
+# Estimate model weights in GB. Prefer the on-disk size (sum of safetensors);
+# fall back to params × bytes/param based on the detected quantization.
+compute_weights_gb() {
+  local config_json="$1" disk_gb="${2:-0}"
+
+  if [[ "$disk_gb" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v d="$disk_gb" 'BEGIN{exit !(d>0)}'; then
+    WEIGHTS_GB="$disk_gb"
+    return 0
+  fi
+
+  # Fallback: params × bytes/param. Detect bytes/param from quantization.
+  local quant params bytes
+  quant=$(jq -r '(.quantization_config.quant_method // .quantization_config.quant_algo // .torch_dtype // "") | ascii_downcase' "$config_json" 2>/dev/null || echo "")
+  params=$(jq -r '.num_parameters // .n_params // 0' "$config_json" 2>/dev/null || echo "0")
+
+  case "$quant" in
+    *nvfp4*|*fp4*|*int4*|*w4*) bytes="0.5" ;;
+    *fp8*|*int8*|*w8*)         bytes="1" ;;
+    *)                          bytes="2" ;;   # bf16/fp16 default
+  esac
+
+  if [[ "$params" =~ ^[0-9]+$ ]] && [[ "$params" -gt 0 ]]; then
+    WEIGHTS_GB=$(awk -v p="$params" -v b="$bytes" 'BEGIN{ printf "%.1f", (p*b)/1073741824 }')
+  else
+    WEIGHTS_GB="0"
+  fi
+}
+
+# Estimate KV cache memory in GB for the given context length.
+# Formula: 2 (K+V) × layers × kv_heads × head_dim × bytes × max_model_len.
+# bytes = 2 (auto/bf16) or 1 (fp8). Reads nested text_config for multimodal models.
+KV_UNCERTAIN=0
+compute_kv_gb() {
+  local config_json="$1" max_len="$2" kv_dtype="${3:-auto}"
+  KV_UNCERTAIN=0
+
+  local base='(.text_config // .)'
+  local layers kv_heads head_dim bytes
+  layers=$(jq -r "${base}.num_hidden_layers // 0" "$config_json" 2>/dev/null || echo "0")
+  kv_heads=$(jq -r "${base} | (.num_key_value_heads // .num_attention_heads // 0)" "$config_json" 2>/dev/null || echo "0")
+  head_dim=$(jq -r "${base} | (.head_dim // (if (.hidden_size // 0) > 0 and (.num_attention_heads // 0) > 0 then ((.hidden_size) / (.num_attention_heads)) else 0 end)) | floor" "$config_json" 2>/dev/null || echo "0")
+
+  # Validate every field is a positive integer before feeding awk (never trust metadata).
+  if ! is_positive_int "$layers" || ! is_positive_int "$kv_heads" || ! is_positive_int "$head_dim"; then
+    KV_GB="0"
+    KV_UNCERTAIN=1
+    return 0
+  fi
+
+  bytes=2
+  [[ "$kv_dtype" == "fp8" ]] && bytes=1
+
+  KV_GB=$(awk -v L="$layers" -v H="$kv_heads" -v D="$head_dim" -v B="$bytes" -v T="$max_len" \
+    'BEGIN{ printf "%.1f", (2*L*H*D*B*T)/1073741824 }')
+}
+
+# Combine weights + KV + cushion into the absolute need (GB) and the vLLM fraction.
+# The fraction is need / total_system_memory — it reflects what the model asks for,
+# NOT the free space. Sets NEED_GB and GPU_MEM_UTIL.
+compute_need_and_fraction() {
+  NEED_GB=$(awk -v w="$WEIGHTS_GB" -v k="$KV_GB" -v h="$MEM_HEADROOM_PCT" \
+    'BEGIN{ printf "%.1f", (w+k)*(1+h/100) }')
+  GPU_MEM_UTIL=$(awk -v n="$NEED_GB" -v T="$TOTAL_MEM_GB" \
+    'BEGIN{ if (T<=0) T=128; u=n/T; if(u>0.95)u=0.95; if(u<0.05)u=0.05; printf "%.2f", u }')
 }
 
 profile_model() {
@@ -243,13 +345,20 @@ profile_model() {
     warn "Unknown model_type '${model_type}' — reasoning and tool-call parsers not configured"
   fi
 
-  # Max context length
-  MAX_MODEL_LEN=$(jq -r '
+  # Max context length — default to 128K, capped to what the model supports.
+  local model_max
+  model_max=$(jq -r '
+    (.text_config // .) |
     .max_position_embeddings //
     .max_sequence_length //
     .seq_length //
     32768' "$config_json" 2>/dev/null || echo "32768")
-  is_positive_int "$MAX_MODEL_LEN" || MAX_MODEL_LEN=32768
+  is_positive_int "$model_max" || model_max=32768
+  if [[ "$model_max" -lt 131072 ]]; then
+    MAX_MODEL_LEN="$model_max"
+  else
+    MAX_MODEL_LEN=131072
+  fi
 
   # Multimodal detection
   IS_MULTIMODAL="false"
@@ -274,21 +383,13 @@ profile_model() {
     warn "Could not determine model size — memory calculation may be inaccurate"
   fi
 
-  # GPU memory utilization calculation
-  local model_size_num="${MODEL_SIZE_GB:-0}"
-  local overhead=2
-  local min_kv_cache
-  min_kv_cache=$(awk "BEGIN {
-    a = $TOTAL_VRAM_GB * 0.15;
-    b = 10;
-    print (a > b) ? a : b
-  }")
-  GPU_MEM_UTIL=$(awk "BEGIN {
-    util = ($model_size_num + $overhead + $min_kv_cache) / $TOTAL_VRAM_GB;
-    if (util > 0.95) util = 0.95;
-    if (util < 0.50) util = 0.50;
-    printf \"%.2f\", util
-  }")
+  # Need-based memory: weights + KV cache + cushion → fraction of TOTAL system memory.
+  # The free space does NOT enter here; it is only checked later (verify_capacity).
+  KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
+  compute_weights_gb "$config_json" "$MODEL_SIZE_GB"
+  compute_kv_gb "$config_json" "$MAX_MODEL_LEN" "$KV_CACHE_DTYPE"
+  [[ "$KV_UNCERTAIN" == "1" ]] && warn "config.json lacks KV cache fields — sizing from weights only"
+  compute_need_and_fraction
 
   # Save profile
   mkdir -p "$PROFILES_DIR"
@@ -302,6 +403,10 @@ profile_model() {
     --argjson max_model_len "$MAX_MODEL_LEN" \
     --argjson is_multimodal "$IS_MULTIMODAL" \
     --arg model_size_gb "$MODEL_SIZE_GB" \
+    --arg weights_gb "$WEIGHTS_GB" \
+    --arg kv_gb "$KV_GB" \
+    --arg need_gb "$NEED_GB" \
+    --arg kv_cache_dtype "$KV_CACHE_DTYPE" \
     '{
       model: $model,
       generated: $generated,
@@ -310,14 +415,126 @@ profile_model() {
       gpu_memory_utilization: $gpu_memory_utilization,
       max_model_len: $max_model_len,
       is_multimodal: $is_multimodal,
-      model_size_gb: $model_size_gb
+      model_size_gb: $model_size_gb,
+      weights_gb: $weights_gb,
+      kv_gb: $kv_gb,
+      need_gb: $need_gb,
+      kv_cache_dtype: $kv_cache_dtype
     }' > "$profile_file"
+}
+
+# Recompute KV + need + fraction from config.json using the current MAX_MODEL_LEN
+# and KV_CACHE_DTYPE. Used after applying --max-len / --kv-cache-dtype overrides so
+# a cached profile still reflects the requested settings. WEIGHTS_GB is reused as-is.
+recompute_memory() {
+  local config_json="$1"
+  [[ -f "$config_json" ]] || return 0
+  compute_kv_gb "$config_json" "$MAX_MODEL_LEN" "$KV_CACHE_DTYPE"
+  [[ "$KV_UNCERTAIN" == "1" ]] && warn "config.json lacks KV cache fields — sizing from weights only"
+  compute_need_and_fraction
+}
+
+# --- Multi-model helpers ---
+
+# Short, human-readable slug from a model ref: last path segment + a size hint.
+# RedHatAI/Qwen3.6-35B-A3B-NVFP4 -> qwen3.6-35b ; nvidia/Llama-4-Scout-17B-16E -> llama-4-scout-17b
+slugify_model() {
+  local model="$1"
+  local tail size base
+  tail="${model##*/}"                                   # last path segment
+  size=$(printf '%s' "$tail" | grep -oiE '[0-9]+(\.[0-9]+)?b' | head -1 || true)
+  base=$(printf '%s' "$tail" | sed -E 's/-?[0-9]+(\.[0-9]+)?[Bb].*$//')   # drop size and trailing tags
+  [[ -z "$base" ]] && base="$tail"
+  local slug="${base}"
+  [[ -n "$size" ]] && slug="${base}-${size}"
+  # Lowercase, keep [a-z0-9.-], collapse repeats, trim dashes
+  slug=$(printf '%s' "$slug" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9.-]+/-/g; s/-+/-/g; s/^-//; s/-$//')
+  [[ -z "$slug" ]] && slug="model"
+  printf '%s\n' "$slug"
+}
+
+# Container name for a model: spark-vllm-<slug>.
+container_name_for_model() {
+  printf '%s-%s\n' "$CONTAINER_NAME" "$(slugify_model "$1")"
+}
+
+# List managed vLLM containers as TSV: name<TAB>model<TAB>port<TAB>need_gb<TAB>weights_gb<TAB>kv_gb.
+# Source of truth = docker labels on running containers (no state file).
+list_managed_containers() {
+  docker ps --filter label=spark.managed=1 \
+    --format '{{.Names}}	{{.Label "spark.model"}}	{{.Label "spark.port"}}	{{.Label "spark.need_gb"}}	{{.Label "spark.weights_gb"}}	{{.Label "spark.kv_gb"}}' \
+    2>/dev/null || true
+}
+
+# Resolve a managed container name from a model ref (matches the spark.model label).
+container_for_ref() {
+  local ref="$1" name model rest
+  while IFS=$'\t' read -r name model rest; do
+    [[ "$model" == "$ref" ]] && { printf '%s\n' "$name"; return 0; }
+  done < <(list_managed_containers)
+  return 1
+}
+
+# Sum of reserved need (GB) across live managed containers, optionally excluding one name.
+reserved_budget_gb() {
+  local exclude="${1:-}"
+  list_managed_containers | awk -F'\t' -v ex="$exclude" '
+    $1 != ex && $4 ~ /^[0-9]+(\.[0-9]+)?$/ { s += $4 }
+    END { printf "%.1f", s+0 }'
+}
+
+# True if a port is already in use (by a managed container or a host listener).
+port_in_use() {
+  local port="$1"
+  list_managed_containers | awk -F'\t' -v p="$port" '$3 == p {found=1} END {exit !found}' && return 0
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$" && return 0
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+# First free port at or above the given start (default 8000).
+next_free_port() {
+  local port="${1:-$DEFAULT_PORT}"
+  while port_in_use "$port"; do
+    port=$(( port + 1 ))
+    [[ "$port" -gt 65535 ]] && die "No free port available"
+  done
+  printf '%s\n' "$port"
+}
+
+# Abort if the new model does not fit the remaining budget. Never touches live models.
+verify_capacity() {
+  local new_need="$1" exclude="${2:-}"
+  local reserved free
+  reserved=$(reserved_budget_gb "$exclude")
+  free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+
+  if awk -v n="$new_need" -v f="$free" 'BEGIN{ exit !(n > f) }'; then
+    err "Not enough memory to start this model"
+    printf "    Requested:  %s GB\n" "$new_need"
+    printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
+      "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
+    local any=0
+    while IFS=$'\t' read -r name model port need _; do
+      [[ -z "$model" ]] && continue
+      [[ "$name" == "$exclude" ]] && continue
+      [[ "$any" -eq 0 ]] && { printf "    In use:\n"; any=1; }
+      printf "      %-32s %s GB  (port %s)\n" "$model" "${need:-?}" "${port:-?}"
+    done < <(list_managed_containers)
+    printf "    Free memory with: ${BOLD}spark stop <model>${NC}\n"
+    exit 1
+  fi
 }
 
 # --- Commands ---
 
 cmd_run() {
-  local model="" port="$DEFAULT_PORT" mem="" max_len="" tools=0 text_only=0
+  local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 tail_logs=0 force=0 regen=0
 
   while [[ $# -gt 0 ]]; do
@@ -325,6 +542,7 @@ cmd_run() {
       --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; shift 2 ;;
       --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; shift 2 ;;
       --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; shift 2 ;;
+      --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; shift 2 ;;
       --tools)     tools=1; shift ;;
       --text-only) text_only=1; shift ;;
       --no-reasoning) no_reasoning=1; shift ;;
@@ -339,26 +557,33 @@ cmd_run() {
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
   is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
-  is_port "$port" || die "Invalid --port value: $port" "Expected an integer from 1 to 65535"
+  [[ -z "$port" ]] || is_port "$port" || die "Invalid --port value: $port" "Expected an integer from 1 to 65535"
   [[ -z "$mem" ]] || is_mem_util "$mem" || die "Invalid --mem value: $mem" "Expected a number from 0.0 to 1.0"
   [[ -z "$max_len" ]] || is_positive_int "$max_len" || die "Invalid --max-len value: $max_len" "Expected a positive integer"
+  [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto or fp8"
 
-  # Check existing container
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+  local cname
+  cname=$(container_name_for_model "$model")
+
+  # Is this model already running? (matched by label, not just by name)
+  local existing
+  existing=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -z "$existing" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$" && existing="$cname"
+  if [[ -n "$existing" ]]; then
     if [[ "$force" == "1" ]]; then
-      docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-      docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+      docker stop "$existing" >/dev/null 2>&1 || true
+      docker rm "$existing" >/dev/null 2>&1 || true
     else
-      err "Container '${CONTAINER_NAME}' is already running"
-      printf "    Stop it first with: spark stop\n"
-      printf "    Or use: spark run --force %s\n" "$model"
+      err "Model '${model}' is already running (container '${existing}')"
+      printf "    Stop it first with: spark stop %s\n" "$model"
+      printf "    Or replace it with: spark run --force %s\n" "$model"
       exit 1
     fi
   fi
 
   # Remove stopped container with same name
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
-    docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$"; then
+    docker rm "$cname" >/dev/null 2>&1 || true
   fi
 
   # Resolve model path
@@ -369,21 +594,39 @@ cmd_run() {
     exit 1
   fi
 
-  # Profile
+  # Profile (sizes memory by the model's NEED: weights + KV + cushion)
   REGEN_PROFILE="$regen"
+  KV_CACHE_DTYPE="${kv_dtype:-auto}"
   profile_model "$model" "$model_path"
 
-  # Apply overrides
-  [[ -n "$mem" ]] && GPU_MEM_UTIL="$mem"
+  # Apply effective settings (these override whatever a cached profile baked in),
+  # then always recompute memory so the reservation reflects this run's flags.
   [[ -n "$max_len" ]] && MAX_MODEL_LEN="$max_len"
+  KV_CACHE_DTYPE="${kv_dtype:-auto}"
+  recompute_memory "${model_path}/config.json"
+  if [[ -n "$mem" ]]; then
+    # Manual fraction: derive need from it so budget accounting stays coherent.
+    GPU_MEM_UTIL="$mem"
+    NEED_GB=$(awk -v m="$mem" -v T="$TOTAL_MEM_GB" 'BEGIN{ printf "%.1f", m*T }')
+  fi
   [[ "$no_reasoning" == "1" ]] && REASONING_PARSER=""
+
+  validate_profile_values
+
+  # Verify it fits the remaining budget BEFORE touching anything.
+  verify_capacity "$NEED_GB" "$cname"
+
+  # Assign a port (auto unless --port given). Reject collisions with live models.
+  if [[ -z "$port" ]]; then
+    port=$(next_free_port)
+  elif list_managed_containers | awk -F'\t' -v p="$port" '$3 == p {exit 0} END {exit 1}'; then
+    die "Port ${port} is already used by another model" "Pick a free port or omit --port to auto-assign"
+  fi
 
   # Detect NGC image
   local ngc_image
   ngc_image=$(detect_ngc_image)
   [[ -z "$ngc_image" ]] && die "No NGC vLLM container found" "Run: spark setup"
-
-  validate_profile_values
 
   # Build vLLM flags
   local vllm_args=(vllm serve "$model"
@@ -391,6 +634,8 @@ cmd_run() {
     --gpu-memory-utilization "$GPU_MEM_UTIL"
     --max-model-len "$MAX_MODEL_LEN"
     --port "$port")
+
+  [[ "$KV_CACHE_DTYPE" == "fp8" ]] && vllm_args+=(--kv-cache-dtype fp8)
 
   if [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]]; then
     vllm_args+=(--reasoning-parser "$REASONING_PARSER")
@@ -404,7 +649,7 @@ cmd_run() {
     vllm_args+=(--limit-mm-per-prompt image=0)
   fi
 
-  # Build Docker command
+  # Build Docker command. Labels store the reservation on the container itself.
   local docker_cmd=(docker run -d
     --gpus all
     --network host
@@ -412,11 +657,24 @@ cmd_run() {
     --ulimit memlock=-1
     --ulimit stack=67108864
     -v "${HF_CACHE_DIR}:/root/.cache/huggingface"
-    --name "$CONTAINER_NAME"
+    --name "$cname"
+    --label spark.managed=1
+    --label "spark.model=${model}"
+    --label "spark.port=${port}"
+    --label "spark.need_gb=${NEED_GB}"
+    --label "spark.weights_gb=${WEIGHTS_GB}"
+    --label "spark.kv_gb=${KV_GB}"
+    --label "spark.max_model_len=${MAX_MODEL_LEN}"
     "$ngc_image")
 
+  # Memory accounting breakdown (shown in dry-run and at launch).
+  local reserved free
+  reserved=$(reserved_budget_gb "$cname")
+  free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+  print_memory_plan "$model" "$cname" "$port" "$reserved" "$free"
+
   if [[ "$dry_run" == "1" ]]; then
-    printf "\n${DIM}# Docker command that would be executed:${NC}\n"
+    printf "${DIM}# Docker command that would be executed:${NC}\n"
     shell_join "${docker_cmd[@]}" "${vllm_args[@]}"
     printf "\n"
     return 0
@@ -431,9 +689,9 @@ cmd_run() {
 
   if [[ "$run_exit" -ne 0 ]]; then
     err "docker run failed (exit $run_exit)"
-    if docker logs "$CONTAINER_NAME" >/dev/null 2>&1; then
+    if docker logs "$cname" >/dev/null 2>&1; then
       printf "    ${DIM}Last logs:${NC}\n"
-      docker logs --tail 10 "$CONTAINER_NAME" 2>&1 | sed 's/^/    /'
+      docker logs --tail 10 "$cname" 2>&1 | sed 's/^/    /'
     elif [[ -s "$run_log" ]]; then
       printf "    ${DIM}Output:${NC}\n"
       tail -10 "$run_log" | sed 's/^/    /'
@@ -443,23 +701,8 @@ cmd_run() {
   fi
   rm -f "$run_log"
 
-  # Summary
-  local type_desc=""
-  if [[ "${IS_MULTIMODAL:-false}" == "true" ]]; then
-    type_desc="Multimodal"
-  else
-    type_desc="Text"
-  fi
-  [[ -n "${MODEL_SIZE_GB:-}" && "$MODEL_SIZE_GB" != "0" ]] && type_desc+=" · ${MODEL_SIZE_GB} GB"
-
-  printf "  ${BOLD}Model:${NC}    %s\n" "$model"
-  printf "  ${BOLD}Type:${NC}     %s\n" "$type_desc"
-  printf "  ${BOLD}Context:${NC}  %s tokens\n" "$MAX_MODEL_LEN"
-  printf "  ${BOLD}Memory:${NC}   %s GPU utilization\n" "$GPU_MEM_UTIL"
-  printf "  ${BOLD}API:${NC}      http://localhost:%s/v1\n" "$port"
-  [[ -n "$REASONING_PARSER" ]] && printf "  ${BOLD}Reasoning:${NC} %s parser enabled\n" "$REASONING_PARSER"
   printf "\n"
-  printf "  Container started. Logs: ${BOLD}spark logs -f${NC}\n"
+  printf "  Container '${BOLD}%s${NC}' started. Logs: ${BOLD}spark logs %s${NC}\n" "$cname" "$model"
   printf "  Test: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$port"
 
   # Auto-restart gateway if running so it picks up the new model
@@ -468,19 +711,101 @@ cmd_run() {
   fi
 
   if [[ "$tail_logs" == "1" ]]; then
-    docker logs -f "$CONTAINER_NAME"
+    docker logs -f "$cname"
   fi
 }
 
+# Print the per-model memory accounting + machine-level totals.
+print_memory_plan() {
+  local model="$1" cname="$2" port="$3" reserved="$4" free="$5"
+  local type_desc="Text"
+  [[ "${IS_MULTIMODAL:-false}" == "true" ]] && type_desc="Multimodal"
+
+  printf "\n  ${BOLD}%s${NC}  ${DIM}(%s)${NC}\n" "$model" "$cname"
+  printf "    Type:      %s\n" "$type_desc"
+  printf "    Context:   %s tokens" "$MAX_MODEL_LEN"
+  [[ "$KV_CACHE_DTYPE" == "fp8" ]] && printf "  (KV cache: fp8)"
+  printf "\n"
+  printf "    Weights:   %s GB\n" "$WEIGHTS_GB"
+  printf "    KV cache:  %s GB\n" "$KV_GB"
+  printf "    ${BOLD}Need:${NC}      %s GB  →  --gpu-memory-utilization %s\n" "$NEED_GB" "$GPU_MEM_UTIL"
+  printf "    API:       http://localhost:%s/v1\n" "$port"
+  [[ -n "$REASONING_PARSER" ]] && printf "    Reasoning: %s parser\n" "$REASONING_PARSER"
+  printf "    ${DIM}Machine:   %s GB total · %s OS-reserved · %s reserved by models · %s free${NC}\n" \
+    "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  if [[ "$MEM_DETECT_FALLBACK" == "1" ]]; then
+    warn "Could not read system memory — using fallback ${TOTAL_MEM_GB} GB (set SPARK_TOTAL_MEM_GB to correct)"
+  fi
+  return 0
+}
+
+# Stop one managed container by name; print the freed reservation.
+stop_one_container() {
+  local name="$1"
+  local need
+  need=$(docker inspect "$name" --format '{{ index .Config.Labels "spark.need_gb" }}' 2>/dev/null || echo "")
+  docker stop "$name" >/dev/null 2>&1
+  docker rm "$name" >/dev/null 2>&1 || true
+  if [[ "$need" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    info "Stopped ${name} (freed ${need} GB)"
+  else
+    info "Stopped ${name}"
+  fi
+}
+
+# spark stop [<model>|--all] — no arg stops the only running model (legacy behavior).
 cmd_stop() {
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
-    warn "No running container '${CONTAINER_NAME}'"
+  local target="${1:-}"
+
+  # Collect running managed containers.
+  local names=()
+  while IFS=$'\t' read -r name _; do
+    [[ -n "$name" ]] && names+=("$name")
+  done < <(list_managed_containers)
+  # Include a legacy/unlabelled spark-vllm container if present.
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    local seen=0 n
+    for n in "${names[@]:-}"; do [[ "$n" == "$CONTAINER_NAME" ]] && seen=1; done
+    [[ "$seen" -eq 0 ]] && names+=("$CONTAINER_NAME")
+  fi
+
+  if [[ ${#names[@]} -eq 0 ]]; then
+    warn "No running models"
     return 0
   fi
 
-  docker stop "$CONTAINER_NAME" >/dev/null 2>&1
-  docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  info "Stopped and removed ${CONTAINER_NAME}"
+  if [[ "$target" == "--all" ]]; then
+    local n
+    for n in "${names[@]}"; do stop_one_container "$n"; done
+  elif [[ -n "$target" ]]; then
+    local name cand n
+    name=$(container_for_ref "$target" 2>/dev/null || true)
+    if [[ -z "$name" ]]; then
+      # Fall back to matching the derived container name.
+      cand=$(container_name_for_model "$target")
+      for n in "${names[@]}"; do [[ "$n" == "$cand" || "$n" == "$target" ]] && name="$n"; done
+    fi
+    if [[ -z "$name" ]]; then
+      err "No running model matches '${target}'"
+      printf "    Running: %s\n" "$(IFS=', '; echo "${names[*]}")"
+      exit 1
+    fi
+    stop_one_container "$name"
+  else
+    # No argument: only safe when exactly one model is running.
+    if [[ ${#names[@]} -gt 1 ]]; then
+      err "Multiple models running — specify which to stop"
+      printf "    %s\n" "$(IFS=', '; echo "${names[*]}")"
+      printf "    Stop one: ${BOLD}spark stop <model>${NC}   ·   Stop all: ${BOLD}spark stop --all${NC}\n"
+      exit 1
+    fi
+    stop_one_container "${names[0]}"
+  fi
+
+  # Refresh the gateway so its routing reflects the remaining models.
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    gateway_restart
+  fi
 }
 
 cmd_pull() {
@@ -587,57 +912,98 @@ cmd_rm() {
   fi
 }
 
+# Human uptime for a running container.
+container_uptime() {
+  local name="$1" started_at
+  started_at=$(docker inspect "$name" --format '{{.State.StartedAt}}' 2>/dev/null || echo "")
+  if [[ -n "$started_at" ]]; then
+    local start_epoch now_epoch diff_s
+    start_epoch=$(date -d "$started_at" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%S" "${started_at%%.*}" +%s 2>/dev/null || echo "0")
+    now_epoch=$(date +%s)
+    diff_s=$(( now_epoch - start_epoch ))
+    printf '%dh %dm' "$(( diff_s / 3600 ))" "$(( (diff_s % 3600) / 60 ))"
+  else
+    printf 'unknown'
+  fi
+}
+
 cmd_status() {
   printf "\n"
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
-    local model uptime
 
-    # Get model from container command
-    model=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null \
-      | sed -n 's/.*serve \([^ ]*\).*/\1/p' || echo "unknown")
+  local rows=0 reserved=0
+  while IFS=$'\t' read -r name model port need weights kv; do
+    [[ -z "$name" ]] && continue
+    rows=$((rows + 1))
+    local up
+    up=$(container_uptime "$name")
+    printf "  ${GREEN}●${NC} ${BOLD}%s${NC}\n" "${model:-unknown}"
+    printf "      Need: %s GB  ·  Weights: %s GB  ·  KV: %s GB  ·  Port: %s  ·  Up: %s\n" \
+      "${need:-?}" "${weights:-?}" "${kv:-?}" "${port:-?}" "$up"
+    printf "      API:  http://localhost:%s/v1\n" "${port:-?}"
+    [[ "${need:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] && reserved=$(awk -v a="$reserved" -v b="$need" 'BEGIN{printf "%.1f", a+b}')
+  done < <(list_managed_containers)
 
-    # Get uptime
-    local started_at
-    started_at=$(docker inspect "$CONTAINER_NAME" --format '{{.State.StartedAt}}' 2>/dev/null)
-    if [[ -n "$started_at" ]]; then
-      local start_epoch now_epoch diff_s
-      start_epoch=$(date -d "$started_at" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%S" "${started_at%%.*}" +%s 2>/dev/null || echo "0")
-      now_epoch=$(date +%s)
-      diff_s=$(( now_epoch - start_epoch ))
-      local hours=$(( diff_s / 3600 ))
-      local mins=$(( (diff_s % 3600) / 60 ))
-      uptime="${hours}h ${mins}m"
-    else
-      uptime="unknown"
-    fi
-
-    # Get port from container
-    local port
-    port=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null \
-      | sed -n 's/.*--port \([0-9]*\).*/\1/p' || echo "8000")
-
-    printf "  ${GREEN}●${NC} vLLM running (${CONTAINER_NAME})\n"
-    printf "    Model:   %s\n" "$model"
-    printf "    Uptime:  %s\n" "$uptime"
-    printf "    API:     http://localhost:%s/v1\n" "$port"
-  else
-    printf "  ${DIM}○${NC} No model running. Start one with: ${BOLD}spark run <model>${NC}\n"
+  # Include a legacy/unlabelled spark-vllm container if present.
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$" \
+     && ! list_managed_containers | grep -q "^${CONTAINER_NAME}	"; then
+    rows=$((rows + 1))
+    local lmodel lport
+    lmodel=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null | sed -n 's/.*serve \([^ ]*\).*/\1/p' || echo "unknown")
+    lport=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null | sed -n 's/.*--port \([0-9]*\).*/\1/p' || echo "8000")
+    printf "  ${GREEN}●${NC} ${BOLD}%s${NC}  ${DIM}(unmanaged)${NC}\n" "$lmodel"
+    printf "      Need: ?  ·  Port: %s  ·  Up: %s\n" "$lport" "$(container_uptime "$CONTAINER_NAME")"
+    printf "      API:  http://localhost:%s/v1\n" "$lport"
   fi
+
+  if [[ "$rows" -eq 0 ]]; then
+    printf "  ${DIM}○${NC} No model running. Start one with: ${BOLD}spark run <model>${NC}\n\n"
+    return 0
+  fi
+
+  local free
+  free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{printf "%.1f", b-r}')
+  printf "\n  ${DIM}Machine: %s GB total · %s OS-reserved · %s reserved by models · %s free${NC}\n" \
+    "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
   printf "\n"
 }
 
+# spark logs [<model>] [-f] — logs of a model, or the only one running.
 cmd_logs() {
-  local follow=0
-  [[ "${1:-}" == "-f" ]] && follow=1
+  local follow=0 target=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f) follow=1; shift ;;
+      *)  target="$1"; shift ;;
+    esac
+  done
 
-  if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
-    die "No container '${CONTAINER_NAME}' found"
+  local name=""
+  if [[ -n "$target" ]]; then
+    name=$(container_for_ref "$target" 2>/dev/null || true)
+    [[ -z "$name" ]] && name=$(container_name_for_model "$target")
+  else
+    # No model given: pick the only running managed container, or the legacy name.
+    local names=()
+    while IFS=$'\t' read -r n _; do [[ -n "$n" ]] && names+=("$n"); done < <(list_managed_containers)
+    if [[ ${#names[@]} -eq 1 ]]; then
+      name="${names[0]}"
+    elif [[ ${#names[@]} -gt 1 ]]; then
+      err "Multiple models running — specify which"
+      printf "    %s\n" "$(IFS=', '; echo "${names[*]}")"
+      exit 1
+    else
+      name="$CONTAINER_NAME"
+    fi
+  fi
+
+  if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+    die "No container found for '${target:-$name}'"
   fi
 
   if [[ "$follow" == "1" ]]; then
-    docker logs -f "$CONTAINER_NAME"
+    docker logs -f "$name"
   else
-    docker logs "$CONTAINER_NAME"
+    docker logs "$name"
   fi
 }
 
@@ -1397,39 +1763,41 @@ cmd_help() {
     spark <command> [options]
 
   ${BOLD}Commands:${NC}
-    setup          Configure DGX Spark from your laptop via SSH
-    doctor         Check all prerequisites (read-only)
-    run <model>    Start serving a model
-    stop           Stop the running model
-    pull <model>   Download a model from HuggingFace
-    list           List downloaded models
-    rm <model>     Remove a downloaded model
-    status         Show current serving status
-    logs [-f]      Show container logs (-f to follow)
-    gateway        Manage LiteLLM gateway (start|stop|status|logs)
-    update         Update spark CLI and NGC vLLM container
-    config         Configure spark settings (e.g. auto-update)
+    setup            Configure DGX Spark from your laptop via SSH
+    doctor           Check all prerequisites (read-only)
+    run <model>      Start serving a model (can run several at once)
+    stop [<model>]   Stop a model (no arg: the only one; --all: every one)
+    pull <model>     Download a model from HuggingFace
+    list             List downloaded models
+    rm <model>       Remove a downloaded model
+    status           Show running models, their reservation, and free memory
+    logs [<model>]   Show container logs (-f to follow)
+    gateway          Manage LiteLLM gateway (start|stop|status|logs)
+    update           Update spark CLI and NGC vLLM container
+    config           Configure spark settings (e.g. auto-update)
 
   ${BOLD}Run flags:${NC}
-    --mem <float>       GPU memory utilization (0.0-1.0)
-    --max-len <int>     Maximum context length
-    --port <int>        API port (default: 8000)
-    --tools             Enable tool calling
-    --text-only         Skip vision encoder
-    --no-reasoning      Disable reasoning parser
-    --dry-run           Print Docker command only
-    --tail              Follow logs after launch
-    --force             Stop existing container first
-    --regen-profile     Regenerate model profile
+    --mem <float>          GPU memory utilization (0.0-1.0), overrides auto-sizing
+    --max-len <int>        Context length (default: 128K, capped to model max)
+    --kv-cache-dtype fp8   Halve KV cache memory
+    --port <int>           API port (default: auto from 8000)
+    --tools                Enable tool calling
+    --text-only            Skip vision encoder
+    --no-reasoning         Disable reasoning parser
+    --dry-run              Print the memory plan and Docker command only
+    --tail                 Follow logs after launch
+    --force                Replace this model if already running
+    --regen-profile        Regenerate model profile
 
   ${BOLD}Examples:${NC}
     spark setup
     spark pull RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
-    spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4 --tools --port 9000
+    spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4   # second model, co-resident
     spark run --dry-run Qwen/Qwen3-30B-A3B
+    spark status
+    spark stop RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark gateway start
-    spark gateway status
 
 EOF
 }
@@ -1490,13 +1858,29 @@ gateway_generate_litellm_yaml() {
   local yaml="model_list:"
   local has_models=0
 
-  # vLLM — add all models currently served (wildcard passthrough)
+  # vLLM — one explicit entry per running model (routes to its own port),
+  # plus the wildcard passthrough for backwards compatibility.
   if [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]]; then
+    local primary_port="" name model port rest
+    while IFS=$'\t' read -r name model port rest; do
+      [[ -z "$model" ]] && continue
+      yaml+="
+  - model_name: \"vllm/${model}\"
+    litellm_params:
+      model: \"openai/${model}\"
+      api_base: \"http://localhost:${port}/v1\"
+      api_key: \"dummy\""
+      has_models=1
+      [[ -z "$primary_port" ]] && primary_port="$port"   # first model
+      [[ "$port" == "$vllm_port" ]] && primary_port="$port"  # prefer the default port
+    done < <(list_managed_containers)
+    [[ -z "$primary_port" ]] && primary_port="$vllm_port"
+
     yaml+="
   - model_name: \"vllm/*\"
     litellm_params:
       model: \"openai/*\"
-      api_base: \"http://localhost:${vllm_port}/v1\"
+      api_base: \"http://localhost:${primary_port}/v1\"
       api_key: \"dummy\""
     has_models=1
   fi
@@ -1908,7 +2292,7 @@ check_for_updates
 
 case "${1:-}" in
   run)     shift; cmd_run "$@" ;;
-  stop)    cmd_stop ;;
+  stop)    shift; cmd_stop "$@" ;;
   pull)    shift; cmd_pull "$@" ;;
   list)    cmd_list ;;
   rm)      shift; cmd_rm "$@" ;;
