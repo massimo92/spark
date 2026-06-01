@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SPARK="${ROOT_DIR}/spark"
 
+# These tests target the vLLM/NVIDIA path; default detection to it so the no-GPU CI
+# runners don't fall through to the Ollama backend. Backend-specific tests override
+# SPARK_BACKEND/SPARK_ACCEL inline, or clear them per-invocation with `env -u`.
+export SPARK_BACKEND="${SPARK_BACKEND:-vllm}"
+export SPARK_ACCEL="${SPARK_ACCEL:-cuda-unified}"
+
 passed=0
 failed=0
 
@@ -34,6 +40,7 @@ case "${1:-}" in
     fi
     ;;
   run)
+    [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_DOCKER_ARGS_FILE}"
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
     ;;
   inspect)
@@ -51,11 +58,51 @@ esac
 EOF
   chmod +x "${dir}/docker"
 
+  # nvidia-smi mock: FAKE_NVIDIA_SMI_EXIT=0 simulates a present GPU. FAKE_VRAM_MIB and
+  # FAKE_GPU_NAME drive the discrete-vs-unified classification and the VRAM pool.
   cat > "${dir}/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
-exit "${FAKE_NVIDIA_SMI_EXIT:-1}"
+args="$*"
+case "$args" in
+  *-L*)
+    [[ "${FAKE_NVIDIA_SMI_EXIT:-1}" == "0" ]] && echo "GPU 0: ${FAKE_GPU_NAME:-NVIDIA Test} (UUID: GPU-0)"
+    exit "${FAKE_NVIDIA_SMI_EXIT:-1}" ;;
+  *memory.total*)
+    [[ -n "${FAKE_VRAM_MIB:-}" ]] && echo "${FAKE_VRAM_MIB}"
+    exit "${FAKE_NVIDIA_SMI_EXIT:-1}" ;;
+  *--query-gpu=name*)
+    [[ -n "${FAKE_GPU_NAME:-}" ]] && echo "${FAKE_GPU_NAME}"
+    exit "${FAKE_NVIDIA_SMI_EXIT:-1}" ;;
+  *)
+    exit "${FAKE_NVIDIA_SMI_EXIT:-1}" ;;
+esac
 EOF
   chmod +x "${dir}/nvidia-smi"
+
+  # ollama mock: list/ps from FAKE_OLLAMA_LIST/FAKE_OLLAMA_PS; pull records to a file.
+  cat > "${dir}/ollama" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list) printf '%b' "${FAKE_OLLAMA_LIST:-}" ;;
+  ps)   printf '%b' "${FAKE_OLLAMA_PS:-}" ;;
+  pull) [[ -n "${FAKE_OLLAMA_PULL_FILE:-}" ]] && echo "$2" >> "${FAKE_OLLAMA_PULL_FILE}"
+        exit "${FAKE_OLLAMA_PULL_EXIT:-0}" ;;
+  stop) exit "${FAKE_OLLAMA_STOP_EXIT:-0}" ;;
+  show) printf '%b' "${FAKE_OLLAMA_SHOW:-}" ;;
+  --version|version) echo "ollama version 0.19.0" ;;
+  *)    exit 0 ;;
+esac
+EOF
+  chmod +x "${dir}/ollama"
+
+  # curl mock: spark only uses it to probe Ollama's :11434 (check_for_updates is
+  # skipped in non-TTY test runs). Succeeds when FAKE_OLLAMA_UP=1.
+  cat > "${dir}/curl" <<'EOF'
+#!/usr/bin/env bash
+[[ "${FAKE_OLLAMA_UP:-0}" == "1" ]] && exit 0
+exit 7
+EOF
+  chmod +x "${dir}/curl"
 
   cat > "${dir}/tailscale" <<'EOF'
 #!/usr/bin/env bash
@@ -559,6 +606,180 @@ EOF
     [[ "$rm_out" == *"Disabled ollama"* ]] && [[ "$disabled" == "false" ]]
 }
 
+# --- Platform / accelerator detection ---
+test_detect_metal_on_apple_silicon() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(env -u SPARK_ACCEL -u SPARK_BACKEND HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_OS_OVERRIDE=Darwin SPARK_ARCH_OVERRIDE=arm64 FAKE_NVIDIA_SMI_EXIT=1 \
+    "$SPARK" __detect 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"accel=metal"* ]] && [[ "$out" == *"backend=ollama"* ]]
+}
+
+test_detect_cuda_unified_on_arm_nvidia() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(env -u SPARK_ACCEL -u SPARK_BACKEND HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 FAKE_NVIDIA_SMI_EXIT=0 \
+    "$SPARK" __detect 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"accel=cuda-unified"* ]] && [[ "$out" == *"backend=vllm"* ]]
+}
+
+test_detect_cuda_discrete_on_x86_nvidia() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(env -u SPARK_ACCEL -u SPARK_BACKEND HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=x86_64 FAKE_NVIDIA_SMI_EXIT=0 FAKE_VRAM_MIB=24576 \
+    "$SPARK" __detect 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"accel=cuda-discrete"* ]] && [[ "$out" == *"backend=vllm"* ]]
+}
+
+test_detect_cpu_without_gpu() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(env -u SPARK_ACCEL -u SPARK_BACKEND HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=x86_64 FAKE_NVIDIA_SMI_EXIT=1 \
+    "$SPARK" __detect 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"accel=cpu"* ]] && [[ "$out" == *"backend=ollama"* ]]
+}
+
+test_discrete_uses_vram_pool() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Small" '{ "model_type":"qwen3", "max_position_embeddings":4096 }'
+  # Discrete GPU: pool is VRAM (24576 MiB → 24 GB), reserve is a small headroom.
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ACCEL=cuda-discrete \
+    FAKE_NVIDIA_SMI_EXIT=0 FAKE_VRAM_MIB=24576 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/Small --dry-run 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"24 GB VRAM"* ]] && [[ "$out" == *"headroom"* ]]
+}
+
+# --- Ollama backend ---
+test_ollama_dry_run_plans_pull() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    "$SPARK" run qwen3:30b --dry-run 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"ollama pull qwen3:30b"* ]] &&
+    [[ "$out" == *"ollama_chat/qwen3:30b"* ]] &&
+    [[ "$out" == *"(ollama)"* ]] &&
+    [[ "$out" != *"docker run"* ]]
+}
+
+test_ollama_run_pulls_and_enables_gateway() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out pulls cfg
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    FAKE_OLLAMA_UP=1 FAKE_OLLAMA_PULL_FILE="${tmp}/pulls.txt" \
+    "$SPARK" run qwen3:30b 2>&1)
+  pulls=$(cat "${tmp}/pulls.txt" 2>/dev/null || echo "")
+  cfg=$(jq -r '.providers.ollama.enabled' "${tmp}/home/.config/spark/gateway.json" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$pulls" == *"qwen3:30b"* ]] && [[ "$cfg" == "true" ]] && [[ "$out" == *"ready via Ollama"* ]]
+}
+
+# --- spark host (local setup) ---
+test_host_check_ollama_ready() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_ACCEL=metal \
+    SPARK_OS_OVERRIDE=Darwin FAKE_OLLAMA_UP=1 FAKE_DOCKER_INFO_EXIT=0 \
+    "$SPARK" host --check 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"backend ollama"* ]] && [[ "$out" == *"Ollama: installed"* ]] &&
+    [[ "$out" == *"ready to serve"* ]]
+}
+
+test_host_check_vllm_no_gpu() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_NVIDIA_SMI_EXIT=1 \
+    "$SPARK" host --check 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"backend vllm"* ]] && [[ "$out" == *"No NVIDIA GPU detected"* ]] &&
+    [[ "$out" == *"incomplete"* ]]
+}
+
+# --- Doctor per backend ---
+test_doctor_ollama_backend() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_ACCEL=metal \
+    FAKE_OLLAMA_UP=1 FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMOD\nqwen3:30b\tabc\t18\tGB\n" \
+    "$SPARK" doctor 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"backend ollama"* ]] && [[ "$out" == *"Ollama service: reachable"* ]] &&
+    [[ "$out" == *"Models: 1 pulled"* ]] && [[ "$out" != *"NGC"* ]]
+}
+
+# --- Gateway networking per OS ---
+# Write a minimal gateway config with the Ollama provider enabled.
+write_ollama_gateway_config() {
+  local home="$1"
+  mkdir -p "${home}/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"ollama":{"enabled":true}}}' \
+    > "${home}/.config/spark/gateway.json"
+}
+
+test_gateway_ollama_route_mac() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin yaml dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  write_ollama_gateway_config "${tmp}/home"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_OVERRIDE=Darwin \
+    FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    "$SPARK" gateway start >/dev/null 2>&1 || true
+  yaml=$(cat "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || echo "")
+  dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$yaml" == *"ollama_chat/*"* ]] && [[ "$yaml" == *"host.docker.internal:11434"* ]] &&
+    [[ "$dargs" == *"-p 4000:4000"* ]]
+}
+
+test_gateway_ollama_route_linux() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin yaml dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  write_ollama_gateway_config "${tmp}/home"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_OVERRIDE=Linux \
+    FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    "$SPARK" gateway start >/dev/null 2>&1 || true
+  yaml=$(cat "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || echo "")
+  dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$yaml" == *"ollama_chat/*"* ]] && [[ "$yaml" == *"http://localhost:11434"* ]] &&
+    [[ "$dargs" == *"--network host"* ]]
+}
+
+# --- Compatibility validation ---
+test_ollama_blocks_vllm_only_model() {
+  local tmp fake_bin out rc
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    "$SPARK" run RedHatAI/Qwen3-NVFP4 --dry-run 2>&1) && rc=0 || rc=$?
+  rm -rf "$tmp"
+  [[ "${rc:-0}" -ne 0 ]] && [[ "$out" == *"vLLM-only"* ]]
+}
+
+test_vllm_blocks_ollama_tag() {
+  local tmp fake_bin out rc
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    "$SPARK" run qwen3:30b --dry-run 2>&1) && rc=0 || rc=$?
+  rm -rf "$tmp"
+  [[ "${rc:-0}" -ne 0 ]] && [[ "$out" == *"Ollama model tag"* ]]
+}
+
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
@@ -582,6 +803,20 @@ run_test "stop --all stops every model" test_stop_all
 run_test "stop with no arg and many models asks which" test_stop_ambiguous_requires_target
 run_test "status renders a table" test_status_renders_table
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
+run_test "detect: Apple Silicon → metal/ollama" test_detect_metal_on_apple_silicon
+run_test "detect: arm64 NVIDIA → cuda-unified/vllm" test_detect_cuda_unified_on_arm_nvidia
+run_test "detect: x86_64 NVIDIA → cuda-discrete/vllm" test_detect_cuda_discrete_on_x86_nvidia
+run_test "detect: no GPU → cpu/ollama" test_detect_cpu_without_gpu
+run_test "discrete GPU reserves from VRAM pool" test_discrete_uses_vram_pool
+run_test "ollama run (dry) plans pull + gateway route" test_ollama_dry_run_plans_pull
+run_test "ollama run pulls and enables gateway" test_ollama_run_pulls_and_enables_gateway
+run_test "ollama backend blocks vLLM-only model" test_ollama_blocks_vllm_only_model
+run_test "vllm backend blocks ollama-style tag" test_vllm_blocks_ollama_tag
+run_test "gateway routes Ollama via host.docker.internal on macOS" test_gateway_ollama_route_mac
+run_test "gateway routes Ollama via localhost on Linux" test_gateway_ollama_route_linux
+run_test "doctor runs Ollama checks on the ollama backend" test_doctor_ollama_backend
+run_test "host --check (ollama) reports ready" test_host_check_ollama_ready
+run_test "host --check (vllm) flags a missing GPU" test_host_check_vllm_no_gpu
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]

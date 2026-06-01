@@ -2,33 +2,58 @@
 
 # spark
 
-CLI tool for NVIDIA DGX Spark. Setup, remote access, and LLM serving — one script, zero friction.
+CLI tool for serving LLMs behind one OpenAI-compatible gateway — on NVIDIA (DGX Spark or a discrete GPU), Apple Silicon, or CPU. spark detects the hardware and picks the right engine. One script, zero friction.
 
 ```
-spark setup                                  # One-time: configures laptop + DGX over SSH
-spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4    # Serve a model (on the DGX)
-curl localhost:8000/v1/models                # Use it
+spark host                                   # One-time: set up THIS machine as a server
+spark run <model>                            # Serve a model (engine chosen by your hardware)
+curl localhost:4000/v1/models                # Use it through the gateway
 ```
+
+> New: spark now runs on **macOS (Apple Silicon)** and **any Linux box**, not just the DGX. On
+> NVIDIA it serves with vLLM; on Apple Silicon and CPU it serves with Ollama (which uses Apple's
+> MLX under the hood on Apple Silicon). The LiteLLM gateway on `:4000` is the same everywhere.
 
 ## What it does
 
-1. **Setup wizard** — run `spark setup` from your laptop and it configures both your machine and the DGX Spark over SSH in one pass: system updates, GPU check, Docker, NGC, HuggingFace CLI, Tailscale, SSH keys, and the vLLM container. Detects what's already done, automates what it can, pauses for manual steps.
+1. **One-command server setup** — `spark host` sets up the machine you run it on: it detects the
+   hardware, installs the right engine (vLLM in Docker on NVIDIA; Ollama on Apple Silicon / CPU),
+   and brings up the gateway. `spark setup` (the original flow) still configures a *remote* DGX
+   Spark from your laptop over SSH.
 
-2. **Remote access** — configures Tailscale and SSH keys so you can reach your DGX Spark from anywhere and disables password login for security.
+2. **Hardware-aware serving** — `spark run <model>` profiles the model, reserves the memory it
+   needs, and launches it on the right engine for your hardware. Run several models at once.
 
-3. **Model serving** — pulls models from HuggingFace and serves them with vLLM using the official NGC container. Auto-detects model settings (reasoning parser, context length, quantization, MoE/multimodal architecture) and generates optimal vLLM flags.
+3. **One gateway, many backends** — a LiteLLM gateway on `:4000` gives every model the same
+   OpenAI-compatible endpoint, whether it's served by vLLM or Ollama, local or remote.
 
-## Why not just Docker + vLLM directly?
+## Platform support
 
-Raw vLLM on DGX Spark requires 5-line Docker commands with non-obvious flags (`--ipc=host`, `--ulimit memlock=-1`), NGC authentication quirks (`$oauthtoken` is a literal username), and per-model configuration that varies by family. spark wraps all of this into a single CLI.
+spark auto-detects the accelerator and picks the engine. Override with `SPARK_BACKEND` (`vllm` |
+`ollama`) or `SPARK_ACCEL` if it ever guesses wrong.
 
-Unlike Ollama, spark uses the official NGC container with continuous batching, PagedAttention, and Blackwell-optimized CUDA kernels — critical for multi-agent 24/7 serving.
+| Host | Accelerator class | Engine | Memory pool |
+|------|-------------------|--------|-------------|
+| Linux + NVIDIA SoC — DGX Spark / GB10, Jetson, Thor (arm64) | `cuda-unified` | vLLM (Docker) | system RAM (unified) |
+| Linux + discrete NVIDIA GPU (x86_64) | `cuda-discrete` | vLLM (Docker) | GPU VRAM |
+| macOS Apple Silicon | `metal` | Ollama (uses MLX) | system RAM (unified) |
+| Intel Mac / Linux without NVIDIA / AMD | `cpu` | Ollama (llama.cpp) | system RAM |
+
+On NVIDIA, vLLM gives continuous batching, PagedAttention, and Blackwell-optimized kernels — best
+for multi-agent 24/7 serving, and the only path that runs NVFP4 weights. On Apple Silicon, Ollama
+0.19+ runs on Apple's **MLX** framework (unified-memory optimized, 32 GB+), so you get native speed
+with no extra work.
+
+> **macOS note:** Docker Desktop can't use the Mac GPU, so the *model* runs natively via Ollama;
+> only the lightweight LiteLLM gateway runs in Docker (so reboot-persistence matches Linux). Inside
+> that container the gateway reaches Ollama at `host.docker.internal:11434`, and you call models as
+> `ollama_chat/<model>`.
 
 ## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/massimo92/spark/main/install.sh | bash
-spark setup
+spark host          # set up THIS machine  (use `spark setup` for a remote DGX)
 ```
 
 Or clone and link:
@@ -36,25 +61,54 @@ Or clone and link:
 ```bash
 git clone https://github.com/massimo92/spark.git
 sudo ln -sf $(pwd)/spark/spark /usr/local/bin/spark
-spark setup
+spark host
 ```
 
-**Requirements:** `spark` is a Bash CLI. Setup installs `jq` on the DGX because model profiles are stored as JSON and read safely instead of being executed as shell scripts.
+**Requirements:** `spark` is a Bash CLI and needs `jq` (model profiles are stored as JSON and read
+safely instead of being executed as shell scripts). `spark host` installs what your hardware needs —
+Docker + the NGC vLLM image on NVIDIA, or Ollama + Docker Desktop (for the gateway) on macOS/CPU.
 
 ## Quickstart
 
+**This machine as a server** (macOS or Linux):
+
+```bash
+spark host                              # detect hardware, install engine + gateway
+spark run qwen3:30b                     # on Apple Silicon / CPU (Ollama)
+spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4 # on NVIDIA (vLLM)
+curl localhost:4000/v1/models           # use it through the gateway
+```
+
+**A remote DGX Spark from your laptop:**
+
 ```bash
 spark setup          # Guided wizard: configures your laptop AND the DGX over SSH
-spark pull RedHatAI/Qwen3.6-35B-A3B-NVFP4
 spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
-curl localhost:8000/v1/models
 ```
 
 ## Commands
 
+### spark host
+
+Set up the machine you run it on as a model server. Detects the hardware, installs the right engine
+and the LiteLLM gateway, and finishes with `spark doctor`.
+
+```bash
+spark host           # interactive setup for this machine
+spark host --check   # read-only: report what's missing, install nothing
+spark host --yes     # auto-confirm install prompts
+```
+
+- **NVIDIA (Linux):** Docker + NVIDIA Container Toolkit + NGC login + the vLLM image, plus the HF CLI.
+- **Apple Silicon / CPU:** Ollama (via Homebrew, the install script, or the app) + Docker Desktop for
+  the gateway.
+
+`spark host` is for the *local* machine; `spark setup` (below) is the separate flow for a *remote*
+DGX Spark over SSH.
+
 ### spark setup
 
-Guided wizard that runs entirely from your laptop. It connects to the DGX Spark over SSH and configures everything in one pass — no need to run setup on both machines.
+Guided wizard that runs entirely from your laptop. It connects to a remote DGX Spark over SSH and configures everything in one pass — no need to run setup on both machines.
 
 ```bash
 spark setup            # Guided wizard (asks for DGX IP + username)
@@ -72,30 +126,40 @@ spark setup --yes      # Auto-confirm install/update prompts; secrets and hostna
 
 ### spark run
 
-The core command. Auto-profiles the model, reserves the memory it needs, and launches vLLM.
-You can run **several models at once** — each gets its own container and port, and the
-gateway routes to all of them (see [Multiple models](#multiple-models)).
+The core command. spark picks the engine from your hardware (see [Platform support](#platform-support)).
 
-If the model isn't downloaded yet, `spark run` fetches just its metadata first to size it
-and check it fits:
+**On NVIDIA (vLLM):** auto-profiles the model, reserves the memory it needs, and launches it in its
+own container. You can run **several models at once** — each gets its own port and the gateway
+routes to all of them (see [Multiple models](#multiple-models)). Model refs are HuggingFace repos
+(`org/name`). If the model isn't downloaded yet, `spark run` fetches just its metadata first to size
+it and check it fits:
 
 - **Fits** → asks to download the full weights and start.
-- **Doesn't fit** → warns and offers to download it anyway (without starting), so you can
-  free memory and launch it later.
+- **Doesn't fit** → warns and offers to download it anyway (without starting), so you can free
+  memory and launch it later.
 
 Use `--no-pull` to skip this and just error on a missing model (e.g. in scripts).
+
+**On Apple Silicon / CPU (Ollama):** pulls the model and routes it through the gateway. Ollama serves
+many models on one port and manages memory itself, so there's no per-model container, port, or
+`--gpu-memory-utilization`. Model refs are Ollama names (`qwen3:30b`, `llama3.3`, or
+`hf.co/<repo>:Q4_K_M`); the vLLM-only flags below are ignored. Call models as `ollama_chat/<model>`.
 
 ```bash
 spark run <model> [flags]
 
-# Examples
+# NVIDIA (vLLM)
 spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
 spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4   # second model, co-resident
 spark run Qwen/Qwen3-30B-A3B --dry-run                  # show the memory plan, don't launch
 spark run nvidia/Llama-3.1-8B-Instruct --kv-cache-dtype fp8   # halve KV cache memory
+
+# Apple Silicon / CPU (Ollama)
+spark run qwen3:30b                                     # pull + route through the gateway
+spark run llama3.3 --dry-run                            # show the plan, don't pull
 ```
 
-**Flags:**
+**Flags** (vLLM backend; ignored on Ollama):
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -250,9 +314,14 @@ spark reserves the memory each model **needs**, independent of how much is free:
 - **Need** = (weights + KV) + ~8 % cushion. The vLLM fraction is `need ÷ total system memory`,
   so every model gets its own `--gpu-memory-utilization`.
 
-Total memory is read from the **system** (`/proc/meminfo`), not `nvidia-smi` — the DGX Spark
-(GB10) uses unified memory, where `nvidia-smi` reports N/A. Override with `SPARK_TOTAL_MEM_GB`,
-`SPARK_OS_RESERVE_GB` (default 10), or `SPARK_MEM_HEADROOM_PCT` (default 8) if needed.
+The memory pool depends on the hardware. **Unified-memory** hosts (DGX Spark / GB10, Apple Silicon)
+read total RAM from the system (`/proc/meminfo` or `sysctl`), where `nvidia-smi` reports N/A. A
+**discrete GPU** uses its VRAM (`nvidia-smi --query-gpu=memory.total`) with a small headroom instead
+of the 10 GB OS reserve. Override with `SPARK_TOTAL_MEM_GB`, `SPARK_OS_RESERVE_GB`, or
+`SPARK_MEM_HEADROOM_PCT` if needed.
+
+This auto-profiling and reservation is the **vLLM** path. On the **Ollama** backend the engine
+manages memory itself, so spark just pulls the model and shows an advisory size.
 
 ### Multiple models
 
@@ -293,14 +362,22 @@ Per-model profiles are cached at `~/.config/spark/profiles/` as JSON. To regener
 
 ## FAQ
 
-**Q: Why not Ollama?**
-A: Ollama lacks continuous batching, PagedAttention, and NGC-optimized CUDA kernels. For single-user chat it's fine; for multi-agent serving, vLLM is significantly better.
+**Q: vLLM or Ollama — which does spark use?**
+A: Whichever fits the hardware (spark auto-detects). On NVIDIA it uses vLLM — continuous batching,
+PagedAttention, Blackwell kernels, NVFP4 — best for multi-agent 24/7 serving. On Apple Silicon and
+CPU it uses Ollama, which on Apple Silicon (0.19+) runs on Apple's MLX for native speed. Force it
+with `SPARK_BACKEND=vllm|ollama`.
+
+**Q: How do I run spark on a Mac?**
+A: `spark host` installs Ollama and the gateway. Then `spark run qwen3:30b` (any Ollama model) and
+call it through the gateway as `ollama_chat/qwen3:30b` on `http://localhost:4000/v1`. NVFP4 / vLLM
+HuggingFace repos don't run on a Mac — use GGUF/Ollama models or `hf.co/<repo>:Q4_K_M`.
 
 **Q: Can I run multiple models?**
-A: Yes. `spark run` starts each model in its own container and port, and the gateway routes to
-all of them. spark checks the new model fits in memory before launching and aborts (without
-touching running models) if it doesn't. See [Multiple models](#multiple-models). To stop one:
-`spark stop <model>`.
+A: Yes. On vLLM each model gets its own container and port, and spark checks the new one fits in
+memory before launching — aborting (without touching running models) if it doesn't. On Ollama, many
+models share one port and load on demand. Either way the gateway routes to all of them. See
+[Multiple models](#multiple-models); stop one with `spark stop <model>`.
 
 **Q: Where are models stored?**
 A: Standard HuggingFace cache at `~/.cache/huggingface`. Use `hf scan-cache` and `hf delete-cache` normally.

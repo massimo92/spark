@@ -41,6 +41,14 @@ detect_total_mem_gb() {
   if [[ -n "${SPARK_TOTAL_MEM_GB:-}" && "${SPARK_TOTAL_MEM_GB}" =~ ^[0-9]+$ ]]; then
     printf '%s\n' "$SPARK_TOTAL_MEM_GB"; return 0
   fi
+  # Discrete NVIDIA GPU: the memory pool vLLM reserves from is VRAM, not system RAM.
+  if [[ "${ACCEL:-}" == "cuda-discrete" ]]; then
+    local vram
+    vram=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)
+    if [[ "$vram" =~ ^[0-9]+$ && "$vram" -gt 0 ]]; then
+      printf '%s\n' $(( vram / 1024 )); return 0
+    fi
+  fi
   if [[ -r /proc/meminfo ]]; then
     local kb
     kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo "")
@@ -58,8 +66,60 @@ detect_total_mem_gb() {
   printf '%s\n' "$gb"
 }
 
+# --- Platform & accelerator detection ---
+# ACCEL is one of:
+#   cuda-unified   NVIDIA SoC with unified memory (GB10/GX10, Jetson, Thor, Grace) — arm64
+#   cuda-discrete  NVIDIA GPU with its own VRAM — typically x86_64
+#   metal          Apple Silicon (Metal GPU, unified memory)
+#   cpu            no supported GPU (Intel Mac, Linux without NVIDIA, AMD)
+_classify_accel() {
+  # No usable NVIDIA GPU → Apple Silicon (metal) or plain CPU.
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+    [[ "$SPARK_OS" == "Darwin" && "$SPARK_ARCH" == "arm64" ]] && { printf 'metal\n'; return 0; }
+    printf 'cpu\n'; return 0
+  fi
+  # NVIDIA present. arm64 NVIDIA == unified-memory SoC (GB10/Thor/Orin/Jetson/Grace).
+  case "$SPARK_ARCH" in
+    aarch64|arm64) printf 'cuda-unified\n'; return 0 ;;
+  esac
+  # x86_64 + NVIDIA: usually discrete, but confirm against SoC signals first.
+  if [[ -r /proc/device-tree/model ]] && grep -qiE 'jetson|orin|thor|grace|gb10' /proc/device-tree/model 2>/dev/null; then
+    printf 'cuda-unified\n'; return 0
+  fi
+  [[ -r /etc/nv_tegra_release ]] && { printf 'cuda-unified\n'; return 0; }
+  local gname
+  gname=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
+  printf '%s' "$gname" | grep -qiE 'GB10|GB200|GH200|Orin|Thor|Grace' && { printf 'cuda-unified\n'; return 0; }
+  # memory.total reported as N/A / [Not Supported] / blank → unified; a real number → discrete.
+  local mt
+  mt=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ' || true)
+  [[ -z "$mt" || ! "$mt" =~ ^[0-9]+$ ]] && { printf 'cuda-unified\n'; return 0; }
+  printf 'cuda-discrete\n'
+}
+
+# Detect OS, CPU arch, accelerator class and the inference backend to use.
+# Override for tests / edge cases: SPARK_OS_OVERRIDE, SPARK_ARCH_OVERRIDE, SPARK_ACCEL, SPARK_BACKEND.
+detect_platform() {
+  SPARK_OS="${SPARK_OS_OVERRIDE:-$(uname -s)}"     # Darwin | Linux
+  SPARK_ARCH="${SPARK_ARCH_OVERRIDE:-$(uname -m)}" # arm64/aarch64 | x86_64
+  ACCEL="${SPARK_ACCEL:-$(_classify_accel)}"
+  if [[ -n "${SPARK_BACKEND:-}" ]]; then
+    BACKEND="$SPARK_BACKEND"
+  else
+    case "$ACCEL" in
+      cuda-unified|cuda-discrete) BACKEND="vllm" ;;
+      *)                          BACKEND="ollama" ;;
+    esac
+  fi
+}
+detect_platform
+
 TOTAL_MEM_GB=$(detect_total_mem_gb)
-OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-10}"          # memory left for OS + desktop
+if [[ "$ACCEL" == "cuda-discrete" ]]; then
+  OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-2}"         # small VRAM headroom (OS runs in system RAM)
+else
+  OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-10}"        # OS + desktop share unified memory
+fi
 MEM_HEADROOM_PCT="${SPARK_MEM_HEADROOM_PCT:-8}"     # per-model cushion (activations/fragmentation)
 BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))       # memory available to models
 
@@ -110,6 +170,34 @@ is_mem_util() {
 
 is_safe_model_ref() {
   [[ "${1:-}" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]]
+}
+
+# An Ollama model ref: 'name', 'name:tag', 'namespace/name:tag', or 'hf.co/<repo>:QUANT'.
+is_ollama_ref() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9._/-]+(:[A-Za-z0-9._-]+)?$ ]]
+}
+
+# Block obviously-incompatible model/backend combinations (no catalog — just stop
+# the impossible cases with an actionable hint). Called before the backend runs.
+validate_model_ref_for_backend() {
+  local ref="$1"
+  case "$BACKEND" in
+    ollama)
+      # NVFP4/FP8/quantized vLLM-format HF repos cannot run on Ollama (GGUF/MLX/llama.cpp).
+      if [[ "$ref" == */* && ! "$ref" =~ ^hf\.co/ ]] \
+         && printf '%s' "$ref" | grep -qiE 'nvfp4|-fp4|-fp8|-awq|-gptq|w4a16|w8a16'; then
+        die "'${ref}' looks like a vLLM-only (NVFP4/FP8/quantized) HuggingFace repo" \
+            "This machine uses the Ollama backend — pass a GGUF/Ollama model like 'qwen3:30b' or 'hf.co/<repo>:Q4_K_M'"
+      fi
+      ;;
+    vllm)
+      # An Ollama-style tag (e.g. qwen3:30b, hf.co/...:Q4) is not a HuggingFace repo.
+      if [[ "$ref" == *:* && ! "$ref" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+        die "'${ref}' looks like an Ollama model tag" \
+            "This machine uses the vLLM backend — pass a HuggingFace repo like 'org/name'"
+      fi
+      ;;
+  esac
 }
 
 is_safe_ngc_tag() {
@@ -587,6 +675,19 @@ cmd_run() {
   done
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
+  validate_model_ref_for_backend "$model"
+
+  # Pick the engine from the detected hardware (vLLM on NVIDIA, Ollama elsewhere).
+  # cmd_run's flag locals are visible to the backend functions via dynamic scoping.
+  case "$BACKEND" in
+    vllm)   run_backend_vllm ;;
+    ollama) run_backend_ollama ;;
+    *)      die "Unknown backend: $BACKEND" "Set SPARK_BACKEND to 'vllm' or 'ollama'" ;;
+  esac
+}
+
+# vLLM in a Docker container with NVIDIA GPUs. Reads cmd_run's flag locals.
+run_backend_vllm() {
   is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
   [[ -z "$port" ]] || is_port "$port" || die "Invalid --port value: $port" "Expected an integer from 1 to 65535"
   [[ -z "$mem" ]] || is_mem_util "$mem" || die "Invalid --mem value: $mem" "Expected a number from 0.0 to 1.0"
@@ -790,6 +891,83 @@ cmd_run() {
   fi
 }
 
+# Is the local Ollama service answering on :11434?
+ollama_reachable() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 2 http://localhost:11434/api/version >/dev/null 2>&1
+  else
+    ollama list >/dev/null 2>&1
+  fi
+}
+
+# Best-effort human-readable size of a pulled Ollama model (advisory only).
+ollama_model_size() {
+  ollama list 2>/dev/null | awk -v m="$1" 'NR>1 && $1==m {print $3" "$4; exit}'
+}
+
+# Enable the Ollama provider in the gateway config and refresh it if running.
+gateway_enable_ollama() {
+  local config
+  config=$(gateway_load_config)
+  config=$(printf '%s' "$config" | jq '.providers.ollama.enabled = true' 2>/dev/null) || return 0
+  gateway_save_config "$config"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    gateway_restart
+  fi
+}
+
+# Ollama (native) — used on Apple Silicon and CPU hosts. Reads cmd_run's flag locals.
+# Ollama multiplexes models on one port (11434) and loads them on demand, so there is
+# no per-model container, port, or GPU-memory fraction; it manages memory itself.
+run_backend_ollama() {
+  is_ollama_ref "$model" || die "Invalid model reference: $model" "Use an Ollama model like 'qwen3:30b' or 'hf.co/<repo>:Q4_K_M'"
+
+  # vLLM-only flags don't apply here — warn instead of silently ignoring them.
+  local ignored=()
+  [[ -n "$mem" ]]      && ignored+=(--mem)
+  [[ -n "$max_len" ]]  && ignored+=(--max-len)
+  [[ -n "$kv_dtype" ]] && ignored+=(--kv-cache-dtype)
+  [[ -n "$port" ]]     && ignored+=(--port)
+  [[ ${#ignored[@]} -gt 0 ]] && warn "Ignoring vLLM-only flag(s) on the Ollama backend: ${ignored[*]}"
+
+  if [[ "$dry_run" == "1" ]]; then
+    printf "\n  ${BOLD}%s${NC}  ${DIM}(ollama)${NC}\n" "$model"
+    printf "    Engine:    Ollama (manages memory automatically; %s GB total)\n" "$TOTAL_MEM_GB"
+    printf "    Route:     gateway ${BOLD}ollama_chat/%s${NC} → http://localhost:11434\n" "$model"
+    printf "${DIM}# Commands that would run:${NC}\n"
+    printf "ollama pull %s\n" "$model"
+    printf "spark gateway add ollama\n\n"
+    return 0
+  fi
+
+  command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark host"
+  ollama_reachable || warn "Ollama service not reachable on :11434 — is it running? (try: ollama serve)"
+
+  # Pull unless already present (or --no-pull).
+  if ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    info "Model '${model}' already pulled"
+  elif [[ "$no_pull" == "1" ]]; then
+    die "Model '${model}' is not pulled" "Remove --no-pull, or run: ollama pull ${model}"
+  else
+    printf "  Pulling ${BOLD}%s${NC} with Ollama...\n" "$model"
+    ollama pull "$model" || die "ollama pull failed for ${model}"
+  fi
+
+  local osize
+  osize=$(ollama_model_size "$model")
+  [[ -n "$osize" ]] && printf "  ${DIM}Size: %s (Ollama loads on demand)${NC}\n" "$osize"
+
+  # Route it through the gateway (enable provider + refresh if running).
+  gateway_enable_ollama
+
+  printf "\n"
+  printf "  Model ${BOLD}%s${NC} ready via Ollama.\n" "$model"
+  printf "  Gateway: ${DIM}call it as ${NC}${BOLD}ollama_chat/%s${NC}${DIM} on http://localhost:%s/v1${NC}\n\n" "$model" "$GATEWAY_PORT"
+
+  [[ "$tail_logs" == "1" ]] && warn "--tail has no effect on the Ollama backend (Ollama runs as a shared service)"
+  return 0
+}
+
 # Print the per-model memory accounting + machine-level totals.
 print_memory_plan() {
   local model="$1" cname="$2" port="$3" reserved="$4" free="$5"
@@ -806,8 +984,13 @@ print_memory_plan() {
   printf "    ${BOLD}Need:${NC}      %s GB  →  --gpu-memory-utilization %s\n" "$NEED_GB" "$GPU_MEM_UTIL"
   printf "    API:       http://localhost:%s/v1\n" "$port"
   [[ -n "$REASONING_PARSER" ]] && printf "    Reasoning: %s parser\n" "$REASONING_PARSER"
-  printf "    ${DIM}Machine:   %s GB total · %s OS-reserved · %s reserved by models · %s free${NC}\n" \
-    "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  if [[ "$ACCEL" == "cuda-discrete" ]]; then
+    printf "    ${DIM}GPU:       %s GB VRAM · %s headroom · %s reserved by models · %s free${NC}\n" \
+      "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  else
+    printf "    ${DIM}Machine:   %s GB total · %s OS-reserved · %s reserved by models · %s free${NC}\n" \
+      "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  fi
   if [[ "$MEM_DETECT_FALLBACK" == "1" ]]; then
     warn "Could not read system memory — using fallback ${TOTAL_MEM_GB} GB (set SPARK_TOTAL_MEM_GB to correct)"
   fi
@@ -829,8 +1012,35 @@ stop_one_container() {
 }
 
 # spark stop [<model>|--all] — no arg stops the only running model (legacy behavior).
+# spark stop on the Ollama backend: unload models from memory (Ollama keeps them on disk).
+cmd_stop_ollama() {
+  local target="$1" m loaded=()
+  command -v ollama >/dev/null 2>&1 || die "Ollama is not installed"
+  while read -r m; do [[ -n "$m" ]] && loaded+=("$m"); done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}')
+
+  if [[ "$target" == "--all" ]]; then
+    [[ ${#loaded[@]} -eq 0 ]] && { warn "No models loaded"; return 0; }
+    for m in "${loaded[@]}"; do ollama stop "$m" >/dev/null 2>&1 && info "Unloaded ${m}"; done
+  elif [[ -n "$target" ]]; then
+    if ollama stop "$target" >/dev/null 2>&1; then info "Unloaded ${target}"; else warn "Model '${target}' was not loaded"; fi
+  elif [[ ${#loaded[@]} -eq 0 ]]; then
+    warn "No models loaded"
+  elif [[ ${#loaded[@]} -gt 1 ]]; then
+    err "Multiple models loaded — specify which to stop"
+    printf "    %s\n" "$(IFS=', '; echo "${loaded[*]}")"
+    exit 1
+  else
+    ollama stop "${loaded[0]}" >/dev/null 2>&1 && info "Unloaded ${loaded[0]}"
+  fi
+}
+
 cmd_stop() {
   local target="${1:-}"
+
+  if [[ "$BACKEND" == "ollama" ]]; then
+    cmd_stop_ollama "$target"
+    return
+  fi
 
   # Collect running managed containers.
   local names=()
@@ -886,8 +1096,20 @@ cmd_stop() {
 cmd_pull() {
   local model="${1:-}"
   [[ -z "$model" ]] && die "No model specified" "Usage: spark pull <model>"
-  is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
+  validate_model_ref_for_backend "$model"
 
+  if [[ "$BACKEND" == "ollama" ]]; then
+    is_ollama_ref "$model" || die "Invalid model reference: $model" "Use an Ollama model like 'qwen3:30b'"
+    command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark host"
+    printf "\n  Pulling %s with Ollama...\n\n" "$model"
+    ollama pull "$model"
+    printf "\n"
+    info "Ready. Run: spark run ${model}"
+    printf "\n"
+    return 0
+  fi
+
+  is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
   printf "\n  Downloading %s...\n\n" "$model"
   hf download "$model"
   printf "\n"
@@ -1002,8 +1224,48 @@ container_uptime() {
   fi
 }
 
+# spark status on the Ollama backend: list pulled + loaded models and the gateway route.
+cmd_status_ollama() {
+  local gw_running=0 gw_port="$GATEWAY_PORT"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    gw_running=1
+    gw_port=$(gateway_load_config | jq -r '.port // 4000' 2>/dev/null)
+  fi
+
+  if ! command -v ollama >/dev/null 2>&1; then
+    printf "  ${DIM}○${NC} Ollama not installed. Set up this machine: ${BOLD}spark host${NC}\n\n"
+    return 0
+  fi
+
+  local rows
+  rows=$(ollama list 2>/dev/null | awk 'NR>1{printf "  %-32s %s %s\n", $1, $3, $4}')
+  if [[ -z "$rows" ]]; then
+    printf "  ${DIM}○${NC} No models pulled. Get one with: ${BOLD}spark run <model>${NC}\n"
+  else
+    printf "  ${DIM}%-32s %s${NC}\n" "MODEL" "SIZE"
+    printf "%s\n" "$rows"
+  fi
+
+  local loaded
+  loaded=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}' | tr '\n' ' ')
+  [[ -n "${loaded// /}" ]] && printf "\n  ${DIM}Loaded now: %s${NC}\n" "$loaded"
+
+  printf "\n  ${DIM}Engine: Ollama (%s) · %s GB unified memory${NC}\n" "$ACCEL" "$TOTAL_MEM_GB"
+  if [[ "$gw_running" -eq 1 ]]; then
+    printf "  ${DIM}Gateway (✓): http://localhost:%s/v1 — call a model as ${NC}${BOLD}ollama_chat/<model>${NC}\n" "$gw_port"
+  else
+    printf "  ${DIM}Gateway: not running — start it with ${NC}${BOLD}spark gateway start${NC}\n"
+  fi
+  printf "\n"
+}
+
 cmd_status() {
   printf "\n"
+
+  if [[ "$BACKEND" == "ollama" ]]; then
+    cmd_status_ollama
+    return
+  fi
 
   # Gateway routing state (computed once): is the gateway up and routing vLLM?
   local gw_running=0 gw_port=4000 gw_vllm=0
@@ -1057,8 +1319,10 @@ cmd_status() {
 
   local free
   free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{printf "%.1f", b-r}')
-  printf "\n  ${DIM}Memory (GB): %s total · %s OS · %s reserved · %s free${NC}\n" \
-    "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  local mem_label="Memory (GB):" os_label="OS"
+  if [[ "$ACCEL" == "cuda-discrete" ]]; then mem_label="VRAM (GB):  "; os_label="headroom"; fi
+  printf "\n  ${DIM}%s %s total · %s %s · %s reserved · %s free${NC}\n" \
+    "$mem_label" "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$os_label" "$reserved" "$free"
   printf "  ${DIM}Direct API: http://localhost:<port>/v1${NC}\n"
   if [[ "$gw_running" -eq 1 && "$gw_vllm" -eq 1 ]]; then
     printf "  ${DIM}Gateway (✓): http://localhost:%s/v1 — call a model as ${NC}${BOLD}vllm/<model>${NC}\n" "$gw_port"
@@ -1075,6 +1339,13 @@ cmd_logs() {
       *)  target="$1"; shift ;;
     esac
   done
+
+  if [[ "$BACKEND" == "ollama" ]]; then
+    warn "Ollama runs as a shared service — spark has no per-model logs for it."
+    printf "    macOS: open the Ollama app, or run ${BOLD}ollama serve${NC} in a terminal.\n"
+    printf "    Linux: ${BOLD}journalctl -u ollama -f${NC}\n"
+    return 0
+  fi
 
   local name=""
   if [[ -n "$target" ]]; then
@@ -1106,32 +1377,25 @@ cmd_logs() {
   fi
 }
 
-cmd_doctor() {
-  printf "\n"
-  local passed=0 total=0
-
+# vLLM/NVIDIA health checks. Updates cmd_doctor's passed/total via dynamic scope.
+doctor_checks_vllm() {
   # GPU
   total=$((total + 1))
   local gpu_info
-  if gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null); then
+  if gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null) && [[ -n "$gpu_info" ]]; then
     info "GPU: ${gpu_info}"
     passed=$((passed + 1))
   else
     err "GPU: nvidia-smi not available or no GPU detected"
   fi
 
-  # Docker
+  # NVIDIA Container Toolkit (lets Docker use the GPU with --gpus all)
   total=$((total + 1))
-  local docker_ver
-  if docker_ver=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
-    if docker info >/dev/null 2>&1; then
-      info "Docker: ${docker_ver}, running"
-      passed=$((passed + 1))
-    else
-      err "Docker: ${docker_ver} installed but not running"
-    fi
+  if docker info 2>/dev/null | grep -qi nvidia || command -v nvidia-ctk >/dev/null 2>&1; then
+    info "NVIDIA Container Toolkit: present"
+    passed=$((passed + 1))
   else
-    err "Docker: not installed"
+    err "NVIDIA Container Toolkit: not detected — needed for 'docker run --gpus all'"
   fi
 
   # Docker group
@@ -1190,6 +1454,69 @@ cmd_doctor() {
       err "HF cache not found at ${HF_CACHE_DIR} — run 'spark pull <model>' to initialize"
     fi
   fi
+}
+
+# Ollama health checks. Updates cmd_doctor's passed/total via dynamic scope.
+doctor_checks_ollama() {
+  # Ollama installed
+  total=$((total + 1))
+  if command -v ollama >/dev/null 2>&1; then
+    info "Ollama: $(ollama --version 2>/dev/null | head -1 || echo installed)"
+    passed=$((passed + 1))
+  else
+    err "Ollama: not installed — run 'spark host' to set it up"
+  fi
+
+  # Ollama service reachable
+  total=$((total + 1))
+  if ollama_reachable; then
+    info "Ollama service: reachable on :11434"
+    passed=$((passed + 1))
+  else
+    err "Ollama service: not reachable on :11434 — start it (ollama serve / Ollama app)"
+  fi
+
+  # Models pulled
+  total=$((total + 1))
+  local n=0
+  command -v ollama >/dev/null 2>&1 && n=$(ollama list 2>/dev/null | awk 'NR>1 && NF>0' | wc -l | tr -d ' ')
+  if [[ "${n:-0}" -gt 0 ]]; then
+    info "Models: ${n} pulled"
+    passed=$((passed + 1))
+  else
+    err "No models pulled yet — run 'spark run <model>'"
+  fi
+
+  # Apple Silicon advisory (MLX engages on 32 GB+ unified memory).
+  [[ "$ACCEL" == "metal" ]] && info "Apple Silicon: Ollama uses MLX on 32 GB+ unified memory (have ${TOTAL_MEM_GB} GB)"
+}
+
+cmd_doctor() {
+  printf "\n"
+  local passed=0 total=0
+
+  # Detected hardware (informational).
+  info "Detected: ${SPARK_OS}/${SPARK_ARCH} · accelerator ${ACCEL} · backend ${BACKEND}"
+
+  # Docker — the LiteLLM gateway runs in a container on both backends.
+  total=$((total + 1))
+  local docker_ver
+  if docker_ver=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
+    if docker info >/dev/null 2>&1; then
+      info "Docker: ${docker_ver}, running"
+      passed=$((passed + 1))
+    else
+      err "Docker: ${docker_ver} installed but not running"
+    fi
+  else
+    err "Docker: not installed"
+  fi
+
+  if [[ "$BACKEND" == "ollama" ]]; then
+    doctor_checks_ollama
+  else
+    doctor_checks_vllm
+  fi
 
   # Gateway
   if [[ -f "$GATEWAY_CONFIG" ]]; then
@@ -1211,6 +1538,213 @@ cmd_doctor() {
     printf " Run '${BOLD}spark setup${NC}' to fix issues."
   fi
   printf "\n\n"
+}
+
+# --- spark host: configure THIS machine as a model server (local, no SSH) ---
+
+# NVIDIA/vLLM prerequisites on the local machine. In --check mode nothing is installed
+# and missing pieces are recorded as failures (never prompts).
+host_setup_vllm() {
+  local auto_yes="$1" check_only="$2" tag
+
+  if nvidia-smi -L >/dev/null 2>&1; then
+    info "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+  else
+    setup_fail "No NVIDIA GPU detected (nvidia-smi)"
+  fi
+
+  if docker info >/dev/null 2>&1; then
+    info "Docker: running"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Docker not installed or not running"
+  else
+    setup_manual_step "Install Docker and start it: https://docs.docker.com/engine/install/"
+  fi
+
+  if groups 2>/dev/null | grep -q docker; then
+    info "Docker group: $(whoami) in docker group"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "$(whoami) not in the docker group"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Add $(whoami) to the docker group?"; then
+    if sudo usermod -aG docker "$(whoami)"; then warn "Added to docker group — log out/in to apply"; else setup_fail "Could not add to docker group"; fi
+  else
+    setup_skip "docker group membership"
+  fi
+
+  if docker info 2>/dev/null | grep -qi nvidia || command -v nvidia-ctk >/dev/null 2>&1; then
+    info "NVIDIA Container Toolkit: present"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "NVIDIA Container Toolkit not detected"
+  else
+    setup_manual_step "Install the NVIDIA Container Toolkit (enables 'docker run --gpus'): https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
+  fi
+
+  if [[ -f "${HOME}/.docker/config.json" ]] && grep -q "nvcr.io" "${HOME}/.docker/config.json" 2>/dev/null; then
+    info "NGC: authenticated"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "NGC not authenticated (docker login nvcr.io)"
+  else
+    setup_manual_step "Log in to NGC: docker login nvcr.io (user \$oauthtoken, password = API key from ngc.nvidia.com)"
+  fi
+
+  if [[ -n "$(detect_ngc_image)" ]]; then
+    info "vLLM image: $(detect_ngc_image)"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "vLLM NGC image not pulled"
+  elif [[ "$auto_yes" != "1" ]]; then
+    printf "  Enter an NGC vLLM tag to pull (e.g. 26.04-py3), blank to skip: "
+    read -r tag
+    if [[ -n "$tag" ]]; then
+      is_safe_ngc_tag "$tag" || die "Invalid NGC tag: $tag"
+      if docker pull "nvcr.io/nvidia/vllm:${tag}"; then info "Pulled vLLM image"; else setup_fail "Image pull failed"; fi
+    else
+      setup_skip "vLLM image pull"
+    fi
+  else
+    setup_skip "vLLM image pull"
+  fi
+
+  if command -v hf >/dev/null 2>&1; then
+    info "HF CLI: installed"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_skip "HuggingFace CLI"
+  elif command -v uv >/dev/null 2>&1 && { [[ "$auto_yes" == "1" ]] || confirm "Install the HuggingFace CLI?"; }; then
+    if uv tool install "huggingface-hub[cli]"; then info "Installed HF CLI"; else setup_fail "HF CLI install failed"; fi
+  else
+    setup_skip "HuggingFace CLI (needs uv)"
+  fi
+}
+
+# Ollama prerequisites on the local machine (Apple Silicon / CPU).
+host_setup_ollama() {
+  local auto_yes="$1" check_only="$2"
+
+  if command -v ollama >/dev/null 2>&1; then
+    info "Ollama: installed"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Ollama not installed"
+  elif [[ "$SPARK_OS" == "Darwin" ]]; then
+    if command -v brew >/dev/null 2>&1 && { [[ "$auto_yes" == "1" ]] || confirm "Install Ollama with Homebrew?"; }; then
+      if brew install ollama; then info "Installed Ollama"; else setup_fail "Ollama install failed"; fi
+    else
+      setup_manual_step "Install Ollama from https://ollama.com/download, then open it once to start the service"
+    fi
+  elif [[ "$auto_yes" == "1" ]] || confirm "Install Ollama (curl https://ollama.com/install.sh | sh)?"; then
+    if curl -fsSL https://ollama.com/install.sh | sh; then info "Installed Ollama"; else setup_fail "Ollama install failed"; fi
+  else
+    setup_skip "Ollama install"
+  fi
+
+  command -v ollama >/dev/null 2>&1 || return 0
+  if ollama_reachable; then
+    info "Ollama service: reachable on :11434"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Ollama service not running on :11434"
+  elif [[ "$SPARK_OS" == "Darwin" ]]; then
+    setup_manual_step "Start Ollama (open the app; it lives in the menu bar)"
+  else
+    info "Ollama runs as a systemd service (started by the installer)"
+  fi
+}
+
+# The LiteLLM gateway runs in Docker on both backends; ensure Docker, enable the
+# provider for this backend, and (re)start it.
+host_setup_gateway() {
+  local check_only="$1" config provider
+  if docker info >/dev/null 2>&1; then
+    info "Docker: available for the gateway"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Docker not available — the LiteLLM gateway needs it"
+    return 0
+  elif [[ "$SPARK_OS" == "Darwin" ]]; then
+    setup_manual_step "Install Docker Desktop (the LiteLLM gateway runs in a container): https://docs.docker.com/desktop/"
+    return 0
+  else
+    setup_fail "Docker not running — needed for the gateway"
+    return 0
+  fi
+
+  [[ "$check_only" == "1" ]] && return 0
+
+  provider="vllm"; [[ "$BACKEND" == "ollama" ]] && provider="ollama"
+  local newcfg
+  config=$(gateway_load_config)
+  newcfg=$(printf '%s' "$config" | jq --arg p "$provider" \
+    '.enabled = true | .port = (.port // 4000) | .providers[$p].enabled = true' 2>/dev/null || true)
+  [[ -n "$newcfg" ]] && config="$newcfg"
+  gateway_save_config "$config"
+  info "Gateway: ${provider} provider enabled"
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    ( gateway_restart ) >/dev/null 2>&1 && info "Gateway restarted" || warn "Could not restart the gateway"
+  else
+    ( gateway_start ) || warn "Start the gateway later with: spark gateway start"
+  fi
+}
+
+# Optional: connect this machine to a tailnet for secure remote access.
+host_setup_tailscale() {
+  if command -v tailscale >/dev/null 2>&1; then
+    setup_manual_step "Connect this machine to your tailnet: sudo tailscale up" "tailscale-connected"
+  elif [[ "$SPARK_OS" == "Darwin" ]]; then
+    setup_manual_step "Install Tailscale from the Mac App Store, then run it" "tailscale-installed"
+  elif confirm "Install Tailscale (curl https://tailscale.com/install.sh | sh)?"; then
+    curl -fsSL https://tailscale.com/install.sh | sh || setup_fail "Tailscale install failed"
+    setup_manual_step "Connect: sudo tailscale up" "tailscale-connected"
+  else
+    setup_skip "Tailscale"
+  fi
+}
+
+cmd_host() {
+  local auto_yes=0 check_only=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes)   auto_yes=1; shift ;;
+      --check) check_only=1; shift ;;
+      *)       die "Unknown flag: $1" "Usage: spark host [--yes] [--check]" ;;
+    esac
+  done
+
+  SETUP_SKIPPED=()
+  SETUP_FAILED=()
+
+  printf "\n  ${BOLD}spark host${NC} — set up this machine as a model server\n\n"
+  info "Detected: ${SPARK_OS}/${SPARK_ARCH} · accelerator ${ACCEL} · backend ${BACKEND}"
+  printf "\n"
+
+  if [[ "$BACKEND" == "ollama" ]]; then
+    host_setup_ollama "$auto_yes" "$check_only"
+  else
+    host_setup_vllm "$auto_yes" "$check_only"
+  fi
+  host_setup_gateway "$check_only"
+
+  if [[ "$check_only" != "1" ]]; then
+    if command -v tailscale >/dev/null 2>&1 && local_tailscale status >/dev/null 2>&1; then
+      info "Tailscale: connected (remote access ready)"
+    elif [[ "$auto_yes" == "1" ]] || confirm "Set up Tailscale for secure remote access?"; then
+      host_setup_tailscale
+    fi
+    printf "\n  ${DIM}Running doctor...${NC}\n"
+    cmd_doctor || true
+  fi
+
+  printf "\n"
+  if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
+    printf "  ${RED}${BOLD}Host setup incomplete:${NC} %d issue(s)\n" "${#SETUP_FAILED[@]}"
+    for step in "${SETUP_FAILED[@]}"; do printf "    ${RED}✗${NC} %s\n" "$step"; done
+    printf "\n  Fix them and re-run: ${BOLD}spark host${NC}\n\n"
+    return 1
+  elif [[ ${#SETUP_SKIPPED[@]} -gt 0 ]]; then
+    printf "  ${YELLOW}${BOLD}Skipped steps:${NC}\n"
+    for step in "${SETUP_SKIPPED[@]}"; do printf "    ${YELLOW}⊘${NC} %s\n" "$step"; done
+    printf "\n  Re-run ${BOLD}spark host${NC} to complete them later.\n\n"
+  else
+    printf "  ${GREEN}${BOLD}This machine is ready to serve models!${NC}\n"
+    printf "  Start one:  ${BOLD}spark run <model>${NC}\n"
+    printf "  Gateway:    ${BOLD}http://localhost:%s/v1${NC}\n\n" "$GATEWAY_PORT"
+  fi
 }
 
 cmd_setup() {
@@ -1856,13 +2390,14 @@ cmd_update() {
 cmd_help() {
   cat <<EOF
 
-  ${BOLD}spark${NC} v${VERSION} — Serve LLMs with vLLM on NVIDIA DGX Spark
+  ${BOLD}spark${NC} v${VERSION} — Serve LLMs on NVIDIA, Apple Silicon, or CPU behind one gateway
 
   ${BOLD}Usage:${NC}
     spark <command> [options]
 
   ${BOLD}Commands:${NC}
-    setup            Configure DGX Spark from your laptop via SSH
+    host             Set up THIS machine as a model server (macOS or Linux)
+    setup            Configure a remote DGX Spark from your laptop via SSH
     doctor           Check all prerequisites (read-only)
     run <model>      Start serving a model (can run several at once)
     stop [<model>]   Stop a model (no arg: the only one; --all: every one)
@@ -1890,7 +2425,8 @@ cmd_help() {
     --regen-profile        Regenerate model profile
 
   ${BOLD}Examples:${NC}
-    spark setup
+    spark host                                             # set up this machine
+    spark host --check                                     # just report what's missing
     spark pull RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4   # second model, co-resident
@@ -1995,13 +2531,17 @@ gateway_generate_litellm_yaml() {
     has_models=1
   fi
 
-  # Ollama
+  # Ollama — use the chat endpoint (LiteLLM-recommended). The gateway runs in Docker:
+  # on macOS it reaches the host's native Ollama via host.docker.internal; on Linux it
+  # shares the host network, so localhost works.
   if [[ "$(echo "$config" | jq -r '.providers.ollama.enabled // false')" == "true" ]]; then
+    local ollama_host="localhost"
+    [[ "$SPARK_OS" == "Darwin" ]] && ollama_host="host.docker.internal"
     yaml+="
-  - model_name: \"ollama/*\"
+  - model_name: \"ollama_chat/*\"
     litellm_params:
-      model: \"ollama/*\"
-      api_base: \"http://localhost:11434\""
+      model: \"ollama_chat/*\"
+      api_base: \"http://${ollama_host}:11434\""
     has_models=1
   fi
 
@@ -2190,6 +2730,18 @@ gateway_restart() {
   gateway_start
 }
 
+# Docker network flags for the gateway. Linux shares the host network (localhost reaches
+# local backends); macOS Docker Desktop can't, so publish the port and let the gateway
+# reach host backends via host.docker.internal.
+gateway_net_args() {
+  local port="$1"
+  if [[ "$SPARK_OS" == "Darwin" ]]; then
+    printf '%s\n' "-p" "${port}:${port}"
+  else
+    printf '%s\n' "--network" "host"
+  fi
+}
+
 gateway_start() {
   local config
   config=$(gateway_load_config)
@@ -2232,16 +2784,18 @@ gateway_start() {
   local port
   port=$(echo "$config" | jq -r '.port // 4000' 2>/dev/null)
 
+  local net_args=()
+  while IFS= read -r _na; do net_args+=("$_na"); done < <(gateway_net_args "$port")
+
+  # Assemble one args array (bash 3.2 on macOS errors on "${empty[@]}" under set -u,
+  # so only splice env_args in when it is non-empty).
+  local run_args=(docker run -d "${net_args[@]}" -v "${litellm_config_path}:/app/config.yaml")
+  [[ ${#env_args[@]} -gt 0 ]] && run_args+=("${env_args[@]}")
+  run_args+=(--name "$GATEWAY_CONTAINER" --restart unless-stopped "$LITELLM_IMAGE"
+    --config /app/config.yaml --port "$port")
+
   printf "\n"
-  docker run -d \
-    --network host \
-    -v "${litellm_config_path}:/app/config.yaml" \
-    "${env_args[@]}" \
-    --name "$GATEWAY_CONTAINER" \
-    --restart unless-stopped \
-    "$LITELLM_IMAGE" \
-    --config /app/config.yaml --port "$port" >/dev/null 2>&1 \
-    || die "Failed to start gateway container"
+  "${run_args[@]}" >/dev/null 2>&1 || die "Failed to start gateway container"
 
   info "LiteLLM gateway started on port ${port}"
   printf "    Test: ${DIM}curl localhost:${port}/v1/models${NC}\n\n"
@@ -2399,11 +2953,13 @@ case "${1:-}" in
   status)  cmd_status ;;
   logs)    shift; cmd_logs "$@" ;;
   doctor)  cmd_doctor ;;
+  host)    shift; cmd_host "$@" ;;
   setup)   shift; cmd_setup "$@" ;;
   update)  cmd_update ;;
   gateway) shift; cmd_gateway "$@" ;;
   config)  shift; cmd_config "$@" ;;
   version) printf "spark v%s\n" "$VERSION" ;;
+  __detect) printf 'os=%s arch=%s accel=%s backend=%s\n' "$SPARK_OS" "$SPARK_ARCH" "$ACCEL" "$BACKEND" ;;
   help|--help|-h|"") cmd_help ;;
   *)       die "Unknown command: $1" "Run 'spark help' for usage" ;;
 esac
