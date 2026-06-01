@@ -2266,13 +2266,17 @@ gateway_generate_litellm_yaml() {
     has_models=1
   fi
 
-  # Ollama
+  # Ollama — use the chat endpoint (LiteLLM-recommended). The gateway runs in Docker:
+  # on macOS it reaches the host's native Ollama via host.docker.internal; on Linux it
+  # shares the host network, so localhost works.
   if [[ "$(echo "$config" | jq -r '.providers.ollama.enabled // false')" == "true" ]]; then
+    local ollama_host="localhost"
+    [[ "$SPARK_OS" == "Darwin" ]] && ollama_host="host.docker.internal"
     yaml+="
-  - model_name: \"ollama/*\"
+  - model_name: \"ollama_chat/*\"
     litellm_params:
-      model: \"ollama/*\"
-      api_base: \"http://localhost:11434\""
+      model: \"ollama_chat/*\"
+      api_base: \"http://${ollama_host}:11434\""
     has_models=1
   fi
 
@@ -2461,6 +2465,18 @@ gateway_restart() {
   gateway_start
 }
 
+# Docker network flags for the gateway. Linux shares the host network (localhost reaches
+# local backends); macOS Docker Desktop can't, so publish the port and let the gateway
+# reach host backends via host.docker.internal.
+gateway_net_args() {
+  local port="$1"
+  if [[ "$SPARK_OS" == "Darwin" ]]; then
+    printf '%s\n' "-p" "${port}:${port}"
+  else
+    printf '%s\n' "--network" "host"
+  fi
+}
+
 gateway_start() {
   local config
   config=$(gateway_load_config)
@@ -2503,9 +2519,12 @@ gateway_start() {
   local port
   port=$(echo "$config" | jq -r '.port // 4000' 2>/dev/null)
 
+  local net_args=()
+  while IFS= read -r _na; do net_args+=("$_na"); done < <(gateway_net_args "$port")
+
   printf "\n"
   docker run -d \
-    --network host \
+    "${net_args[@]}" \
     -v "${litellm_config_path}:/app/config.yaml" \
     "${env_args[@]}" \
     --name "$GATEWAY_CONTAINER" \

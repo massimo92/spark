@@ -40,6 +40,7 @@ case "${1:-}" in
     fi
     ;;
   run)
+    [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_DOCKER_ARGS_FILE}"
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
     ;;
   inspect)
@@ -685,6 +686,45 @@ test_ollama_run_pulls_and_enables_gateway() {
   [[ "$pulls" == *"qwen3:30b"* ]] && [[ "$cfg" == "true" ]] && [[ "$out" == *"ready via Ollama"* ]]
 }
 
+# --- Gateway networking per OS ---
+# Write a minimal gateway config with the Ollama provider enabled.
+write_ollama_gateway_config() {
+  local home="$1"
+  mkdir -p "${home}/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"ollama":{"enabled":true}}}' \
+    > "${home}/.config/spark/gateway.json"
+}
+
+test_gateway_ollama_route_mac() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin yaml dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  write_ollama_gateway_config "${tmp}/home"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_OVERRIDE=Darwin \
+    FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    "$SPARK" gateway start >/dev/null 2>&1 || true
+  yaml=$(cat "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || echo "")
+  dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$yaml" == *"ollama_chat/*"* ]] && [[ "$yaml" == *"host.docker.internal:11434"* ]] &&
+    [[ "$dargs" == *"-p 4000:4000"* ]]
+}
+
+test_gateway_ollama_route_linux() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin yaml dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  write_ollama_gateway_config "${tmp}/home"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_OVERRIDE=Linux \
+    FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    "$SPARK" gateway start >/dev/null 2>&1 || true
+  yaml=$(cat "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || echo "")
+  dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$yaml" == *"ollama_chat/*"* ]] && [[ "$yaml" == *"http://localhost:11434"* ]] &&
+    [[ "$dargs" == *"--network host"* ]]
+}
+
 # --- Compatibility validation ---
 test_ollama_blocks_vllm_only_model() {
   local tmp fake_bin out rc
@@ -736,6 +776,8 @@ run_test "ollama run (dry) plans pull + gateway route" test_ollama_dry_run_plans
 run_test "ollama run pulls and enables gateway" test_ollama_run_pulls_and_enables_gateway
 run_test "ollama backend blocks vLLM-only model" test_ollama_blocks_vllm_only_model
 run_test "vllm backend blocks ollama-style tag" test_vllm_blocks_ollama_tag
+run_test "gateway routes Ollama via host.docker.internal on macOS" test_gateway_ollama_route_mac
+run_test "gateway routes Ollama via localhost on Linux" test_gateway_ollama_route_linux
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]
