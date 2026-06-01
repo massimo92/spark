@@ -237,13 +237,25 @@ load_profile() {
 }
 
 # Estimate model weights in GB. Prefer the on-disk size (sum of safetensors);
-# fall back to params × bytes/param based on the detected quantization.
+# fall back to the safetensors index (total_size), then to params × bytes/param.
 compute_weights_gb() {
   local config_json="$1" disk_gb="${2:-0}"
 
   if [[ "$disk_gb" =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v d="$disk_gb" 'BEGIN{exit !(d>0)}'; then
     WEIGHTS_GB="$disk_gb"
     return 0
+  fi
+
+  # Weights not on disk yet: read the exact total from the safetensors index
+  # (model.safetensors.index.json), which ships alongside config.json.
+  local index_json total
+  index_json="$(dirname "$config_json")/model.safetensors.index.json"
+  if [[ -f "$index_json" ]]; then
+    total=$(jq -r '.metadata.total_size // 0' "$index_json" 2>/dev/null || echo "0")
+    if [[ "$total" =~ ^[0-9]+$ ]] && [[ "$total" -gt 0 ]]; then
+      WEIGHTS_GB=$(awk -v t="$total" 'BEGIN{ printf "%.1f", t/1073741824 }')
+      return 0
+    fi
   fi
 
   # Fallback: params × bytes/param. Detect bytes/param from quantization.
@@ -379,14 +391,13 @@ profile_model() {
       | awk '{s+=$1} END {printf "%.1f", s/1073741824}' 2>/dev/null || echo "0")
   fi
 
-  if [[ "$MODEL_SIZE_GB" == "0" || "$MODEL_SIZE_GB" == "0.0" || -z "$MODEL_SIZE_GB" ]]; then
-    warn "Could not determine model size — memory calculation may be inaccurate"
-  fi
-
   # Need-based memory: weights + KV cache + cushion → fraction of TOTAL system memory.
   # The free space does NOT enter here; it is only checked later (verify_capacity).
   KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
   compute_weights_gb "$config_json" "$MODEL_SIZE_GB"
+  if awk -v w="$WEIGHTS_GB" 'BEGIN{exit !(w<=0)}'; then
+    warn "Could not determine model weights — memory calculation may be inaccurate"
+  fi
   compute_kv_gb "$config_json" "$MAX_MODEL_LEN" "$KV_CACHE_DTYPE"
   [[ "$KV_UNCERTAIN" == "1" ]] && warn "config.json lacks KV cache fields — sizing from weights only"
   compute_need_and_fraction
@@ -531,11 +542,30 @@ verify_capacity() {
   fi
 }
 
+# Download just the metadata (config.json + safetensors index) so we can size the
+# model and check it fits BEFORE pulling tens of GB of weights. Returns 0 on success.
+fetch_model_metadata() {
+  local model="$1"
+  command -v hf >/dev/null 2>&1 || { err "hf CLI not found" ; printf "    Install it with: spark setup\n"; return 1; }
+  hf download "$model" config.json >/dev/null 2>&1 || return 1
+  # Index is best-effort: single-file models won't have it (weights then fall back to params).
+  hf download "$model" model.safetensors.index.json >/dev/null 2>&1 || true
+  return 0
+}
+
+# Download the full model weights.
+download_model_full() {
+  local model="$1"
+  printf "\n  Downloading %s...\n\n" "$model"
+  hf download "$model"
+  printf "\n"
+}
+
 # --- Commands ---
 
 cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
-  local no_reasoning=0 dry_run=0 tail_logs=0 force=0 regen=0
+  local no_reasoning=0 dry_run=0 tail_logs=0 force=0 regen=0 no_pull=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -546,6 +576,7 @@ cmd_run() {
       --tools)     tools=1; shift ;;
       --text-only) text_only=1; shift ;;
       --no-reasoning) no_reasoning=1; shift ;;
+      --no-pull)   no_pull=1; shift ;;
       --dry-run)   dry_run=1; shift ;;
       --tail)      tail_logs=1; shift ;;
       --force)     force=1; shift ;;
@@ -586,16 +617,25 @@ cmd_run() {
     docker rm "$cname" >/dev/null 2>&1 || true
   fi
 
-  # Resolve model path
-  local model_path
+  # Resolve model path. If it is not downloaded, fetch just the metadata so we can
+  # size it and decide whether to pull the full weights (capacity-first).
+  local model_path needs_download=0
   if ! model_path=$(resolve_model_path "$model"); then
-    err "Model '${model}' not found in HF cache"
-    printf "    Download it first: spark pull %s\n" "$model"
-    exit 1
+    # Only offer to download interactively (a TTY, or SPARK_ASSUME_INTERACTIVE).
+    if [[ "$dry_run" == "1" || "$no_pull" == "1" || ( ! -t 0 && -z "${SPARK_ASSUME_INTERACTIVE:-}" ) ]]; then
+      err "Model '${model}' not found in HF cache"
+      printf "    Download it first: spark pull %s\n" "$model"
+      exit 1
+    fi
+    warn "Model '${model}' is not downloaded — fetching metadata to check if it fits..."
+    fetch_model_metadata "$model" || die "Could not fetch model metadata" "Check the model name and your connection"
+    model_path=$(resolve_model_path "$model") || die "Metadata download did not produce a usable snapshot"
+    needs_download=1
+    REGEN_PROFILE=1   # no cached profile yet; size from the fetched metadata
   fi
 
   # Profile (sizes memory by the model's NEED: weights + KV + cushion)
-  REGEN_PROFILE="$regen"
+  REGEN_PROFILE="${REGEN_PROFILE:-$regen}"
   KV_CACHE_DTYPE="${kv_dtype:-auto}"
   profile_model "$model" "$model_path"
 
@@ -613,7 +653,42 @@ cmd_run() {
 
   validate_profile_values
 
-  # Verify it fits the remaining budget BEFORE touching anything.
+  # Capacity check BEFORE touching anything (and before pulling weights).
+  if [[ "$needs_download" == "1" ]]; then
+    local reserved free
+    reserved=$(reserved_budget_gb "$cname")
+    free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+    if awk -v n="$NEED_GB" -v f="$free" 'BEGIN{ exit !(n > f) }'; then
+      # Does not fit: warn, then offer to download anyway WITHOUT starting.
+      warn "This model needs ${NEED_GB} GB but only ${free} GB is free — it will not start now."
+      list_managed_containers | while IFS=$'\t' read -r n m p nd _; do
+        [[ -n "$m" ]] && printf "      %-32s %s GB  (port %s)\n" "$m" "${nd:-?}" "${p:-?}"
+      done
+      if confirm "Download it anyway (without starting)?"; then
+        download_model_full "$model"
+        info "Downloaded ${model}. Free memory (spark stop <model>) and then: spark run ${model}"
+        exit 0
+      fi
+      printf "    Aborted. Nothing downloaded beyond metadata.\n"
+      exit 1
+    fi
+    # Fits: confirm the (large) download, then continue to launch.
+    if ! confirm "Model fits (needs ${NEED_GB} GB, ${free} GB free). Download and start?"; then
+      printf "    Aborted.\n"
+      exit 0
+    fi
+    download_model_full "$model"
+    model_path=$(resolve_model_path "$model") || die "Download did not produce a usable snapshot"
+    # Re-profile now that the real weights are on disk (exact size).
+    REGEN_PROFILE=1
+    profile_model "$model" "$model_path"
+    [[ -n "$max_len" ]] && MAX_MODEL_LEN="$max_len"
+    KV_CACHE_DTYPE="${kv_dtype:-auto}"
+    recompute_memory "${model_path}/config.json"
+    if [[ -n "$mem" ]]; then GPU_MEM_UTIL="$mem"; NEED_GB=$(awk -v m="$mem" -v T="$TOTAL_MEM_GB" 'BEGIN{ printf "%.1f", m*T }'); fi
+    [[ "$no_reasoning" == "1" ]] && REASONING_PARSER=""
+    validate_profile_values
+  fi
   verify_capacity "$NEED_GB" "$cname"
 
   # Assign a port (auto unless --port given). Reject collisions with live models.
@@ -930,6 +1005,16 @@ container_uptime() {
 cmd_status() {
   printf "\n"
 
+  # Gateway routing state (computed once): is the gateway up and routing vLLM?
+  local gw_running=0 gw_port=4000 gw_vllm=0
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    gw_running=1
+    local gcfg
+    gcfg=$(gateway_load_config)
+    gw_port=$(echo "$gcfg" | jq -r '.port // 4000' 2>/dev/null)
+    [[ "$(echo "$gcfg" | jq -r '.providers.vllm.enabled // false')" == "true" ]] && gw_vllm=1
+  fi
+
   local rows=0 reserved=0
   while IFS=$'\t' read -r name model port need weights kv; do
     [[ -z "$name" ]] && continue
@@ -939,7 +1024,10 @@ cmd_status() {
     printf "  ${GREEN}●${NC} ${BOLD}%s${NC}\n" "${model:-unknown}"
     printf "      Need: %s GB  ·  Weights: %s GB  ·  KV: %s GB  ·  Port: %s  ·  Up: %s\n" \
       "${need:-?}" "${weights:-?}" "${kv:-?}" "${port:-?}" "$up"
-    printf "      API:  http://localhost:%s/v1\n" "${port:-?}"
+    printf "      API:      http://localhost:%s/v1\n" "${port:-?}"
+    if [[ "$gw_running" -eq 1 && "$gw_vllm" -eq 1 && -n "$model" ]]; then
+      printf "      Gateway:  ${BOLD}vllm/%s${NC}  via http://localhost:%s/v1\n" "$model" "$gw_port"
+    fi
     [[ "${need:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] && reserved=$(awk -v a="$reserved" -v b="$need" 'BEGIN{printf "%.1f", a+b}')
   done < <(list_managed_containers)
 
@@ -952,7 +1040,10 @@ cmd_status() {
     lport=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null | sed -n 's/.*--port \([0-9]*\).*/\1/p' || echo "8000")
     printf "  ${GREEN}●${NC} ${BOLD}%s${NC}  ${DIM}(unmanaged)${NC}\n" "$lmodel"
     printf "      Need: ?  ·  Port: %s  ·  Up: %s\n" "$lport" "$(container_uptime "$CONTAINER_NAME")"
-    printf "      API:  http://localhost:%s/v1\n" "$lport"
+    printf "      API:      http://localhost:%s/v1\n" "$lport"
+    if [[ "$gw_running" -eq 1 && "$gw_vllm" -eq 1 && -n "$lmodel" && "$lmodel" != "unknown" ]]; then
+      printf "      Gateway:  ${BOLD}vllm/%s${NC}  via http://localhost:%s/v1\n" "$lmodel" "$gw_port"
+    fi
   fi
 
   if [[ "$rows" -eq 0 ]]; then
@@ -1784,6 +1875,7 @@ cmd_help() {
     --tools                Enable tool calling
     --text-only            Skip vision encoder
     --no-reasoning         Disable reasoning parser
+    --no-pull              Don't offer to download a missing model; just error
     --dry-run              Print the memory plan and Docker command only
     --tail                 Follow logs after launch
     --force                Replace this model if already running

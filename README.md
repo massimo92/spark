@@ -76,6 +76,15 @@ The core command. Auto-profiles the model, reserves the memory it needs, and lau
 You can run **several models at once** — each gets its own container and port, and the
 gateway routes to all of them (see [Multiple models](#multiple-models)).
 
+If the model isn't downloaded yet, `spark run` fetches just its metadata first to size it
+and check it fits:
+
+- **Fits** → asks to download the full weights and start.
+- **Doesn't fit** → warns and offers to download it anyway (without starting), so you can
+  free memory and launch it later.
+
+Use `--no-pull` to skip this and just error on a missing model (e.g. in scripts).
+
 ```bash
 spark run <model> [flags]
 
@@ -97,6 +106,7 @@ spark run nvidia/Llama-3.1-8B-Instruct --kv-cache-dtype fp8   # halve KV cache m
 | `--tools` | off | Enable tool calling |
 | `--text-only` | off | Skip vision encoder |
 | `--no-reasoning` | off | Disable reasoning parser |
+| `--no-pull` | off | Don't offer to download a missing model; just error |
 | `--dry-run` | off | Print the memory plan and Docker command only |
 | `--tail` | off | Follow logs after launch |
 | `--force` | off | Replace this model if it is already running |
@@ -130,7 +140,9 @@ spark logs <model> -f  # Follow logs
 ```
 
 `spark status` lists each running model with the memory it reserves (need = weights + KV cache),
-and a machine summary: total · OS-reserved · reserved by models · free.
+its direct API port, and — when the gateway is up — its LiteLLM route (`vllm/<model>` via
+`http://localhost:4000/v1`). It ends with a machine summary: total · OS-reserved · reserved by
+models · free.
 
 ### spark doctor
 

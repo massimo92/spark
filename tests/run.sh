@@ -62,6 +62,33 @@ EOF
 exit 1
 EOF
   chmod +x "${dir}/tailscale"
+
+  # hf mock: "downloads" by writing files into the HF cache. config.json carries known
+  # KV dims; the index reports ~14 GB of weights (total_size).
+  cat > "${dir}/hf" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == "download" ]] || exit 0
+repo="$2"; file="${3:-}"
+dir="${HOME}/.cache/huggingface/hub/models--${repo//\//--}/snapshots/1"
+mkdir -p "$dir"
+case "$file" in
+  config.json)
+    cat > "${dir}/config.json" <<JSON
+{ "model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"num_hidden_layers":48,
+  "num_key_value_heads":4,"num_attention_heads":32,"head_dim":128,"hidden_size":2048,
+  "max_position_embeddings":262144,"quantization_config":{"quant_method":"nvfp4"} }
+JSON
+    ;;
+  model.safetensors.index.json)
+    echo '{ "metadata": { "total_size": 15032385536 } }' > "${dir}/model.safetensors.index.json"
+    ;;
+  "")
+    : > "${dir}/model-00001-of-00001.safetensors"
+    ;;
+esac
+EOF
+  chmod +x "${dir}/hf"
 }
 
 run_test() {
@@ -360,6 +387,87 @@ EOF
     [[ "$yaml" == *'model_name: "vllm/*"'* ]]
 }
 
+test_missing_model_no_pull_errors() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home"
+
+  set +e
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/Missing --no-pull </dev/null 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+
+  [[ "$status" -ne 0 ]] && [[ "$output" == *"not found in HF cache"* ]]
+}
+
+test_missing_model_dry_run_errors() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home"
+
+  set +e
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/Missing --dry-run </dev/null 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+
+  [[ "$status" -ne 0 ]] && [[ "$output" == *"not found in HF cache"* ]]
+}
+
+test_autopull_fits_downloads_and_starts() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output status weights
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home"
+
+  set +e
+  output=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_ASSUME_INTERACTIVE=1 SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Qwen/Qwen3-30B 2>&1)
+  status=$?
+  weights="${tmp}/home/.cache/huggingface/hub/models--Qwen--Qwen3-30B/snapshots/1/model-00001-of-00001.safetensors"
+  local downloaded=0; [[ -f "$weights" ]] && downloaded=1
+  set -e
+  rm -rf "$tmp"
+
+  [[ "$status" -eq 0 ]] &&
+    [[ "$output" == *"not downloaded"* ]] &&
+    [[ "$output" == *"Model fits"* ]] &&
+    [[ "$output" == *"started"* ]] &&
+    [[ "$downloaded" -eq 1 ]]
+}
+
+test_autopull_no_fit_download_only() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home"
+
+  # A live 100 GB model leaves no room; answer "y" to download anyway (without starting).
+  set +e
+  output=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_ASSUME_INTERACTIVE=1 SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    FAKE_MANAGED='spark-vllm-big\torg/big\t8000\t100.0\t80.0\t20.0\n' \
+    "$SPARK" run Qwen/Qwen3-30B 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+
+  [[ "$status" -eq 0 ]] &&
+    [[ "$output" == *"will not start now"* ]] &&
+    [[ "$output" == *"Downloaded Qwen/Qwen3-30B"* ]] &&
+    [[ "$output" != *"started"* ]]
+}
+
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
@@ -373,6 +481,10 @@ run_test "missing KV fields warns without aborting" test_missing_kv_fields_warns
 run_test "capacity verification aborts when it does not fit" test_capacity_verification_aborts
 run_test "port auto-assignment skips a busy port" test_port_auto_skips_busy
 run_test "gateway YAML has per-model entries plus wildcard" test_gateway_yaml_per_model
+run_test "missing model with --no-pull errors clearly" test_missing_model_no_pull_errors
+run_test "missing model with --dry-run errors clearly" test_missing_model_dry_run_errors
+run_test "auto-pull: fits → downloads and starts" test_autopull_fits_downloads_and_starts
+run_test "auto-pull: does not fit → downloads without starting" test_autopull_no_fit_download_only
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]
