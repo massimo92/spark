@@ -314,6 +314,7 @@ load_profile() {
   TOOL_CALL_PARSER=$(jq -r '.tool_call_parser // ""' "$profile_file") || die "Could not read profile: $profile_file"
   GPU_MEM_UTIL=$(jq -r '.gpu_memory_utilization // ""' "$profile_file") || die "Could not read profile: $profile_file"
   MAX_MODEL_LEN=$(jq -r '.max_model_len // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  MODEL_MAX_LEN="$MAX_MODEL_LEN"   # cached proxy for the model's max context (fit suggestions)
   IS_MULTIMODAL=$(jq -r '.is_multimodal // "false"' "$profile_file") || die "Could not read profile: $profile_file"
   MODEL_SIZE_GB=$(jq -r '.model_size_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
   WEIGHTS_GB=$(jq -r '.weights_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
@@ -454,6 +455,7 @@ profile_model() {
     .seq_length //
     32768' "$config_json" 2>/dev/null || echo "32768")
   is_positive_int "$model_max" || model_max=32768
+  MODEL_MAX_LEN="$model_max"   # the model's own max context (used to cap fit suggestions)
   if [[ "$model_max" -lt 131072 ]]; then
     MAX_MODEL_LEN="$model_max"
   else
@@ -607,27 +609,138 @@ next_free_port() {
 }
 
 # Abort if the new model does not fit the remaining budget. Never touches live models.
+# Format a token count as a short label: 32768 -> 32K.
+fmt_ctx() { awk -v n="${1:-0}" 'BEGIN{ if (n>0 && n%1024==0) printf "%dK", n/1024; else printf "%d", n }'; }
+
+# Given free GB, compute the two largest "clean" context windows that would fit:
+#   FIT_CTX_AUTO (KV in auto, 2 bytes) and FIT_CTX_FP8 (KV in fp8, 1 byte -> double the tokens).
+# Capped at the model's max and 131072, rounded down. FIT_POSSIBLE=1 if any option exists.
+fit_options() {
+  local free="$1"
+  FIT_POSSIBLE=0; FIT_CTX_AUTO=0; FIT_CTX_FP8=0
+  [[ "${KV_UNCERTAIN:-0}" == "1" ]] && return 0
+  is_positive_int "${MAX_MODEL_LEN:-0}" || return 0
+  awk -v k="${KV_GB:-0}" 'BEGIN{ exit !(k>0) }' || return 0
+
+  local cap="${MODEL_MAX_LEN:-131072}"
+  [[ "$cap" =~ ^[0-9]+$ ]] || cap=131072
+  [[ "$cap" -gt 131072 ]] && cap=131072
+
+  read -r FIT_POSSIBLE FIT_CTX_AUTO FIT_CTX_FP8 < <(awk \
+    -v free="$free" -v w="${WEIGHTS_GB:-0}" -v h="${MEM_HEADROOM_PCT:-8}" \
+    -v kv="${KV_GB:-0}" -v cur="${MAX_MODEL_LEN}" -v dt="${KV_CACHE_DTYPE:-auto}" -v cap="$cap" '
+    BEGIN{
+      kv_budget = free/(1+h/100) - w;
+      if (kv_budget <= 0) { print 0, 0, 0; exit }
+      per_tok_cur  = kv / cur;
+      per_tok_auto = (dt=="fp8") ? per_tok_cur*2 : per_tok_cur;
+      per_tok_fp8  = per_tok_auto/2;
+      max_auto = kv_budget/per_tok_auto;
+      max_fp8  = kv_budget/per_tok_fp8;
+      n=split("2048 4096 8192 16384 32768 65536 131072", S, " ");
+      ca=0; cf=0;
+      for(i=1;i<=n;i++){ if(S[i]<=max_auto && S[i]<=cap) ca=S[i]; if(S[i]<=max_fp8 && S[i]<=cap) cf=S[i]; }
+      print ((ca>0||cf>0)?1:0), ca, cf;
+    }')
+  return 0
+}
+
+# Print the fitting options as text + the command to use (non-interactive / dry-run).
+print_fit_suggestion() {
+  local model="$1"
+  if [[ "${FIT_POSSIBLE:-0}" != "1" ]]; then
+    printf "    Reducing context won't help — free memory: ${BOLD}spark stop <model>${NC}\n"
+    return 0
+  fi
+  [[ "${FIT_CTX_AUTO:-0}" -gt 0 ]] && printf "    → Fits at up to %s ctx:  ${BOLD}spark run %s --max-len %s${NC}\n" "$(fmt_ctx "$FIT_CTX_AUTO")" "$model" "$FIT_CTX_AUTO"
+  [[ "${FIT_CTX_FP8:-0}" -gt 0 ]] && printf "    → or up to %s with fp8:  ${BOLD}spark run %s --max-len %s --kv-cache-dtype fp8${NC}\n" "$(fmt_ctx "$FIT_CTX_FP8")" "$model" "$FIT_CTX_FP8"
+  return 0
+}
+
+# True when we can prompt the user (a TTY, or the test/interactive override).
+is_interactive() { [[ -t 0 || -n "${SPARK_ASSUME_INTERACTIVE:-}" ]]; }
+
+# Check the model fits in the free budget. If it does not:
+#  - --mem set: suggest the largest --mem that fits, then abort (context can't help a fixed --mem).
+#  - interactive: offer a context menu (auto vs fp8); the choice updates MAX_MODEL_LEN/KV_CACHE_DTYPE
+#    and memory, and the launch continues.
+#  - non-interactive: print the fitting options + command, then abort.
+#  - dry-run: print the verdict/options and continue (never prompts, never aborts).
 verify_capacity() {
-  local new_need="$1" exclude="${2:-}"
+  local new_need="$1" exclude="${2:-}" dry_run="${3:-0}" mem="${4:-}" model="${5:-}" config_json="${6:-}"
   local reserved free
   reserved=$(reserved_budget_gb "$exclude")
   free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
 
-  if awk -v n="$new_need" -v f="$free" 'BEGIN{ exit !(n > f) }'; then
-    err "Not enough memory to start this model"
-    printf "    Requested:  %s GB\n" "$new_need"
-    printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
-      "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
-    local any=0
-    while IFS=$'\t' read -r name model port need _; do
-      [[ -z "$model" ]] && continue
-      [[ "$name" == "$exclude" ]] && continue
-      [[ "$any" -eq 0 ]] && { printf "    In use:\n"; any=1; }
-      printf "      %-32s %s GB  (port %s)\n" "$model" "${need:-?}" "${port:-?}"
-    done < <(list_managed_containers)
-    printf "    Free memory with: ${BOLD}spark stop <model>${NC}\n"
+  awk -v n="$new_need" -v f="$free" 'BEGIN{ exit !(n > f) }' || return 0   # fits
+
+  err "Not enough memory to start this model"
+  printf "    Needs:      %s GB\n" "$new_need"
+  printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
+    "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
+  local any=0 name m port need _
+  while IFS=$'\t' read -r name m port need _; do
+    [[ -z "$m" ]] && continue
+    [[ "$name" == "$exclude" ]] && continue
+    [[ "$any" -eq 0 ]] && { printf "    In use:\n"; any=1; }
+    printf "      %-32s %s GB  (port %s)\n" "$m" "${need:-?}" "${port:-?}"
+  done < <(list_managed_containers)
+
+  # Manual --mem: reducing context won't change a fixed reservation; suggest a smaller --mem.
+  if [[ -n "$mem" ]]; then
+    local maxmem
+    maxmem=$(awk -v f="$free" -v T="$TOTAL_MEM_GB" 'BEGIN{ x=f/T; if(x<0)x=0; printf "%.2f", x }')
+    printf "    → Fits with --mem ≤ %s:  ${BOLD}spark run %s --mem %s${NC}\n" "$maxmem" "$model" "$maxmem"
+    printf "    Or free memory:  ${BOLD}spark stop <model>${NC}\n"
+    [[ "$dry_run" == "1" ]] && return 0
     exit 1
   fi
+
+  fit_options "$free"
+
+  if [[ "$FIT_POSSIBLE" != "1" ]]; then
+    print_fit_suggestion "$model"
+    printf "    Or free memory:  ${BOLD}spark stop <model>${NC}\n"
+    [[ "$dry_run" == "1" ]] && return 0
+    exit 1
+  fi
+
+  if [[ "$dry_run" == "1" ]]; then
+    print_fit_suggestion "$model"
+    return 0
+  fi
+
+  if ! is_interactive; then
+    print_fit_suggestion "$model"
+    printf "    Or free memory:  ${BOLD}spark stop <model>${NC}\n"
+    exit 1
+  fi
+
+  # Interactive: offer the fitting contexts and apply the choice.
+  printf "\n    Choose a context that fits:\n"
+  local i=1 opt_auto="" opt_fp8="" choice cancel
+  if [[ "$FIT_CTX_AUTO" -gt 0 ]]; then printf "      %d) %s tokens   (KV auto)\n" "$i" "$FIT_CTX_AUTO"; opt_auto="$i"; i=$((i+1)); fi
+  if [[ "$FIT_CTX_FP8" -gt 0 ]]; then printf "      %d) %s tokens   (KV fp8 — slightly less precision)\n" "$i" "$FIT_CTX_FP8"; opt_fp8="$i"; i=$((i+1)); fi
+  printf "      %d) cancel\n" "$i"
+  cancel="$i"
+  while true; do
+    printf "    > "
+    read -r choice || choice="$cancel"
+    if [[ -n "$opt_auto" && "$choice" == "$opt_auto" ]]; then
+      MAX_MODEL_LEN="$FIT_CTX_AUTO"; KV_CACHE_DTYPE="auto"; break
+    elif [[ -n "$opt_fp8" && "$choice" == "$opt_fp8" ]]; then
+      MAX_MODEL_LEN="$FIT_CTX_FP8"; KV_CACHE_DTYPE="fp8"; break
+    elif [[ "$choice" == "$cancel" ]]; then
+      printf "    Aborted.\n"; exit 0
+    else
+      printf "    Enter a number from 1 to %s.\n" "$cancel"
+    fi
+  done
+
+  [[ -n "$config_json" ]] && recompute_memory "$config_json"
+  info "Using ${MAX_MODEL_LEN} ctx (KV ${KV_CACHE_DTYPE}) — needs ${NEED_GB} GB"
+  awk -v n="${NEED_GB}" -v f="$free" 'BEGIN{ exit !(n > f) }' && { err "Still doesn't fit after adjustment"; exit 1; }
+  return 0
 }
 
 # Download just the metadata (config.json + safetensors index) so we can size the
@@ -760,27 +873,46 @@ run_backend_vllm() {
     reserved=$(reserved_budget_gb "$cname")
     free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
     if awk -v n="$NEED_GB" -v f="$free" 'BEGIN{ exit !(n > f) }'; then
-      # Does not fit: warn, then offer to download anyway WITHOUT starting.
-      warn "This model needs ${NEED_GB} GB but only ${free} GB is free — it will not start now."
-      list_managed_containers | while IFS=$'\t' read -r n m p nd _; do
-        [[ -n "$m" ]] && printf "      %-32s %s GB  (port %s)\n" "$m" "${nd:-?}" "${p:-?}"
-      done
-      if confirm "Download it anyway (without starting)?"; then
-        download_model_full "$model"
-        info "Downloaded ${model}. Free memory (spark stop <model>) and then: spark run ${model}"
+      # Does not fit at the requested context (sized from metadata, before downloading).
+      err "Not enough memory to start this model"
+      printf "    Needs:  %s GB    Free:  %s GB\n" "$NEED_GB" "$free"
+      fit_options "$free"
+      if [[ "$FIT_POSSIBLE" == "1" && -z "$mem" ]] && is_interactive; then
+        printf "\n    Choose what to do:\n"
+        local i=1 oa="" of="" choice dl ca
+        [[ "$FIT_CTX_AUTO" -gt 0 ]] && { printf "      %d) download + start at %s tokens (KV auto)\n" "$i" "$FIT_CTX_AUTO"; oa="$i"; i=$((i+1)); }
+        [[ "$FIT_CTX_FP8" -gt 0 ]] && { printf "      %d) download + start at %s tokens (KV fp8)\n" "$i" "$FIT_CTX_FP8"; of="$i"; i=$((i+1)); }
+        printf "      %d) download only (don't start)\n" "$i"; dl="$i"; i=$((i+1))
+        printf "      %d) cancel\n" "$i"; ca="$i"
+        while true; do
+          printf "    > "; read -r choice || choice="$ca"
+          if [[ -n "$oa" && "$choice" == "$oa" ]]; then max_len="$FIT_CTX_AUTO"; kv_dtype="auto"; break
+          elif [[ -n "$of" && "$choice" == "$of" ]]; then max_len="$FIT_CTX_FP8"; kv_dtype="fp8"; break
+          elif [[ "$choice" == "$dl" ]]; then download_model_full "$model"; info "Downloaded ${model}. Free memory then: spark run ${model}"; exit 0
+          elif [[ "$choice" == "$ca" ]]; then printf "    Aborted.\n"; exit 0
+          else printf "    Enter a number from 1 to %s.\n" "$ca"; fi
+        done
+      else
+        [[ -z "$mem" ]] && print_fit_suggestion "$model"
+        if [[ -z "$mem" ]] && is_interactive && confirm "Download it anyway (without starting)?"; then
+          download_model_full "$model"
+          info "Downloaded ${model}. Free memory then: spark run ${model}"
+          exit 0
+        fi
+        printf "    Aborted. Nothing downloaded beyond metadata.\n"
+        exit 1
+      fi
+    else
+      # Fits: confirm the (large) download, then continue to launch.
+      if ! confirm "Model fits (needs ${NEED_GB} GB, ${free} GB free). Download and start?"; then
+        printf "    Aborted.\n"
         exit 0
       fi
-      printf "    Aborted. Nothing downloaded beyond metadata.\n"
-      exit 1
     fi
-    # Fits: confirm the (large) download, then continue to launch.
-    if ! confirm "Model fits (needs ${NEED_GB} GB, ${free} GB free). Download and start?"; then
-      printf "    Aborted.\n"
-      exit 0
-    fi
+
+    # Download the full weights and re-profile at the effective context.
     download_model_full "$model"
     model_path=$(resolve_model_path "$model") || die "Download did not produce a usable snapshot"
-    # Re-profile now that the real weights are on disk (exact size).
     REGEN_PROFILE=1
     profile_model "$model" "$model_path"
     [[ -n "$max_len" ]] && MAX_MODEL_LEN="$max_len"
@@ -790,7 +922,7 @@ run_backend_vllm() {
     [[ "$no_reasoning" == "1" ]] && REASONING_PARSER=""
     validate_profile_values
   fi
-  verify_capacity "$NEED_GB" "$cname"
+  verify_capacity "$NEED_GB" "$cname" "$dry_run" "$mem" "$model" "${model_path}/config.json"
 
   # Assign a port (auto unless --port given). Reject collisions with live models.
   if [[ -z "$port" ]]; then
