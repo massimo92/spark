@@ -5,7 +5,7 @@
 CLI tool for serving LLMs behind one OpenAI-compatible gateway — on NVIDIA (DGX Spark or a discrete GPU), Apple Silicon, or CPU. spark detects the hardware and picks the right engine. One script, zero friction.
 
 ```
-spark host                                   # One-time: set up THIS machine as a server
+spark setup                                  # One-time: guided setup (this machine, or a remote one)
 spark run <model>                            # Serve a model (engine chosen by your hardware)
 curl localhost:4000/v1/models                # Use it through the gateway
 ```
@@ -16,10 +16,11 @@ curl localhost:4000/v1/models                # Use it through the gateway
 
 ## What it does
 
-1. **One-command server setup** — `spark host` sets up the machine you run it on: it detects the
-   hardware, installs the right engine (vLLM in Docker on NVIDIA; Ollama on Apple Silicon / CPU),
-   and brings up the gateway. `spark setup` (the original flow) still configures a *remote* DGX
-   Spark from your laptop over SSH.
+1. **One-command server setup** — `spark setup` is a guided wizard that asks **where** to install:
+   *this machine*, or *another machine over SSH*. Either way it runs the **same install set** —
+   detect the hardware, install the right engine (vLLM in Docker on NVIDIA; Ollama on Apple Silicon /
+   CPU), bring up the gateway, and harden the OS (Linux). A server gets identical software whether you
+   configure it locally or remotely.
 
 2. **Hardware-aware serving** — `spark run <model>` profiles the model, reserves the memory it
    needs, and launches it on the right engine for your hardware. Run several models at once.
@@ -53,7 +54,7 @@ with no extra work.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/massimo92/spark/main/install.sh | bash
-spark host          # set up THIS machine  (use `spark setup` for a remote DGX)
+spark setup          # guided: set up THIS machine, or a remote one over SSH
 ```
 
 Or clone and link:
@@ -61,11 +62,11 @@ Or clone and link:
 ```bash
 git clone https://github.com/massimo92/spark.git
 sudo ln -sf $(pwd)/spark/spark /usr/local/bin/spark
-spark host
+spark setup
 ```
 
 **Requirements:** `spark` is a Bash CLI and needs `jq` (model profiles are stored as JSON and read
-safely instead of being executed as shell scripts). `spark host` installs what your hardware needs —
+safely instead of being executed as shell scripts). `spark setup` installs what your hardware needs —
 Docker + the NGC vLLM image on NVIDIA, or Ollama + Docker Desktop (for the gateway) on macOS/CPU.
 
 ## Quickstart
@@ -73,56 +74,54 @@ Docker + the NGC vLLM image on NVIDIA, or Ollama + Docker Desktop (for the gatew
 **This machine as a server** (macOS or Linux):
 
 ```bash
-spark host                              # detect hardware, install engine + gateway
+spark setup                             # pick [1] this machine → installs engine + gateway
 spark run qwen3:30b                     # on Apple Silicon / CPU (Ollama)
 spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4 # on NVIDIA (vLLM)
 curl localhost:4000/v1/models           # use it through the gateway
 ```
 
-**A remote DGX Spark from your laptop:**
+**A remote machine from your laptop:**
 
 ```bash
-spark setup          # Guided wizard: configures your laptop AND the DGX over SSH
+spark setup          # pick [2] another machine → asks for user@host, configures it over SSH
 spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
 ```
 
 ## Commands
 
-### spark host
-
-Set up the machine you run it on as a model server. Detects the hardware, installs the right engine
-and the LiteLLM gateway, and finishes with `spark doctor`.
-
-```bash
-spark host           # interactive setup for this machine
-spark host --check   # read-only: report what's missing, install nothing
-spark host --yes     # auto-confirm install prompts
-```
-
-- **NVIDIA (Linux):** Docker + NVIDIA Container Toolkit + NGC login + the vLLM image, plus the HF CLI.
-- **Apple Silicon / CPU:** Ollama (via Homebrew, the install script, or the app) + Docker Desktop for
-  the gateway.
-
-`spark host` is for the *local* machine; `spark setup` (below) is the separate flow for a *remote*
-DGX Spark over SSH.
-
 ### spark setup
 
-Guided wizard that runs entirely from your laptop. It connects to a remote DGX Spark over SSH and configures everything in one pass — no need to run setup on both machines.
+One guided wizard for both local and remote setup. It asks two questions, then runs the **same
+install set** against whichever target you chose, and finishes with `spark doctor` (local) or a
+secured SSH connection (remote).
 
 ```bash
-spark setup            # Guided wizard (asks for DGX IP + username)
-spark setup --check    # Read-only mode — only check, don't fix
-spark setup --yes      # Auto-confirm install/update prompts; secrets and hostnames still require input
+spark setup           # interactive wizard
+spark setup --check   # read-only: report what's missing, install nothing
+spark setup --yes     # auto-confirm install prompts (secrets/hostnames still require input)
 ```
 
-**Phase 1 (Client):** Tailscale, SSH key generation.
+**Question 1 — where?**
+- **[1] This machine** — configure the box you're on.
+- **[2] Another machine over SSH** — asks for `user@host`.
 
-**Phase 2 (DGX — remote via SSH):** GPU check, system updates, uv, nvitop, jq, Tailscale, Docker group, NGC login, HF CLI, vLLM container.
+**Question 2 (remote only) — do you already have public-key SSH access?**
+- **Yes** → connects with your key directly.
+- **No** → asks for the password once, connects via `sshpass` (a *bootstrap* login), installs your
+  public key, then disables password auth — but only **after** verifying key login works, so you can
+  never lock yourself out.
 
-**Phase 3 (Link):** copies SSH key to DGX, disables password login, NVIDIA Sync (macOS).
+**The shared install set** (gated on the target's OS/backend):
+- **NVIDIA (Linux):** Docker + NVIDIA Container Toolkit + NGC login + the vLLM image, uv, HF CLI, nvitop.
+- **Apple Silicon / CPU:** Ollama (Homebrew / install script / app) + Docker Desktop for the gateway.
+- **Every Linux target:** `jq`, the LiteLLM gateway, and OS hardening (earlyoom + sshd `MemoryMin`).
 
-`--check` exits non-zero if required setup items are missing and prints an incomplete setup summary instead of reporting success.
+**Remote-only steps:** copy your SSH key, deploy the `spark` CLI to the target, disable password
+login, and NVIDIA Sync (macOS). In **host** mode spark never disables password login automatically —
+it only warns, so you don't get locked out if your key isn't installed.
+
+`--check` exits non-zero if required items are missing and prints an incomplete-setup summary instead
+of reporting success.
 
 ### spark run
 
@@ -347,7 +346,7 @@ overuses RAM **reclaims or OOM-kills itself** instead of dragging the host into 
 host (and sshd) keep their memory. Tunable via `SPARK_MEM_LIMIT_MARGIN_PCT`; disable per-run with
 `--no-mem-limit`. Unified memory only.
 
-For a server that must stay reachable, run **`spark host`** (Linux): it can install **earlyoom**
+For a server that must stay reachable, run **`spark setup`** (Linux): it can install **earlyoom**
 (kills a runaway model on low memory before the kernel deadlocks) and give **sshd a `MemoryMin`
 floor** (so it's never paged out). Together with the per-container limit, that makes a
 memory-overcommit freeze — the kind that needs a physical reboot — effectively impossible.
@@ -415,7 +414,7 @@ CPU it uses Ollama, which on Apple Silicon (0.19+) runs on Apple's MLX for nativ
 with `SPARK_BACKEND=vllm|ollama`.
 
 **Q: How do I run spark on a Mac?**
-A: `spark host` installs Ollama and the gateway. Then `spark run qwen3:30b` (any Ollama model) and
+A: `spark setup` (pick [1] this machine) installs Ollama and the gateway. Then `spark run qwen3:30b` (any Ollama model) and
 call it through the gateway as `ollama_chat/qwen3:30b` on `http://localhost:4000/v1`. NVFP4 / vLLM
 HuggingFace repos don't run on a Mac — use GGUF/Ollama models or `hf.co/<repo>:Q4_K_M`.
 

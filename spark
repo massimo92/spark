@@ -275,6 +275,79 @@ close_remote() {
   fi
 }
 
+# --- Execution context (local target | remote target) ---
+# spark setup configures EITHER this machine (local) or a remote one over SSH.
+# Every install step is written once and dispatched through ctx_* to the active target,
+# so a server gets the exact same software whether configured locally or remotely.
+SETUP_TARGET="local"     # "local" | "remote"
+SETUP_USED_SSHPASS=0     # 1 while the SSH master is password-based (before the key is copied)
+TGT_OS=""                # target platform — mirrors SPARK_OS/ARCH/ACCEL/BACKEND for the TARGET
+TGT_ARCH=""
+TGT_ACCEL=""
+TGT_BACKEND=""
+
+# PATH prefix for user-installed tools (uv, hf, nvitop, spark). $HOME stays literal so it
+# expands on the target, not on the controller.
+TGT_PATH='export PATH=$HOME/.local/bin:$HOME/.cargo/bin:$PATH;'
+
+# Run a command STRING on the active target. Caller owns quoting (single contract: target-side
+# $HOME/$PATH in single quotes; controller values double-quoted only after validation; secrets
+# never interpolated — piped via ctx_run_stdin).
+ctx_run() {
+  if [[ "$SETUP_TARGET" == "remote" ]]; then remote "$1"; else bash -c "$1"; fi
+}
+
+# Run a command STRING as root on the target. Wrapped in `bash -c` on both paths so compound
+# commands (a && b) run entirely under sudo.
+ctx_sudo() {
+  if [[ "$SETUP_TARGET" == "remote" ]]; then
+    local q; printf -v q '%q' "$1"
+    ssh -t -o ControlPath="$REMOTE_CONTROL" "${REMOTE_USER}@${REMOTE_HOST}" "sudo bash -c $q"
+  else
+    sudo bash -c "$1"
+  fi
+}
+
+# Pipe controller stdin (e.g. a secret from `read -rs`) into a target command.
+ctx_run_stdin() {
+  if [[ "$SETUP_TARGET" == "remote" ]]; then remote "$1"; else bash -c "$1"; fi
+}
+
+# Write controller stdin to a file on the target.
+ctx_write_file() {
+  if [[ "$SETUP_TARGET" == "remote" ]]; then remote "cat > $1"; else cat > "$1"; fi
+}
+
+# The target's own username (for docker-group membership etc.).
+ctx_user() {
+  if [[ "$SETUP_TARGET" == "remote" ]]; then printf '%s' "$REMOTE_USER"; else whoami; fi
+}
+
+# True if a command exists on the target (system PATH).
+ctx_has() {
+  ctx_run "command -v $1 >/dev/null 2>&1"
+}
+
+# Populate TGT_* for the active target. Local copies the globals; remote probes over SSH.
+detect_target_platform() {
+  if [[ "$SETUP_TARGET" == "local" ]]; then
+    TGT_OS="$SPARK_OS"; TGT_ARCH="$SPARK_ARCH"
+    TGT_ACCEL="$ACCEL"; TGT_BACKEND="$BACKEND"
+    return 0
+  fi
+  TGT_OS="$(remote 'uname -s' 2>/dev/null | tr -d '[:space:]')"
+  TGT_ARCH="$(remote 'uname -m' 2>/dev/null | tr -d '[:space:]')"
+  [[ -z "$TGT_OS" ]] && TGT_OS="Linux"
+  [[ -z "$TGT_ARCH" ]] && TGT_ARCH="aarch64"
+  if remote 'nvidia-smi -L' >/dev/null 2>&1; then
+    TGT_ACCEL="cuda"; TGT_BACKEND="vllm"
+  elif remote "${TGT_PATH} command -v ollama" >/dev/null 2>&1; then
+    TGT_ACCEL="cpu"; TGT_BACKEND="ollama"
+  else
+    TGT_ACCEL="cuda"; TGT_BACKEND="vllm"   # DGX Spark default
+  fi
+}
+
 # --- Model Path Resolution ---
 resolve_model_path() {
   local model="$1"
@@ -1124,7 +1197,7 @@ run_backend_ollama() {
     return 0
   fi
 
-  command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark host"
+  command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark setup"
   ollama_reachable || warn "Ollama service not reachable on :11434 — is it running? (try: ollama serve)"
 
   # Pull unless already present (or --no-pull).
@@ -1303,7 +1376,7 @@ cmd_pull() {
 
   if [[ "$BACKEND" == "ollama" ]]; then
     is_ollama_ref "$model" || die "Invalid model reference: $model" "Use an Ollama model like 'qwen3:30b'"
-    command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark host"
+    command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark setup"
     printf "\n  Pulling %s with Ollama...\n\n" "$model"
     ollama pull "$model"
     printf "\n"
@@ -1436,7 +1509,7 @@ cmd_status_ollama() {
   fi
 
   if ! command -v ollama >/dev/null 2>&1; then
-    printf "  ${DIM}○${NC} Ollama not installed. Set up this machine: ${BOLD}spark host${NC}\n\n"
+    printf "  ${DIM}○${NC} Ollama not installed. Set up this machine: ${BOLD}spark setup${NC}\n\n"
     return 0
   fi
 
@@ -1667,7 +1740,7 @@ doctor_checks_ollama() {
     info "Ollama: $(ollama --version 2>/dev/null | head -1 || echo installed)"
     passed=$((passed + 1))
   else
-    err "Ollama: not installed — run 'spark host' to set it up"
+    err "Ollama: not installed — run 'spark setup' to set it up"
   fi
 
   # Ollama service reachable
@@ -1743,171 +1816,346 @@ cmd_doctor() {
   printf "\n\n"
 }
 
-# --- spark host: configure THIS machine as a model server (local, no SSH) ---
+# --- spark setup: configure a machine (local or remote) as a model server ---
+#
+# One wizard, one install set. `spark setup` asks WHERE to install (this machine, or a
+# remote one over SSH); every step below runs against the chosen target via ctx_*, so a
+# server receives the exact same software whether it is configured locally or remotely.
 
-# NVIDIA/vLLM prerequisites on the local machine. In --check mode nothing is installed
-# and missing pieces are recorded as failures (never prompts).
-host_setup_vllm() {
-  local auto_yes="$1" check_only="$2" tag
+# Write controller stdin to a root-owned file on the target.
+ctx_sudo_write() {  # $1 = path; reads stdin
+  if [[ "$SETUP_TARGET" == "remote" ]]; then
+    remote "sudo tee $1 >/dev/null"
+  else
+    sudo tee "$1" >/dev/null
+  fi
+}
 
-  if nvidia-smi -L >/dev/null 2>&1; then
-    info "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+# --- Install steps (shared across local/remote) ---
+
+step_gpu_check() {
+  if ctx_run 'nvidia-smi -L' >/dev/null 2>&1; then
+    info "GPU: $(ctx_run 'nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1')"
   else
     setup_fail "No NVIDIA GPU detected (nvidia-smi)"
   fi
+}
 
-  if docker info >/dev/null 2>&1; then
+step_docker_check() {
+  local check_only="$2"
+  if ctx_run 'docker info >/dev/null 2>&1'; then
     info "Docker: running"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "Docker not installed or not running"
+  elif [[ "$TGT_OS" == "Darwin" ]]; then
+    setup_manual_step "Install Docker Desktop and start it: https://docs.docker.com/desktop/"
   else
     setup_manual_step "Install Docker and start it: https://docs.docker.com/engine/install/"
   fi
+}
 
-  if groups 2>/dev/null | grep -q docker; then
-    info "Docker group: $(whoami) in docker group"
+step_docker_group() {
+  local auto_yes="$1" check_only="$2" u
+  [[ "$TGT_OS" == "Linux" ]] || return 0
+  u="$(ctx_user)"
+  if ctx_run 'groups 2>/dev/null | grep -q docker'; then
+    info "Docker group: ${u} in docker group"
   elif [[ "$check_only" == "1" ]]; then
-    setup_fail "$(whoami) not in the docker group"
-  elif [[ "$auto_yes" == "1" ]] || confirm "Add $(whoami) to the docker group?"; then
-    if sudo usermod -aG docker "$(whoami)"; then warn "Added to docker group — log out/in to apply"; else setup_fail "Could not add to docker group"; fi
+    setup_fail "${u} not in the docker group"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Add ${u} to the docker group?"; then
+    if ctx_sudo "usermod -aG docker ${u}"; then
+      warn "Added to docker group — log out/in to apply"
+    else
+      setup_fail "Could not add to docker group"
+    fi
   else
     setup_skip "docker group membership"
   fi
+}
 
-  if docker info 2>/dev/null | grep -qi nvidia || command -v nvidia-ctk >/dev/null 2>&1; then
+step_nvidia_ctk() {
+  local auto_yes="$1" check_only="$2"
+  [[ "$TGT_OS" == "Linux" ]] || return 0
+  if ctx_run 'docker info 2>/dev/null | grep -qi nvidia || command -v nvidia-ctk >/dev/null 2>&1'; then
     info "NVIDIA Container Toolkit: present"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "NVIDIA Container Toolkit not detected"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Install the NVIDIA Container Toolkit (enables 'docker run --gpus')?"; then
+    if ctx_sudo 'curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" > /etc/apt/sources.list.d/nvidia-container-toolkit.list && apt-get update && apt-get install -y nvidia-container-toolkit && nvidia-ctk runtime configure --runtime=docker && systemctl restart docker'; then
+      info "Installed NVIDIA Container Toolkit"
+    else
+      setup_fail "NVIDIA Container Toolkit install failed"
+    fi
   else
     setup_manual_step "Install the NVIDIA Container Toolkit (enables 'docker run --gpus'): https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
   fi
+}
 
-  if [[ -f "${HOME}/.docker/config.json" ]] && grep -q "nvcr.io" "${HOME}/.docker/config.json" 2>/dev/null; then
+step_ngc_login() {
+  local check_only="$2" key
+  if ctx_run 'test -f $HOME/.docker/config.json && grep -q nvcr.io $HOME/.docker/config.json'; then
     info "NGC: authenticated"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "NGC not authenticated (docker login nvcr.io)"
   else
-    setup_manual_step "Log in to NGC: docker login nvcr.io (user \$oauthtoken, password = API key from ngc.nvidia.com)"
+    printf "  ${DIM}NGC is NVIDIA's registry — needed to pull the vLLM serving image.${NC}\n"
+    setup_manual_step "Create an NGC account + API key: ngc.nvidia.com -> Setup -> API Keys" ""
+    printf "  Enter your NGC API key (blank to skip): "
+    read -rs key; printf "\n"
+    if [[ -n "$key" ]]; then
+      if printf '%s' "$key" | ctx_run_stdin 'docker login nvcr.io -u \$oauthtoken --password-stdin'; then
+        info "NGC Docker login successful"
+      else
+        setup_fail "NGC login failed"
+      fi
+    else
+      setup_skip "NGC Docker login"
+    fi
   fi
+}
 
-  if [[ -n "$(detect_ngc_image)" ]]; then
-    info "vLLM image: $(detect_ngc_image)"
+step_vllm_image() {
+  local auto_yes="$1" check_only="$2" tag have
+  have="$(ctx_run 'docker images --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | grep "nvcr.io/nvidia/vllm" | head -1' 2>/dev/null || true)"
+  if [[ -n "$have" ]]; then
+    info "vLLM image: ${have}"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "vLLM NGC image not pulled"
-  elif [[ "$auto_yes" != "1" ]]; then
+  elif [[ "$auto_yes" == "1" ]]; then
+    setup_skip "vLLM image pull"
+  else
     printf "  Enter an NGC vLLM tag to pull (e.g. 26.04-py3), blank to skip: "
     read -r tag
     if [[ -n "$tag" ]]; then
       is_safe_ngc_tag "$tag" || die "Invalid NGC tag: $tag"
-      if docker pull "nvcr.io/nvidia/vllm:${tag}"; then info "Pulled vLLM image"; else setup_fail "Image pull failed"; fi
+      if ctx_run "docker pull nvcr.io/nvidia/vllm:${tag}"; then info "Pulled vLLM image"; else setup_fail "Image pull failed"; fi
     else
       setup_skip "vLLM image pull"
     fi
-  else
-    setup_skip "vLLM image pull"
   fi
+}
 
-  if command -v hf >/dev/null 2>&1; then
+step_uv() {
+  local check_only="$2"
+  if ctx_run "${TGT_PATH} command -v uv" >/dev/null 2>&1; then
+    info "uv: installed"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "uv not installed"
+  else
+    if ctx_run 'curl -LsSf https://astral.sh/uv/install.sh | sh'; then info "Installed uv"; else setup_fail "uv install failed"; fi
+  fi
+}
+
+step_hf_cli() {
+  local check_only="$2"
+  if ctx_run "${TGT_PATH} command -v hf" >/dev/null 2>&1; then
     info "HF CLI: installed"
   elif [[ "$check_only" == "1" ]]; then
-    setup_skip "HuggingFace CLI"
-  elif command -v uv >/dev/null 2>&1 && { [[ "$auto_yes" == "1" ]] || confirm "Install the HuggingFace CLI?"; }; then
-    if uv tool install "huggingface-hub[cli]"; then info "Installed HF CLI"; else setup_fail "HF CLI install failed"; fi
+    setup_fail "HuggingFace CLI not installed"
+  elif ctx_run "${TGT_PATH} command -v uv" >/dev/null 2>&1; then
+    if ctx_run "${TGT_PATH} uv tool install 'huggingface-hub[cli]'"; then info "Installed HF CLI"; else setup_fail "HF CLI install failed"; fi
   else
     setup_skip "HuggingFace CLI (needs uv)"
   fi
 }
 
-# Ollama prerequisites on the local machine (Apple Silicon / CPU).
-host_setup_ollama() {
-  local auto_yes="$1" check_only="$2"
+step_nvitop() {
+  local check_only="$2"
+  if ctx_run "${TGT_PATH} command -v nvitop" >/dev/null 2>&1; then
+    info "nvitop: installed"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_skip "nvitop"
+  elif ctx_run "${TGT_PATH} command -v uv" >/dev/null 2>&1; then
+    if ctx_run "${TGT_PATH} uv tool install nvitop"; then info "Installed nvitop"; else setup_fail "nvitop install failed"; fi
+  else
+    setup_skip "nvitop (needs uv)"
+  fi
+}
 
-  if command -v ollama >/dev/null 2>&1; then
+step_jq() {
+  local check_only="$2"
+  [[ "$TGT_OS" == "Linux" ]] || return 0
+  if ctx_has jq; then
+    info "jq: installed"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "jq not installed"
+  else
+    if ctx_sudo 'apt-get install -y jq'; then info "Installed jq"; else setup_fail "jq install failed"; fi
+  fi
+}
+
+step_apt_upgrade() {
+  local auto_yes="$1" check_only="$2" upgradable
+  [[ "$TGT_OS" == "Linux" ]] || return 0
+  [[ "$check_only" == "1" ]] && return 0
+  upgradable="$(ctx_run 'apt list --upgradable 2>/dev/null | grep -c upgradable' 2>/dev/null | tr -d '[:space:]' || echo 0)"
+  [[ "$upgradable" =~ ^[0-9]+$ ]] || upgradable=0
+  if [[ "$upgradable" -gt 0 ]]; then
+    if [[ "$auto_yes" == "1" ]] || confirm "${upgradable} upgradable packages. Update the system?"; then
+      if ctx_sudo 'apt-get update && apt-get full-upgrade -y'; then info "System updated"; else setup_fail "System update failed"; fi
+    else
+      setup_skip "System updates"
+    fi
+  else
+    info "System is up to date"
+  fi
+}
+
+step_snap_cleanup() {
+  local check_only="$2"
+  [[ "$TGT_OS" == "Linux" ]] || return 0
+  if ctx_run 'snap list 2>/dev/null | grep -q firmware-updater'; then
+    if [[ "$check_only" == "1" ]]; then
+      warn "firmware-updater snap should be removed"
+    else
+      ctx_sudo 'snap remove firmware-updater' && info "Removed snap firmware-updater" || true
+    fi
+  fi
+}
+
+step_ollama() {
+  local auto_yes="$1" check_only="$2"
+  if ctx_has ollama; then
     info "Ollama: installed"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "Ollama not installed"
-  elif [[ "$SPARK_OS" == "Darwin" ]]; then
-    if command -v brew >/dev/null 2>&1 && { [[ "$auto_yes" == "1" ]] || confirm "Install Ollama with Homebrew?"; }; then
-      if brew install ollama; then info "Installed Ollama"; else setup_fail "Ollama install failed"; fi
+  elif [[ "$TGT_OS" == "Darwin" ]]; then
+    if ctx_has brew && { [[ "$auto_yes" == "1" ]] || confirm "Install Ollama with Homebrew?"; }; then
+      if ctx_run 'brew install ollama'; then info "Installed Ollama"; else setup_fail "Ollama install failed"; fi
     else
       setup_manual_step "Install Ollama from https://ollama.com/download, then open it once to start the service"
     fi
   elif [[ "$auto_yes" == "1" ]] || confirm "Install Ollama (curl https://ollama.com/install.sh | sh)?"; then
-    if curl -fsSL https://ollama.com/install.sh | sh; then info "Installed Ollama"; else setup_fail "Ollama install failed"; fi
+    if ctx_run 'curl -fsSL https://ollama.com/install.sh | sh'; then info "Installed Ollama"; else setup_fail "Ollama install failed"; fi
   else
     setup_skip "Ollama install"
   fi
 
-  command -v ollama >/dev/null 2>&1 || return 0
-  if ollama_reachable; then
+  ctx_has ollama || return 0
+  if [[ "$SETUP_TARGET" == "local" ]] && ollama_reachable; then
+    info "Ollama service: reachable on :11434"
+  elif [[ "$SETUP_TARGET" == "remote" ]] && remote 'curl -fsS http://localhost:11434/api/version >/dev/null 2>&1'; then
     info "Ollama service: reachable on :11434"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "Ollama service not running on :11434"
-  elif [[ "$SPARK_OS" == "Darwin" ]]; then
+  elif [[ "$TGT_OS" == "Darwin" ]]; then
     setup_manual_step "Start Ollama (open the app; it lives in the menu bar)"
   else
     info "Ollama runs as a systemd service (started by the installer)"
   fi
 }
 
-# The LiteLLM gateway runs in Docker on both backends; ensure Docker, enable the
-# provider for this backend, and (re)start it.
-host_setup_gateway() {
-  local check_only="$1" config provider
-  if docker info >/dev/null 2>&1; then
-    info "Docker: available for the gateway"
-  elif [[ "$check_only" == "1" ]]; then
-    setup_fail "Docker not available — the LiteLLM gateway needs it"
-    return 0
-  elif [[ "$SPARK_OS" == "Darwin" ]]; then
-    setup_manual_step "Install Docker Desktop (the LiteLLM gateway runs in a container): https://docs.docker.com/desktop/"
-    return 0
-  else
-    setup_fail "Docker not running — needed for the gateway"
+# Optional: connect the target to a tailnet for secure remote access.
+step_tailscale() {
+  local auto_yes="$1" check_only="$2" tk="tailscale-connected"
+  [[ "$SETUP_TARGET" == "remote" ]] && tk="remote-tailscale-connected"
+  if ctx_run 'command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1'; then
+    info "Tailscale: installed and connected"
     return 0
   fi
-
-  [[ "$check_only" == "1" ]] && return 0
-
-  provider="vllm"; [[ "$BACKEND" == "ollama" ]] && provider="ollama"
-  local newcfg
-  config=$(gateway_load_config)
-  newcfg=$(printf '%s' "$config" | jq --arg p "$provider" \
-    '.enabled = true | .port = (.port // 4000) | .providers[$p].enabled = true' 2>/dev/null || true)
-  [[ -n "$newcfg" ]] && config="$newcfg"
-  gateway_save_config "$config"
-  info "Gateway: ${provider} provider enabled"
-
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    ( gateway_restart ) >/dev/null 2>&1 && info "Gateway restarted" || warn "Could not restart the gateway"
+  [[ "$check_only" == "1" ]] && { info "Tailscale: not configured (optional)"; return 0; }
+  if ctx_has tailscale; then
+    setup_manual_step "Connect the target to your tailnet: sudo tailscale up" "$tk"
+  elif [[ "$TGT_OS" == "Darwin" ]]; then
+    setup_manual_step "Install Tailscale from the Mac App Store, then run it" "$tk"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Install Tailscale on the target (curl https://tailscale.com/install.sh | sh)?"; then
+    ctx_run 'curl -fsSL https://tailscale.com/install.sh | sh' && info "Installed Tailscale" || setup_fail "Tailscale install failed"
+    setup_manual_step "Connect: sudo tailscale up (open the printed URL to authenticate)" "$tk"
   else
-    ( gateway_start ) || warn "Start the gateway later with: spark gateway start"
+    setup_skip "Tailscale"
   fi
 }
 
-# Optional: connect this machine to a tailnet for secure remote access.
-host_setup_tailscale() {
-  if command -v tailscale >/dev/null 2>&1; then
-    setup_manual_step "Connect this machine to your tailnet: sudo tailscale up" "tailscale-connected"
-  elif [[ "$SPARK_OS" == "Darwin" ]]; then
-    setup_manual_step "Install Tailscale from the Mac App Store, then run it" "tailscale-installed"
-  elif confirm "Install Tailscale (curl https://tailscale.com/install.sh | sh)?"; then
-    curl -fsSL https://tailscale.com/install.sh | sh || setup_fail "Tailscale install failed"
-    setup_manual_step "Connect: sudo tailscale up" "tailscale-connected"
+# The LiteLLM gateway runs in Docker on both backends. In --check we only verify Docker;
+# otherwise we enable this backend's provider (plus optional cloud providers) and start it.
+step_gateway() {
+  local auto_yes="$1" check_only="$2"
+  if ctx_run 'docker info >/dev/null 2>&1'; then
+    info "Docker: available for the gateway"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Docker not available — the LiteLLM gateway needs it"; return 0
+  elif [[ "$TGT_OS" == "Darwin" ]]; then
+    setup_manual_step "Install Docker Desktop (the gateway runs in a container): https://docs.docker.com/desktop/"; return 0
   else
-    setup_skip "Tailscale"
+    setup_fail "Docker not running — needed for the gateway"; return 0
+  fi
+  [[ "$check_only" == "1" ]] && return 0
+
+  if [[ "$auto_yes" != "1" ]] && ! confirm "Set up the LiteLLM gateway (unified API for local + cloud models)?"; then
+    setup_skip "LiteLLM gateway"; return 0
+  fi
+
+  if ctx_run "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q 'ghcr.io/berriai/litellm'"; then
+    info "LiteLLM image present"
+  elif ctx_run "docker pull ${LITELLM_IMAGE}"; then
+    info "Pulled ${LITELLM_IMAGE}"
+  else
+    setup_fail "LiteLLM image pull failed"; return 0
+  fi
+
+  local prov="vllm"; [[ "$TGT_BACKEND" == "ollama" ]] && prov="ollama"
+  local gw_or=0 gw_zen=0 gw_tg=0 or_key="" zen_key="" tg_key=""
+  if [[ "$auto_yes" != "1" ]]; then
+    if confirm "Enable OpenRouter? (cloud, needs API key)"; then
+      printf "  OpenRouter API key (blank to skip): "; read -rs or_key; printf "\n"; [[ -n "$or_key" ]] && gw_or=1
+    fi
+    if confirm "Enable Zen / OpenCode? (cloud, needs API key)"; then
+      printf "  Zen API key (blank to skip): "; read -rs zen_key; printf "\n"; [[ -n "$zen_key" ]] && gw_zen=1
+    fi
+    if confirm "Enable Together AI? (cloud, needs API key)"; then
+      printf "  Together AI API key (blank to skip): "; read -rs tg_key; printf "\n"; [[ -n "$tg_key" ]] && gw_tg=1
+    fi
+  fi
+
+  local gw_json
+  gw_json=$(jq -n \
+    --argjson port "$GATEWAY_PORT" \
+    --argjson vllm_en "$( [[ "$prov" == "vllm" ]] && echo true || echo false )" \
+    --argjson ollama_en "$( [[ "$prov" == "ollama" ]] && echo true || echo false )" \
+    --argjson or_en "$( [[ "$gw_or" == "1" ]] && echo true || echo false )" --arg or_key "$or_key" \
+    --argjson zen_en "$( [[ "$gw_zen" == "1" ]] && echo true || echo false )" --arg zen_key "$zen_key" \
+    --argjson tg_en "$( [[ "$gw_tg" == "1" ]] && echo true || echo false )" --arg tg_key "$tg_key" \
+    '{enabled:true, port:$port, providers:{
+        vllm:{enabled:$vllm_en, port:8000},
+        ollama:{enabled:$ollama_en},
+        openrouter:{enabled:$or_en, api_key:$or_key},
+        zen:{enabled:$zen_en, api_key:$zen_key},
+        together:{enabled:$tg_en, api_key:$tg_key}
+      }}')
+
+  # gateway_save_config writes the controller copy used by gateway_generate_litellm_yaml.
+  gateway_save_config "$gw_json"
+
+  if [[ "$SETUP_TARGET" == "remote" ]]; then
+    ctx_run 'mkdir -p $HOME/.config/spark'
+    printf '%s\n' "$gw_json" | ctx_write_file '$HOME/.config/spark/gateway.json'
+    local yaml; yaml="$(gateway_generate_litellm_yaml)"
+    [[ -n "$yaml" ]] && printf '%s\n' "$yaml" | ctx_write_file '$HOME/.config/spark/litellm_config.yaml'
+    local env_flags=""
+    [[ -n "$or_key" ]] && env_flags+=" -e OPENROUTER_API_KEY='${or_key}'"
+    [[ -n "$zen_key" ]] && env_flags+=" -e ZEN_API_KEY='${zen_key}'"
+    [[ -n "$tg_key" ]] && env_flags+=" -e TOGETHER_API_KEY='${tg_key}'"
+    ctx_run "docker rm -f ${GATEWAY_CONTAINER} 2>/dev/null || true"
+    if ctx_run "docker run -d --network host -v ~/.config/spark/litellm_config.yaml:/app/config.yaml ${env_flags} --name ${GATEWAY_CONTAINER} --restart unless-stopped ${LITELLM_IMAGE} --config /app/config.yaml --port ${GATEWAY_PORT}"; then
+      info "LiteLLM gateway started on :${GATEWAY_PORT}"
+    else
+      setup_fail "Gateway failed to start"
+    fi
+  else
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+      ( gateway_restart ) >/dev/null 2>&1 && info "Gateway restarted" || warn "Could not restart the gateway"
+    else
+      ( gateway_start ) && info "LiteLLM gateway started on :${GATEWAY_PORT}" || warn "Start it later: spark gateway start"
+    fi
   fi
 }
 
 # OS hardening (Linux + systemd) so SSH always has room even if models exhaust RAM:
 #   1) early-OOM (earlyoom) kills the memory hog before the kernel deadlocks into swap thrash.
 #   2) MemoryMin protects sshd from reclaim so it never gets paged out / starved.
-host_setup_hardening() {
+step_earlyoom() {
   local auto_yes="$1" check_only="$2"
-  command -v systemctl >/dev/null 2>&1 || { setup_skip "OS hardening (needs systemd)"; return 0; }
-
-  # 1) early-OOM via earlyoom
-  if systemctl is-active --quiet earlyoom 2>/dev/null; then
+  if ctx_run 'systemctl is-active --quiet earlyoom'; then
     info "early-OOM: earlyoom active"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "early-OOM not active — install earlyoom so a runaway model is killed before the box freezes"
@@ -1916,10 +2164,9 @@ host_setup_hardening() {
     printf "    Why: it kills the biggest model the instant free RAM runs low, so a runaway model\n"
     printf "    can't drag the whole machine into a swap freeze that needs a physical reboot.${NC}\n"
     if [[ "$auto_yes" == "1" ]] || confirm "Install + enable earlyoom?"; then
-      if sudo apt-get update >/dev/null 2>&1 && sudo apt-get install -y earlyoom >/dev/null 2>&1; then
-        printf 'EARLYOOM_ARGS="-m 8 -s 100 --avoid '\''(^|/)(systemd|sshd?|ssh|dbus)$'\'' --prefer '\''(^|/)(vllm|python|pt_main_thread)$'\''"\n' | sudo tee /etc/default/earlyoom >/dev/null
-        if sudo systemctl enable --now earlyoom >/dev/null 2>&1; then
-          sudo systemctl restart earlyoom >/dev/null 2>&1 || true
+      if ctx_sudo 'apt-get update >/dev/null 2>&1 && apt-get install -y earlyoom >/dev/null 2>&1'; then
+        printf 'EARLYOOM_ARGS="-m 8 -s 100 --avoid '\''(^|/)(systemd|sshd?|ssh|dbus)$'\'' --prefer '\''(^|/)(vllm|python|pt_main_thread)$'\''"\n' | ctx_sudo_write /etc/default/earlyoom
+        if ctx_sudo 'systemctl enable --now earlyoom && systemctl restart earlyoom'; then
           info "early-OOM: earlyoom installed and enabled"
         else
           setup_fail "Could not enable earlyoom"
@@ -1931,12 +2178,13 @@ host_setup_hardening() {
       setup_skip "early-OOM (earlyoom)"
     fi
   fi
+}
 
-  # 2) sshd MemoryMin (512M = 536870912 bytes)
-  local unit cur
-  unit=$(systemctl list-unit-files --no-legend ssh.service sshd.service 2>/dev/null | awk 'NR==1{print $1}')
+step_sshd_memorymin() {
+  local auto_yes="$1" check_only="$2" unit cur
+  unit="$(ctx_run 'systemctl list-unit-files --no-legend ssh.service sshd.service 2>/dev/null | awk "NR==1{print \$1}"')"
   [[ -z "$unit" ]] && unit="ssh.service"
-  cur=$(systemctl show -p MemoryMin --value "$unit" 2>/dev/null)
+  cur="$(ctx_run "systemctl show -p MemoryMin --value ${unit} 2>/dev/null")"
   if [[ "$cur" == "536870912" ]]; then
     info "sshd memory: ${unit} MemoryMin=512M (reclaim-protected)"
   elif [[ "$check_only" == "1" ]]; then
@@ -1946,10 +2194,10 @@ host_setup_hardening() {
     printf "    Why: under memory pressure the kernel won't page sshd out, so you can always connect\n"
     printf "    to the machine to fix things instead of being locked out. Restarting ssh is safe.${NC}\n"
     if [[ "$auto_yes" == "1" ]] || confirm "Reserve 512M for ${unit}?"; then
-      sudo mkdir -p "/etc/systemd/system/${unit}.d"
-      printf '[Service]\nMemoryAccounting=yes\nMemoryMin=512M\n' | sudo tee "/etc/systemd/system/${unit}.d/10-spark-memory.conf" >/dev/null
-      sudo systemctl daemon-reload >/dev/null 2>&1
-      if sudo systemctl reload "$unit" >/dev/null 2>&1 || sudo systemctl restart "$unit" >/dev/null 2>&1; then
+      ctx_sudo "mkdir -p /etc/systemd/system/${unit}.d"
+      printf '[Service]\nMemoryAccounting=yes\nMemoryMin=512M\n' | ctx_sudo_write "/etc/systemd/system/${unit}.d/10-spark-memory.conf"
+      ctx_sudo 'systemctl daemon-reload'
+      if ctx_sudo "systemctl reload ${unit} || systemctl restart ${unit}"; then
         info "sshd memory: ${unit} MemoryMin=512M set"
       else
         setup_fail "Could not apply MemoryMin to ${unit}"
@@ -1960,53 +2208,294 @@ host_setup_hardening() {
   fi
 }
 
-cmd_host() {
-  local auto_yes=0 check_only=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --yes)   auto_yes=1; shift ;;
-      --check) check_only=1; shift ;;
-      *)       die "Unknown flag: $1" "Usage: spark host [--yes] [--check]" ;;
-    esac
-  done
+# The one install set — identical software whether the target is local or remote.
+run_install_set() {
+  local auto_yes="$1" check_only="$2"
+  step_apt_upgrade "$auto_yes" "$check_only"
+  if [[ "$TGT_BACKEND" == "ollama" ]]; then
+    step_ollama "$auto_yes" "$check_only"
+  else
+    step_gpu_check "$auto_yes" "$check_only"
+    step_docker_check "$auto_yes" "$check_only"
+    step_docker_group "$auto_yes" "$check_only"
+    step_nvidia_ctk "$auto_yes" "$check_only"
+    step_ngc_login "$auto_yes" "$check_only"
+    step_vllm_image "$auto_yes" "$check_only"
+    step_uv "$auto_yes" "$check_only"
+    step_hf_cli "$auto_yes" "$check_only"
+    step_nvitop "$auto_yes" "$check_only"
+  fi
+  step_jq "$auto_yes" "$check_only"
+  step_gateway "$auto_yes" "$check_only"
+  if [[ "$TGT_OS" == "Linux" ]] && ctx_has systemctl; then
+    step_earlyoom "$auto_yes" "$check_only"
+    step_sshd_memorymin "$auto_yes" "$check_only"
+  fi
+}
 
-  SETUP_SKIPPED=()
-  SETUP_FAILED=()
+# --- Client-side helpers (run on the controller in remote mode) ---
 
-  printf "\n  ${BOLD}spark host${NC} — set up this machine as a model server\n\n"
-  info "Detected: ${SPARK_OS}/${SPARK_ARCH} · accelerator ${ACCEL} · backend ${BACKEND}"
+ensure_local_ssh_key() {
+  local auto_yes="$1" check_only="$2"
+  if [[ -f "${HOME}/.ssh/id_ed25519.pub" || -f "${HOME}/.ssh/id_rsa.pub" ]]; then
+    info "SSH key pair exists"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "No SSH key pair found"
+  elif [[ "$auto_yes" == "1" ]] || confirm "No SSH key found. Generate one?"; then
+    mkdir -p "${HOME}/.ssh"
+    ssh-keygen -t ed25519 -f "${HOME}/.ssh/id_ed25519" -N "" -q
+    info "Generated SSH key: ~/.ssh/id_ed25519"
+  else
+    setup_skip "SSH key generation"
+  fi
+}
+
+ensure_local_tailscale() {
+  local auto_yes="$1" check_only="$2"
+  if local_tailscale status >/dev/null 2>&1; then
+    info "Tailscale: installed and connected (this machine)"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Tailscale not installed/connected (this machine)"
+  elif [[ "$SPARK_OS" == "Darwin" ]]; then
+    setup_manual_step "Install Tailscale from the Mac App Store or https://tailscale.com/download" "tailscale-installed"
+    local_tailscale status >/dev/null 2>&1 || setup_manual_step "Connect Tailscale: open the app and sign in" "tailscale-connected"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Install Tailscale?"; then
+    curl -fsSL https://tailscale.com/install.sh | sh && info "Installed Tailscale" || setup_fail "Tailscale install failed"
+    local_tailscale status >/dev/null 2>&1 || setup_manual_step "Connect: sudo tailscale up" "tailscale-connected"
+  else
+    setup_skip "Tailscale (this machine)"
+  fi
+}
+
+# Copy this CLI to the remote so `spark` is available there too.
+deploy_spark_binary() {
+  local self
+  self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
+  remote 'mkdir -p ~/.local/bin'
+  remote 'cat > ~/.local/bin/spark && chmod +x ~/.local/bin/spark' < "$self"
+  remote 'grep -q "local/bin" ~/.bashrc 2>/dev/null' || remote 'echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.bashrc'
+  info "Installed spark CLI to ~/.local/bin/spark (remote)"
+}
+
+# --- Remote-only secure phase ---
+
+step_copy_pubkey() {
+  local check_only="$2" pub=""
+  if [[ "$check_only" == "1" ]]; then
+    remote 'test -s ~/.ssh/authorized_keys' 2>/dev/null && info "SSH authorized_keys present on remote" || setup_fail "No SSH authorized_keys on remote"
+    return 0
+  fi
+  if [[ -f "${HOME}/.ssh/id_ed25519.pub" ]]; then
+    pub=$(cat "${HOME}/.ssh/id_ed25519.pub")
+  elif [[ -f "${HOME}/.ssh/id_rsa.pub" ]]; then
+    pub=$(cat "${HOME}/.ssh/id_rsa.pub")
+  fi
+  if [[ -n "$pub" ]]; then
+    remote 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
+    printf '%s\n' "$pub" | remote 'cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+    info "Copied SSH public key to remote"
+  else
+    setup_skip "SSH key copy (no local key found)"
+  fi
+}
+
+step_disable_password_ssh() {
+  local auto_yes="$1" check_only="$2"
+  if remote "grep -q '^PasswordAuthentication no' /etc/ssh/sshd_config" 2>/dev/null; then
+    info "Password SSH login disabled"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "Password SSH login not disabled"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Disable password SSH login on the remote (key-only auth)?"; then
+    ctx_sudo "sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config"
+    ctx_sudo 'systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true'
+    info "Disabled password SSH login"
+  else
+    setup_skip "Disable password SSH"
+  fi
+}
+
+# Host mode never disables password auth automatically (you could lock yourself out if your
+# key isn't installed). Warn and let the user decide.
+setup_local_secure_warn() {
+  [[ "$TGT_OS" == "Linux" ]] || return 0
+  if grep -q '^PasswordAuthentication no' /etc/ssh/sshd_config 2>/dev/null; then
+    info "Password SSH login already disabled"
+  else
+    warn "Password SSH auth is still enabled on this machine."
+    printf "    ${DIM}spark won't disable it automatically in host mode — you could lock yourself out\n"
+    printf "    if your key isn't installed. To harden manually once key auth works:\n"
+    printf "    sudo sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && sudo systemctl reload ssh${NC}\n"
+  fi
+}
+
+# --- SSH bootstrap (first login to a brand-new server) ---
+
+# Use sshpass for the very first connection when the user has no key yet, then switch to the
+# key after it's installed. Falls back to interactive SSH if sshpass isn't available.
+ensure_sshpass() {
+  command -v sshpass >/dev/null 2>&1 && return 0
+  if [[ "$SPARK_OS" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+    warn "sshpass isn't installed (needed for password bootstrap)."
+    if confirm "Install sshpass via Homebrew (tap hudochenkov/sshpass)?"; then
+      brew install hudochenkov/sshpass/sshpass >/dev/null 2>&1 && command -v sshpass >/dev/null 2>&1 && return 0
+    fi
+  fi
+  warn "Proceeding without sshpass — SSH will prompt for the password interactively."
+  return 1
+}
+
+open_remote_bootstrap() {
+  local want_pw="$1" pw=""
+  REMOTE_CONTROL="/tmp/spark-setup-${REMOTE_USER}@${REMOTE_HOST}"
+  if [[ "$want_pw" == "1" ]]; then
+    printf "  Enter the SSH password for %s@%s: " "$REMOTE_USER" "$REMOTE_HOST"
+    read -rs pw; printf "\n"
+    if [[ -n "$pw" ]] && ensure_sshpass; then
+      SETUP_USED_SSHPASS=1
+      printf "  Connecting to %s@%s...\n" "$REMOTE_USER" "$REMOTE_HOST"
+      SSHPASS="$pw" sshpass -e ssh \
+        -o ControlMaster=yes -o ControlPath="$REMOTE_CONTROL" \
+        -o ControlPersist=600 -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=accept-new \
+        -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+        -fN "${REMOTE_USER}@${REMOTE_HOST}" || { pw=""; return 1; }
+      pw=""
+      info "Connected to ${REMOTE_HOST} (password bootstrap)"
+      return 0
+    fi
+    pw=""
+  fi
+  open_remote "$REMOTE_USER" "$REMOTE_HOST"
+}
+
+# After the key is installed, drop sshpass and reconnect by key. Proving the key works BEFORE
+# disabling password auth guarantees we never lock the user out.
+reopen_remote_keybased() {
+  [[ "$SETUP_USED_SSHPASS" == "1" ]] || return 0
+  close_remote
+  if open_remote "$REMOTE_USER" "$REMOTE_HOST"; then
+    SETUP_USED_SSHPASS=0
+    info "Switched to key-based SSH"
+    return 0
+  fi
+  die "Key-based reconnect failed — leaving password auth ON for safety" \
+      "Your key may not have installed correctly; fix it before disabling password auth"
+}
+
+# --- Orchestrators ---
+
+setup_local() {
+  local auto_yes="$1" check_only="$2"
+  SETUP_TARGET="local"
+  detect_target_platform
+
+  printf "\n  ${BOLD}spark setup${NC} — set up this machine as a model server\n\n"
+  info "Detected: ${TGT_OS}/${TGT_ARCH} · accelerator ${TGT_ACCEL} · backend ${TGT_BACKEND}"
   printf "\n"
 
-  if [[ "$BACKEND" == "ollama" ]]; then
-    host_setup_ollama "$auto_yes" "$check_only"
-  else
-    host_setup_vllm "$auto_yes" "$check_only"
-  fi
-  host_setup_gateway "$check_only"
-  [[ "$SPARK_OS" == "Linux" ]] && host_setup_hardening "$auto_yes" "$check_only"
+  run_install_set "$auto_yes" "$check_only"
 
   if [[ "$check_only" != "1" ]]; then
-    if command -v tailscale >/dev/null 2>&1 && local_tailscale status >/dev/null 2>&1; then
-      info "Tailscale: connected (remote access ready)"
-    elif [[ "$auto_yes" == "1" ]] || confirm "Set up Tailscale for secure remote access?"; then
-      host_setup_tailscale
-    fi
+    step_tailscale "$auto_yes" "$check_only"
+    setup_local_secure_warn
     printf "\n  ${DIM}Running doctor...${NC}\n"
     cmd_doctor || true
   fi
+}
 
+setup_remote() {
+  local auto_yes="$1" check_only="$2" spec want_pw=0
+  SETUP_TARGET="remote"
+
+  printf "\n  ${BOLD}spark setup${NC} — configure a remote machine over SSH\n\n"
+  printf "  ${BLUE}${BOLD}Phase 0: Connect${NC}\n\n"
+  printf "  Enter the target as ${BOLD}user@host${NC} (e.g. me@10.0.0.5): "
+  read -r spec || true
+  [[ -z "$spec" ]] && die "A target user@host is required"
+  [[ "$spec" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9._:-]+$ ]] || die "Invalid target: $spec" "Use the form user@host"
+  REMOTE_USER="${spec%@*}"
+  REMOTE_HOST="${spec#*@}"
+
+  if confirm "Do you already have public-key SSH access to ${REMOTE_HOST}?"; then
+    want_pw=0
+  else
+    want_pw=1
+  fi
+
+  trap close_remote EXIT
+  open_remote_bootstrap "$want_pw" || die "Could not connect to ${spec}" "Check the address, SSH access, and password"
+  detect_target_platform
+  info "Remote: ${TGT_OS}/${TGT_ARCH} · backend ${TGT_BACKEND}"
+  printf "\n"
+
+  printf "  ${BLUE}${BOLD}Phase 1: Client${NC}\n"
+  printf "  ${DIM}Prepares this machine to talk to the remote over a private network.${NC}\n\n"
+  ensure_local_tailscale "$auto_yes" "$check_only"
+  ensure_local_ssh_key "$auto_yes" "$check_only"
+  [[ "$check_only" != "1" ]] && deploy_spark_binary
+  printf "\n"
+
+  printf "  ${BLUE}${BOLD}Phase 2: Remote install${NC}\n"
+  printf "  ${DIM}Installs the same model-serving stack used in host mode.${NC}\n\n"
+  step_snap_cleanup "$auto_yes" "$check_only"
+  run_install_set "$auto_yes" "$check_only"
+  step_tailscale "$auto_yes" "$check_only"
+  printf "\n"
+
+  printf "  ${BLUE}${BOLD}Phase 3: Secure connection${NC}\n"
+  printf "  ${DIM}Installs your key, then locks SSH to key-only auth.${NC}\n\n"
+  step_copy_pubkey "$auto_yes" "$check_only"
+  if [[ "$check_only" != "1" ]]; then
+    reopen_remote_keybased
+    step_disable_password_ssh "$auto_yes" "$check_only"
+    [[ "$SPARK_OS" == "Darwin" ]] && setup_manual_step "Install NVIDIA Sync from nvidia.com/sync (optional file sync)" ""
+  else
+    step_disable_password_ssh "$auto_yes" "$check_only"
+  fi
+
+  close_remote
+  trap - EXIT
+}
+
+run_setup_wizard() {
+  local auto_yes="$1" check_only="$2" pick=""
+  printf "\n  ${BOLD}spark setup${NC} — what do you want to set up?\n\n"
+  printf "    ${BOLD}[1]${NC} This machine\n"
+  printf "    ${BOLD}[2]${NC} Another machine over SSH\n\n"
+  printf "  > "
+  read -r pick || true
+  case "$pick" in
+    1) setup_local "$auto_yes" "$check_only" ;;
+    2) setup_remote "$auto_yes" "$check_only" ;;
+    "")
+      # No input (e.g. `spark setup --check </dev/null` in CI) → check THIS machine.
+      if [[ "$check_only" == "1" ]]; then
+        setup_local "$auto_yes" "$check_only"
+      else
+        die "Enter 1 (this machine) or 2 (another machine)"
+      fi
+      ;;
+    *) die "Enter 1 (this machine) or 2 (another machine)" ;;
+  esac
+}
+
+setup_summary() {
   printf "\n"
   if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
-    printf "  ${RED}${BOLD}Host setup incomplete:${NC} %d issue(s)\n" "${#SETUP_FAILED[@]}"
+    printf "  ${RED}${BOLD}Setup incomplete:${NC} %d issue(s)\n" "${#SETUP_FAILED[@]}"
     for step in "${SETUP_FAILED[@]}"; do printf "    ${RED}✗${NC} %s\n" "$step"; done
-    printf "\n  Fix them and re-run: ${BOLD}spark host${NC}\n\n"
+    printf "\n  Fix them and re-run: ${BOLD}spark setup${NC}\n\n"
     return 1
   elif [[ ${#SETUP_SKIPPED[@]} -gt 0 ]]; then
     printf "  ${YELLOW}${BOLD}Skipped steps:${NC}\n"
     for step in "${SETUP_SKIPPED[@]}"; do printf "    ${YELLOW}⊘${NC} %s\n" "$step"; done
-    printf "\n  Re-run ${BOLD}spark host${NC} to complete them later.\n\n"
+    printf "\n  Re-run ${BOLD}spark setup${NC} to complete them later.\n\n"
+  elif [[ "$SETUP_TARGET" == "remote" ]]; then
+    printf "  ${GREEN}${BOLD}Setup complete!${NC}\n"
+    printf "  Connect: ${BOLD}ssh %s@%s${NC}\n" "$REMOTE_USER" "$REMOTE_HOST"
+    printf "  Then:    ${BOLD}spark run <model>${NC}\n\n"
   else
-    printf "  ${GREEN}${BOLD}This machine is ready to serve models!${NC}\n"
+    printf "  ${GREEN}${BOLD}Setup complete!${NC} This machine is ready to serve models.\n"
     printf "  Start one:  ${BOLD}spark run <model>${NC}\n"
     printf "  Gateway:    ${BOLD}http://localhost:%s/v1${NC}\n\n" "$GATEWAY_PORT"
   fi
@@ -2014,509 +2503,20 @@ cmd_host() {
 
 cmd_setup() {
   local auto_yes=0 check_only=0
-
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --yes)    auto_yes=1; shift ;;
-      --check)  check_only=1; shift ;;
-      *)        die "Unknown flag: $1" ;;
+      --yes)     auto_yes=1; shift ;;
+      --check)   check_only=1; shift ;;
+      -h|--help) cmd_help; return 0 ;;
+      *)         die "Unknown flag: $1" "Usage: spark setup [--check] [--yes]" ;;
     esac
   done
 
   SETUP_SKIPPED=()
   SETUP_FAILED=()
 
-  run_setup "$auto_yes" "$check_only"
-
-  # Summary
-  printf "\n"
-  if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
-    printf "  ${RED}${BOLD}Setup incomplete:${NC} %d issue(s) found\n" "${#SETUP_FAILED[@]}"
-    for step in "${SETUP_FAILED[@]}"; do
-      printf "    ${RED}✗${NC} %s\n" "$step"
-    done
-    printf "\n  Re-run with: ${BOLD}spark setup${NC} after fixing them.\n"
-    return 1
-  elif [[ ${#SETUP_SKIPPED[@]} -gt 0 ]]; then
-    printf "  ${YELLOW}${BOLD}Skipped steps:${NC}\n"
-    for step in "${SETUP_SKIPPED[@]}"; do
-      printf "    ${YELLOW}⊘${NC} %s\n" "$step"
-    done
-    printf "\n  Re-run with: ${BOLD}spark setup${NC} to complete them later.\n"
-  else
-    printf "  ${GREEN}${BOLD}Setup complete!${NC}\n"
-    printf "  Connect: ${BOLD}ssh %s@%s${NC}\n" "$REMOTE_USER" "$REMOTE_HOST"
-    printf "  Then:    ${BOLD}spark pull <model>${NC} and ${BOLD}spark run <model>${NC}\n"
-  fi
-  printf "\n"
-}
-
-run_setup() {
-  local auto_yes="$1" check_only="$2"
-
-  printf "\n  ${BOLD}spark setup${NC} — System configuration wizard\n\n"
-
-  trap close_remote EXIT
-
-  # --- Phase 0: Connect to DGX ---
-  printf "  ${BLUE}${BOLD}Phase 0: Connect to DGX Spark${NC}\n\n"
-
-  printf "  Before continuing, enable SSH on your DGX Spark:\n"
-  printf "    ${DIM}1. On the DGX Spark desktop, open Settings → System → Secure Shell${NC}\n"
-  printf "    ${DIM}2. Toggle SSH to ON${NC}\n"
-  printf "    ${DIM}3. Note the IP address shown on the network settings${NC}\n\n"
-
-  if [[ "$check_only" == "1" ]]; then
-    printf "  Enter DGX Spark IP/hostname (or 's' to skip remote checks): "
-  else
-    printf "  Enter DGX Spark IP or hostname: "
-  fi
-  read -r dgx_host || true
-  local has_remote=0
-  if [[ -z "$dgx_host" || "$dgx_host" == "s" ]]; then
-    if [[ "$check_only" == "1" ]]; then
-      warn "Skipping remote checks — only checking local setup"
-    else
-      die "DGX Spark address is required for setup"
-    fi
-  else
-    printf "  Enter username on the DGX Spark: "
-    read -r dgx_user || true
-    [[ -z "$dgx_user" ]] && die "Username is required"
-
-    if ! open_remote "$dgx_user" "$dgx_host"; then
-      die "Could not connect to ${dgx_user}@${dgx_host}" \
-        "Make sure SSH is enabled and the IP/credentials are correct"
-    fi
-    has_remote=1
-  fi
-
-  printf "\n"
-
-  # --- Phase 1: Client (local) ---
-  printf "  ${BLUE}${BOLD}Phase 1: Client Setup${NC}\n"
-  printf "  ${DIM}Prepares your laptop to talk to the DGX over a private network.${NC}\n\n"
-
-  # Tailscale local
-  printf "  ${DIM}Tailscale creates a private VPN so you can reach the DGX from anywhere.${NC}\n"
-  if local_tailscale status >/dev/null 2>&1; then
-    info "Tailscale installed and connected"
-  elif [[ "$check_only" != "1" ]]; then
-    local os_type
-    os_type=$(uname -s)
-    if [[ "$os_type" == "Darwin" ]]; then
-      setup_manual_step "Install Tailscale from the Mac App Store or https://tailscale.com/download" \
-        "tailscale-installed"
-    else
-      if [[ "$auto_yes" == "1" ]] || confirm "Install Tailscale?"; then
-        curl -fsSL https://tailscale.com/install.sh | sh
-        info "Installed Tailscale"
-      else
-        setup_skip "Tailscale (local)"
-        warn "Skipped Tailscale"
-      fi
-    fi
-    if ! local_tailscale status >/dev/null 2>&1; then
-      setup_manual_step "Connect Tailscale: run 'sudo tailscale up' (or open the app on macOS)" \
-        "tailscale-connected"
-    fi
-  else
-    setup_fail "Tailscale not installed/connected (local)"
-  fi
-
-  # SSH key local
-  printf "  ${DIM}SSH keys let you connect to the DGX without typing a password each time.${NC}\n"
-  if [[ -f "${HOME}/.ssh/id_ed25519.pub" ]] || [[ -f "${HOME}/.ssh/id_rsa.pub" ]]; then
-    info "SSH key pair exists"
-  elif [[ "$check_only" != "1" ]]; then
-    if [[ "$auto_yes" == "1" ]] || confirm "No SSH key found. Generate one?"; then
-      mkdir -p "${HOME}/.ssh"
-      ssh-keygen -t ed25519 -f "${HOME}/.ssh/id_ed25519" -N "" -q
-      info "Generated SSH key: ~/.ssh/id_ed25519"
-    else
-      setup_skip "SSH key generation"
-      warn "Skipped SSH key generation"
-    fi
-  else
-    setup_fail "No SSH key pair found"
-  fi
-
-  printf "\n"
-
-  if [[ "$has_remote" != "1" ]]; then
-    close_remote
-    trap - EXIT
-    return
-  fi
-
-  # --- Phase 2: DGX remote ---
-  printf "  ${BLUE}${BOLD}Phase 2: DGX Spark Setup (remote)${NC}\n"
-  printf "  ${DIM}Installs tools and containers on the DGX needed to serve models.${NC}\n\n"
-
-  # GPU
-  local gpu_info
-  if gpu_info=$(remote nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null); then
-    info "GPU: ${gpu_info}"
-  elif [[ "$check_only" == "1" ]]; then
-    setup_fail "No NVIDIA GPU detected on DGX"
-  else
-    die "No NVIDIA GPU detected on DGX Spark"
-  fi
-
-  # System updates
-  if [[ "$check_only" != "1" ]]; then
-    local upgradable
-    upgradable=$(remote "apt list --upgradable 2>/dev/null | grep -c upgradable" 2>/dev/null | tr -d '[:space:]' || echo "0")
-    [[ "$upgradable" =~ ^[0-9]+$ ]] || upgradable=0
-    if [[ "$upgradable" -gt 0 ]]; then
-      if [[ "$auto_yes" == "1" ]] || confirm "DGX has ${upgradable} upgradable packages. Update?"; then
-        remote_sudo "apt update && sudo apt full-upgrade -y"
-        info "System updated"
-      else
-        setup_skip "System updates"
-        warn "Skipped system updates"
-      fi
-    else
-      info "System is up to date"
-    fi
-  fi
-
-  # Remove snap firmware-updater
-  if remote "snap list 2>/dev/null | grep -q firmware-updater" 2>/dev/null; then
-    if [[ "$check_only" != "1" ]]; then
-      remote_sudo "snap remove firmware-updater"
-      info "Removed snap firmware-updater"
-    else
-      warn "firmware-updater snap should be removed"
-    fi
-  else
-    info "No firmware-updater snap"
-  fi
-
-  # spark CLI — canonical location is ~/.local/bin/spark
-  if [[ "$check_only" != "1" ]]; then
-    local self
-    self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
-    remote "mkdir -p ~/.local/bin"
-    remote "cat > ~/.local/bin/spark && chmod +x ~/.local/bin/spark" < "$self"
-    # Ensure ~/.local/bin is in PATH
-    if ! remote "grep -q 'local/bin' ~/.bashrc" 2>/dev/null; then
-      remote 'echo '\''export PATH="\$HOME/.local/bin:\$PATH"'\'' >> ~/.bashrc'
-    fi
-    # Remove stale copies that shadow ~/.local/bin/spark
-    for stale_path in "/usr/local/bin/spark" "\$HOME/spark"; do
-      remote "test -f $stale_path && rm -f $stale_path 2>/dev/null && echo 'removed $stale_path'" 2>/dev/null || true
-    done
-    info "Installed spark CLI to ~/.local/bin/spark"
-  elif remote "export PATH=\$HOME/.local/bin:\$PATH && command -v spark" >/dev/null 2>&1; then
-    info "spark CLI installed"
-  else
-    setup_fail "spark CLI not installed"
-  fi
-
-  # uv
-  if remote "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && command -v uv" >/dev/null 2>&1; then
-    info "uv already installed"
-  elif [[ "$check_only" != "1" ]]; then
-    remote "curl -LsSf https://astral.sh/uv/install.sh | sh"
-    info "Installed uv"
-  else
-    setup_fail "uv not installed"
-  fi
-
-  # nvitop
-  if remote "export PATH=\$HOME/.local/bin:\$PATH && command -v nvitop" >/dev/null 2>&1; then
-    info "nvitop already installed"
-  elif [[ "$check_only" != "1" ]]; then
-    remote "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv tool install nvitop"
-    info "Installed nvitop"
-  else
-    setup_fail "nvitop not installed"
-  fi
-
-  # jq
-  if remote command -v jq >/dev/null 2>&1; then
-    info "jq installed"
-  elif [[ "$check_only" != "1" ]]; then
-    remote_sudo "apt install -y jq"
-    info "Installed jq"
-  else
-    setup_fail "jq not installed"
-  fi
-
-  # Tailscale on DGX
-  printf "  ${DIM}Tailscale on the DGX lets you reach it from anywhere without port-forwarding.${NC}\n"
-  if remote "command -v tailscale && tailscale status" >/dev/null 2>&1; then
-    info "Tailscale installed and connected (DGX)"
-  elif [[ "$check_only" != "1" ]]; then
-    if [[ "$auto_yes" == "1" ]] || confirm "Install Tailscale on DGX?"; then
-      remote "curl -fsSL https://tailscale.com/install.sh | sh"
-      info "Installed Tailscale on DGX"
-      printf "    ${YELLOW}Run on the DGX: sudo tailscale up${NC}\n"
-      printf "    ${YELLOW}It will print a URL — open it in your browser to authenticate${NC}\n"
-      setup_manual_step "Tailscale: authenticate DGX via the URL printed above" \
-        "remote-tailscale-connected"
-    else
-      setup_skip "Tailscale (DGX)"
-      warn "Skipped Tailscale on DGX"
-    fi
-  else
-    setup_fail "Tailscale not installed/connected (DGX)"
-  fi
-
-  # Docker group
-  if remote "groups | grep -q docker" 2>/dev/null; then
-    info "User in docker group"
-  elif [[ "$check_only" != "1" ]]; then
-    remote_sudo "usermod -aG docker ${REMOTE_USER}"
-    warn "Added to docker group — some steps may need DGX re-login"
-  else
-    setup_fail "User not in docker group"
-  fi
-
-  # NGC login
-  printf "  ${DIM}NGC is NVIDIA's container registry — needed to pull the vLLM serving image.${NC}\n"
-  if remote "test -f ~/.docker/config.json && grep -q nvcr.io ~/.docker/config.json" 2>/dev/null; then
-    info "NGC Docker login configured"
-  elif [[ "$check_only" != "1" ]]; then
-    setup_manual_step "Create NGC account at ngc.nvidia.com" ""
-    setup_manual_step "Generate API key: ngc.nvidia.com → Settings → API Keys → Generate Personal Key" ""
-
-    printf "  Enter your NGC API key (or 's' to skip): "
-    read -rs ngc_key
-    printf "\n"
-    if [[ "$ngc_key" != "s" && -n "$ngc_key" ]]; then
-      printf "%s" "$ngc_key" | remote "docker login nvcr.io -u \\\$oauthtoken --password-stdin"
-      info "NGC Docker login successful"
-    else
-      setup_skip "NGC Docker login"
-      warn "Skipped NGC login"
-    fi
-  else
-    setup_fail "NGC not authenticated"
-  fi
-
-  # HF CLI
-  if remote "export PATH=\$HOME/.local/bin:\$PATH && command -v hf" >/dev/null 2>&1; then
-    info "HuggingFace CLI installed"
-  elif [[ "$check_only" != "1" ]]; then
-    remote "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv tool install 'huggingface-hub[cli]'"
-    info "Installed HuggingFace CLI"
-  else
-    setup_fail "HuggingFace CLI not installed"
-  fi
-
-  # vLLM container
-  printf "  ${DIM}vLLM is the inference engine that serves your models via an OpenAI-compatible API.${NC}\n"
-  local remote_ngc
-  remote_ngc=$(remote "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep 'nvcr.io/nvidia/vllm' | head -1" 2>/dev/null || true)
-  if [[ -n "$remote_ngc" ]]; then
-    info "NGC vLLM container: ${remote_ngc}"
-  elif [[ "$check_only" != "1" ]]; then
-    printf "  No vLLM container found. Enter NGC tag to pull (e.g., 26.04-py3): "
-    read -r ngc_tag
-    if [[ -n "$ngc_tag" ]]; then
-      is_safe_ngc_tag "$ngc_tag" || die "Invalid NGC tag: $ngc_tag"
-      local pull_image="nvcr.io/nvidia/vllm:${ngc_tag}"
-      printf "  Pulling %s on DGX (this may take a while)...\n" "$pull_image"
-      remote "docker pull ${pull_image}"
-      info "Pulled ${pull_image}"
-    else
-      setup_skip "NGC vLLM container"
-      warn "Skipped vLLM container pull"
-    fi
-  else
-    setup_fail "NGC vLLM container not pulled"
-  fi
-
-  # LiteLLM gateway (optional)
-  printf "  ${DIM}LiteLLM is an API gateway that unifies local models (vLLM) and cloud providers${NC}\n"
-  printf "  ${DIM}(OpenRouter, Together, etc.) under a single endpoint. Your agents talk to LiteLLM${NC}\n"
-  printf "  ${DIM}without knowing if the model is local or cloud.${NC}\n"
-  if [[ "$check_only" != "1" ]]; then
-    printf "\n"
-    if [[ "$auto_yes" == "1" ]] || confirm "Install LiteLLM gateway? (unified API for local + cloud models)"; then
-      # Pull LiteLLM image
-      local litellm_exists
-      litellm_exists=$(remote "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -c 'ghcr.io/berriai/litellm' || true" 2>/dev/null | tr -d '[:space:]')
-      if [[ "${litellm_exists:-0}" -gt 0 ]]; then
-        info "LiteLLM image already pulled"
-      else
-        printf "  Pulling LiteLLM image on DGX...\n"
-        remote "docker pull ${LITELLM_IMAGE}"
-        info "Pulled ${LITELLM_IMAGE}"
-      fi
-
-      # Provider selection
-      printf "\n  ${BOLD}Select providers to enable:${NC}\n\n"
-      local gw_vllm=1 gw_openrouter=0 gw_ollama=0 gw_zen=0 gw_together=0
-
-      printf "  ${GREEN}✓${NC} vLLM (local, auto-configured from spark)\n"
-
-      if confirm "  Enable OpenRouter? (cloud, requires API key)"; then
-        gw_openrouter=1
-      fi
-      if confirm "  Enable Ollama? (local, requires ollama running on DGX)"; then
-        gw_ollama=1
-      fi
-      if confirm "  Enable Zen / OpenCode? (cloud, requires API key)"; then
-        gw_zen=1
-      fi
-      if confirm "  Enable Together AI? (cloud, requires API key)"; then
-        gw_together=1
-      fi
-
-      # Collect API keys
-      local openrouter_key="" zen_key="" together_key=""
-      if [[ "$gw_openrouter" == "1" ]]; then
-        printf "  Enter OpenRouter API key (or 's' to skip): "
-        read -rs openrouter_key; printf "\n"
-        if [[ "$openrouter_key" == "s" ]]; then openrouter_key=""; gw_openrouter=0; warn "Skipped OpenRouter"; fi
-      fi
-      if [[ "$gw_zen" == "1" ]]; then
-        printf "  Enter Zen (OpenCode) API key (or 's' to skip): "
-        read -rs zen_key; printf "\n"
-        if [[ "$zen_key" == "s" ]]; then zen_key=""; gw_zen=0; warn "Skipped Zen"; fi
-      fi
-      if [[ "$gw_together" == "1" ]]; then
-        printf "  Enter Together AI API key (or 's' to skip): "
-        read -rs together_key; printf "\n"
-        if [[ "$together_key" == "s" ]]; then together_key=""; gw_together=0; warn "Skipped Together AI"; fi
-      fi
-
-      # Build gateway.json
-      local gw_json
-      gw_json=$(jq -n \
-        --argjson enabled true \
-        --argjson port "$GATEWAY_PORT" \
-        --argjson vllm_enabled "$( [[ "$gw_vllm" == "1" ]] && echo true || echo false )" \
-        --argjson openrouter_enabled "$( [[ "$gw_openrouter" == "1" ]] && echo true || echo false )" \
-        --arg openrouter_key "$openrouter_key" \
-        --argjson ollama_enabled "$( [[ "$gw_ollama" == "1" ]] && echo true || echo false )" \
-        --argjson zen_enabled "$( [[ "$gw_zen" == "1" ]] && echo true || echo false )" \
-        --arg zen_key "$zen_key" \
-        --argjson together_enabled "$( [[ "$gw_together" == "1" ]] && echo true || echo false )" \
-        --arg together_key "$together_key" \
-        '{
-          enabled: $enabled,
-          port: $port,
-          providers: {
-            vllm: { enabled: $vllm_enabled, port: 8000 },
-            openrouter: { enabled: $openrouter_enabled, api_key: $openrouter_key },
-            ollama: { enabled: $ollama_enabled },
-            zen: { enabled: $zen_enabled, api_key: $zen_key },
-            together: { enabled: $together_enabled, api_key: $together_key }
-          }
-        }')
-
-      # Save config on DGX
-      remote "mkdir -p ~/.config/spark"
-      printf '%s\n' "$gw_json" | remote "cat > ~/.config/spark/gateway.json"
-      info "Gateway config saved"
-
-      # Generate litellm_config.yaml on DGX
-      gateway_save_config "$gw_json"
-      local litellm_yaml
-      litellm_yaml=$(gateway_generate_litellm_yaml)
-      if [[ -n "$litellm_yaml" ]]; then
-        printf '%s\n' "$litellm_yaml" | remote "cat > ~/.config/spark/litellm_config.yaml"
-        info "LiteLLM config generated"
-      fi
-
-      # Start gateway
-      local gw_env_args=()
-      [[ -n "$openrouter_key" ]] && gw_env_args+=("-e" "OPENROUTER_API_KEY=${openrouter_key}")
-      [[ -n "$zen_key" ]] && gw_env_args+=("-e" "ZEN_API_KEY=${zen_key}")
-      [[ -n "$together_key" ]] && gw_env_args+=("-e" "TOGETHER_API_KEY=${together_key}")
-
-      remote "docker rm -f ${GATEWAY_CONTAINER} 2>/dev/null || true"
-      # Build docker run command remotely
-      local env_flags=""
-      [[ -n "$openrouter_key" ]] && env_flags+=" -e OPENROUTER_API_KEY='${openrouter_key}'"
-      [[ -n "$zen_key" ]] && env_flags+=" -e ZEN_API_KEY='${zen_key}'"
-      [[ -n "$together_key" ]] && env_flags+=" -e TOGETHER_API_KEY='${together_key}'"
-
-      remote "docker run -d --network host \
-        -v ~/.config/spark/litellm_config.yaml:/app/config.yaml \
-        ${env_flags} \
-        --name ${GATEWAY_CONTAINER} \
-        --restart unless-stopped \
-        ${LITELLM_IMAGE} \
-        --config /app/config.yaml --port ${GATEWAY_PORT}"
-
-      info "LiteLLM gateway started on port ${GATEWAY_PORT}"
-      printf "    Test: ${DIM}curl localhost:${GATEWAY_PORT}/v1/models${NC}\n"
-    else
-      setup_skip "LiteLLM gateway"
-      warn "Skipped LiteLLM gateway"
-    fi
-  elif remote "docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^${GATEWAY_CONTAINER}$'" 2>/dev/null; then
-    info "LiteLLM gateway running"
-  else
-    local gw_config_exists
-    gw_config_exists=$(remote "test -f ~/.config/spark/gateway.json && echo yes" 2>/dev/null || echo "no")
-    if [[ "$gw_config_exists" == "yes" ]]; then
-      warn "LiteLLM gateway configured but not running"
-    fi
-  fi
-
-  printf "\n"
-
-  # --- Phase 3: Link both machines ---
-  printf "  ${BLUE}${BOLD}Phase 3: Secure Connection${NC}\n"
-  printf "  ${DIM}Locks down SSH so only your laptop can connect to the DGX.${NC}\n\n"
-
-  # ssh-copy-id
-  local has_remote_key
-  has_remote_key=$(remote "test -s ~/.ssh/authorized_keys && echo yes" 2>/dev/null || echo "no")
-
-  if [[ "$has_remote_key" == "yes" ]]; then
-    info "SSH authorized_keys present on DGX"
-  elif [[ "$check_only" != "1" ]]; then
-    local pub_key=""
-    if [[ -f "${HOME}/.ssh/id_ed25519.pub" ]]; then
-      pub_key=$(cat "${HOME}/.ssh/id_ed25519.pub")
-    elif [[ -f "${HOME}/.ssh/id_rsa.pub" ]]; then
-      pub_key=$(cat "${HOME}/.ssh/id_rsa.pub")
-    fi
-
-    if [[ -n "$pub_key" ]]; then
-      remote "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-      printf "%s\n" "$pub_key" | remote "cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-      info "Copied SSH public key to DGX"
-    else
-      setup_skip "SSH key copy (no local key found)"
-      warn "No SSH public key to copy"
-    fi
-  else
-    setup_fail "No SSH authorized_keys on DGX"
-  fi
-
-  # Disable password SSH
-  printf "  ${DIM}Disabling password login forces key-only auth — prevents brute-force attacks.${NC}\n"
-  if remote "grep -q '^PasswordAuthentication no' /etc/ssh/sshd_config" 2>/dev/null; then
-    info "Password SSH login disabled"
-  elif [[ "$check_only" == "1" ]]; then
-    setup_fail "Password SSH login not disabled"
-  elif [[ "$check_only" != "1" ]]; then
-    if [[ "$auto_yes" == "1" ]] || confirm "Disable password SSH login on DGX?"; then
-      remote_sudo "sed -i 's/.*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config"
-      remote_sudo "systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true"
-      info "Disabled password SSH login"
-    else
-      setup_skip "Disable password SSH"
-      warn "Skipped disabling password SSH"
-    fi
-  fi
-
-  # NVIDIA Sync (macOS)
-  if [[ "$(uname -s)" == "Darwin" && "$check_only" != "1" ]]; then
-    printf "  ${DIM}NVIDIA Sync keeps files in sync between your Mac and the DGX (like Dropbox for DGX).${NC}\n"
-    setup_manual_step "Install NVIDIA Sync from nvidia.com/sync (optional, for file sync)" ""
-  fi
-
-  close_remote
-  trap - EXIT
+  run_setup_wizard "$auto_yes" "$check_only"
+  setup_summary
 }
 
 manual_check_passed() {
@@ -2661,8 +2661,7 @@ cmd_help() {
     spark <command> [options]
 
   ${BOLD}Commands:${NC}
-    host             Set up THIS machine as a model server (macOS or Linux)
-    setup            Configure a remote DGX Spark from your laptop via SSH
+    setup            Set up a model server — this machine or a remote one over SSH
     doctor           Check all prerequisites (read-only)
     run <model>      Start serving a model (can run several at once)
     stop [<model>]   Stop a model (no arg: the only one; --all: every one)
@@ -2690,8 +2689,8 @@ cmd_help() {
     --regen-profile        Regenerate model profile
 
   ${BOLD}Examples:${NC}
-    spark host                                             # set up this machine
-    spark host --check                                     # just report what's missing
+    spark setup                                            # interactive: this machine or a remote one
+    spark setup --check                                    # just report what's missing
     spark pull RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4   # second model, co-resident
@@ -3218,7 +3217,6 @@ case "${1:-}" in
   status)  cmd_status ;;
   logs)    shift; cmd_logs "$@" ;;
   doctor)  cmd_doctor ;;
-  host)    shift; cmd_host "$@" ;;
   setup)   shift; cmd_setup "$@" ;;
   update)  cmd_update ;;
   gateway) shift; cmd_gateway "$@" ;;

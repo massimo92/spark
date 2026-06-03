@@ -9,8 +9,7 @@ flowchart LR
     load["at load: detect_platform\nSPARK_OS · SPARK_ARCH · ACCEL · BACKEND"] --> start
     start["spark &lt;cmd&gt;"] --> dispatch{command}
     dispatch -->|run| run["cmd_run\n→ run_backend_vllm | run_backend_ollama"]
-    dispatch -->|host| host["cmd_host\nset up THIS machine"]
-    dispatch -->|setup| setup["cmd_setup\nremote DGX over SSH"]
+    dispatch -->|setup| setup["cmd_setup\nwizard: this machine | remote over SSH"]
     dispatch -->|stop| stop["cmd_stop"]
     dispatch -->|pull| pull["cmd_pull"]
     dispatch -->|list| list["cmd_list"]
@@ -77,93 +76,54 @@ flowchart TD
     tail -->|no| done["done"]
 ```
 
-## spark setup (wizard)
+## spark setup (one wizard, one install set)
+
+`spark setup` asks **where** to install, then runs a single shared install set (`run_install_set`)
+against the chosen target via the `ctx_*` layer — so a server gets the **same software** whether
+configured locally or over SSH. `--check` reports without changing anything; `--yes` auto-confirms.
 
 ```mermaid
 flowchart TD
-    entry["cmd_setup :695\nparse --yes, --check"] --> run_setup
+    entry["cmd_setup\nparse --check / --yes"] --> wiz["run_setup_wizard"]
+    wiz --> q1{"[1] this machine\n[2] another over SSH"}
 
-    run_setup["run_setup :735"] --> phase0
+    q1 -->|1 / empty+--check| local["setup_local\nSETUP_TARGET=local\ndetect_target_platform"]
+    q1 -->|2| ask["setup_remote: ask user@host"]
 
-    phase0["Phase 0: Connect\nask DGX IP + username"] --> input{"IP provided?"}
+    ask --> q2{"already have\npublic-key access?"}
+    q2 -->|yes| openk["open_remote (key)"]
+    q2 -->|no| boot["open_remote_bootstrap\nread -rs password → sshpass\n(fallback: interactive)"]
+    openk --> det
+    boot --> det["detect_target_platform\n(probe OS/accel over SSH)"]
 
-    input -->|empty + --check| local_only["skip remote\nhas_remote=0"]
-    input -->|empty, no --check| die["die: address required"]
-    input -->|provided| ssh["open_remote :124\nSSH ControlMaster\nControlPersist=600"]
+    det --> p1["Phase 1 (client):\nensure_local_tailscale · ensure_local_ssh_key\ndeploy_spark_binary"]
+    p1 --> shared
 
-    ssh --> ssh_ok{"connected?"}
-    ssh_ok -->|no| die2["die: cannot connect"]
-    ssh_ok -->|yes| phase1
+    local --> shared
 
-    local_only --> phase1
+    subgraph shared ["run_install_set — identical for local & remote (gated on TGT_OS/TGT_BACKEND)"]
+        s_apt["apt upgrade (Linux)"] --> s_fork{"backend?"}
+        s_fork -->|vllm| s_v["gpu · docker · docker group\nNVIDIA Container Toolkit · NGC login\nvLLM image · uv · HF CLI · nvitop"]
+        s_fork -->|ollama| s_o["install Ollama · :11434 service"]
+        s_v --> s_jq
+        s_o --> s_jq
+        s_jq["jq (Linux)"] --> s_gw["gateway: pull LiteLLM\nproviders + start"]
+        s_gw --> s_hard["earlyoom + sshd MemoryMin\n(Linux + systemd)"]
+    end
 
-    phase1["Phase 1: Client Setup :774"]
-    phase1 --> ts_local{"Tailscale\nlocal?"}
-    ts_local -->|installed| ts_ok["OK"]
-    ts_local -->|missing + not check| ts_install["macOS: manual step\nLinux: curl install.sh"]
-    ts_local -->|missing + check| ts_fail["setup_fail"]
+    shared --> branch{"target?"}
+    branch -->|local| lsec["step_tailscale\nsetup_local_secure_warn (warn only)\ncmd_doctor"]
+    branch -->|remote| rsec["Phase 3 (secure):\nstep_copy_pubkey →\nreopen_remote_keybased (prove key) →\ndisable password SSH → NVIDIA Sync (macOS)"]
 
-    ts_ok --> sshkey
-    ts_install --> sshkey
-    ts_fail --> sshkey
-
-    sshkey{"SSH key\nexists?"}
-    sshkey -->|yes| key_ok["OK"]
-    sshkey -->|no + not check| keygen["ssh-keygen ed25519"]
-    sshkey -->|no + check| key_fail["setup_fail"]
-
-    key_ok --> has_r
-    keygen --> has_r
-    key_fail --> has_r
-
-    has_r{"has_remote?"}
-    has_r -->|no| summ
-    has_r -->|yes| phase2
-
-    phase2["Phase 2: DGX Remote :823"]
-    phase2 --> gpu["remote nvidia-smi"]
-    gpu --> apt["remote apt upgrade"]
-    apt --> snap["remove firmware-updater"]
-    snap --> uv["remote install uv"]
-    uv --> nvitop["remote install nvitop"]
-    nvitop --> jq["remote install jq"]
-    jq --> ts_dgx["remote Tailscale\n+ manual_step auth"]
-    ts_dgx --> docker["remote docker group"]
-    docker --> ngc_login["NGC API key\nremote docker login"]
-    ngc_login --> hf["remote HF CLI"]
-    hf --> vllm["remote docker pull\nvLLM container"]
-
-    vllm --> phase3["Phase 3: Secure Connection :983"]
-    phase3 --> copykey["copy local pubkey\n→ remote authorized_keys"]
-    copykey --> disable_pw["disable password SSH\nsed sshd_config + restart sshd"]
-    disable_pw --> sync["NVIDIA Sync\n(macOS only)"]
-    sync --> close["close_remote"]
-
-    close --> summ
-
-    summ{"failures?"}
-    summ -->|yes| incomplete["Setup incomplete:\nN issues found"]
-    summ -->|no + skips| skipped["Skipped steps:\nlist"]
-    summ -->|all green| complete["Setup complete!\nssh user@host"]
+    lsec --> summ
+    rsec --> summ
+    summ["setup_summary:\ncomplete / skipped / incomplete"]
 ```
 
-## spark host (set up THIS machine)
-
-```mermaid
-flowchart TD
-    h0["cmd_host\nparse --yes / --check"] --> hann["announce SPARK_OS/ARCH · ACCEL · BACKEND"]
-    hann --> hfork{"BACKEND?"}
-    hfork -->|vllm| hv["host_setup_vllm\nGPU · Docker · docker group\nNVIDIA Container Toolkit · NGC login\nvLLM image · HF CLI"]
-    hfork -->|ollama| ho["host_setup_ollama\ninstall Ollama (brew / install.sh / app)\nensure :11434 service"]
-    hv --> hgw
-    ho --> hgw
-    hgw["host_setup_gateway\nDocker present? enable provider in gateway.json\ngateway_start (publish -p on macOS, --network host on Linux)"]
-    hgw --> hhard["host_setup_hardening (Linux+systemd)\nearlyoom (kill hog before freeze)\nsshd MemoryMin=512M (never starve SSH)"]
-    hhard --> htail{"--check?"}
-    htail -->|no| htail2["optional Tailscale → cmd_doctor"]
-    htail -->|yes| hsum
-    htail2 --> hsum["summary: ready / skipped / incomplete"]
-```
+Key safety points: in **host** mode spark never disables password SSH automatically (you could
+lock yourself out) — it only warns. In **server** mode it disables password auth **only after**
+`reopen_remote_keybased` proves the freshly-copied key works; if that reconnect fails it aborts
+before touching `sshd_config`.
 
 The gateway always runs in Docker (so reboot-persistence matches Linux), but its networking branches
 by OS: on macOS it publishes the port and reaches the host's native Ollama via
