@@ -909,6 +909,61 @@ test_mem_override_suggests_mem() {
   [[ "$status" -ne 0 ]] && [[ "$out" == *"Fits with --mem ≤ 0.21"* ]] && [[ "$out" != *"--max-len"* ]]
 }
 
+# --- Per-container hard memory limit (--memory) ---
+# 30B NEED 28.1 → 28.1×1.25×1024 = ceil(35968) = 35968 MiB.
+test_mem_limit_present_unified() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"--memory 35968m"* ]] && [[ "$dargs" == *"--memory-swap 35968m"* ]]
+}
+
+test_mem_limit_absent_discrete() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-discrete \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"vllm serve"* ]] && [[ "$dargs" != *"--memory"* ]]
+}
+
+test_mem_limit_absent_with_flag() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    "$SPARK" run Qwen/Qwen3-30B --no-mem-limit </dev/null >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"vllm serve"* ]] && [[ "$dargs" != *"--memory"* ]]
+}
+
+test_mem_limit_margin_env() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  # 28.1×1.5×1024 = ceil(43161.6) = 43162 MiB.
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    SPARK_MEM_LIMIT_MARGIN_PCT=50 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"--memory 43162m"* ]] && [[ "$dargs" != *"35968m"* ]]
+}
+
 # --- Unified-memory utilization cap ---
 # 30B need 28; reserve 80. Raw budget leaves 31 free (would fit), but the 85% cap (102.8)
 # leaves only 22.8 -> blocked by the cap. Proves the cap binds when stacking models.
@@ -999,6 +1054,10 @@ run_test "menu: choosing auto relaunches at the auto context" test_menu_choose_a
 run_test "menu: cancel aborts without starting" test_menu_cancel_aborts
 run_test "auto-pull menu downloads + starts at chosen context" test_autopull_menu_downloads_at_choice
 run_test "--mem too high suggests a smaller --mem" test_mem_override_suggests_mem
+run_test "per-container --memory limit present on unified" test_mem_limit_present_unified
+run_test "per-container --memory limit absent on discrete" test_mem_limit_absent_discrete
+run_test "per-container --memory limit absent with --no-mem-limit" test_mem_limit_absent_with_flag
+run_test "per-container --memory limit honors margin env" test_mem_limit_margin_env
 run_test "memory cap blocks stacking past the limit" test_cap_blocks_when_stacking
 run_test "memory cap applies to a single model too" test_cap_applies_to_single_model
 run_test "memory cap exempt on discrete GPUs" test_cap_exempt_on_discrete
