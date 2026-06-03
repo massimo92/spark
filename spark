@@ -122,6 +122,11 @@ else
 fi
 MEM_HEADROOM_PCT="${SPARK_MEM_HEADROOM_PCT:-8}"     # per-model cushion (activations/fragmentation)
 BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))       # memory available to models
+# On unified memory, the load peak of a starting model (its weights streaming through the page
+# cache) stacks on whatever is resident; letting reservations sum near full RAM can thrash the
+# box hard enough to need a power cycle. Cap the TOTAL reserved at this % of RAM (fail-safe;
+# tunable). Discrete GPUs are exempt — the OS isn't in VRAM and vLLM OOMs cleanly.
+MEM_MAX_UTIL_PCT="${SPARK_MEM_MAX_UTIL_PCT:-85}"
 
 # Detect the latest pulled NGC vLLM image
 detect_ngc_image() {
@@ -666,18 +671,33 @@ is_interactive() { [[ -t 0 || -n "${SPARK_ASSUME_INTERACTIVE:-}" ]]; }
 #    and memory, and the launch continues.
 #  - non-interactive: print the fitting options + command, then abort.
 #  - dry-run: print the verdict/options and continue (never prompts, never aborts).
+# Memory available to models: the smaller of (total − OS reserve) and MEM_MAX_UTIL_PCT% of total.
+# The % cap is the fail-safe against load-peak thrash on unified memory and applies always (one
+# model or several). Discrete GPUs are exempt: the OS isn't in VRAM and vLLM OOMs cleanly.
+usable_budget() {
+  if [[ "$ACCEL" == "cuda-discrete" ]]; then printf '%s\n' "$BUDGET_GB"; return 0; fi
+  awk -v b="$BUDGET_GB" -v t="$TOTAL_MEM_GB" -v p="$MEM_MAX_UTIL_PCT" \
+    'BEGIN{ cap=t*p/100; if (cap<b) b=cap; printf "%.1f", b }'
+}
+
 verify_capacity() {
   local new_need="$1" exclude="${2:-}" dry_run="${3:-0}" mem="${4:-}" model="${5:-}" config_json="${6:-}"
-  local reserved free
+  local reserved free eff_budget
   reserved=$(reserved_budget_gb "$exclude")
-  free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+  eff_budget=$(usable_budget "$reserved")
+  free=$(awk -v b="$eff_budget" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
 
   awk -v n="$new_need" -v f="$free" 'BEGIN{ exit !(n > f) }' || return 0   # fits
 
   err "Not enough memory to start this model"
   printf "    Needs:      %s GB\n" "$new_need"
-  printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
-    "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
+  if awk -v e="$eff_budget" -v b="$BUDGET_GB" 'BEGIN{ exit !(e < b) }'; then
+    printf "    Free:       %s GB  (memory cap %s%% = %s GB of %s total)\n" \
+      "$free" "$MEM_MAX_UTIL_PCT" "$eff_budget" "$TOTAL_MEM_GB"
+  else
+    printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
+      "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
+  fi
   local any=0 name m port need _
   while IFS=$'\t' read -r name m port need _; do
     [[ -z "$m" ]] && continue
@@ -870,7 +890,7 @@ run_backend_vllm() {
   if [[ "$needs_download" == "1" ]]; then
     local reserved free
     reserved=$(reserved_budget_gb "$cname")
-    free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+    free=$(awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
     if awk -v n="$NEED_GB" -v f="$free" 'BEGIN{ exit !(n > f) }'; then
       # Does not fit at the requested context (sized from metadata, before downloading).
       err "Not enough memory to start this model"
@@ -977,7 +997,7 @@ run_backend_vllm() {
   # Memory accounting breakdown (shown in dry-run and at launch).
   local reserved free
   reserved=$(reserved_budget_gb "$cname")
-  free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+  free=$(awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
   print_memory_plan "$model" "$cname" "$port" "$reserved" "$free"
 
   if [[ "$dry_run" == "1" ]]; then
