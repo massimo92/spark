@@ -1899,6 +1899,57 @@ host_setup_tailscale() {
   fi
 }
 
+# OS hardening (Linux + systemd) so SSH always has room even if models exhaust RAM:
+#   1) early-OOM (earlyoom) kills the memory hog before the kernel deadlocks into swap thrash.
+#   2) MemoryMin protects sshd from reclaim so it never gets paged out / starved.
+host_setup_hardening() {
+  local auto_yes="$1" check_only="$2"
+  command -v systemctl >/dev/null 2>&1 || { setup_skip "OS hardening (needs systemd)"; return 0; }
+
+  # 1) early-OOM via earlyoom
+  if systemctl is-active --quiet earlyoom 2>/dev/null; then
+    info "early-OOM: earlyoom active"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "early-OOM not active — install earlyoom so a runaway model is killed before the box freezes"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Install + enable earlyoom (kills the memory hog before an OOM freeze)?"; then
+    if sudo apt-get update >/dev/null 2>&1 && sudo apt-get install -y earlyoom >/dev/null 2>&1; then
+      printf 'EARLYOOM_ARGS="-m 8 -s 100 --avoid '\''(^|/)(systemd|sshd?|ssh|dbus)$'\'' --prefer '\''(^|/)(vllm|python|pt_main_thread)$'\''"\n' | sudo tee /etc/default/earlyoom >/dev/null
+      if sudo systemctl enable --now earlyoom >/dev/null 2>&1; then
+        sudo systemctl restart earlyoom >/dev/null 2>&1 || true
+        info "early-OOM: earlyoom installed and enabled"
+      else
+        setup_fail "Could not enable earlyoom"
+      fi
+    else
+      setup_fail "Could not install earlyoom (apt)"
+    fi
+  else
+    setup_skip "early-OOM (earlyoom)"
+  fi
+
+  # 2) sshd MemoryMin (512M = 536870912 bytes)
+  local unit cur
+  unit=$(systemctl list-unit-files --no-legend ssh.service sshd.service 2>/dev/null | awk 'NR==1{print $1}')
+  [[ -z "$unit" ]] && unit="ssh.service"
+  cur=$(systemctl show -p MemoryMin --value "$unit" 2>/dev/null)
+  if [[ "$cur" == "536870912" ]]; then
+    info "sshd memory: ${unit} MemoryMin=512M (reclaim-protected)"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "sshd has no MemoryMin — it can be starved under memory pressure"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Reserve 512M for ${unit} so SSH never starves?"; then
+    sudo mkdir -p "/etc/systemd/system/${unit}.d"
+    printf '[Service]\nMemoryAccounting=yes\nMemoryMin=512M\n' | sudo tee "/etc/systemd/system/${unit}.d/10-spark-memory.conf" >/dev/null
+    sudo systemctl daemon-reload >/dev/null 2>&1
+    if sudo systemctl reload "$unit" >/dev/null 2>&1 || sudo systemctl restart "$unit" >/dev/null 2>&1; then
+      info "sshd memory: ${unit} MemoryMin=512M set"
+    else
+      setup_fail "Could not apply MemoryMin to ${unit}"
+    fi
+  else
+    setup_skip "sshd MemoryMin"
+  fi
+}
+
 cmd_host() {
   local auto_yes=0 check_only=0
   while [[ $# -gt 0 ]]; do
@@ -1922,6 +1973,7 @@ cmd_host() {
     host_setup_vllm "$auto_yes" "$check_only"
   fi
   host_setup_gateway "$check_only"
+  [[ "$SPARK_OS" == "Linux" ]] && host_setup_hardening "$auto_yes" "$check_only"
 
   if [[ "$check_only" != "1" ]]; then
     if command -v tailscale >/dev/null 2>&1 && local_tailscale status >/dev/null 2>&1; then

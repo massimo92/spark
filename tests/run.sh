@@ -107,6 +107,19 @@ exit 7
 EOF
   chmod +x "${dir}/curl"
 
+  # systemctl mock for spark host hardening checks.
+  cat > "${dir}/systemctl" <<'EOF'
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  *is-active*earlyoom*)  exit "${FAKE_EARLYOOM_ACTIVE:-1}" ;;
+  *list-unit-files*)     echo "ssh.service enabled enabled" ;;
+  *"show -p MemoryMin"*) echo "${FAKE_SSHD_MEMORYMIN:-}" ;;
+  *)                     exit 0 ;;
+esac
+EOF
+  chmod +x "${dir}/systemctl"
+
   cat > "${dir}/tailscale" <<'EOF'
 #!/usr/bin/env bash
 exit 1
@@ -716,6 +729,27 @@ test_host_check_vllm_no_gpu() {
     [[ "$out" == *"incomplete"* ]]
 }
 
+# --- Host OS hardening (early-OOM + sshd MemoryMin) ---
+test_host_check_hardening_missing() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux "$SPARK" host --check </dev/null 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"early-OOM not active"* ]] && [[ "$out" == *"sshd has no MemoryMin"* ]]
+}
+
+test_host_check_hardening_present() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SSHD_MEMORYMIN=536870912 \
+    "$SPARK" host --check </dev/null 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"earlyoom active"* ]] && [[ "$out" == *"MemoryMin=512M (reclaim-protected)"* ]] &&
+    [[ "$out" != *"early-OOM not active"* ]]
+}
+
 # --- Doctor per backend ---
 test_doctor_ollama_backend() {
   local tmp fake_bin out
@@ -1066,6 +1100,8 @@ run_test "gateway routes Ollama via localhost on Linux" test_gateway_ollama_rout
 run_test "doctor runs Ollama checks on the ollama backend" test_doctor_ollama_backend
 run_test "host --check (ollama) reports ready" test_host_check_ollama_ready
 run_test "host --check (vllm) flags a missing GPU" test_host_check_vllm_no_gpu
+run_test "host --check flags missing OS hardening" test_host_check_hardening_missing
+run_test "host --check passes with hardening present" test_host_check_hardening_present
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]
