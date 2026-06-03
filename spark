@@ -122,10 +122,11 @@ else
 fi
 MEM_HEADROOM_PCT="${SPARK_MEM_HEADROOM_PCT:-8}"     # per-model cushion (activations/fragmentation)
 BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))       # memory available to models
-# On unified memory, co-locating a 2nd model stacks its load peak (weights through page cache)
-# on the resident model(s); summing close to the full budget can thrash the box. Cap the summed
-# reservation here. Only applies when co-locating; a single model can still use the full budget.
-MEM_COLOC_UTIL_PCT="${SPARK_MEM_COLOC_UTIL_PCT:-88}"
+# On unified memory, the load peak of a starting model (its weights streaming through the page
+# cache) stacks on whatever is resident; letting reservations sum near full RAM can thrash the
+# box hard enough to need a power cycle. Cap the TOTAL reserved at this % of RAM (fail-safe;
+# tunable). Discrete GPUs are exempt — the OS isn't in VRAM and vLLM OOMs cleanly.
+MEM_MAX_UTIL_PCT="${SPARK_MEM_MAX_UTIL_PCT:-85}"
 
 # Detect the latest pulled NGC vLLM image
 detect_ngc_image() {
@@ -670,15 +671,13 @@ is_interactive() { [[ -t 0 || -n "${SPARK_ASSUME_INTERACTIVE:-}" ]]; }
 #    and memory, and the launch continues.
 #  - non-interactive: print the fitting options + command, then abort.
 #  - dry-run: print the verdict/options and continue (never prompts, never aborts).
-# Effective budget for a new model given what's already reserved. On unified memory, once
-# something else is resident, cap the summed reservation at MEM_COLOC_UTIL_PCT of total to
-# leave headroom for the new model's load peak. A lone model (reserved 0) keeps the full budget.
-# Discrete GPUs are exempt: the OS isn't in VRAM and vLLM OOMs cleanly instead of freezing the host.
+# Memory available to models: the smaller of (total − OS reserve) and MEM_MAX_UTIL_PCT% of total.
+# The % cap is the fail-safe against load-peak thrash on unified memory and applies always (one
+# model or several). Discrete GPUs are exempt: the OS isn't in VRAM and vLLM OOMs cleanly.
 usable_budget() {
-  local reserved="$1"
   if [[ "$ACCEL" == "cuda-discrete" ]]; then printf '%s\n' "$BUDGET_GB"; return 0; fi
-  awk -v b="$BUDGET_GB" -v t="$TOTAL_MEM_GB" -v p="$MEM_COLOC_UTIL_PCT" -v r="$reserved" \
-    'BEGIN{ cap=t*p/100; if (r>0 && cap<b) b=cap; printf "%.1f", b }'
+  awk -v b="$BUDGET_GB" -v t="$TOTAL_MEM_GB" -v p="$MEM_MAX_UTIL_PCT" \
+    'BEGIN{ cap=t*p/100; if (cap<b) b=cap; printf "%.1f", b }'
 }
 
 verify_capacity() {
@@ -693,8 +692,8 @@ verify_capacity() {
   err "Not enough memory to start this model"
   printf "    Needs:      %s GB\n" "$new_need"
   if awk -v e="$eff_budget" -v b="$BUDGET_GB" 'BEGIN{ exit !(e < b) }'; then
-    printf "    Free:       %s GB  (co-location cap %s%% = %s GB of %s total)\n" \
-      "$free" "$MEM_COLOC_UTIL_PCT" "$eff_budget" "$TOTAL_MEM_GB"
+    printf "    Free:       %s GB  (memory cap %s%% = %s GB of %s total)\n" \
+      "$free" "$MEM_MAX_UTIL_PCT" "$eff_budget" "$TOTAL_MEM_GB"
   else
     printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
       "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"

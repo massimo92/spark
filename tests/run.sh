@@ -9,9 +9,9 @@ SPARK="${ROOT_DIR}/spark"
 # SPARK_BACKEND/SPARK_ACCEL inline, or clear them per-invocation with `env -u`.
 export SPARK_BACKEND="${SPARK_BACKEND:-vllm}"
 export SPARK_ACCEL="${SPARK_ACCEL:-cuda-unified}"
-# Disable the unified-memory co-location cap by default so existing capacity/menu tests
-# see the raw budget; the cap-specific tests set SPARK_MEM_COLOC_UTIL_PCT explicitly.
-export SPARK_MEM_COLOC_UTIL_PCT="${SPARK_MEM_COLOC_UTIL_PCT:-100}"
+# Disable the unified-memory utilization cap by default so existing capacity/menu tests see
+# the raw budget; the cap-specific tests set SPARK_MEM_MAX_UTIL_PCT explicitly.
+export SPARK_MEM_MAX_UTIL_PCT="${SPARK_MEM_MAX_UTIL_PCT:-100}"
 
 passed=0
 failed=0
@@ -909,50 +909,54 @@ test_mem_override_suggests_mem() {
   [[ "$status" -ne 0 ]] && [[ "$out" == *"Fits with --mem ≤ 0.21"* ]] && [[ "$out" != *"--max-len"* ]]
 }
 
-# --- Co-location memory cap (unified memory) ---
-# 30B need 28; reserve 80. Raw budget leaves 31 free (would fit), but the 88% cap (106.5)
-# leaves only 26.5 -> blocked by the cap. Proves the cap binds when stacking models.
-test_coloc_cap_blocks_when_stacking() {
+# --- Unified-memory utilization cap ---
+# 30B need 28; reserve 80. Raw budget leaves 31 free (would fit), but the 85% cap (102.8)
+# leaves only 22.8 -> blocked by the cap. Proves the cap binds when stacking models.
+test_cap_blocks_when_stacking() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
   set +e
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_MEM_COLOC_UTIL_PCT=88 \
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_MEM_MAX_UTIL_PCT=85 \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     FAKE_MANAGED='spark-vllm-big\torg/big\t8000\t80.0\t65.0\t15.0\n' \
     "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1)
   status=$?
   set -e
   rm -rf "$tmp"
-  [[ "$status" -eq 0 ]] && [[ "$out" == *"Not enough memory"* ]] && [[ "$out" == *"co-location cap 88%"* ]]
+  [[ "$status" -eq 0 ]] && [[ "$out" == *"Not enough memory"* ]] && [[ "$out" == *"memory cap 85%"* ]]
 }
 
-# A lone model (nothing else reserved) is NOT capped: --mem 0.9 (108.9 GB) is allowed.
-test_coloc_cap_skips_single_model() {
+# The cap applies to a single model too: --mem 0.9 (108.9 GB) exceeds the 85% cap (102.8)
+# and is blocked, suggesting the largest --mem that fits.
+test_cap_applies_to_single_model() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out
+  local tmp fake_bin out status
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_MEM_COLOC_UTIL_PCT=88 \
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_MEM_MAX_UTIL_PCT=85 \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     "$SPARK" run Qwen/Qwen3-30B --mem 0.9 --dry-run </dev/null 2>&1)
+  status=$?
+  set -e
   rm -rf "$tmp"
-  [[ "$out" == *"docker run"* ]] && [[ "$out" != *"Not enough memory"* ]]
+  [[ "$status" -eq 0 ]] && [[ "$out" == *"Not enough memory"* ]] && [[ "$out" == *"Fits with --mem ≤ 0.85"* ]]
 }
 
-# Discrete GPUs are exempt from the cap (OS isn't in VRAM): same stacking fits.
-test_coloc_cap_exempt_on_discrete() {
+# Discrete GPUs are exempt from the cap (OS isn't in VRAM): the stacking case fits.
+test_cap_exempt_on_discrete() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-discrete \
-    SPARK_MEM_COLOC_UTIL_PCT=88 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    SPARK_MEM_MAX_UTIL_PCT=85 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     FAKE_MANAGED='spark-vllm-big\torg/big\t8000\t80.0\t65.0\t15.0\n' \
     "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"docker run"* ]] && [[ "$out" != *"co-location cap"* ]]
+  [[ "$out" == *"docker run"* ]] && [[ "$out" != *"memory cap"* ]]
 }
 
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
@@ -995,9 +999,9 @@ run_test "menu: choosing auto relaunches at the auto context" test_menu_choose_a
 run_test "menu: cancel aborts without starting" test_menu_cancel_aborts
 run_test "auto-pull menu downloads + starts at chosen context" test_autopull_menu_downloads_at_choice
 run_test "--mem too high suggests a smaller --mem" test_mem_override_suggests_mem
-run_test "co-location cap blocks stacking past the limit" test_coloc_cap_blocks_when_stacking
-run_test "co-location cap skips a single model" test_coloc_cap_skips_single_model
-run_test "co-location cap exempt on discrete GPUs" test_coloc_cap_exempt_on_discrete
+run_test "memory cap blocks stacking past the limit" test_cap_blocks_when_stacking
+run_test "memory cap applies to a single model too" test_cap_applies_to_single_model
+run_test "memory cap exempt on discrete GPUs" test_cap_exempt_on_discrete
 run_test "gateway routes Ollama via host.docker.internal on macOS" test_gateway_ollama_route_mac
 run_test "gateway routes Ollama via localhost on Linux" test_gateway_ollama_route_linux
 run_test "doctor runs Ollama checks on the ollama backend" test_doctor_ollama_backend
