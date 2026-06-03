@@ -331,6 +331,13 @@ own port, and the LiteLLM gateway registers one route per model plus the `vllm/*
 Before launching, spark checks the new model fits: `sum(reserved by live models) + new need`
 must not exceed `total − OS reserve`. The running models are **never touched** by this check.
 
+On **unified memory**, co-locating a second model also stacks its *load peak* (the new weights
+streaming through the page cache) on top of the resident model, which can briefly exceed total
+RAM and thrash the box. So when something is already running, spark additionally caps the summed
+reservation at `SPARK_MEM_COLOC_UTIL_PCT`% of total (default **88**) — a lone model still gets the
+full budget. If a second model would push past the cap, the "doesn't fit" menu offers it at a
+smaller context. Discrete GPUs are exempt (the OS isn't in VRAM and vLLM OOMs cleanly).
+
 ```bash
 spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4              # worker
 spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4 # evaluator, co-resident
