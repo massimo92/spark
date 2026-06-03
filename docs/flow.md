@@ -61,7 +61,7 @@ flowchart TD
     override --> verify["verify_capacity\nreserved + need <= total - OS reserve\nif not: fit_options → menu (auto/fp8 ctx) or\nsuggest+abort (non-interactive) or show (dry-run)"]
     verify --> port["assign port (auto 8000+)\nname spark-vllm-<slug>"]
     port --> ngc["detect_ngc_image\ndocker images | grep vllm"]
-    ngc --> build["build arrays\nvllm_args: serve, model, flags\ndocker_cmd: gpus, network, ipc, ulimits, volume, spark.* labels"]
+    ngc --> build["build arrays\nvllm_args: serve, model, flags\ndocker_cmd: gpus, network, ipc, ulimits, volume, spark.* labels\n+ --memory/--memory-swap = NEED×1.25 (unified, hard cgroup cap)"]
 
     build --> plan["print memory plan\nweights, KV, need, fraction, free"]
     plan --> dry{"--dry-run?"}
@@ -158,7 +158,8 @@ flowchart TD
     hv --> hgw
     ho --> hgw
     hgw["host_setup_gateway\nDocker present? enable provider in gateway.json\ngateway_start (publish -p on macOS, --network host on Linux)"]
-    hgw --> htail{"--check?"}
+    hgw --> hhard["host_setup_hardening (Linux+systemd)\nearlyoom (kill hog before freeze)\nsshd MemoryMin=512M (never starve SSH)"]
+    hhard --> htail{"--check?"}
     htail -->|no| htail2["optional Tailscale → cmd_doctor"]
     htail -->|yes| hsum
     htail2 --> hsum["summary: ready / skipped / incomplete"]

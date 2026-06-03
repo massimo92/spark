@@ -127,6 +127,10 @@ BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))       # memory available to models
 # box hard enough to need a power cycle. Cap the TOTAL reserved at this % of RAM (fail-safe;
 # tunable). Discrete GPUs are exempt — the OS isn't in VRAM and vLLM OOMs cleanly.
 MEM_MAX_UTIL_PCT="${SPARK_MEM_MAX_UTIL_PCT:-85}"
+# Hard per-container memory ceiling (Docker --memory / cgroup memory.max) = NEED × (1 + this/100),
+# on unified memory only. Confines a model's load-peak page cache to its own cgroup so it
+# reclaims/OOMs itself instead of thrashing the host. Discrete GPUs exempt; --no-mem-limit disables.
+MEM_LIMIT_MARGIN_PCT="${SPARK_MEM_LIMIT_MARGIN_PCT:-25}"
 
 # Detect the latest pulled NGC vLLM image
 detect_ngc_image() {
@@ -785,11 +789,12 @@ download_model_full() {
 
 cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
-  local no_reasoning=0 dry_run=0 tail_logs=0 force=0 regen=0 no_pull=0
+  local no_reasoning=0 dry_run=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; shift 2 ;;
+      --no-mem-limit) no_mem_limit=1; shift ;;
       --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; shift 2 ;;
       --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; shift 2 ;;
       --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; shift 2 ;;
@@ -976,6 +981,14 @@ run_backend_vllm() {
     vllm_args+=(--limit-mm-per-prompt image=0)
   fi
 
+  # Hard memory ceiling (cgroup memory.max) so a model that overuses RAM reclaims/OOMs itself
+  # instead of thrashing the host. Unified memory only; discrete GPUs run their KV in VRAM.
+  local mem_limit_mib=""
+  if [[ "$ACCEL" != "cuda-discrete" && "$no_mem_limit" != "1" ]]; then
+    mem_limit_mib=$(awk -v n="$NEED_GB" -v p="$MEM_LIMIT_MARGIN_PCT" \
+      'BEGIN{ v=n*(1+p/100)*1024; iv=int(v); if(v>iv) iv++; printf "%d", iv }')
+  fi
+
   # Build Docker command. Labels store the reservation on the container itself.
   local docker_cmd=(docker run -d
     --gpus all
@@ -991,8 +1004,10 @@ run_backend_vllm() {
     --label "spark.need_gb=${NEED_GB}"
     --label "spark.weights_gb=${WEIGHTS_GB}"
     --label "spark.kv_gb=${KV_GB}"
-    --label "spark.max_model_len=${MAX_MODEL_LEN}"
-    "$ngc_image")
+    --label "spark.max_model_len=${MAX_MODEL_LEN}")
+  # --memory-swap == --memory disables the container's swap → clean self-OOM, no host thrash.
+  [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_limit_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
+  docker_cmd+=("$ngc_image")
 
   # Memory accounting breakdown (shown in dry-run and at launch).
   local reserved free
@@ -1169,6 +1184,7 @@ print_memory_plan() {
   printf "    Weights:   %s GB\n" "$WEIGHTS_GB"
   printf "    KV cache:  %s GB\n" "$KV_GB"
   printf "    ${BOLD}Need:${NC}      %s GB  →  --gpu-memory-utilization %s\n" "$NEED_GB" "$GPU_MEM_UTIL"
+  [[ -n "${mem_limit_mib:-}" ]] && printf "    Limit:     %s MiB  (hard cgroup cap, NEED +%s%%)\n" "$mem_limit_mib" "$MEM_LIMIT_MARGIN_PCT"
   printf "    API:       http://localhost:%s/v1\n" "$port"
   [[ -n "$REASONING_PARSER" ]] && printf "    Reasoning: %s parser\n" "$REASONING_PARSER"
   if [[ "$ACCEL" == "cuda-discrete" ]]; then
@@ -1883,6 +1899,67 @@ host_setup_tailscale() {
   fi
 }
 
+# OS hardening (Linux + systemd) so SSH always has room even if models exhaust RAM:
+#   1) early-OOM (earlyoom) kills the memory hog before the kernel deadlocks into swap thrash.
+#   2) MemoryMin protects sshd from reclaim so it never gets paged out / starved.
+host_setup_hardening() {
+  local auto_yes="$1" check_only="$2"
+  command -v systemctl >/dev/null 2>&1 || { setup_skip "OS hardening (needs systemd)"; return 0; }
+
+  # 1) early-OOM via earlyoom
+  if systemctl is-active --quiet earlyoom 2>/dev/null; then
+    info "early-OOM: earlyoom active"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "early-OOM not active — install earlyoom so a runaway model is killed before the box freezes"
+  else
+    printf "    ${DIM}What: install 'earlyoom' (a tiny background service, a few KB).\n"
+    printf "    Why: it kills the biggest model the instant free RAM runs low, so a runaway model\n"
+    printf "    can't drag the whole machine into a swap freeze that needs a physical reboot.${NC}\n"
+    if [[ "$auto_yes" == "1" ]] || confirm "Install + enable earlyoom?"; then
+      if sudo apt-get update >/dev/null 2>&1 && sudo apt-get install -y earlyoom >/dev/null 2>&1; then
+        printf 'EARLYOOM_ARGS="-m 8 -s 100 --avoid '\''(^|/)(systemd|sshd?|ssh|dbus)$'\'' --prefer '\''(^|/)(vllm|python|pt_main_thread)$'\''"\n' | sudo tee /etc/default/earlyoom >/dev/null
+        if sudo systemctl enable --now earlyoom >/dev/null 2>&1; then
+          sudo systemctl restart earlyoom >/dev/null 2>&1 || true
+          info "early-OOM: earlyoom installed and enabled"
+        else
+          setup_fail "Could not enable earlyoom"
+        fi
+      else
+        setup_fail "Could not install earlyoom (apt)"
+      fi
+    else
+      setup_skip "early-OOM (earlyoom)"
+    fi
+  fi
+
+  # 2) sshd MemoryMin (512M = 536870912 bytes)
+  local unit cur
+  unit=$(systemctl list-unit-files --no-legend ssh.service sshd.service 2>/dev/null | awk 'NR==1{print $1}')
+  [[ -z "$unit" ]] && unit="ssh.service"
+  cur=$(systemctl show -p MemoryMin --value "$unit" 2>/dev/null)
+  if [[ "$cur" == "536870912" ]]; then
+    info "sshd memory: ${unit} MemoryMin=512M (reclaim-protected)"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "sshd has no MemoryMin — it can be starved under memory pressure"
+  else
+    printf "    ${DIM}What: reserve 512 MB for the SSH service (a protected floor — free when unused).\n"
+    printf "    Why: under memory pressure the kernel won't page sshd out, so you can always connect\n"
+    printf "    to the machine to fix things instead of being locked out. Restarting ssh is safe.${NC}\n"
+    if [[ "$auto_yes" == "1" ]] || confirm "Reserve 512M for ${unit}?"; then
+      sudo mkdir -p "/etc/systemd/system/${unit}.d"
+      printf '[Service]\nMemoryAccounting=yes\nMemoryMin=512M\n' | sudo tee "/etc/systemd/system/${unit}.d/10-spark-memory.conf" >/dev/null
+      sudo systemctl daemon-reload >/dev/null 2>&1
+      if sudo systemctl reload "$unit" >/dev/null 2>&1 || sudo systemctl restart "$unit" >/dev/null 2>&1; then
+        info "sshd memory: ${unit} MemoryMin=512M set"
+      else
+        setup_fail "Could not apply MemoryMin to ${unit}"
+      fi
+    else
+      setup_skip "sshd MemoryMin"
+    fi
+  fi
+}
+
 cmd_host() {
   local auto_yes=0 check_only=0
   while [[ $# -gt 0 ]]; do
@@ -1906,6 +1983,7 @@ cmd_host() {
     host_setup_vllm "$auto_yes" "$check_only"
   fi
   host_setup_gateway "$check_only"
+  [[ "$SPARK_OS" == "Linux" ]] && host_setup_hardening "$auto_yes" "$check_only"
 
   if [[ "$check_only" != "1" ]]; then
     if command -v tailscale >/dev/null 2>&1 && local_tailscale status >/dev/null 2>&1; then

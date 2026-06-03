@@ -107,6 +107,19 @@ exit 7
 EOF
   chmod +x "${dir}/curl"
 
+  # systemctl mock for spark host hardening checks.
+  cat > "${dir}/systemctl" <<'EOF'
+#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  *is-active*earlyoom*)  exit "${FAKE_EARLYOOM_ACTIVE:-1}" ;;
+  *list-unit-files*)     echo "ssh.service enabled enabled" ;;
+  *"show -p MemoryMin"*) echo "${FAKE_SSHD_MEMORYMIN:-}" ;;
+  *)                     exit 0 ;;
+esac
+EOF
+  chmod +x "${dir}/systemctl"
+
   cat > "${dir}/tailscale" <<'EOF'
 #!/usr/bin/env bash
 exit 1
@@ -716,6 +729,27 @@ test_host_check_vllm_no_gpu() {
     [[ "$out" == *"incomplete"* ]]
 }
 
+# --- Host OS hardening (early-OOM + sshd MemoryMin) ---
+test_host_check_hardening_missing() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux "$SPARK" host --check </dev/null 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"early-OOM not active"* ]] && [[ "$out" == *"sshd has no MemoryMin"* ]]
+}
+
+test_host_check_hardening_present() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SSHD_MEMORYMIN=536870912 \
+    "$SPARK" host --check </dev/null 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"earlyoom active"* ]] && [[ "$out" == *"MemoryMin=512M (reclaim-protected)"* ]] &&
+    [[ "$out" != *"early-OOM not active"* ]]
+}
+
 # --- Doctor per backend ---
 test_doctor_ollama_backend() {
   local tmp fake_bin out
@@ -909,6 +943,61 @@ test_mem_override_suggests_mem() {
   [[ "$status" -ne 0 ]] && [[ "$out" == *"Fits with --mem ≤ 0.21"* ]] && [[ "$out" != *"--max-len"* ]]
 }
 
+# --- Per-container hard memory limit (--memory) ---
+# 30B NEED 28.1 → 28.1×1.25×1024 = ceil(35968) = 35968 MiB.
+test_mem_limit_present_unified() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"--memory 35968m"* ]] && [[ "$dargs" == *"--memory-swap 35968m"* ]]
+}
+
+test_mem_limit_absent_discrete() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-discrete \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"vllm serve"* ]] && [[ "$dargs" != *"--memory"* ]]
+}
+
+test_mem_limit_absent_with_flag() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    "$SPARK" run Qwen/Qwen3-30B --no-mem-limit </dev/null >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"vllm serve"* ]] && [[ "$dargs" != *"--memory"* ]]
+}
+
+test_mem_limit_margin_env() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  # 28.1×1.5×1024 = ceil(43161.6) = 43162 MiB.
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    SPARK_MEM_LIMIT_MARGIN_PCT=50 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"--memory 43162m"* ]] && [[ "$dargs" != *"35968m"* ]]
+}
+
 # --- Unified-memory utilization cap ---
 # 30B need 28; reserve 80. Raw budget leaves 31 free (would fit), but the 85% cap (102.8)
 # leaves only 22.8 -> blocked by the cap. Proves the cap binds when stacking models.
@@ -959,6 +1048,122 @@ test_cap_exempt_on_discrete() {
   [[ "$out" == *"docker run"* ]] && [[ "$out" != *"memory cap"* ]]
 }
 
+# --- Command coverage: spark's own logic per command (not the external tools) ---
+test_pull_vllm_ready() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm "$SPARK" pull Org/Model </dev/null 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Ready. Run: spark run Org/Model"* ]]
+}
+
+test_pull_ollama_routes() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama "$SPARK" pull qwen3:30b </dev/null 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"with Ollama"* ]] && [[ "$out" == *"Ready"* ]]
+}
+
+test_list_shows_models() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.cache/huggingface/hub/models--Org--Alpha/snapshots/1"
+  mkdir -p "${tmp}/home/.cache/huggingface/hub/models--Org--Beta/snapshots/1"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" list 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"MODEL"* ]] && [[ "$out" == *"Org/Alpha"* ]] && [[ "$out" == *"Org/Beta"* ]]
+}
+
+test_list_empty() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" list 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"No models downloaded"* ]]
+}
+
+test_rm_removes_the_right_dir() {
+  local tmp fake_bin out d
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  d="${tmp}/home/.cache/huggingface/hub/models--Org--Gone"; mkdir -p "${d}/snapshots/1"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 "$SPARK" rm Org/Gone 2>&1)
+  local gone=1; [[ -d "$d" ]] && gone=0
+  rm -rf "$tmp"
+  [[ "$out" == *"Removed Org/Gone"* ]] && [[ "$gone" -eq 1 ]]
+}
+
+test_rm_not_found() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" rm Org/Missing </dev/null 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"not found in cache"* ]]
+}
+
+test_logs_ollama_message() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama "$SPARK" logs 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"shared service"* ]] && [[ "$out" == *"journalctl"* ]]
+}
+
+test_logs_vllm_no_container() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm "$SPARK" logs Org/Model </dev/null 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"No container found"* ]]
+}
+
+test_config_set_and_show() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin set_out show_out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  set_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config auto-update on 2>&1)
+  show_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config 2>&1)
+  rm -rf "$tmp"
+  [[ "$set_out" == *"Auto-update enabled"* ]] && [[ "$show_out" == *"auto-update: true"* ]]
+}
+
+test_gateway_stop_when_none() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" gateway stop 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"No running gateway"* ]]
+}
+
+test_gateway_status_running() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"vllm":{"enabled":true}}}' > "${tmp}/home/.config/spark/gateway.json"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NAMES='spark-litellm\n' "$SPARK" gateway status 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"gateway running"* ]] && [[ "$out" == *"vLLM"* ]]
+}
+
+test_status_ollama_lists() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMOD\nqwen3:30b\tabc\t18\tGB\n" "$SPARK" status 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"qwen3:30b"* ]] && [[ "$out" == *"Engine: Ollama"* ]]
+}
+
+test_stop_ollama_unloads() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    FAKE_OLLAMA_PS="NAME\tID\nqwen3:30b\tabc\n" "$SPARK" stop qwen3:30b 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Unloaded qwen3:30b"* ]]
+}
+
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
@@ -982,6 +1187,19 @@ run_test "stop --all stops every model" test_stop_all
 run_test "stop with no arg and many models asks which" test_stop_ambiguous_requires_target
 run_test "status renders a table" test_status_renders_table
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
+run_test "pull (vllm) reports ready" test_pull_vllm_ready
+run_test "pull routes to Ollama on the ollama backend" test_pull_ollama_routes
+run_test "list shows downloaded models" test_list_shows_models
+run_test "list reports empty cache" test_list_empty
+run_test "rm removes the right model dir" test_rm_removes_the_right_dir
+run_test "rm errors on a model not in cache" test_rm_not_found
+run_test "logs on ollama points to the service logs" test_logs_ollama_message
+run_test "logs errors when no container exists" test_logs_vllm_no_container
+run_test "config sets and shows auto-update" test_config_set_and_show
+run_test "gateway stop reports when none running" test_gateway_stop_when_none
+run_test "gateway status shows running + providers" test_gateway_status_running
+run_test "status (ollama) lists pulled models" test_status_ollama_lists
+run_test "stop (ollama) unloads a model" test_stop_ollama_unloads
 run_test "detect: Apple Silicon → metal/ollama" test_detect_metal_on_apple_silicon
 run_test "detect: arm64 NVIDIA → cuda-unified/vllm" test_detect_cuda_unified_on_arm_nvidia
 run_test "detect: x86_64 NVIDIA → cuda-discrete/vllm" test_detect_cuda_discrete_on_x86_nvidia
@@ -999,6 +1217,10 @@ run_test "menu: choosing auto relaunches at the auto context" test_menu_choose_a
 run_test "menu: cancel aborts without starting" test_menu_cancel_aborts
 run_test "auto-pull menu downloads + starts at chosen context" test_autopull_menu_downloads_at_choice
 run_test "--mem too high suggests a smaller --mem" test_mem_override_suggests_mem
+run_test "per-container --memory limit present on unified" test_mem_limit_present_unified
+run_test "per-container --memory limit absent on discrete" test_mem_limit_absent_discrete
+run_test "per-container --memory limit absent with --no-mem-limit" test_mem_limit_absent_with_flag
+run_test "per-container --memory limit honors margin env" test_mem_limit_margin_env
 run_test "memory cap blocks stacking past the limit" test_cap_blocks_when_stacking
 run_test "memory cap applies to a single model too" test_cap_applies_to_single_model
 run_test "memory cap exempt on discrete GPUs" test_cap_exempt_on_discrete
@@ -1007,6 +1229,8 @@ run_test "gateway routes Ollama via localhost on Linux" test_gateway_ollama_rout
 run_test "doctor runs Ollama checks on the ollama backend" test_doctor_ollama_backend
 run_test "host --check (ollama) reports ready" test_host_check_ollama_ready
 run_test "host --check (vllm) flags a missing GPU" test_host_check_vllm_no_gpu
+run_test "host --check flags missing OS hardening" test_host_check_hardening_missing
+run_test "host --check passes with hardening present" test_host_check_hardening_present
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]
