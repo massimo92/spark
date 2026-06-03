@@ -107,7 +107,7 @@ exit 7
 EOF
   chmod +x "${dir}/curl"
 
-  # systemctl mock for spark host hardening checks.
+  # systemctl mock for spark setup OS-hardening checks.
   cat > "${dir}/systemctl" <<'EOF'
 #!/usr/bin/env bash
 args="$*"
@@ -125,6 +125,31 @@ EOF
 exit 1
 EOF
   chmod +x "${dir}/tailscale"
+
+  # ssh mock for spark setup remote tests. Opening the ControlMaster (-fN) and closing it
+  # (-O exit) succeed; otherwise the last arg is the remote command and we answer probes.
+  # FAKE_SSH_NVIDIA=1 makes the fake remote look like an NVIDIA/vLLM box.
+  cat > "${dir}/ssh" <<'EOF'
+#!/usr/bin/env bash
+for a in "$@"; do
+  [[ "$a" == "-fN" || "$a" == "-O" ]] && exit 0
+done
+cmd="${@: -1}"
+case "$cmd" in
+  *"uname -s"*)            echo Linux ;;
+  *"uname -m"*)            echo aarch64 ;;
+  *"nvidia-smi -L"*)       [[ "${FAKE_SSH_NVIDIA:-0}" == "1" ]] && exit 0 || exit 1 ;;
+  *"query-gpu"*)           echo "Remote GPU" ;;
+  *"command -v ollama"*)   exit 1 ;;
+  *"command -v systemctl"*) exit 0 ;;
+  *is-active*earlyoom*)    exit 1 ;;
+  *"list-unit-files"*)     echo "ssh.service enabled enabled" ;;
+  *"show -p MemoryMin"*)   echo "" ;;
+  *)                       exit 1 ;;
+esac
+exit 0
+EOF
+  chmod +x "${dir}/ssh"
 
   # hf mock: "downloads" by writing files into the HF cache. config.json carries known
   # KV dims; the index reports ~14 GB of weights (total_size).
@@ -705,14 +730,14 @@ test_ollama_run_pulls_and_enables_gateway() {
   [[ "$pulls" == *"qwen3:30b"* ]] && [[ "$cfg" == "true" ]] && [[ "$out" == *"ready via Ollama"* ]]
 }
 
-# --- spark host (local setup) ---
+# --- spark setup --host (local setup; --check goes straight to local in non-TTY) ---
 test_host_check_ollama_ready() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_ACCEL=metal \
     SPARK_OS_OVERRIDE=Darwin FAKE_OLLAMA_UP=1 FAKE_DOCKER_INFO_EXIT=0 \
-    "$SPARK" host --check 2>&1) || true
+    "$SPARK" setup --check </dev/null 2>&1) || true
   rm -rf "$tmp"
   [[ "$out" == *"backend ollama"* ]] && [[ "$out" == *"Ollama: installed"* ]] &&
     [[ "$out" == *"ready to serve"* ]]
@@ -723,7 +748,7 @@ test_host_check_vllm_no_gpu() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
     SPARK_OS_OVERRIDE=Linux FAKE_NVIDIA_SMI_EXIT=1 \
-    "$SPARK" host --check 2>&1) || true
+    "$SPARK" setup --check </dev/null 2>&1) || true
   rm -rf "$tmp"
   [[ "$out" == *"backend vllm"* ]] && [[ "$out" == *"No NVIDIA GPU detected"* ]] &&
     [[ "$out" == *"incomplete"* ]]
@@ -734,7 +759,7 @@ test_host_check_hardening_missing() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
-    SPARK_OS_OVERRIDE=Linux "$SPARK" host --check </dev/null 2>&1) || true
+    SPARK_OS_OVERRIDE=Linux "$SPARK" setup --check </dev/null 2>&1) || true
   rm -rf "$tmp"
   [[ "$out" == *"early-OOM not active"* ]] && [[ "$out" == *"sshd has no MemoryMin"* ]]
 }
@@ -744,10 +769,54 @@ test_host_check_hardening_present() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
     SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SSHD_MEMORYMIN=536870912 \
-    "$SPARK" host --check </dev/null 2>&1) || true
+    "$SPARK" setup --check </dev/null 2>&1) || true
   rm -rf "$tmp"
   [[ "$out" == *"earlyoom active"* ]] && [[ "$out" == *"MemoryMin=512M (reclaim-protected)"* ]] &&
     [[ "$out" != *"early-OOM not active"* ]]
+}
+
+# --- Unified setup wizard (host vs server picker, parity, bootstrap) ---
+test_setup_picker_routes_to_host() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  # Pick [1] this machine; --check short-circuits the install prompts.
+  out=$(printf '1\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    SPARK_ACCEL=metal SPARK_OS_OVERRIDE=Darwin FAKE_OLLAMA_UP=1 FAKE_DOCKER_INFO_EXIT=0 \
+    "$SPARK" setup --check 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"what do you want to set up"* ]] && [[ "$out" == *"set up this machine"* ]] &&
+    [[ "$out" == *"backend ollama"* ]]
+}
+
+test_setup_host_no_disable_password() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux "$SPARK" setup --check </dev/null 2>&1) || true
+  rm -rf "$tmp"
+  # Host mode (--check) must never claim to disable password SSH.
+  [[ "$out" != *"Disabled password SSH login"* ]]
+}
+
+test_setup_server_check_parity() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  # Drive the wizard: [2] remote, target, "no key" -> bootstrap. ssh/sshpass are mocked so
+  # the install set runs against a fake "remote" that mirrors the local checks.
+  out=$(printf '2\nme@10.0.0.5\nn\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_OS_OVERRIDE=Linux FAKE_SSH_NVIDIA=1 \
+    "$SPARK" setup --check 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"Phase 2: Remote install"* ]] && [[ "$out" == *"NVIDIA Container Toolkit"* ]]
+}
+
+test_setup_unknown_flag_fails() {
+  local out status
+  set +e
+  out=$("$SPARK" setup --bogus </dev/null 2>&1); status=$?
+  set -e
+  [[ "$status" -ne 0 ]] && [[ "$out" == *"Unknown flag"* ]]
 }
 
 # --- Doctor per backend ---
@@ -1227,10 +1296,14 @@ run_test "memory cap exempt on discrete GPUs" test_cap_exempt_on_discrete
 run_test "gateway routes Ollama via host.docker.internal on macOS" test_gateway_ollama_route_mac
 run_test "gateway routes Ollama via localhost on Linux" test_gateway_ollama_route_linux
 run_test "doctor runs Ollama checks on the ollama backend" test_doctor_ollama_backend
-run_test "host --check (ollama) reports ready" test_host_check_ollama_ready
-run_test "host --check (vllm) flags a missing GPU" test_host_check_vllm_no_gpu
-run_test "host --check flags missing OS hardening" test_host_check_hardening_missing
-run_test "host --check passes with hardening present" test_host_check_hardening_present
+run_test "setup --host (ollama) reports ready" test_host_check_ollama_ready
+run_test "setup --host (vllm) flags a missing GPU" test_host_check_vllm_no_gpu
+run_test "setup --host flags missing OS hardening" test_host_check_hardening_missing
+run_test "setup --host passes with hardening present" test_host_check_hardening_present
+run_test "setup picker [1] routes to this machine" test_setup_picker_routes_to_host
+run_test "setup --host never disables password SSH" test_setup_host_no_disable_password
+run_test "setup --server installs the same set (parity)" test_setup_server_check_parity
+run_test "setup rejects unknown flags" test_setup_unknown_flag_fails
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]
