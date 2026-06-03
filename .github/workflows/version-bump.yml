@@ -1,0 +1,43 @@
+name: Version bump
+
+# Auto-increment the patch version in `spark` whenever the CLI changes on main,
+# so `spark update` can detect a newer version. Only runs when `spark` itself
+# changes; the bump commit carries [skip ci] so it never re-triggers itself.
+on:
+  push:
+    branches: [main]
+    paths: [spark]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    if: ${{ !contains(github.event.head_commit.message, 'bump version') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump patch version
+        run: |
+          cur=$(grep -m1 '^VERSION="' spark | sed -E 's/^VERSION="([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')
+          if [[ ! "$cur" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Could not parse VERSION (got '$cur')"; exit 1
+          fi
+          IFS=. read -r major minor patch <<< "$cur"
+          new="${major}.${minor}.$((patch + 1))"
+          sed -i -E "s/^VERSION=\"[0-9]+\.[0-9]+\.[0-9]+\"/VERSION=\"${new}\"/" spark
+          echo "VERSION ${cur} -> ${new}"
+          echo "NEW_VERSION=${new}" >> "$GITHUB_ENV"
+
+      - name: Commit, tag and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add spark
+          git commit -m "chore: bump version to ${NEW_VERSION} [skip ci]"
+          git tag "v${NEW_VERSION}"
+          git push origin HEAD:main --follow-tags
