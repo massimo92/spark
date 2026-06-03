@@ -1048,6 +1048,122 @@ test_cap_exempt_on_discrete() {
   [[ "$out" == *"docker run"* ]] && [[ "$out" != *"memory cap"* ]]
 }
 
+# --- Command coverage: spark's own logic per command (not the external tools) ---
+test_pull_vllm_ready() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm "$SPARK" pull Org/Model </dev/null 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Ready. Run: spark run Org/Model"* ]]
+}
+
+test_pull_ollama_routes() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama "$SPARK" pull qwen3:30b </dev/null 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"with Ollama"* ]] && [[ "$out" == *"Ready"* ]]
+}
+
+test_list_shows_models() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.cache/huggingface/hub/models--Org--Alpha/snapshots/1"
+  mkdir -p "${tmp}/home/.cache/huggingface/hub/models--Org--Beta/snapshots/1"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" list 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"MODEL"* ]] && [[ "$out" == *"Org/Alpha"* ]] && [[ "$out" == *"Org/Beta"* ]]
+}
+
+test_list_empty() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" list 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"No models downloaded"* ]]
+}
+
+test_rm_removes_the_right_dir() {
+  local tmp fake_bin out d
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  d="${tmp}/home/.cache/huggingface/hub/models--Org--Gone"; mkdir -p "${d}/snapshots/1"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 "$SPARK" rm Org/Gone 2>&1)
+  local gone=1; [[ -d "$d" ]] && gone=0
+  rm -rf "$tmp"
+  [[ "$out" == *"Removed Org/Gone"* ]] && [[ "$gone" -eq 1 ]]
+}
+
+test_rm_not_found() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" rm Org/Missing </dev/null 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"not found in cache"* ]]
+}
+
+test_logs_ollama_message() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama "$SPARK" logs 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"shared service"* ]] && [[ "$out" == *"journalctl"* ]]
+}
+
+test_logs_vllm_no_container() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm "$SPARK" logs Org/Model </dev/null 2>&1) || true
+  rm -rf "$tmp"
+  [[ "$out" == *"No container found"* ]]
+}
+
+test_config_set_and_show() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin set_out show_out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  set_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config auto-update on 2>&1)
+  show_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config 2>&1)
+  rm -rf "$tmp"
+  [[ "$set_out" == *"Auto-update enabled"* ]] && [[ "$show_out" == *"auto-update: true"* ]]
+}
+
+test_gateway_stop_when_none() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" gateway stop 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"No running gateway"* ]]
+}
+
+test_gateway_status_running() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"vllm":{"enabled":true}}}' > "${tmp}/home/.config/spark/gateway.json"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NAMES='spark-litellm\n' "$SPARK" gateway status 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"gateway running"* ]] && [[ "$out" == *"vLLM"* ]]
+}
+
+test_status_ollama_lists() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMOD\nqwen3:30b\tabc\t18\tGB\n" "$SPARK" status 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"qwen3:30b"* ]] && [[ "$out" == *"Engine: Ollama"* ]]
+}
+
+test_stop_ollama_unloads() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    FAKE_OLLAMA_PS="NAME\tID\nqwen3:30b\tabc\n" "$SPARK" stop qwen3:30b 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Unloaded qwen3:30b"* ]]
+}
+
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
@@ -1071,6 +1187,19 @@ run_test "stop --all stops every model" test_stop_all
 run_test "stop with no arg and many models asks which" test_stop_ambiguous_requires_target
 run_test "status renders a table" test_status_renders_table
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
+run_test "pull (vllm) reports ready" test_pull_vllm_ready
+run_test "pull routes to Ollama on the ollama backend" test_pull_ollama_routes
+run_test "list shows downloaded models" test_list_shows_models
+run_test "list reports empty cache" test_list_empty
+run_test "rm removes the right model dir" test_rm_removes_the_right_dir
+run_test "rm errors on a model not in cache" test_rm_not_found
+run_test "logs on ollama points to the service logs" test_logs_ollama_message
+run_test "logs errors when no container exists" test_logs_vllm_no_container
+run_test "config sets and shows auto-update" test_config_set_and_show
+run_test "gateway stop reports when none running" test_gateway_stop_when_none
+run_test "gateway status shows running + providers" test_gateway_status_running
+run_test "status (ollama) lists pulled models" test_status_ollama_lists
+run_test "stop (ollama) unloads a model" test_stop_ollama_unloads
 run_test "detect: Apple Silicon → metal/ollama" test_detect_metal_on_apple_silicon
 run_test "detect: arm64 NVIDIA → cuda-unified/vllm" test_detect_cuda_unified_on_arm_nvidia
 run_test "detect: x86_64 NVIDIA → cuda-discrete/vllm" test_detect_cuda_discrete_on_x86_nvidia
