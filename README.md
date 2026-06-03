@@ -329,8 +329,7 @@ Run several models at once; each lands in its own container (`spark-vllm-<name>-
 own port, and the LiteLLM gateway registers one route per model plus the `vllm/*` wildcard.
 
 Before launching, spark checks the new model fits: `sum(reserved by live models) + new need`
-must not exceed `total − OS reserve`. If it doesn't fit, spark aborts with a clear message and
-**leaves the running models untouched**.
+must not exceed `total − OS reserve`. The running models are **never touched** by this check.
 
 ```bash
 spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4              # worker
@@ -339,6 +338,32 @@ spark status                                          # see both + free memory
 # Both answer via the gateway:
 curl localhost:4000/v1/models
 ```
+
+### When a model doesn't fit
+
+The weights are fixed, but the **KV cache scales with context** — so a model that doesn't fit at
+128K often fits at a smaller context. Instead of just failing, spark computes the largest context
+windows that fit and lets you choose:
+
+```
+✗ Not enough memory to start this model
+    Needs:  89.9 GB    Free:  80.4 GB
+    Choose a context that fits:
+      1) 32768 tokens   (KV auto)
+      2) 65536 tokens   (KV fp8 — slightly less precision)
+      3) cancel
+    >
+```
+
+Picking an option relaunches at that context/precision. In scripts (no TTY) spark prints the
+options with the exact command and exits instead of prompting. `--dry-run` shows the verdict and
+options **without** aborting, so you can preview. If you pinned `--mem`, spark suggests the largest
+`--mem` that fits (context can't change a fixed reservation). If even the weights don't fit, it
+tells you to free memory.
+
+On the **Ollama** backend there's no hard reservation (Ollama offloads to CPU when a model is too
+big), so spark just **estimates** the model's size at Ollama's default context and, if it exceeds
+your usable memory, warns that it will be slower and asks you to confirm.
 
 ## Configuration
 
@@ -375,9 +400,10 @@ HuggingFace repos don't run on a Mac — use GGUF/Ollama models or `hf.co/<repo>
 
 **Q: Can I run multiple models?**
 A: Yes. On vLLM each model gets its own container and port, and spark checks the new one fits in
-memory before launching — aborting (without touching running models) if it doesn't. On Ollama, many
-models share one port and load on demand. Either way the gateway routes to all of them. See
-[Multiple models](#multiple-models); stop one with `spark stop <model>`.
+memory before launching (running models are never touched). If it doesn't fit, spark offers the
+largest context windows that would fit and lets you pick one — see
+[When a model doesn't fit](#when-a-model-doesnt-fit). On Ollama, many models share one port and load
+on demand. Either way the gateway routes to all of them; stop one with `spark stop <model>`.
 
 **Q: Where are models stored?**
 A: Standard HuggingFace cache at `~/.cache/huggingface`. Use `hf scan-cache` and `hf delete-cache` normally.

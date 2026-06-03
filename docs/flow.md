@@ -58,7 +58,7 @@ flowchart TD
     end
 
     profile --> override["apply CLI overrides + recompute\n--mem, --max-len, --kv-cache-dtype"]
-    override --> verify["verify_capacity\nreserved + need <= total - OS reserve\nelse abort (untouched)"]
+    override --> verify["verify_capacity\nreserved + need <= total - OS reserve\nif not: fit_options → menu (auto/fp8 ctx) or\nsuggest+abort (non-interactive) or show (dry-run)"]
     verify --> port["assign port (auto 8000+)\nname spark-vllm-<slug>"]
     port --> ngc["detect_ngc_image\ndocker images | grep vllm"]
     ngc --> build["build arrays\nvllm_args: serve, model, flags\ndocker_cmd: gpus, network, ipc, ulimits, volume, spark.* labels"]

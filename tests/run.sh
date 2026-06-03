@@ -398,20 +398,22 @@ test_capacity_verification_aborts() {
   make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
 
-  # A live model reserving 100 GB; budget is 121-10=111, so 28.1 more does not fit.
+  # A live model reserving 100 GB; budget is 121-10=111, so weights (14) alone don't fit
+  # in the 11 GB free -> aborts non-interactively (no context helps).
   set +e
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     FAKE_MANAGED='spark-vllm-big\torg/big\t8000\t100.0\t80.0\t20.0\n' \
-    "$SPARK" run Qwen/Qwen3-30B --dry-run 2>&1)
+    "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1)
   status=$?
   set -e
   rm -rf "$tmp"
 
   [[ "$status" -ne 0 ]] &&
     [[ "$output" == *"Not enough memory"* ]] &&
-    [[ "$output" == *"Requested:  28.1 GB"* ]] &&
-    [[ "$output" == *"org/big"* ]]
+    [[ "$output" == *"Needs:      28.1 GB"* ]] &&
+    [[ "$output" == *"org/big"* ]] &&
+    [[ "$output" == *"won't help"* ]]
 }
 
 test_port_auto_skips_busy() {
@@ -529,7 +531,8 @@ test_autopull_no_fit_download_only() {
   rm -rf "$tmp"
 
   [[ "$status" -eq 0 ]] &&
-    [[ "$output" == *"will not start now"* ]] &&
+    [[ "$output" == *"Not enough memory"* ]] &&
+    [[ "$output" == *"won't help"* ]] &&
     [[ "$output" == *"Downloaded Qwen/Qwen3-30B"* ]] &&
     [[ "$output" != *"started"* ]]
 }
@@ -677,7 +680,7 @@ test_ollama_run_pulls_and_enables_gateway() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out pulls cfg
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_TOTAL_MEM_GB=121 \
     FAKE_OLLAMA_UP=1 FAKE_OLLAMA_PULL_FILE="${tmp}/pulls.txt" \
     "$SPARK" run qwen3:30b 2>&1)
   pulls=$(cat "${tmp}/pulls.txt" 2>/dev/null || echo "")
@@ -720,6 +723,32 @@ test_doctor_ollama_backend() {
   rm -rf "$tmp"
   [[ "$out" == *"backend ollama"* ]] && [[ "$out" == *"Ollama service: reachable"* ]] &&
     [[ "$out" == *"Models: 1 pulled"* ]] && [[ "$out" != *"NGC"* ]]
+}
+
+# --- Ollama advisory (estimate at default ctx + warn/confirm) ---
+test_ollama_oversized_warns_aborts() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(printf 'n\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    SPARK_TOTAL_MEM_GB=121 SPARK_ASSUME_INTERACTIVE=1 FAKE_OLLAMA_UP=1 \
+    FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMODIFIED\nbig:latest\tabc123\t200\tGB\n" \
+    "$SPARK" run big:latest 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"offload layers to CPU"* ]] && [[ "$out" == *"Aborted"* ]] && [[ "$out" != *"ready via Ollama"* ]]
+}
+
+test_ollama_oversized_continue_yes() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    SPARK_TOTAL_MEM_GB=121 SPARK_ASSUME_INTERACTIVE=1 FAKE_OLLAMA_UP=1 \
+    FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMODIFIED\nbig:latest\tabc123\t200\tGB\n" \
+    FAKE_OLLAMA_SHOW="block_count 80\nattention.head_count_kv 8\nattention.key_length 128\n" \
+    "$SPARK" run big:latest 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"offload layers to CPU"* ]] && [[ "$out" == *"ready via Ollama"* ]]
 }
 
 # --- Gateway networking per OS ---
@@ -780,6 +809,103 @@ test_vllm_blocks_ollama_tag() {
   [[ "${rc:-0}" -ne 0 ]] && [[ "$out" == *"Ollama model tag"* ]]
 }
 
+# --- Capacity: context menu (auto vs fp8) when a model doesn't fit ---
+# 30B: weights 14, KV@128K 12, need 28.1. Reserve 85 -> free 26: doesn't fit at 128K,
+# but fits at 64K auto (need 21.6) or 128K fp8 (need 21.6).
+RESERVE_85='spark-vllm-big\torg/big\t8000\t85.0\t70.0\t15.0\n'
+
+test_dryrun_shows_fit_options() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_MANAGED="$RESERVE_85" \
+    "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$out" == *"Not enough memory"* ]] &&
+    [[ "$out" == *"Fits at up to 64K"* ]] &&
+    [[ "$out" == *"up to 128K with fp8"* ]] &&
+    [[ "$out" == *"docker run"* ]]
+}
+
+test_menu_choose_fp8_relaunches() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  printf '2\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_ASSUME_INTERACTIVE=1 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    FAKE_MANAGED="$RESERVE_85" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    "$SPARK" run Qwen/Qwen3-30B >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"--max-model-len 131072"* ]] && [[ "$dargs" == *"--kv-cache-dtype fp8"* ]]
+}
+
+test_menu_choose_auto_relaunches() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  printf '1\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_ASSUME_INTERACTIVE=1 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    FAKE_MANAGED="$RESERVE_85" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    "$SPARK" run Qwen/Qwen3-30B >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"--max-model-len 65536"* ]] && [[ "$dargs" != *"--kv-cache-dtype fp8"* ]]
+}
+
+test_menu_cancel_aborts() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  out=$(printf '3\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_ASSUME_INTERACTIVE=1 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    FAKE_MANAGED="$RESERVE_85" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    "$SPARK" run Qwen/Qwen3-30B 2>&1 || true)
+  dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$out" == *"Aborted"* ]] && [[ -z "$dargs" ]]
+}
+
+test_autopull_menu_downloads_at_choice() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs weights downloaded
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
+  # Not downloaded; sized from metadata. Reserve 85 -> doesn't fit at 128K. Pick option 2 (fp8 128K).
+  printf '2\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+    SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    FAKE_MANAGED="$RESERVE_85" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    "$SPARK" run Qwen/Qwen3-30B >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
+  weights="${tmp}/home/.cache/huggingface/hub/models--Qwen--Qwen3-30B/snapshots/1/model-00001-of-00001.safetensors"
+  downloaded=0; [[ -f "$weights" ]] && downloaded=1
+  rm -rf "$tmp"
+  [[ "$downloaded" -eq 1 ]] && [[ "$dargs" == *"--max-model-len 131072"* ]] && [[ "$dargs" == *"--kv-cache-dtype fp8"* ]]
+}
+
+test_mem_override_suggests_mem() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_MANAGED="$RESERVE_85" \
+    "$SPARK" run Qwen/Qwen3-30B --mem 0.9 </dev/null 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] && [[ "$out" == *"Fits with --mem ≤ 0.21"* ]] && [[ "$out" != *"--max-len"* ]]
+}
+
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
@@ -810,8 +936,16 @@ run_test "detect: no GPU → cpu/ollama" test_detect_cpu_without_gpu
 run_test "discrete GPU reserves from VRAM pool" test_discrete_uses_vram_pool
 run_test "ollama run (dry) plans pull + gateway route" test_ollama_dry_run_plans_pull
 run_test "ollama run pulls and enables gateway" test_ollama_run_pulls_and_enables_gateway
+run_test "ollama oversized model warns and aborts on no" test_ollama_oversized_warns_aborts
+run_test "ollama oversized model continues on yes" test_ollama_oversized_continue_yes
 run_test "ollama backend blocks vLLM-only model" test_ollama_blocks_vllm_only_model
 run_test "vllm backend blocks ollama-style tag" test_vllm_blocks_ollama_tag
+run_test "dry-run shows fit options without aborting" test_dryrun_shows_fit_options
+run_test "menu: choosing fp8 relaunches at 2x context" test_menu_choose_fp8_relaunches
+run_test "menu: choosing auto relaunches at the auto context" test_menu_choose_auto_relaunches
+run_test "menu: cancel aborts without starting" test_menu_cancel_aborts
+run_test "auto-pull menu downloads + starts at chosen context" test_autopull_menu_downloads_at_choice
+run_test "--mem too high suggests a smaller --mem" test_mem_override_suggests_mem
 run_test "gateway routes Ollama via host.docker.internal on macOS" test_gateway_ollama_route_mac
 run_test "gateway routes Ollama via localhost on Linux" test_gateway_ollama_route_linux
 run_test "doctor runs Ollama checks on the ollama backend" test_doctor_ollama_backend
