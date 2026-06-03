@@ -1911,20 +1911,25 @@ host_setup_hardening() {
     info "early-OOM: earlyoom active"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "early-OOM not active — install earlyoom so a runaway model is killed before the box freezes"
-  elif [[ "$auto_yes" == "1" ]] || confirm "Install + enable earlyoom (kills the memory hog before an OOM freeze)?"; then
-    if sudo apt-get update >/dev/null 2>&1 && sudo apt-get install -y earlyoom >/dev/null 2>&1; then
-      printf 'EARLYOOM_ARGS="-m 8 -s 100 --avoid '\''(^|/)(systemd|sshd?|ssh|dbus)$'\'' --prefer '\''(^|/)(vllm|python|pt_main_thread)$'\''"\n' | sudo tee /etc/default/earlyoom >/dev/null
-      if sudo systemctl enable --now earlyoom >/dev/null 2>&1; then
-        sudo systemctl restart earlyoom >/dev/null 2>&1 || true
-        info "early-OOM: earlyoom installed and enabled"
+  else
+    printf "    ${DIM}What: install 'earlyoom' (a tiny background service, a few KB).\n"
+    printf "    Why: it kills the biggest model the instant free RAM runs low, so a runaway model\n"
+    printf "    can't drag the whole machine into a swap freeze that needs a physical reboot.${NC}\n"
+    if [[ "$auto_yes" == "1" ]] || confirm "Install + enable earlyoom?"; then
+      if sudo apt-get update >/dev/null 2>&1 && sudo apt-get install -y earlyoom >/dev/null 2>&1; then
+        printf 'EARLYOOM_ARGS="-m 8 -s 100 --avoid '\''(^|/)(systemd|sshd?|ssh|dbus)$'\'' --prefer '\''(^|/)(vllm|python|pt_main_thread)$'\''"\n' | sudo tee /etc/default/earlyoom >/dev/null
+        if sudo systemctl enable --now earlyoom >/dev/null 2>&1; then
+          sudo systemctl restart earlyoom >/dev/null 2>&1 || true
+          info "early-OOM: earlyoom installed and enabled"
+        else
+          setup_fail "Could not enable earlyoom"
+        fi
       else
-        setup_fail "Could not enable earlyoom"
+        setup_fail "Could not install earlyoom (apt)"
       fi
     else
-      setup_fail "Could not install earlyoom (apt)"
+      setup_skip "early-OOM (earlyoom)"
     fi
-  else
-    setup_skip "early-OOM (earlyoom)"
   fi
 
   # 2) sshd MemoryMin (512M = 536870912 bytes)
@@ -1936,17 +1941,22 @@ host_setup_hardening() {
     info "sshd memory: ${unit} MemoryMin=512M (reclaim-protected)"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "sshd has no MemoryMin — it can be starved under memory pressure"
-  elif [[ "$auto_yes" == "1" ]] || confirm "Reserve 512M for ${unit} so SSH never starves?"; then
-    sudo mkdir -p "/etc/systemd/system/${unit}.d"
-    printf '[Service]\nMemoryAccounting=yes\nMemoryMin=512M\n' | sudo tee "/etc/systemd/system/${unit}.d/10-spark-memory.conf" >/dev/null
-    sudo systemctl daemon-reload >/dev/null 2>&1
-    if sudo systemctl reload "$unit" >/dev/null 2>&1 || sudo systemctl restart "$unit" >/dev/null 2>&1; then
-      info "sshd memory: ${unit} MemoryMin=512M set"
-    else
-      setup_fail "Could not apply MemoryMin to ${unit}"
-    fi
   else
-    setup_skip "sshd MemoryMin"
+    printf "    ${DIM}What: reserve 512 MB for the SSH service (a protected floor — free when unused).\n"
+    printf "    Why: under memory pressure the kernel won't page sshd out, so you can always connect\n"
+    printf "    to the machine to fix things instead of being locked out. Restarting ssh is safe.${NC}\n"
+    if [[ "$auto_yes" == "1" ]] || confirm "Reserve 512M for ${unit}?"; then
+      sudo mkdir -p "/etc/systemd/system/${unit}.d"
+      printf '[Service]\nMemoryAccounting=yes\nMemoryMin=512M\n' | sudo tee "/etc/systemd/system/${unit}.d/10-spark-memory.conf" >/dev/null
+      sudo systemctl daemon-reload >/dev/null 2>&1
+      if sudo systemctl reload "$unit" >/dev/null 2>&1 || sudo systemctl restart "$unit" >/dev/null 2>&1; then
+        info "sshd memory: ${unit} MemoryMin=512M set"
+      else
+        setup_fail "Could not apply MemoryMin to ${unit}"
+      fi
+    else
+      setup_skip "sshd MemoryMin"
+    fi
   fi
 }
 
