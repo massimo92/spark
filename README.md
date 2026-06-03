@@ -174,6 +174,7 @@ spark run llama3.3 --dry-run                            # show the plan, don't p
 | `--dry-run` | off | Print the memory plan and Docker command only |
 | `--tail` | off | Follow logs after launch |
 | `--force` | off | Replace this model if it is already running |
+| `--no-mem-limit` | off | Don't set the hard `--memory` cgroup limit on the container |
 | `--regen-profile` | off | Regenerate model profile |
 
 ### spark stop
@@ -338,6 +339,18 @@ the **total** reserved at `SPARK_MEM_MAX_UTIL_PCT`% of RAM (default **85**, tuna
 model or several. If a launch would exceed it, the "doesn't fit" menu offers a smaller context (or,
 with `--mem`, a smaller fraction). Discrete GPUs are exempt (the OS isn't in VRAM and vLLM OOMs
 cleanly).
+
+And as enforcement (not just accounting), each container gets a **hard `--memory` cgroup limit** =
+`NEED × (1 + SPARK_MEM_LIMIT_MARGIN_PCT/100)` (default margin **25%**), with swap disabled. On
+cgroup v2 a container's page cache and allocations are charged to its own cgroup, so a model that
+overuses RAM **reclaims or OOM-kills itself** instead of dragging the host into swap thrash — the
+host (and sshd) keep their memory. Tunable via `SPARK_MEM_LIMIT_MARGIN_PCT`; disable per-run with
+`--no-mem-limit`. Unified memory only.
+
+For a server that must stay reachable, run **`spark host`** (Linux): it can install **earlyoom**
+(kills a runaway model on low memory before the kernel deadlocks) and give **sshd a `MemoryMin`
+floor** (so it's never paged out). Together with the per-container limit, that makes a
+memory-overcommit freeze — the kind that needs a physical reboot — effectively impossible.
 
 ```bash
 spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4              # worker
