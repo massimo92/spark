@@ -1117,7 +1117,7 @@ run_backend_ollama() {
   else
     oest=$(awk -v w="$ow" 'BEGIN{ printf "%.1f", w*1.15 }')   # KV unknown — weights + cushion
   fi
-  if awk -v e="$oest" -v b="$BUDGET_GB" 'BEGIN{ exit !(e > b) }'; then
+  if awk -v e="$oest" -v b="$BUDGET_GB" 'BEGIN{ exit !(b > 0 && e > b) }'; then
     warn "Estimated ~${oest} GB at 4096 ctx, above ~${BUDGET_GB} GB usable — Ollama will offload layers to CPU (slower)."
     if ! confirm "Continue anyway?"; then
       printf "    Aborted. Model stays downloaded; free memory or use a smaller model.\n"

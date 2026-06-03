@@ -680,7 +680,7 @@ test_ollama_run_pulls_and_enables_gateway() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out pulls cfg
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_TOTAL_MEM_GB=121 \
     FAKE_OLLAMA_UP=1 FAKE_OLLAMA_PULL_FILE="${tmp}/pulls.txt" \
     "$SPARK" run qwen3:30b 2>&1)
   pulls=$(cat "${tmp}/pulls.txt" 2>/dev/null || echo "")
