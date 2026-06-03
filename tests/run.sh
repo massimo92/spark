@@ -725,6 +725,32 @@ test_doctor_ollama_backend() {
     [[ "$out" == *"Models: 1 pulled"* ]] && [[ "$out" != *"NGC"* ]]
 }
 
+# --- Ollama advisory (estimate at default ctx + warn/confirm) ---
+test_ollama_oversized_warns_aborts() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(printf 'n\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    SPARK_TOTAL_MEM_GB=121 SPARK_ASSUME_INTERACTIVE=1 FAKE_OLLAMA_UP=1 \
+    FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMODIFIED\nbig:latest\tabc123\t200\tGB\n" \
+    "$SPARK" run big:latest 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"offload layers to CPU"* ]] && [[ "$out" == *"Aborted"* ]] && [[ "$out" != *"ready via Ollama"* ]]
+}
+
+test_ollama_oversized_continue_yes() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    SPARK_TOTAL_MEM_GB=121 SPARK_ASSUME_INTERACTIVE=1 FAKE_OLLAMA_UP=1 \
+    FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMODIFIED\nbig:latest\tabc123\t200\tGB\n" \
+    FAKE_OLLAMA_SHOW="block_count 80\nattention.head_count_kv 8\nattention.key_length 128\n" \
+    "$SPARK" run big:latest 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"offload layers to CPU"* ]] && [[ "$out" == *"ready via Ollama"* ]]
+}
+
 # --- Gateway networking per OS ---
 # Write a minimal gateway config with the Ollama provider enabled.
 write_ollama_gateway_config() {
@@ -910,6 +936,8 @@ run_test "detect: no GPU → cpu/ollama" test_detect_cpu_without_gpu
 run_test "discrete GPU reserves from VRAM pool" test_discrete_uses_vram_pool
 run_test "ollama run (dry) plans pull + gateway route" test_ollama_dry_run_plans_pull
 run_test "ollama run pulls and enables gateway" test_ollama_run_pulls_and_enables_gateway
+run_test "ollama oversized model warns and aborts on no" test_ollama_oversized_warns_aborts
+run_test "ollama oversized model continues on yes" test_ollama_oversized_continue_yes
 run_test "ollama backend blocks vLLM-only model" test_ollama_blocks_vllm_only_model
 run_test "vllm backend blocks ollama-style tag" test_vllm_blocks_ollama_tag
 run_test "dry-run shows fit options without aborting" test_dryrun_shows_fit_options

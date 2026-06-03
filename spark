@@ -1037,6 +1037,24 @@ ollama_model_size() {
   ollama list 2>/dev/null | awk -v m="$1" 'NR>1 && $1==m {print $3" "$4; exit}'
 }
 
+# Model weights size in GiB, parsed from `ollama list` (e.g. "18 GB" -> 18.0).
+ollama_weights_gb() {
+  local s; s=$(ollama_model_size "$1")
+  awk -v s="$s" 'BEGIN{ n=s+0; if (s ~ /[Mm]B/) n=n/1024; else if (s ~ /[Tt]B/) n=n*1024; printf "%.1f", n }'
+}
+
+# Estimate KV cache (GiB) for an Ollama model at `ctx` tokens, parsing the GGUF metadata
+# that `ollama show` prints. Echoes a number, or nothing if the fields aren't available.
+ollama_arch_kv() {
+  local m="$1" ctx="$2" info layers kvh kdim
+  info=$(ollama show "$m" 2>/dev/null) || return 0
+  layers=$(printf '%s\n' "$info" | grep -iE 'block_count'   | grep -oE '[0-9]+' | head -1)
+  kvh=$(printf '%s\n' "$info"    | grep -iE 'head_count_kv' | grep -oE '[0-9]+' | head -1)
+  kdim=$(printf '%s\n' "$info"   | grep -iE 'key_length|head_dim' | grep -oE '[0-9]+' | head -1)
+  is_positive_int "$layers" && is_positive_int "$kvh" && is_positive_int "$kdim" || return 0
+  awk -v L="$layers" -v H="$kvh" -v D="$kdim" -v T="$ctx" 'BEGIN{ printf "%.1f", (2*L*H*D*2*T)/1073741824 }'
+}
+
 # Enable the Ollama provider in the gateway config and refresh it if running.
 gateway_enable_ollama() {
   local config
@@ -1088,6 +1106,24 @@ run_backend_ollama() {
   local osize
   osize=$(ollama_model_size "$model")
   [[ -n "$osize" ]] && printf "  ${DIM}Size: %s (Ollama loads on demand)${NC}\n" "$osize"
+
+  # Advisory capacity estimate at Ollama's default context (num_ctx 4096). Ollama offloads
+  # layers to CPU if it doesn't fit (it doesn't fail), so this warns + confirms, not blocks.
+  local ow okv oest
+  ow=$(ollama_weights_gb "$model")
+  okv=$(ollama_arch_kv "$model" 4096)
+  if [[ -n "$okv" ]]; then
+    oest=$(awk -v w="$ow" -v k="$okv" 'BEGIN{ printf "%.1f", (w+k)*1.05 }')
+  else
+    oest=$(awk -v w="$ow" 'BEGIN{ printf "%.1f", w*1.15 }')   # KV unknown — weights + cushion
+  fi
+  if awk -v e="$oest" -v b="$BUDGET_GB" 'BEGIN{ exit !(e > b) }'; then
+    warn "Estimated ~${oest} GB at 4096 ctx, above ~${BUDGET_GB} GB usable — Ollama will offload layers to CPU (slower)."
+    if ! confirm "Continue anyway?"; then
+      printf "    Aborted. Model stays downloaded; free memory or use a smaller model.\n"
+      exit 0
+    fi
+  fi
 
   # Route it through the gateway (enable provider + refresh if running).
   gateway_enable_ollama
