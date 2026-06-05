@@ -118,29 +118,28 @@ TOTAL_MEM_GB=$(detect_total_mem_gb)
 if [[ "$ACCEL" == "cuda-discrete" ]]; then
   OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-2}"         # small VRAM headroom (OS runs in system RAM)
 else
-  OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-10}"        # OS + desktop share unified memory
+  OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-7}"         # OS working set (OS+sshd+gateway+docker+buffer)
 fi
 MEM_HEADROOM_PCT="${SPARK_MEM_HEADROOM_PCT:-8}"     # per-model cushion (activations/fragmentation)
-BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))       # memory available to models
-# On unified memory, the load peak of a starting model (its weights streaming through the page
-# cache) stacks on whatever is resident; letting reservations sum near full RAM can thrash the
-# box hard enough to need a power cycle. Cap the TOTAL reserved at this % of RAM (fail-safe;
-# tunable). Discrete GPUs are exempt — the OS isn't in VRAM and vLLM OOMs cleanly.
-MEM_MAX_UTIL_PCT="${SPARK_MEM_MAX_UTIL_PCT:-85}"
-# Hard per-container memory ceiling (Docker --memory / cgroup memory.max) = NEED × (1 + this/100),
-# on unified memory only. Confines a model's load-peak page cache to its own cgroup so it
-# reclaims/OOMs itself instead of thrashing the host. Discrete GPUs exempt; --no-mem-limit disables.
-MEM_LIMIT_MARGIN_PCT="${SPARK_MEM_LIMIT_MARGIN_PCT:-25}"
-# Default cap on concurrent requests. vLLM's own default is 256, which can exceed the cache
-# blocks a tightly-sized hybrid (Mamba) model can allocate and abort startup. 100 is plenty for
-# personal use and boots tight; raise per-run with --max-num-seqs or globally with this env.
+# Admission budget = everything minus what the OS needs to stay responsive. The host stays safe via
+# the per-container cgroup cap (below) + swap-off + sshd OOM protection (spark host), not a separate
+# arbitrary utilization cap. On a single 24/7 model you can use ~90%+ of RAM.
+BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))
+# Per-container hard ceiling (Docker --memory / cgroup memory.max) = NEED + this, on unified memory
+# only. Confines a model's STARTUP PEAK to its own cgroup so it self-OOMs cleanly instead of
+# thrashing the host. The peak is torch.compile + CUDA-graph capture (pinned, non-swappable), not
+# the weights — measured per model and cached in the profile; else this conservative default.
+WARMUP_HEADROOM_GB="${SPARK_WARMUP_HEADROOM_GB:-20}"
+# Default cap on concurrent requests. vLLM's own default is 256, which can exceed the cache blocks a
+# tight hybrid (Mamba) model allocates and abort startup. Raise per-run with --max-num-seqs.
 MAX_NUM_SEQS_DEFAULT="${SPARK_MAX_NUM_SEQS:-100}"
-# Adaptive startup supervision: after launch, wait until the model serves and auto-retry
-# recoverable startup failures (concurrency too high for the cache → lower --max-num-seqs;
-# warmup OOM → raise the cgroup margin within the 85% cap).
+# Adaptive startup supervision: wait until the model serves; auto-retry recoverable startup failures
+# (concurrency too high for the cache → lower --max-num-seqs; warmup OOM → --enforce-eager).
 STARTUP_TIMEOUT="${SPARK_STARTUP_TIMEOUT:-600}"          # seconds to wait for the API to come up
 STARTUP_MAX_RETRIES="${SPARK_STARTUP_MAX_RETRIES:-2}"    # auto-retries on a recoverable failure
-MEM_LIMIT_MARGIN_MAX_PCT="${SPARK_MEM_LIMIT_MARGIN_MAX_PCT:-200}"  # ceiling for the OOM-retry bump
+# earlyoom's emergency floor: kill the hog when free RAM drops below this %. The last-resort backstop
+# (the cgroup cap + admission keep normal operation far from it). spark host configures earlyoom here.
+EARLYOOM_MIN_FREE_PCT="${SPARK_EARLYOOM_MIN_FREE_PCT:-5}"
 
 # Detect the latest pulled NGC vLLM image
 detect_ngc_image() {
@@ -408,6 +407,7 @@ load_profile() {
   MAX_MODEL_LEN=$(jq -r '.max_model_len // ""' "$profile_file") || die "Could not read profile: $profile_file"
   MODEL_MAX_LEN="$MAX_MODEL_LEN"   # cached proxy for the model's max context (fit suggestions)
   IS_MULTIMODAL=$(jq -r '.is_multimodal // "false"' "$profile_file") || die "Could not read profile: $profile_file"
+  IS_MOE=$(jq -r '.is_moe // "0"' "$profile_file") || die "Could not read profile: $profile_file"
   MODEL_SIZE_GB=$(jq -r '.model_size_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
   WEIGHTS_GB=$(jq -r '.weights_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
   KV_GB=$(jq -r '.kv_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
@@ -562,6 +562,15 @@ profile_model() {
     IS_MULTIMODAL="true"
   fi
 
+  # MoE detection: vLLM under-profiles MoE startup memory (imbalanced experts) → big warmup peak.
+  # Used to bias --enforce-eager on the first launch when there's no measured peak yet.
+  IS_MOE="0"
+  local has_experts
+  has_experts=$(jq -r '(.text_config // .) | (has("num_experts") or has("n_routed_experts") or has("num_local_experts") or has("num_experts_per_tok"))' "$config_json" 2>/dev/null || echo "false")
+  if [[ "$has_experts" == "true" ]] || echo "$arch_list" | grep -qiE "moe|mixture"; then
+    IS_MOE="1"
+  fi
+
   # Model size (sum of safetensors)
   # -L follows symlinks (HF cache uses symlinks in snapshots/)
   MODEL_SIZE_GB=$(find -L "$model_path" -name "*.safetensors" -exec stat -Lc%s {} + 2>/dev/null \
@@ -600,6 +609,7 @@ profile_model() {
     --arg kv_gb "$KV_GB" \
     --arg need_gb "$NEED_GB" \
     --arg kv_cache_dtype "$KV_CACHE_DTYPE" \
+    --arg is_moe "$IS_MOE" \
     '{
       model: $model,
       generated: $generated,
@@ -608,12 +618,74 @@ profile_model() {
       gpu_memory_utilization: $gpu_memory_utilization,
       max_model_len: $max_model_len,
       is_multimodal: $is_multimodal,
+      is_moe: $is_moe,
       model_size_gb: $model_size_gb,
       weights_gb: $weights_gb,
       kv_gb: $kv_gb,
       need_gb: $need_gb,
       kv_cache_dtype: $kv_cache_dtype
     }' > "$profile_file"
+}
+
+profile_file_for() {
+  printf '%s/%s.json' "$PROFILES_DIR" "$(printf '%s' "$1" | sed 's/\//--/g')"
+}
+
+# Load a cached warmup measurement (peak + the enforce-eager that worked) for THIS model at the
+# final launch config (ctx/kv). Sets WARMUP_PEAK_GB / PROFILE_ENFORCE_EAGER (empty if none). The
+# community DB (data/model_profiles.json) is consulted as a fallback hint when there's no local one.
+load_warmup_cache() {
+  local model="$1" pf key
+  WARMUP_PEAK_GB=""; PROFILE_ENFORCE_EAGER=""
+  key="${MAX_MODEL_LEN}/${KV_CACHE_DTYPE}"
+  pf=$(profile_file_for "$model")
+  if [[ -f "$pf" ]]; then
+    WARMUP_PEAK_GB=$(jq -r --arg k "$key" '(.warmup // {})[$k].peak_gb // ""' "$pf" 2>/dev/null || echo "")
+    PROFILE_ENFORCE_EAGER=$(jq -r --arg k "$key" '(.warmup // {})[$k].enforce_eager // ""' "$pf" 2>/dev/null || echo "")
+  fi
+  [[ -n "$WARMUP_PEAK_GB" ]] && return 0
+  community_warmup_hint "$model"   # may set WARMUP_PEAK_GB / PROFILE_ENFORCE_EAGER as a hint
+}
+
+# Look up a shipped community profile (data/model_profiles.json) keyed by the dimensions that affect
+# the peak: model · accel · vllm tag · ctx · kv. Match is a HINT (the cgroup cap + reactive retry
+# still validate), never authoritative — hardware/version differences make it approximate.
+community_warmup_hint() {
+  local model="$1" db key ngc tag
+  db="${SPARK_DIR:-$(dirname "$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")")}/data/model_profiles.json"
+  [[ -f "$db" ]] || return 0
+  ngc=$(detect_ngc_image 2>/dev/null); tag="${ngc##*:}"
+  key="${MAX_MODEL_LEN}/${KV_CACHE_DTYPE}"
+  WARMUP_PEAK_GB=$(jq -r --arg m "$model" --arg a "$ACCEL" --arg t "$tag" --arg k "$key" \
+    '[.[] | select(.model==$m and .accel==$a and .vllm_tag==$t and .config==$k)][0].warmup_peak_gb // ""' \
+    "$db" 2>/dev/null || echo "")
+  PROFILE_ENFORCE_EAGER=$(jq -r --arg m "$model" --arg a "$ACCEL" --arg t "$tag" --arg k "$key" \
+    '[.[] | select(.model==$m and .accel==$a and .vllm_tag==$t and .config==$k)][0].enforce_eager // ""' \
+    "$db" 2>/dev/null || echo "")
+}
+
+# Record the measured warmup peak for THIS model+config into its local profile (keyed by ctx/kv).
+save_warmup_peak() {
+  local model="$1" peak_gb="$2" eager="$3" pf tmp key
+  pf=$(profile_file_for "$model")
+  [[ -f "$pf" ]] || return 0
+  key="${MAX_MODEL_LEN}/${KV_CACHE_DTYPE}"
+  tmp=$(mktemp)
+  if jq --arg k "$key" --arg p "$peak_gb" --arg e "$eager" --arg d "$(date +%Y-%m-%d)" \
+      '.warmup = ((.warmup // {}) + {($k): {peak_gb: $p, enforce_eager: $e, date: $d}})' \
+      "$pf" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$pf"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# A container's cgroup v2 high-water mark (exact, no sampling) in GB. Empty if unavailable.
+container_peak_gb() {
+  local bytes
+  bytes=$(docker exec "$1" cat /sys/fs/cgroup/memory.peak 2>/dev/null | tr -d '[:space:]')
+  [[ "$bytes" =~ ^[0-9]+$ ]] || return 0
+  awk -v b="$bytes" 'BEGIN{ printf "%.1f", b/1073741824 }'
 }
 
 # Recompute KV + need + fraction from config.json using the current MAX_MODEL_LEN
@@ -758,13 +830,10 @@ is_interactive() { [[ -t 0 || -n "${SPARK_ASSUME_INTERACTIVE:-}" ]]; }
 #    and memory, and the launch continues.
 #  - non-interactive: print the fitting options + command, then abort.
 #  - dry-run: print the verdict/options and continue (never prompts, never aborts).
-# Memory available to models: the smaller of (total − OS reserve) and MEM_MAX_UTIL_PCT% of total.
-# The % cap is the fail-safe against load-peak thrash on unified memory and applies always (one
-# model or several). Discrete GPUs are exempt: the OS isn't in VRAM and vLLM OOMs cleanly.
+# Admission budget for the sum of model reservations = TOTAL − OS reserve. The host is protected by
+# the per-container cgroup cap + swap-off + sshd OOM protection, so there's no separate util cap.
 usable_budget() {
-  if [[ "$ACCEL" == "cuda-discrete" ]]; then printf '%s\n' "$BUDGET_GB"; return 0; fi
-  awk -v b="$BUDGET_GB" -v t="$TOTAL_MEM_GB" -v p="$MEM_MAX_UTIL_PCT" \
-    'BEGIN{ cap=t*p/100; if (cap<b) b=cap; printf "%.1f", b }'
+  printf '%s\n' "$BUDGET_GB"
 }
 
 verify_capacity() {
@@ -778,13 +847,8 @@ verify_capacity() {
 
   err "Not enough memory to start this model"
   printf "    Needs:      %s GB\n" "$new_need"
-  if awk -v e="$eff_budget" -v b="$BUDGET_GB" 'BEGIN{ exit !(e < b) }'; then
-    printf "    Free:       %s GB  (memory cap %s%% = %s GB of %s total)\n" \
-      "$free" "$MEM_MAX_UTIL_PCT" "$eff_budget" "$TOTAL_MEM_GB"
-  else
-    printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
-      "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
-  fi
+  printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
+    "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
   local any=0 name m port need _
   while IFS=$'\t' read -r name m port need _; do
     [[ -z "$m" ]] && continue
@@ -873,12 +937,14 @@ download_model_full() {
 cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
-  local no_wait=0 max_num_seqs=""
+  local no_wait=0 max_num_seqs="" enforce_eager_flag="auto"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; shift 2 ;;
       --no-mem-limit) no_mem_limit=1; shift ;;
+      --enforce-eager)    enforce_eager_flag=1; shift ;;
+      --no-enforce-eager) enforce_eager_flag=0; shift ;;
       --no-wait)   no_wait=1; shift ;;
       --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; shift 2 ;;
       --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; shift 2 ;;
@@ -909,9 +975,22 @@ cmd_run() {
   esac
 }
 
-# (Re)build vllm_args + docker_cmd from the current $seqs (concurrency) and $margin_pct (cgroup
-# headroom). Called once and again on each adaptive-startup retry. Reads/writes run_backend_vllm
-# locals via dynamic scope (same pattern as the backend reading cmd_run's flags).
+# Decide whether to launch with --enforce-eager (no CUDA-graph capture → no startup peak).
+# Manual flag wins; otherwise: a cached profile that needed eager → eager; a large MoE with no
+# measurement (vLLM under-profiles these → big peak) → eager; else off (CUDA graphs, faster).
+resolve_enforce_eager() {
+  case "${enforce_eager_flag:-auto}" in
+    1|yes|on|true)  printf '1'; return 0 ;;
+    0|no|off|false) printf '0'; return 0 ;;
+  esac
+  [[ -n "${PROFILE_ENFORCE_EAGER:-}" ]] && { printf '%s' "$PROFILE_ENFORCE_EAGER"; return 0; }
+  if [[ -z "${WARMUP_PEAK_GB:-}" && "${IS_MOE:-0}" == "1" ]]; then printf '1'; return 0; fi
+  printf '0'
+}
+
+# (Re)build vllm_args + docker_cmd from the current $seqs (concurrency), $headroom_gb (cgroup cap
+# above NEED) and $enforce_eager. Called once and again on each adaptive-startup retry. Reads/writes
+# run_backend_vllm locals via dynamic scope (same pattern as the backend reading cmd_run's flags).
 build_launch() {
   vllm_args=(vllm serve "$model"
     --trust-remote-code
@@ -920,14 +999,17 @@ build_launch() {
     --max-num-seqs "$seqs"
     --port "$port")
   [[ "$KV_CACHE_DTYPE" == "fp8" ]] && vllm_args+=(--kv-cache-dtype fp8)
+  [[ "$enforce_eager" == "1" ]] && vllm_args+=(--enforce-eager)
   [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]] && vllm_args+=(--reasoning-parser "$REASONING_PARSER")
   [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] && vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
   [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt image=0)
 
+  # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). If the real peak
+  # exceeds it, the container self-OOMs cleanly (OOMKilled) and the loop retries with --enforce-eager.
   mem_limit_mib=""
   if [[ "$ACCEL" != "cuda-discrete" && "$no_mem_limit" != "1" ]]; then
-    mem_limit_mib=$(awk -v n="$NEED_GB" -v p="$margin_pct" \
-      'BEGIN{ v=n*(1+p/100)*1024; iv=int(v); if(v>iv) iv++; printf "%d", iv }')
+    mem_limit_mib=$(awk -v n="$NEED_GB" -v h="$headroom_gb" \
+      'BEGIN{ v=(n+h)*1024; iv=int(v); if(v>iv) iv++; printf "%d", iv }')
   fi
   docker_cmd=(docker run -d
     --gpus all
@@ -1119,11 +1201,17 @@ run_backend_vllm() {
   ngc_image=$(detect_ngc_image)
   [[ -z "$ngc_image" ]] && die "No NGC vLLM container found" "Run: spark setup"
 
-  # Concurrency cap: replace vLLM's default (256) with a sane ceiling so a tightly-sized hybrid
-  # (Mamba) model boots. Raise per-run with --max-num-seqs. The adaptive loop below lowers it
-  # only if even this doesn't fit. $margin_pct is the cgroup headroom (raised on a warmup OOM).
+  # Concurrency cap (raise with --max-num-seqs); cgroup headroom for the startup peak (cached per
+  # model, else default); and enforce-eager (kills the torch.compile/CUDA-graph peak). The adaptive
+  # loop below lowers $seqs for cache-block errors and flips $enforce_eager on a warmup OOM.
   local seqs="${max_num_seqs:-$MAX_NUM_SEQS_DEFAULT}"
-  local margin_pct="$MEM_LIMIT_MARGIN_PCT"
+  load_warmup_cache "$model"   # sets WARMUP_PEAK_GB / PROFILE_ENFORCE_EAGER for the final ctx/kv
+  # Cgroup headroom above NEED: from the cached measured peak if we have one, else the default.
+  local headroom_gb
+  headroom_gb=$(awk -v p="${WARMUP_PEAK_GB:-}" -v n="$NEED_GB" -v d="$WARMUP_HEADROOM_GB" \
+    'BEGIN{ if(p=="" || p+0<=0){ printf "%d", d; exit } h=p-n; if(h<4)h=4; printf "%.0f", h }')
+  local enforce_eager
+  enforce_eager=$(resolve_enforce_eager)
   local vllm_args=() docker_cmd=() mem_limit_mib=""
   build_launch
 
@@ -1144,7 +1232,7 @@ run_backend_vllm() {
 
   # Supervised adaptive launch: start the container, wait until it serves, and auto-retry
   # recoverable startup failures. Levers: lower $seqs (concurrency) for cache-block errors;
-  # raise $margin_pct (cgroup headroom, capped by the 85% envelope) for a warmup OOM.
+  # flip $enforce_eager (removes the torch.compile/CUDA-graph startup peak) on a warmup OOM.
   local attempt=0 serve_state="nowait"
   while : ; do
     docker rm -f "$cname" >/dev/null 2>&1 || true
@@ -1191,18 +1279,16 @@ run_backend_vllm() {
         docker logs --tail 15 "$cname" 2>&1 | sed 's/^/    /'
         exit 1 ;;
       exit:oom)
-        local m_max new_margin
-        m_max=$(awk -v f="$free" -v n="$NEED_GB" -v cap="$MEM_LIMIT_MARGIN_MAX_PCT" \
-          'BEGIN{ if(n<=0){print 0; exit} m=(f/n-1)*100; if(m>cap)m=cap; if(m<0)m=0; printf "%d", m }')
-        new_margin=$((margin_pct + 25))
-        if [[ "$attempt" -lt "$STARTUP_MAX_RETRIES" && "$new_margin" -le "$m_max" && "$m_max" -gt "$margin_pct" ]]; then
-          attempt=$((attempt + 1)); margin_pct="$new_margin"
-          info "Startup hit the memory ceiling — retrying with +${margin_pct}% headroom."
+        # The startup peak (torch.compile + CUDA-graph capture) overflowed the container cap. The
+        # principled fix is --enforce-eager: it removes that peak entirely (no graph capture).
+        if [[ "$attempt" -lt "$STARTUP_MAX_RETRIES" && "$enforce_eager" != "1" ]]; then
+          attempt=$((attempt + 1)); enforce_eager=1
+          info "Startup peak too big — retrying with --enforce-eager (no CUDA graphs; ~10-20% slower)."
           build_launch
           continue
         fi
-        err "Startup peak exceeds the safe memory cap for ${model}."
-        printf "    Reduce context (--max-len) or free memory (spark stop <model>).\n"
+        err "Startup peak exceeds the memory budget for ${model}, even with --enforce-eager."
+        printf "    Reduce context (--max-len), free memory (spark stop <model>), or use a smaller model.\n"
         exit 1 ;;
       *)
         err "vLLM failed to start."
@@ -1210,6 +1296,14 @@ run_backend_vllm() {
         exit 1 ;;
     esac
   done
+
+  # Learn the real startup peak (exact cgroup high-water mark) and cache it for next time, so future
+  # launches size the headroom / enforce-eager from a measured fact instead of a guess.
+  if [[ "$serve_state" == "ready" ]]; then
+    local measured
+    measured=$(container_peak_gb "$cname")
+    [[ -n "$measured" ]] && save_warmup_peak "$model" "$measured" "$enforce_eager"
+  fi
 
   printf "\n  Container '${BOLD}%s${NC}' started." "$cname"
   case "$serve_state" in
@@ -1358,8 +1452,9 @@ print_memory_plan() {
   printf "    Weights:   %s GB\n" "$WEIGHTS_GB"
   printf "    KV cache:  %s GB\n" "$KV_GB"
   printf "    ${BOLD}Need:${NC}      %s GB  →  --gpu-memory-utilization %s\n" "$NEED_GB" "$GPU_MEM_UTIL"
-  [[ -n "${mem_limit_mib:-}" ]] && printf "    Limit:     %s MiB  (hard cgroup cap, NEED +%s%%)\n" "$mem_limit_mib" "$margin_pct"
+  [[ -n "${mem_limit_mib:-}" ]] && printf "    Limit:     %s MiB  (cgroup cap = NEED + %s GB warmup headroom)\n" "$mem_limit_mib" "${headroom_gb:-?}"
   [[ -n "${seqs:-}" ]] && printf "    Concur.:   %s requests  (max-num-seqs)\n" "$seqs"
+  [[ "${enforce_eager:-0}" == "1" ]] && printf "    Eager:     on  (CUDA graphs disabled — smaller startup peak)\n"
   printf "    API:       http://localhost:%s/v1\n" "$port"
   [[ -n "$REASONING_PARSER" ]] && printf "    Reasoning: %s parser\n" "$REASONING_PARSER"
   if [[ "$ACCEL" == "cuda-discrete" ]]; then
@@ -2255,58 +2350,100 @@ step_gateway() {
 # OS hardening (Linux + systemd) so SSH always has room even if models exhaust RAM:
 #   1) early-OOM (earlyoom) kills the memory hog before the kernel deadlocks into swap thrash.
 #   2) MemoryMin protects sshd from reclaim so it never gets paged out / starved.
+# earlyoom is the emergency backstop. Declarative: reconciles to '-m $EARLYOOM_MIN_FREE_PCT -s 100'
+# regardless of any old/divergent config (e.g. a -m 8 / -m 3 left from experiments).
 step_earlyoom() {
-  local auto_yes="$1" check_only="$2"
-  if ctx_run 'systemctl is-active --quiet earlyoom'; then
-    info "early-OOM: earlyoom active"
-  elif [[ "$check_only" == "1" ]]; then
-    setup_fail "early-OOM not active — install earlyoom so a runaway model is killed before the box freezes"
-  else
-    printf "    ${DIM}What: install 'earlyoom' (a tiny background service, a few KB).\n"
-    printf "    Why: it kills the biggest model the instant free RAM runs low, so a runaway model\n"
-    printf "    can't drag the whole machine into a swap freeze that needs a physical reboot.${NC}\n"
-    if [[ "$auto_yes" == "1" ]] || confirm "Install + enable earlyoom?"; then
-      if ctx_sudo 'apt-get update >/dev/null 2>&1 && apt-get install -y earlyoom >/dev/null 2>&1'; then
-        printf 'EARLYOOM_ARGS="-m 8 -s 100 --avoid '\''(^|/)(systemd|sshd?|ssh|dbus)$'\'' --prefer '\''(^|/)(vllm|python|pt_main_thread)$'\''"\n' | ctx_sudo_write /etc/default/earlyoom
-        if ctx_sudo 'systemctl enable --now earlyoom && systemctl restart earlyoom'; then
-          info "early-OOM: earlyoom installed and enabled"
-        else
-          setup_fail "Could not enable earlyoom"
-        fi
-      else
-        setup_fail "Could not install earlyoom (apt)"
-      fi
-    else
-      setup_skip "early-OOM (earlyoom)"
+  local auto_yes="$1" check_only="$2" want="$EARLYOOM_MIN_FREE_PCT" installed=0 active=0 cur_m
+  local ef="${EARLYOOM_DEFAULT_FILE:-/etc/default/earlyoom}"
+  ctx_run 'command -v earlyoom >/dev/null 2>&1' && installed=1
+  ctx_run 'systemctl is-active --quiet earlyoom' && active=1
+  cur_m="$(ctx_run "grep -oE -- '-m[ =][0-9]+' '$ef' 2>/dev/null | grep -oE '[0-9]+' | head -1")"
+  if [[ "$installed" == "1" && "$active" == "1" && "$cur_m" == "$want" ]]; then
+    info "early-OOM: earlyoom active (-m ${want}%, reclaim-protected backstop)"
+    return 0
+  fi
+  if [[ "$check_only" == "1" ]]; then
+    if [[ "$installed" != "1" ]]; then setup_fail "early-OOM not active — install earlyoom so a runaway model is killed before the box freezes"
+    else setup_fail "earlyoom not at -m ${want}% (found '${cur_m:-none}') — re-run spark host to reconcile"; fi
+    return 0
+  fi
+  printf "    ${DIM}What: install/configure 'earlyoom' (-m ${want}%%): kill the memory hog when free RAM is low.\n"
+  printf "    Why: it acts EARLY (before swap thrash), so a runaway model can't freeze the box. The\n"
+  printf "    cgroup cap + admission keep normal operation far from this floor.${NC}\n"
+  if [[ "$auto_yes" == "1" ]] || confirm "Install/repair earlyoom at -m ${want}%?"; then
+    if [[ "$installed" != "1" ]] && ! ctx_sudo 'apt-get update >/dev/null 2>&1 && apt-get install -y earlyoom >/dev/null 2>&1'; then
+      setup_fail "Could not install earlyoom (apt)"; return 0
     fi
+    printf 'EARLYOOM_ARGS="-m %s -s 100 --avoid '\''(^|/)(systemd|sshd?|ssh|dbus)$'\'' --prefer '\''(^|/)(vllm|python|pt_main_thread)$'\''"\n' "$want" | ctx_sudo_write "$ef"
+    if ctx_sudo 'systemctl enable --now earlyoom >/dev/null 2>&1; systemctl restart earlyoom'; then
+      info "early-OOM: earlyoom set to -m ${want}%"
+    else
+      setup_fail "Could not enable earlyoom"
+    fi
+  else
+    setup_skip "early-OOM (earlyoom)"
   fi
 }
 
+# Protect SSH so you can ALWAYS connect: MemoryMin (reclaim-protected, stays responsive) +
+# OOMScoreAdjust=-1000 (the OOM killer never picks sshd). Declarative single drop-in, idempotent.
 step_sshd_memorymin() {
-  local auto_yes="$1" check_only="$2" unit cur
+  local auto_yes="$1" check_only="$2" unit mm oom
   unit="$(ctx_run 'systemctl list-unit-files --no-legend ssh.service sshd.service 2>/dev/null | awk "NR==1{print \$1}"')"
   [[ -z "$unit" ]] && unit="ssh.service"
-  cur="$(ctx_run "systemctl show -p MemoryMin --value ${unit} 2>/dev/null")"
-  if [[ "$cur" == "536870912" ]]; then
-    info "sshd memory: ${unit} MemoryMin=512M (reclaim-protected)"
-  elif [[ "$check_only" == "1" ]]; then
-    setup_fail "sshd has no MemoryMin — it can be starved under memory pressure"
-  else
-    printf "    ${DIM}What: reserve 512 MB for the SSH service (a protected floor — free when unused).\n"
-    printf "    Why: under memory pressure the kernel won't page sshd out, so you can always connect\n"
-    printf "    to the machine to fix things instead of being locked out. Restarting ssh is safe.${NC}\n"
-    if [[ "$auto_yes" == "1" ]] || confirm "Reserve 512M for ${unit}?"; then
-      ctx_sudo "mkdir -p /etc/systemd/system/${unit}.d"
-      printf '[Service]\nMemoryAccounting=yes\nMemoryMin=512M\n' | ctx_sudo_write "/etc/systemd/system/${unit}.d/10-spark-memory.conf"
-      ctx_sudo 'systemctl daemon-reload'
-      if ctx_sudo "systemctl reload ${unit} || systemctl restart ${unit}"; then
-        info "sshd memory: ${unit} MemoryMin=512M set"
-      else
-        setup_fail "Could not apply MemoryMin to ${unit}"
-      fi
+  mm="$(ctx_run "systemctl show -p MemoryMin --value ${unit} 2>/dev/null")"
+  oom="$(ctx_run "systemctl show -p OOMScoreAdjust --value ${unit} 2>/dev/null")"
+  if [[ "$mm" == "536870912" && "$oom" == "-1000" ]]; then
+    info "sshd: ${unit} MemoryMin=512M + OOMScoreAdjust=-1000 (always reachable)"
+    return 0
+  fi
+  if [[ "$check_only" == "1" ]]; then
+    setup_fail "sshd not fully protected (MemoryMin/OOMScoreAdjust) — it can be starved or OOM-killed"
+    return 0
+  fi
+  printf "    ${DIM}What: reserve 512 MB for sshd and make it OOM-immune (drop-in on ${unit}).\n"
+  printf "    Why: under memory pressure sshd stays resident AND the OOM killer never targets it, so\n"
+  printf "    you can always connect to fix things. Restarting ssh is safe (your session survives).${NC}\n"
+  if [[ "$auto_yes" == "1" ]] || confirm "Protect ${unit} (MemoryMin + OOM-immune)?"; then
+    ctx_sudo "mkdir -p /etc/systemd/system/${unit}.d"
+    printf '[Service]\nMemoryAccounting=yes\nMemoryMin=512M\nOOMScoreAdjust=-1000\n' | ctx_sudo_write "/etc/systemd/system/${unit}.d/10-spark-memory.conf"
+    ctx_sudo 'systemctl daemon-reload'
+    if ctx_sudo "systemctl reload ${unit} || systemctl restart ${unit}"; then
+      info "sshd: ${unit} MemoryMin=512M + OOMScoreAdjust=-1000 set"
     else
-      setup_skip "sshd MemoryMin"
+      setup_fail "Could not protect ${unit}"
     fi
+  else
+    setup_skip "sshd protection"
+  fi
+}
+
+# Disable host swap so a memory spike can't thrash the box (the original freeze cause). With no swap
+# the kernel OOM-kills promptly instead of thrashing forever. Declarative + idempotent.
+step_swapoff() {
+  local auto_yes="$1" check_only="$2" swap_on
+  swap_on="$(ctx_run 'swapon --show=NAME --noheadings 2>/dev/null | head -1' 2>/dev/null)"
+  if [[ -z "$swap_on" ]]; then
+    info "Swap: off (no thrash risk)"
+    return 0
+  fi
+  if [[ "$check_only" == "1" ]]; then
+    setup_fail "Swap is on — a memory spike can thrash the box; spark host disables it"
+    return 0
+  fi
+  printf "    ${DIM}What: turn off swap (swapoff -a) and comment swap lines in /etc/fstab.\n"
+  printf "    Why: swap thrash is what froze the box and needed a physical reboot — with no swap the\n"
+  printf "    kernel OOM-kills the hog promptly instead. Inference nodes run swapless by design.${NC}\n"
+  if [[ "$auto_yes" == "1" ]] || confirm "Disable swap now and persist it?"; then
+    ctx_sudo 'swapoff -a'
+    ctx_sudo "sed -ri.spark-bak 's@^([^#].*[[:space:]]swap[[:space:]])@#\\1@' /etc/fstab"
+    if [[ -z "$(ctx_run 'swapon --show=NAME --noheadings 2>/dev/null | head -1' 2>/dev/null)" ]]; then
+      info "Swap: disabled"
+    else
+      setup_fail "Could not disable swap"
+    fi
+  else
+    setup_skip "Swap off"
   fi
 }
 
@@ -2330,6 +2467,7 @@ run_install_set() {
   step_jq "$auto_yes" "$check_only"
   step_gateway "$auto_yes" "$check_only"
   if [[ "$TGT_OS" == "Linux" ]] && ctx_has systemctl; then
+    step_swapoff "$auto_yes" "$check_only"
     step_earlyoom "$auto_yes" "$check_only"
     step_sshd_memorymin "$auto_yes" "$check_only"
   fi
@@ -2781,6 +2919,8 @@ cmd_help() {
     --max-len <int>        Context length (default: 128K, capped to model max)
     --kv-cache-dtype fp8   Halve KV cache memory
     --max-num-seqs <int>   Max concurrent requests (default: 100; raise for more throughput)
+    --enforce-eager        Disable CUDA graphs (smaller startup peak; ~10-20% slower). Auto for big MoE.
+    --no-enforce-eager     Force CUDA graphs on
     --port <int>           API port (default: auto from 8000)
     --tools                Enable tool calling
     --text-only            Skip vision encoder

@@ -60,7 +60,7 @@ flowchart TD
     override --> verify["verify_capacity\nreserved + need <= total - OS reserve\nif not: fit_options → menu (auto/fp8 ctx) or\nsuggest+abort (non-interactive) or show (dry-run)"]
     verify --> port["assign port (auto 8000+)\nname spark-vllm-<slug>"]
     port --> ngc["detect_ngc_image\ndocker images | grep vllm"]
-    ngc --> build["build_launch (rebuildable)\nvllm_args: serve, model, flags, --max-num-seqs (default 100)\ndocker_cmd: gpus, network, ipc, ulimits, volume, spark.* labels\n+ --memory/--memory-swap = NEED×(1+margin) (unified cgroup cap)"]
+    ngc --> build["build_launch (rebuildable)\nvllm_args: serve, model, --max-num-seqs (100), --enforce-eager (auto)\ndocker_cmd: gpus, network, ipc, ulimits, volume, spark.* labels\n+ --memory/--memory-swap = NEED + warmup headroom (cached peak)"]
 
     build --> plan["print memory plan\nweights, KV, need, fraction, concurrency, free"]
     plan --> dry{"--dry-run?"}
@@ -77,7 +77,7 @@ flowchart TD
     verdict -->|ready| summary["print container + API URL\nauto-restart gateway"]
     verdict -->|timeout| summary
     verdict -->|exit:mamba:N| lower["lower --max-num-seqs → N\nbuild_launch + retry"]
-    verdict -->|exit:oom| bump["raise cgroup margin (≤85% cap)\nbuild_launch + retry"]
+    verdict -->|exit:oom| bump["--enforce-eager (kill CUDA-graph peak)\nbuild_launch + retry"]
     verdict -->|exit:other| abort["err: failed to start\nshow logs · exit 1"]
     lower --> exec
     bump --> exec
@@ -91,8 +91,8 @@ flowchart TD
 init (e.g. a hybrid/Mamba model whose concurrency exceeds the cache it can allocate). So spark
 **supervises**: `await_startup` waits until the API serves, the container exits, or it times out. On a
 recoverable exit it adjusts one lever and retries — lower `--max-num-seqs` for cache-block failures
-(keeps memory tight), or raise the cgroup margin for a warmup OOM (never past the 85% cap). `--no-wait`
-skips supervision; `SPARK_STARTUP_TIMEOUT` / `SPARK_MAX_NUM_SEQS` tune it.
+(keeps memory tight), or `--enforce-eager` for a warmup OOM (removes the CUDA-graph capture peak). On
+success it caches the measured peak (cgroup `memory.peak`) per model. `--no-wait` skips supervision.
 
 ## spark setup (one wizard, one install set)
 
@@ -126,7 +126,7 @@ flowchart TD
         s_v --> s_jq
         s_o --> s_jq
         s_jq["jq (Linux)"] --> s_gw["gateway: pull LiteLLM\nproviders + start"]
-        s_gw --> s_hard["earlyoom + sshd MemoryMin\n(Linux + systemd)"]
+        s_gw --> s_hard["host hardening (Linux+systemd, idempotent):\nswap off · earlyoom -m5 · sshd MemoryMin + OOMScoreAdjust=-1000"]
     end
 
     shared --> branch{"target?"}
