@@ -9,9 +9,6 @@ SPARK="${ROOT_DIR}/spark"
 # SPARK_BACKEND/SPARK_ACCEL inline, or clear them per-invocation with `env -u`.
 export SPARK_BACKEND="${SPARK_BACKEND:-vllm}"
 export SPARK_ACCEL="${SPARK_ACCEL:-cuda-unified}"
-# Disable the unified-memory utilization cap by default so existing capacity/menu tests see
-# the raw budget; the cap-specific tests set SPARK_MEM_MAX_UTIL_PCT explicitly.
-export SPARK_MEM_MAX_UTIL_PCT="${SPARK_MEM_MAX_UTIL_PCT:-100}"
 
 passed=0
 failed=0
@@ -131,13 +128,22 @@ EOF
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
-  *is-active*earlyoom*)  exit "${FAKE_EARLYOOM_ACTIVE:-1}" ;;
-  *list-unit-files*)     echo "ssh.service enabled enabled" ;;
-  *"show -p MemoryMin"*) echo "${FAKE_SSHD_MEMORYMIN:-}" ;;
-  *)                     exit 0 ;;
+  *is-active*earlyoom*)        exit "${FAKE_EARLYOOM_ACTIVE:-1}" ;;
+  *list-unit-files*)           echo "ssh.service enabled enabled" ;;
+  *"show -p MemoryMin"*)       echo "${FAKE_SSHD_MEMORYMIN:-}" ;;
+  *"show -p OOMScoreAdjust"*)  echo "${FAKE_SSHD_OOMSCORE:-}" ;;
+  *)                           exit 0 ;;
 esac
 EOF
   chmod +x "${dir}/systemctl"
+
+  # swapon mock: prints active swap devices. FAKE_SWAP_ON=1 → one device (swap on); default off.
+  cat > "${dir}/swapon" <<'EOF'
+#!/usr/bin/env bash
+[[ "${FAKE_SWAP_ON:-0}" == "1" ]] && echo "/swapfile"
+exit 0
+EOF
+  chmod +x "${dir}/swapon"
 
   cat > "${dir}/tailscale" <<'EOF'
 #!/usr/bin/env bash
@@ -773,24 +779,27 @@ test_host_check_vllm_no_gpu() {
     [[ "$out" == *"incomplete"* ]]
 }
 
-# --- Host OS hardening (early-OOM + sshd MemoryMin) ---
+# --- Host OS hardening (swap-off + earlyoom -m5 + sshd MemoryMin/OOMScoreAdjust) ---
 test_host_check_hardening_missing() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
     SPARK_OS_OVERRIDE=Linux "$SPARK" setup --check </dev/null 2>&1) || true
   rm -rf "$tmp"
-  [[ "$out" == *"early-OOM not active"* ]] && [[ "$out" == *"sshd has no MemoryMin"* ]]
+  [[ "$out" == *"early-OOM not active"* ]] && [[ "$out" == *"not fully protected"* ]]
 }
 
 test_host_check_hardening_present() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  printf 'EARLYOOM_ARGS="-m 5 -s 100"\n' > "${tmp}/earlyoom.conf"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${fake_bin}/earlyoom"; chmod +x "${fake_bin}/earlyoom"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
-    SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SSHD_MEMORYMIN=536870912 \
+    SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SSHD_MEMORYMIN=536870912 FAKE_SSHD_OOMSCORE=-1000 \
+    EARLYOOM_DEFAULT_FILE="${tmp}/earlyoom.conf" \
     "$SPARK" setup --check </dev/null 2>&1) || true
   rm -rf "$tmp"
-  [[ "$out" == *"earlyoom active"* ]] && [[ "$out" == *"MemoryMin=512M (reclaim-protected)"* ]] &&
+  [[ "$out" == *"earlyoom active (-m 5%"* ]] && [[ "$out" == *"OOMScoreAdjust=-1000"* ]] &&
     [[ "$out" != *"early-OOM not active"* ]]
 }
 
@@ -937,7 +946,9 @@ test_vllm_blocks_ollama_tag() {
 # --- Capacity: context menu (auto vs fp8) when a model doesn't fit ---
 # 30B: weights 14, KV@128K 12, need 28.1. Reserve 85 -> free 26: doesn't fit at 128K,
 # but fits at 64K auto (need 21.6) or 128K fp8 (need 21.6).
-RESERVE_85='spark-vllm-big\torg/big\t8000\t85.0\t70.0\t15.0\n'
+# Reserved so the 30B doesn't fit at full context (budget 114 − 88 = 26 GB free), to exercise the
+# fit menu — same free as before (when budget was 111 − 85).
+RESERVE_85='spark-vllm-big\torg/big\t8000\t88.0\t73.0\t15.0\n'
 
 test_dryrun_shows_fit_options() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
@@ -1043,7 +1054,8 @@ test_mem_limit_present_unified() {
     "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
   dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$dargs" == *"--memory 35968m"* ]] && [[ "$dargs" == *"--memory-swap 35968m"* ]]
+  # cgroup cap = NEED + WARMUP_HEADROOM (default 20): (28.1+20)×1024 = ceil(49254.4) = 49255 MiB.
+  [[ "$dargs" == *"--memory 49255m"* ]] && [[ "$dargs" == *"--memory-swap 49255m"* ]]
 }
 
 test_mem_limit_absent_discrete() {
@@ -1072,18 +1084,18 @@ test_mem_limit_absent_with_flag() {
   [[ "$dargs" == *"vllm serve"* ]] && [[ "$dargs" != *"--memory"* ]]
 }
 
-test_mem_limit_margin_env() {
+test_mem_limit_headroom_env() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin dargs
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
-  # 28.1×1.5×1024 = ceil(43161.6) = 43162 MiB.
+  # SPARK_WARMUP_HEADROOM_GB=30: (28.1+30)×1024 = ceil(59494.4) = 59495 MiB.
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
-    SPARK_MEM_LIMIT_MARGIN_PCT=50 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    SPARK_WARMUP_HEADROOM_GB=30 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
   dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$dargs" == *"--memory 43162m"* ]] && [[ "$dargs" != *"35968m"* ]]
+  [[ "$dargs" == *"--memory 59495m"* ]] && [[ "$dargs" != *"49255m"* ]]
 }
 
 # --- Adaptive supervised startup ---
@@ -1143,7 +1155,8 @@ test_startup_retry_oom() {
     "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1 || true)
   last=$(tail -1 "${tmp}/d.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$last" == *"--memory 43162m"* ]] && [[ "$out" == *"+50% headroom"* ]] && [[ "$out" == *"serving"* ]]
+  # The warmup-OOM lever is now --enforce-eager (removes the CUDA-graph peak), not a margin bump.
+  [[ "$last" == *"--enforce-eager"* ]] && [[ "$out" == *"--enforce-eager"* ]] && [[ "$out" == *"serving"* ]]
 }
 
 # An unrecognized startup crash aborts without retrying.
@@ -1176,54 +1189,74 @@ test_startup_no_wait() {
   [[ "$out" == *"started"* ]] && [[ "$out" != *"waiting for it to serve"* ]]
 }
 
-# --- Unified-memory utilization cap ---
-# 30B need 28; reserve 80. Raw budget leaves 31 free (would fit), but the 85% cap (102.8)
-# leaves only 22.8 -> blocked by the cap. Proves the cap binds when stacking models.
-test_cap_blocks_when_stacking() {
+# A MoE model (vLLM under-profiles these → big startup peak) gets --enforce-eager auto on the first
+# launch (no measured peak yet); a dense model does not.
+MOE_CONFIG='{ "model_type":"qwen3_moe", "architectures":["Qwen3MoeForCausalLM"],
+  "num_hidden_layers":48, "num_key_value_heads":4, "num_attention_heads":32,
+  "head_dim":128, "hidden_size":2048, "max_position_embeddings":262144, "num_experts":128,
+  "quantization_config":{"quant_method":"nvfp4"}, "num_parameters":30000000000 }'
+test_enforce_eager_auto_for_moe() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin moe dense
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Moe" "$MOE_CONFIG"
+  make_model "${tmp}/home" "Org/Dense" "$KV_CONFIG"
+  moe=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Org/Moe --dry-run </dev/null 2>&1 || true)
+  dense=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Org/Dense --dry-run </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$moe" == *"--enforce-eager"* ]] && [[ "$dense" != *"--enforce-eager"* ]]
+}
+
+# --- Admission budget (TOTAL − OS reserve) ---
+# Admission budget = TOTAL − OS_RESERVE (unified default 7 → 114 GB). 30B need 28 + reserved 90 =
+# 118 > 114 → blocked by the budget. Proves the budget binds when stacking models.
+test_budget_blocks_when_stacking() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
   set +e
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_MEM_MAX_UTIL_PCT=85 \
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
-    FAKE_MANAGED='spark-vllm-big\torg/big\t8000\t80.0\t65.0\t15.0\n' \
+    FAKE_MANAGED='spark-vllm-big\torg/big\t8000\t90.0\t75.0\t15.0\n' \
     "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1)
   status=$?
   set -e
   rm -rf "$tmp"
-  [[ "$status" -eq 0 ]] && [[ "$out" == *"Not enough memory"* ]] && [[ "$out" == *"memory cap 85%"* ]]
+  [[ "$status" -eq 0 ]] && [[ "$out" == *"Not enough memory"* ]] && [[ "$out" == *"OS-reserved"* ]]
 }
 
-# The cap applies to a single model too: --mem 0.9 (108.9 GB) exceeds the 85% cap (102.8)
-# and is blocked, suggesting the largest --mem that fits.
-test_cap_applies_to_single_model() {
+# The budget applies to a single model too: --mem 0.97 (117.4 GB) exceeds the budget (114) and is
+# blocked, suggesting the largest --mem that fits.
+test_budget_blocks_single_model() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
   set +e
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_MEM_MAX_UTIL_PCT=85 \
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
-    "$SPARK" run Qwen/Qwen3-30B --mem 0.9 --dry-run </dev/null 2>&1)
+    "$SPARK" run Qwen/Qwen3-30B --mem 0.97 --dry-run </dev/null 2>&1)
   status=$?
   set -e
   rm -rf "$tmp"
-  [[ "$status" -eq 0 ]] && [[ "$out" == *"Not enough memory"* ]] && [[ "$out" == *"Fits with --mem ≤ 0.85"* ]]
+  [[ "$status" -eq 0 ]] && [[ "$out" == *"Not enough memory"* ]] && [[ "$out" == *"Fits with --mem"* ]]
 }
 
-# Discrete GPUs are exempt from the cap (OS isn't in VRAM): the stacking case fits.
-test_cap_exempt_on_discrete() {
+# Discrete GPUs get a smaller OS reserve (2 → budget 119): the stacking case (108) fits.
+test_budget_larger_on_discrete() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-discrete \
-    SPARK_MEM_MAX_UTIL_PCT=85 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     FAKE_MANAGED='spark-vllm-big\torg/big\t8000\t80.0\t65.0\t15.0\n' \
     "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"docker run"* ]] && [[ "$out" != *"memory cap"* ]]
+  [[ "$out" == *"vllm serve"* ]] && [[ "$out" != *"Not enough memory"* ]]
 }
 
 # --- Command coverage: spark's own logic per command (not the external tools) ---
@@ -1398,16 +1431,17 @@ run_test "--mem too high suggests a smaller --mem" test_mem_override_suggests_me
 run_test "per-container --memory limit present on unified" test_mem_limit_present_unified
 run_test "per-container --memory limit absent on discrete" test_mem_limit_absent_discrete
 run_test "per-container --memory limit absent with --no-mem-limit" test_mem_limit_absent_with_flag
-run_test "per-container --memory limit honors margin env" test_mem_limit_margin_env
+run_test "per-container --memory limit honors warmup headroom env" test_mem_limit_headroom_env
 run_test "default max-num-seqs cap is 100 (announced)" test_max_num_seqs_default
 run_test "--max-num-seqs overrides the default" test_max_num_seqs_override
 run_test "startup retries Mamba failure with lower --max-num-seqs" test_startup_retry_mamba
 run_test "startup retries warmup OOM with more headroom" test_startup_retry_oom
 run_test "unrecoverable startup aborts without retry" test_startup_unrecoverable_aborts
 run_test "--no-wait launches without supervising" test_startup_no_wait
-run_test "memory cap blocks stacking past the limit" test_cap_blocks_when_stacking
-run_test "memory cap applies to a single model too" test_cap_applies_to_single_model
-run_test "memory cap exempt on discrete GPUs" test_cap_exempt_on_discrete
+run_test "enforce-eager auto for MoE, not for dense" test_enforce_eager_auto_for_moe
+run_test "budget blocks stacking past total − OS reserve" test_budget_blocks_when_stacking
+run_test "budget blocks a single model over the limit" test_budget_blocks_single_model
+run_test "budget is larger on discrete (smaller OS reserve)" test_budget_larger_on_discrete
 run_test "gateway routes Ollama via host.docker.internal on macOS" test_gateway_ollama_route_mac
 run_test "gateway routes Ollama via localhost on Linux" test_gateway_ollama_route_linux
 run_test "doctor runs Ollama checks on the ollama backend" test_doctor_ollama_backend
