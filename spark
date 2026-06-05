@@ -2368,8 +2368,8 @@ step_earlyoom() {
     return 0
   fi
   printf "    ${DIM}What: install/configure 'earlyoom' (-m ${want}%%): kill the memory hog when free RAM is low.\n"
-  printf "    Why: it acts EARLY (before swap thrash), so a runaway model can't freeze the box. The\n"
-  printf "    cgroup cap + admission keep normal operation far from this floor.${NC}\n"
+  printf "    Why: it kills the offending model EARLY, while there's still free RAM, before the machine\n"
+  printf "    bogs down and locks you out. The cgroup cap + admission keep normal use far from this floor.${NC}\n"
   if [[ "$auto_yes" == "1" ]] || confirm "Install/repair earlyoom at -m ${want}%?"; then
     if [[ "$installed" != "1" ]] && ! ctx_sudo 'apt-get update >/dev/null 2>&1 && apt-get install -y earlyoom >/dev/null 2>&1'; then
       setup_fail "Could not install earlyoom (apt)"; return 0
@@ -2432,8 +2432,9 @@ step_swapoff() {
     return 0
   fi
   printf "    ${DIM}What: turn off swap (swapoff -a) and comment swap lines in /etc/fstab.\n"
-  printf "    Why: swap thrash is what froze the box and needed a physical reboot — with no swap the\n"
-  printf "    kernel OOM-kills the hog promptly instead. Inference nodes run swapless by design.${NC}\n"
+  printf "    Why: if RAM fills up, swap pages memory out to disk — the whole machine crawls and can\n"
+  printf "    stop answering SSH for minutes. With no swap the kernel instead kills just the over-using\n"
+  printf "    process at once and the box stays responsive. Inference servers run swapless.${NC}\n"
   if [[ "$auto_yes" == "1" ]] || confirm "Disable swap now and persist it?"; then
     ctx_sudo 'swapoff -a'
     ctx_sudo "sed -ri.spark-bak 's@^([^#].*[[:space:]]swap[[:space:]])@#\\1@' /etc/fstab"
