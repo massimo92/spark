@@ -254,7 +254,15 @@ REMOTE_USER=""
 REMOTE_HOST=""
 REMOTE_CONTROL=""
 
+# Run a command on the remote. `-n` redirects ssh's stdin from /dev/null so a command-run never
+# drains the script's own stdin — critical when called from inside a pipeline (e.g. the sudo-probe
+# inside ctx_sudo_write would otherwise eat the file content being piped to `tee`). Use remote_in()
+# for the calls that DO need to stream stdin (password feed, `tee`, `cat > file`).
 remote() {
+  ssh -n -o ControlPath="$REMOTE_CONTROL" "${REMOTE_USER}@${REMOTE_HOST}" "$@"
+}
+# Same, but keeps stdin connected for commands that read it (sudo -S password, tee, cat > file).
+remote_in() {
   ssh -o ControlPath="$REMOTE_CONTROL" "${REMOTE_USER}@${REMOTE_HOST}" "$@"
 }
 
@@ -308,7 +316,7 @@ ctx_run() {
 # remote sudo can't open a TTY, so we feed the password via `sudo -S` on stdin everywhere).
 _sudo_pw_ok() {
   if [[ "$SETUP_TARGET" == "remote" ]]; then
-    printf '%s\n' "$SUDO_PW" | remote "sudo -S -p '' true" 2>/dev/null
+    printf '%s\n' "$SUDO_PW" | remote_in "sudo -S -p '' true" 2>/dev/null
   else
     printf '%s\n' "$SUDO_PW" | sudo -S -p '' true 2>/dev/null
   fi
@@ -340,7 +348,7 @@ ctx_sudo() {
   if [[ -z "$SUDO_PW" ]]; then
     if [[ "$SETUP_TARGET" == "remote" ]]; then remote "sudo -n bash -c $q"; else sudo -n bash -c "$1"; fi
   elif [[ "$SETUP_TARGET" == "remote" ]]; then
-    printf '%s\n' "$SUDO_PW" | remote "sudo -S -p '' bash -c $q"
+    printf '%s\n' "$SUDO_PW" | remote_in "sudo -S -p '' bash -c $q"
   else
     printf '%s\n' "$SUDO_PW" | sudo -S -p '' bash -c "$1"
   fi
@@ -348,12 +356,12 @@ ctx_sudo() {
 
 # Pipe controller stdin (e.g. a secret from `read -rs`) into a target command.
 ctx_run_stdin() {
-  if [[ "$SETUP_TARGET" == "remote" ]]; then remote "$1"; else bash -c "$1"; fi
+  if [[ "$SETUP_TARGET" == "remote" ]]; then remote_in "$1"; else bash -c "$1"; fi
 }
 
 # Write controller stdin to a file on the target.
 ctx_write_file() {
-  if [[ "$SETUP_TARGET" == "remote" ]]; then remote "cat > $1"; else cat > "$1"; fi
+  if [[ "$SETUP_TARGET" == "remote" ]]; then remote_in "cat > $1"; else cat > "$1"; fi
 }
 
 # The target's own username (for docker-group membership etc.).
@@ -2052,10 +2060,10 @@ cmd_doctor() {
 ctx_sudo_write() {  # $1 = path; reads file content from stdin
   ensure_sudo_pw
   if [[ -z "$SUDO_PW" ]]; then
-    if [[ "$SETUP_TARGET" == "remote" ]]; then remote "sudo -n tee $1 >/dev/null"; else sudo -n tee "$1" >/dev/null; fi
+    if [[ "$SETUP_TARGET" == "remote" ]]; then remote_in "sudo -n tee $1 >/dev/null"; else sudo -n tee "$1" >/dev/null; fi
   elif [[ "$SETUP_TARGET" == "remote" ]]; then
     # sudo -S eats the first stdin line (the password); tee gets the rest (the content).
-    { printf '%s\n' "$SUDO_PW"; cat; } | remote "sudo -S -p '' tee $1 >/dev/null"
+    { printf '%s\n' "$SUDO_PW"; cat; } | remote_in "sudo -S -p '' tee $1 >/dev/null"
   else
     { printf '%s\n' "$SUDO_PW"; cat; } | sudo -S -p '' tee "$1" >/dev/null
   fi
@@ -2543,12 +2551,20 @@ ensure_local_tailscale() {
 
 # Copy this CLI to the remote so `spark` is available there too.
 deploy_spark_binary() {
-  local self
+  local self rv
   self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
+  # Always overwrite the remote binary with this controller's copy, so the server runs the exact
+  # same spark version every setup run (no stale CLI lingering on the server).
   remote 'mkdir -p ~/.local/bin'
-  remote 'cat > ~/.local/bin/spark && chmod +x ~/.local/bin/spark' < "$self"
+  remote_in 'cat > ~/.local/bin/spark && chmod +x ~/.local/bin/spark' < "$self"
   remote 'grep -q "local/bin" ~/.bashrc 2>/dev/null' || remote 'echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.bashrc'
-  info "Installed spark CLI to ~/.local/bin/spark (remote)"
+  # Verify the deployed version matches this controller's — surfaces a botched copy immediately.
+  rv="$(remote 'grep -m1 "^VERSION=" ~/.local/bin/spark 2>/dev/null | cut -d\" -f2')"
+  if [[ "$rv" == "$VERSION" ]]; then
+    info "Installed spark CLI v${VERSION} to ~/.local/bin/spark (remote, matches controller)"
+  else
+    setup_fail "spark CLI copy mismatch (remote '${rv:-none}' vs controller '${VERSION}') — re-run setup"
+  fi
 }
 
 # --- Remote-only secure phase ---
@@ -2566,7 +2582,7 @@ step_copy_pubkey() {
   fi
   if [[ -n "$pub" ]]; then
     remote 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
-    printf '%s\n' "$pub" | remote 'cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+    printf '%s\n' "$pub" | remote_in 'cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
     info "Copied SSH public key to remote"
   else
     setup_skip "SSH key copy (no local key found)"

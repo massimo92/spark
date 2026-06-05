@@ -170,6 +170,7 @@ case "$cmd" in
   *is-active*earlyoom*)    exit 1 ;;
   *"list-unit-files"*)     echo "ssh.service enabled enabled" ;;
   *"show -p MemoryMin"*)   echo "" ;;
+  *'grep -m1 "^VERSION="'*) echo "${FAKE_REMOTE_SPARK_VERSION:-0.0.0}" ;;
   *)                       exit 1 ;;
 esac
 exit 0
