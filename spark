@@ -258,10 +258,6 @@ remote() {
   ssh -o ControlPath="$REMOTE_CONTROL" "${REMOTE_USER}@${REMOTE_HOST}" "$@"
 }
 
-remote_sudo() {
-  ssh -t -o ControlPath="$REMOTE_CONTROL" "${REMOTE_USER}@${REMOTE_HOST}" "sudo $*"
-}
-
 open_remote() {
   local user="$1" host="$2"
   REMOTE_USER="$user"
@@ -290,6 +286,8 @@ close_remote() {
 # so a server gets the exact same software whether configured locally or remotely.
 SETUP_TARGET="local"     # "local" | "remote"
 SETUP_USED_SSHPASS=0     # 1 while the SSH master is password-based (before the key is copied)
+SUDO_PW=""               # target sudo password, asked once per run (empty if sudo is passwordless)
+SUDO_READY=0             # 1 once sudo auth has been established (or confirmed passwordless)
 TGT_OS=""                # target platform — mirrors SPARK_OS/ARCH/ACCEL/BACKEND for the TARGET
 TGT_ARCH=""
 TGT_ACCEL=""
@@ -306,14 +304,41 @@ ctx_run() {
   if [[ "$SETUP_TARGET" == "remote" ]]; then remote "$1"; else bash -c "$1"; fi
 }
 
-# Run a command STRING as root on the target. Wrapped in `bash -c` on both paths so compound
-# commands (a && b) run entirely under sudo.
-ctx_sudo() {
+# Acquire sudo auth ONCE per run: detect passwordless sudo, else prompt a single time (over SSH the
+# remote sudo can't open a TTY, so we feed the password via `sudo -S` on stdin everywhere).
+_sudo_pw_ok() {
   if [[ "$SETUP_TARGET" == "remote" ]]; then
-    local q; printf -v q '%q' "$1"
-    ssh -t -o ControlPath="$REMOTE_CONTROL" "${REMOTE_USER}@${REMOTE_HOST}" "sudo bash -c $q"
+    printf '%s\n' "$SUDO_PW" | remote "sudo -S -p '' true" 2>/dev/null
   else
-    sudo bash -c "$1"
+    printf '%s\n' "$SUDO_PW" | sudo -S -p '' true 2>/dev/null
+  fi
+}
+ensure_sudo_pw() {
+  [[ "$SUDO_READY" == "1" ]] && return 0
+  if ctx_run 'sudo -n true 2>/dev/null'; then SUDO_PW=""; SUDO_READY=1; return 0; fi
+  local tries=0
+  while [[ "$tries" -lt 3 ]]; do
+    printf "  Enter the sudo password for %s (asked once): " "$(ctx_user)"
+    read -rs SUDO_PW; printf "\n"
+    if _sudo_pw_ok; then SUDO_READY=1; return 0; fi
+    warn "Wrong sudo password — try again."
+    tries=$((tries + 1))
+  done
+  SUDO_PW=""
+  die "Could not authenticate sudo on the target"
+}
+
+# Run a command STRING as root on the target. Wrapped in `bash -c` so compound commands run under
+# sudo. Uses the once-acquired password via `sudo -S` (no TTY needed) — or `sudo -n` if passwordless.
+ctx_sudo() {
+  ensure_sudo_pw
+  local q; printf -v q '%q' "$1"
+  if [[ -z "$SUDO_PW" ]]; then
+    if [[ "$SETUP_TARGET" == "remote" ]]; then remote "sudo -n bash -c $q"; else sudo -n bash -c "$1"; fi
+  elif [[ "$SETUP_TARGET" == "remote" ]]; then
+    printf '%s\n' "$SUDO_PW" | remote "sudo -S -p '' bash -c $q"
+  else
+    printf '%s\n' "$SUDO_PW" | sudo -S -p '' bash -c "$1"
   fi
 }
 
@@ -2020,11 +2045,15 @@ cmd_doctor() {
 # server receives the exact same software whether it is configured locally or remotely.
 
 # Write controller stdin to a root-owned file on the target.
-ctx_sudo_write() {  # $1 = path; reads stdin
-  if [[ "$SETUP_TARGET" == "remote" ]]; then
-    remote "sudo tee $1 >/dev/null"
+ctx_sudo_write() {  # $1 = path; reads file content from stdin
+  ensure_sudo_pw
+  if [[ -z "$SUDO_PW" ]]; then
+    if [[ "$SETUP_TARGET" == "remote" ]]; then remote "sudo -n tee $1 >/dev/null"; else sudo -n tee "$1" >/dev/null; fi
+  elif [[ "$SETUP_TARGET" == "remote" ]]; then
+    # sudo -S eats the first stdin line (the password); tee gets the rest (the content).
+    { printf '%s\n' "$SUDO_PW"; cat; } | remote "sudo -S -p '' tee $1 >/dev/null"
   else
-    sudo tee "$1" >/dev/null
+    { printf '%s\n' "$SUDO_PW"; cat; } | sudo -S -p '' tee "$1" >/dev/null
   fi
 }
 
@@ -2755,8 +2784,10 @@ cmd_setup() {
 
   SETUP_SKIPPED=()
   SETUP_FAILED=()
+  SUDO_PW=""; SUDO_READY=0
 
   run_setup_wizard "$auto_yes" "$check_only"
+  SUDO_PW=""   # don't keep the password resident after setup
   setup_summary
 }
 
