@@ -139,6 +139,23 @@ it and check it fits:
 
 Use `--no-pull` to skip this and just error on a missing model (e.g. in scripts).
 
+**Supervised startup (auto-tuning).** `docker run` only reports that the container *started* — vLLM
+can still crash seconds later during initialization. So `spark run` **waits until the model actually
+serves** (showing live progress) and, on a recoverable startup failure, **fixes it automatically and
+retries**:
+
+- **Concurrency cap.** spark caps concurrent requests at **100** (`--max-num-seqs`, vs vLLM's default
+  256). This lets a tightly-sized **hybrid (Mamba) model** boot without wasting memory — its fixed
+  per-sequence cache blocks would otherwise demand far more memory at the default. 100 is plenty for
+  personal use; raise it with `--max-num-seqs N` (uses more memory) or globally via `SPARK_MAX_NUM_SEQS`.
+- **Still doesn't fit?** If even that is too many for the cache, spark reads the exact limit from
+  vLLM's own error and retries with a lower `--max-num-seqs` — keeping memory tight.
+- **Warm-up OOM?** If the startup peak hits the container's memory ceiling, spark retries with more
+  cgroup headroom, never exceeding the 85% safety cap; if it still won't fit, it aborts with guidance.
+
+`--no-wait` launches and returns immediately (no supervision). `SPARK_STARTUP_TIMEOUT` (default 600s)
+bounds the wait — a slow first-time compile won't be killed, just reported as still warming up.
+
 **On Apple Silicon / CPU (Ollama):** pulls the model and routes it through the gateway. Ollama serves
 many models on one port and manages memory itself, so there's no per-model container, port, or
 `--gpu-memory-utilization`. Model refs are Ollama names (`qwen3:30b`, `llama3.3`, or
@@ -165,12 +182,14 @@ spark run llama3.3 --dry-run                            # show the plan, don't p
 | `--mem <float>` | Auto | GPU memory utilization (0.0–1.0), overrides auto-sizing |
 | `--max-len <int>` | 128K | Context length (capped to the model's maximum) |
 | `--kv-cache-dtype fp8` | auto | Store the KV cache in fp8 (halves its memory) |
+| `--max-num-seqs <int>` | 100 | Max concurrent requests; raise for more throughput (more memory) |
 | `--port <int>` | Auto (8000+) | API port; auto-assigned to the next free one |
 | `--tools` | off | Enable tool calling |
 | `--text-only` | off | Skip vision encoder |
 | `--no-reasoning` | off | Disable reasoning parser |
 | `--no-pull` | off | Don't offer to download a missing model; just error |
 | `--dry-run` | off | Print the memory plan and Docker command only |
+| `--no-wait` | off | Don't supervise startup; launch and return immediately |
 | `--tail` | off | Follow logs after launch |
 | `--force` | off | Replace this model if it is already running |
 | `--no-mem-limit` | off | Don't set the hard `--memory` cgroup limit on the container |

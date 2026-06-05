@@ -47,10 +47,27 @@ case "${1:-}" in
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
     ;;
   inspect)
-    [[ -n "${FAKE_DOCKER_INSPECT:-}" ]] && echo "${FAKE_DOCKER_INSPECT}"
+    # Adaptive-startup tests: vary by attempt (= number of `run` lines captured so far).
+    _att=0
+    [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run ' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
+    case "$args" in
+      *State.Status*)
+        if [[ -n "${FAKE_RETRY:-}" && "${_att}" -le 1 ]]; then echo "exited"
+        else echo "${FAKE_STATE_STATUS:-running}"; fi ;;
+      *State.OOMKilled*)
+        if [[ "${FAKE_RETRY:-}" == "oom" && "${_att}" -le 1 ]]; then echo "true"
+        else echo "${FAKE_OOMKILLED:-false}"; fi ;;
+      *) [[ -n "${FAKE_DOCKER_INSPECT:-}" ]] && echo "${FAKE_DOCKER_INSPECT}" ;;
+    esac
     ;;
   logs)
-    [[ -n "${FAKE_DOCKER_LOGS:-}" ]] && echo "${FAKE_DOCKER_LOGS}"
+    _att=0
+    [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run ' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
+    if [[ "${FAKE_RETRY:-}" == "mamba" && "${_att}" -le 1 ]]; then
+      echo "ValueError: max_num_seqs (100) exceeds available Mamba cache blocks (${FAKE_MAMBA_N:-64}). Lower max_num_seqs to at most ${FAKE_MAMBA_N:-64} or increase gpu_memory_utilization."
+    else
+      [[ -n "${FAKE_DOCKER_LOGS:-}" ]] && echo "${FAKE_DOCKER_LOGS}"
+    fi
     ;;
   manifest)
     exit 0
@@ -98,12 +115,14 @@ esac
 EOF
   chmod +x "${dir}/ollama"
 
-  # curl mock: spark only uses it to probe Ollama's :11434 (check_for_updates is
-  # skipped in non-TTY test runs). Succeeds when FAKE_OLLAMA_UP=1.
+  # curl mock: probes Ollama's :11434 (FAKE_OLLAMA_UP) and vLLM readiness at /v1/models
+  # (FAKE_VLLM_READY, default ready so supervised launches don't block in tests).
   cat > "${dir}/curl" <<'EOF'
 #!/usr/bin/env bash
-[[ "${FAKE_OLLAMA_UP:-0}" == "1" ]] && exit 0
-exit 7
+case "$*" in
+  */v1/models*) [[ "${FAKE_VLLM_READY:-1}" == "1" ]] && exit 0; exit 7 ;;
+  *)            [[ "${FAKE_OLLAMA_UP:-0}" == "1" ]] && exit 0; exit 7 ;;
+esac
 EOF
   chmod +x "${dir}/curl"
 
@@ -1067,6 +1086,96 @@ test_mem_limit_margin_env() {
   [[ "$dargs" == *"--memory 43162m"* ]] && [[ "$dargs" != *"35968m"* ]]
 }
 
+# --- Adaptive supervised startup ---
+# Default concurrency cap is 100 (replacing vLLM's 256) and is announced.
+test_max_num_seqs_default() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1 || true)
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"--max-num-seqs 100"* ]] && [[ "$out" == *"up to 100 concurrent"* ]]
+}
+
+test_max_num_seqs_override() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    "$SPARK" run Qwen/Qwen3-30B --max-num-seqs 200 </dev/null >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"--max-num-seqs 200"* ]] && [[ "$dargs" != *"--max-num-seqs 100"* ]]
+}
+
+# Hybrid/Mamba cache-block failure → auto-lower --max-num-seqs and retry, then serve.
+test_startup_retry_mamba() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out last
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    FAKE_RETRY=mamba FAKE_MAMBA_N=64 \
+    "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1 || true)
+  last=$(tail -1 "${tmp}/d.txt" 2>/dev/null || echo "")
+  local nruns; nruns=$(grep -c '^run ' "${tmp}/d.txt" 2>/dev/null || echo 0)
+  rm -rf "$tmp"
+  [[ "$nruns" -eq 2 ]] && [[ "$last" == *"--max-num-seqs 64"* ]] &&
+    [[ "$out" == *"retrying with --max-num-seqs 64"* ]] && [[ "$out" == *"serving"* ]]
+}
+
+# Warmup OOM → raise the cgroup margin (25%→50%) within the cap and retry.
+test_startup_retry_oom() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out last
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    FAKE_RETRY=oom \
+    "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1 || true)
+  last=$(tail -1 "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$last" == *"--memory 43162m"* ]] && [[ "$out" == *"+50% headroom"* ]] && [[ "$out" == *"serving"* ]]
+}
+
+# An unrecognized startup crash aborts without retrying.
+test_startup_unrecoverable_aborts() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out nruns
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    FAKE_STATE_STATUS=exited FAKE_DOCKER_LOGS="RuntimeError: unrelated fatal error" \
+    "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1)
+  set -e
+  nruns=$(grep -c '^run ' "${tmp}/d.txt" 2>/dev/null || echo 0)
+  rm -rf "$tmp"
+  [[ "$nruns" -eq 1 ]] && [[ "$out" == *"failed to start"* ]]
+}
+
+# --no-wait launches and returns without supervising.
+test_startup_no_wait() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Qwen/Qwen3-30B --no-wait </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"started"* ]] && [[ "$out" != *"waiting for it to serve"* ]]
+}
+
 # --- Unified-memory utilization cap ---
 # 30B need 28; reserve 80. Raw budget leaves 31 free (would fit), but the 85% cap (102.8)
 # leaves only 22.8 -> blocked by the cap. Proves the cap binds when stacking models.
@@ -1290,6 +1399,12 @@ run_test "per-container --memory limit present on unified" test_mem_limit_presen
 run_test "per-container --memory limit absent on discrete" test_mem_limit_absent_discrete
 run_test "per-container --memory limit absent with --no-mem-limit" test_mem_limit_absent_with_flag
 run_test "per-container --memory limit honors margin env" test_mem_limit_margin_env
+run_test "default max-num-seqs cap is 100 (announced)" test_max_num_seqs_default
+run_test "--max-num-seqs overrides the default" test_max_num_seqs_override
+run_test "startup retries Mamba failure with lower --max-num-seqs" test_startup_retry_mamba
+run_test "startup retries warmup OOM with more headroom" test_startup_retry_oom
+run_test "unrecoverable startup aborts without retry" test_startup_unrecoverable_aborts
+run_test "--no-wait launches without supervising" test_startup_no_wait
 run_test "memory cap blocks stacking past the limit" test_cap_blocks_when_stacking
 run_test "memory cap applies to a single model too" test_cap_applies_to_single_model
 run_test "memory cap exempt on discrete GPUs" test_cap_exempt_on_discrete

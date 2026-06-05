@@ -60,21 +60,39 @@ flowchart TD
     override --> verify["verify_capacity\nreserved + need <= total - OS reserve\nif not: fit_options → menu (auto/fp8 ctx) or\nsuggest+abort (non-interactive) or show (dry-run)"]
     verify --> port["assign port (auto 8000+)\nname spark-vllm-<slug>"]
     port --> ngc["detect_ngc_image\ndocker images | grep vllm"]
-    ngc --> build["build arrays\nvllm_args: serve, model, flags\ndocker_cmd: gpus, network, ipc, ulimits, volume, spark.* labels\n+ --memory/--memory-swap = NEED×1.25 (unified, hard cgroup cap)"]
+    ngc --> build["build_launch (rebuildable)\nvllm_args: serve, model, flags, --max-num-seqs (default 100)\ndocker_cmd: gpus, network, ipc, ulimits, volume, spark.* labels\n+ --memory/--memory-swap = NEED×(1+margin) (unified cgroup cap)"]
 
-    build --> plan["print memory plan\nweights, KV, need, fraction, free"]
+    build --> plan["print memory plan\nweights, KV, need, fraction, concurrency, free"]
     plan --> dry{"--dry-run?"}
     dry -->|yes| print["shell_join + print"]
-    dry -->|no| exec["docker run"]
+    dry -->|no| exec["docker run -d"]
 
-    exec --> check{"exit 0?"}
-    check -->|no| fail["err: docker run failed\nshow last 10 log lines"]
-    check -->|yes| summary["print container + API URL\nauto-restart gateway"]
+    exec --> runok{"container started?"}
+    runok -->|no| fail["err: docker run failed\nshow last 10 log lines"]
+    runok -->|yes| nowait{"--no-wait?"}
+    nowait -->|yes| summary
+    nowait -->|no| await["await_startup\npoll inspect / curl /v1/models / logs"]
+
+    await --> verdict{"verdict"}
+    verdict -->|ready| summary["print container + API URL\nauto-restart gateway"]
+    verdict -->|timeout| summary
+    verdict -->|exit:mamba:N| lower["lower --max-num-seqs → N\nbuild_launch + retry"]
+    verdict -->|exit:oom| bump["raise cgroup margin (≤85% cap)\nbuild_launch + retry"]
+    verdict -->|exit:other| abort["err: failed to start\nshow logs · exit 1"]
+    lower --> exec
+    bump --> exec
 
     summary --> tail{"--tail?"}
     tail -->|yes| logs["docker logs -f"]
     tail -->|no| done["done"]
 ```
+
+`docker run -d` only reports that the container *started* — vLLM can still crash seconds later during
+init (e.g. a hybrid/Mamba model whose concurrency exceeds the cache it can allocate). So spark
+**supervises**: `await_startup` waits until the API serves, the container exits, or it times out. On a
+recoverable exit it adjusts one lever and retries — lower `--max-num-seqs` for cache-block failures
+(keeps memory tight), or raise the cgroup margin for a warmup OOM (never past the 85% cap). `--no-wait`
+skips supervision; `SPARK_STARTUP_TIMEOUT` / `SPARK_MAX_NUM_SEQS` tune it.
 
 ## spark setup (one wizard, one install set)
 
