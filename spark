@@ -122,7 +122,7 @@ else
 fi
 MEM_HEADROOM_PCT="${SPARK_MEM_HEADROOM_PCT:-8}"     # per-model cushion (activations/fragmentation)
 # Admission budget = everything minus what the OS needs to stay responsive. The host stays safe via
-# the per-container cgroup cap (below) + swap-off + sshd OOM protection (spark host), not a separate
+# the per-container cgroup cap (below) + swap-off + sshd OOM protection (spark setup), not a separate
 # arbitrary utilization cap. On a single 24/7 model you can use ~90%+ of RAM.
 BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))
 # Per-container hard ceiling (Docker --memory / cgroup memory.max) = NEED + this, on unified memory
@@ -138,7 +138,7 @@ MAX_NUM_SEQS_DEFAULT="${SPARK_MAX_NUM_SEQS:-100}"
 STARTUP_TIMEOUT="${SPARK_STARTUP_TIMEOUT:-600}"          # seconds to wait for the API to come up
 STARTUP_MAX_RETRIES="${SPARK_STARTUP_MAX_RETRIES:-2}"    # auto-retries on a recoverable failure
 # earlyoom's emergency floor: kill the hog when free RAM drops below this %. The last-resort backstop
-# (the cgroup cap + admission keep normal operation far from it). spark host configures earlyoom here.
+# (the cgroup cap + admission keep normal operation far from it). spark setup configures earlyoom here.
 EARLYOOM_MIN_FREE_PCT="${SPARK_EARLYOOM_MIN_FREE_PCT:-5}"
 
 # Detect the latest pulled NGC vLLM image
@@ -2364,7 +2364,7 @@ step_earlyoom() {
   fi
   if [[ "$check_only" == "1" ]]; then
     if [[ "$installed" != "1" ]]; then setup_fail "early-OOM not active — install earlyoom so a runaway model is killed before the box freezes"
-    else setup_fail "earlyoom not at -m ${want}% (found '${cur_m:-none}') — re-run spark host to reconcile"; fi
+    else setup_fail "earlyoom not at -m ${want}% (found '${cur_m:-none}') — re-run spark setup to reconcile"; fi
     return 0
   fi
   printf "    ${DIM}What: install/configure 'earlyoom' (-m ${want}%%): kill the memory hog when free RAM is low.\n"
@@ -2428,7 +2428,7 @@ step_swapoff() {
     return 0
   fi
   if [[ "$check_only" == "1" ]]; then
-    setup_fail "Swap is on — a memory spike can thrash the box; spark host disables it"
+    setup_fail "Swap is on — a memory spike can thrash the box; spark setup disables it"
     return 0
   fi
   printf "    ${DIM}What: turn off swap (swapoff -a) and comment swap lines in /etc/fstab.\n"
