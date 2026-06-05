@@ -131,6 +131,16 @@ MEM_MAX_UTIL_PCT="${SPARK_MEM_MAX_UTIL_PCT:-85}"
 # on unified memory only. Confines a model's load-peak page cache to its own cgroup so it
 # reclaims/OOMs itself instead of thrashing the host. Discrete GPUs exempt; --no-mem-limit disables.
 MEM_LIMIT_MARGIN_PCT="${SPARK_MEM_LIMIT_MARGIN_PCT:-25}"
+# Default cap on concurrent requests. vLLM's own default is 256, which can exceed the cache
+# blocks a tightly-sized hybrid (Mamba) model can allocate and abort startup. 100 is plenty for
+# personal use and boots tight; raise per-run with --max-num-seqs or globally with this env.
+MAX_NUM_SEQS_DEFAULT="${SPARK_MAX_NUM_SEQS:-100}"
+# Adaptive startup supervision: after launch, wait until the model serves and auto-retry
+# recoverable startup failures (concurrency too high for the cache → lower --max-num-seqs;
+# warmup OOM → raise the cgroup margin within the 85% cap).
+STARTUP_TIMEOUT="${SPARK_STARTUP_TIMEOUT:-600}"          # seconds to wait for the API to come up
+STARTUP_MAX_RETRIES="${SPARK_STARTUP_MAX_RETRIES:-2}"    # auto-retries on a recoverable failure
+MEM_LIMIT_MARGIN_MAX_PCT="${SPARK_MEM_LIMIT_MARGIN_MAX_PCT:-200}"  # ceiling for the OOM-retry bump
 
 # Detect the latest pulled NGC vLLM image
 detect_ngc_image() {
@@ -863,11 +873,14 @@ download_model_full() {
 cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
+  local no_wait=0 max_num_seqs=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; shift 2 ;;
       --no-mem-limit) no_mem_limit=1; shift ;;
+      --no-wait)   no_wait=1; shift ;;
+      --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; shift 2 ;;
       --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; shift 2 ;;
       --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; shift 2 ;;
       --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; shift 2 ;;
@@ -896,6 +909,78 @@ cmd_run() {
   esac
 }
 
+# (Re)build vllm_args + docker_cmd from the current $seqs (concurrency) and $margin_pct (cgroup
+# headroom). Called once and again on each adaptive-startup retry. Reads/writes run_backend_vllm
+# locals via dynamic scope (same pattern as the backend reading cmd_run's flags).
+build_launch() {
+  vllm_args=(vllm serve "$model"
+    --trust-remote-code
+    --gpu-memory-utilization "$GPU_MEM_UTIL"
+    --max-model-len "$MAX_MODEL_LEN"
+    --max-num-seqs "$seqs"
+    --port "$port")
+  [[ "$KV_CACHE_DTYPE" == "fp8" ]] && vllm_args+=(--kv-cache-dtype fp8)
+  [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]] && vllm_args+=(--reasoning-parser "$REASONING_PARSER")
+  [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] && vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
+  [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt image=0)
+
+  mem_limit_mib=""
+  if [[ "$ACCEL" != "cuda-discrete" && "$no_mem_limit" != "1" ]]; then
+    mem_limit_mib=$(awk -v n="$NEED_GB" -v p="$margin_pct" \
+      'BEGIN{ v=n*(1+p/100)*1024; iv=int(v); if(v>iv) iv++; printf "%d", iv }')
+  fi
+  docker_cmd=(docker run -d
+    --gpus all
+    --network host
+    --ipc=host
+    --ulimit memlock=-1
+    --ulimit stack=67108864
+    -v "${HF_CACHE_DIR}:/root/.cache/huggingface"
+    --name "$cname"
+    --label spark.managed=1
+    --label "spark.model=${model}"
+    --label "spark.port=${port}"
+    --label "spark.need_gb=${NEED_GB}"
+    --label "spark.weights_gb=${WEIGHTS_GB}"
+    --label "spark.kv_gb=${KV_GB}"
+    --label "spark.max_model_len=${MAX_MODEL_LEN}")
+  [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_limit_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
+  docker_cmd+=("$ngc_image")
+}
+
+# Watch a just-launched vLLM container until it serves or stops. Echoes one of:
+#   ready | timeout | exit:oom | exit:mamba:<N> | exit:other
+# Progress lines go to stderr so the caller can capture the verdict from stdout.
+await_startup() {
+  local cname="$1" port="$2" timeout="$3"
+  local waited=0 interval=3 ticks=0 st oom logs n last
+  while [[ "$waited" -lt "$timeout" ]]; do
+    st=$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || echo "")
+    if [[ -n "$st" && "$st" != "running" && "$st" != "created" ]]; then
+      oom=$(docker inspect -f '{{.State.OOMKilled}}' "$cname" 2>/dev/null || echo "false")
+      logs=$(docker logs --tail 80 "$cname" 2>&1 || true)
+      [[ "$oom" == "true" ]] && { printf 'exit:oom\n'; return 0; }
+      n=$(printf '%s' "$logs" | grep -oiE 'max_num_seqs to at most [0-9]+' | grep -oE '[0-9]+' | head -1)
+      if [[ -z "$n" ]] && printf '%s' "$logs" | grep -qiE 'mamba cache blocks|exceeds available .*cache blocks'; then
+        n=64   # pattern matched but no number parsed — conservative fallback
+      fi
+      [[ -n "$n" ]] && { printf 'exit:mamba:%s\n' "$n"; return 0; }
+      printf 'exit:other\n'; return 0
+    fi
+    if curl -fsS "http://localhost:${port}/v1/models" >/dev/null 2>&1; then
+      printf 'ready\n'; return 0
+    fi
+    ticks=$((ticks + 1))
+    if [[ $((ticks % 5)) -eq 0 ]]; then
+      last=$(docker logs --tail 1 "$cname" 2>&1 | tail -1 | cut -c1-80)
+      [[ -n "$last" ]] && printf "    ${DIM}%s${NC}\n" "$last" >&2
+    fi
+    sleep "$interval"
+    waited=$((waited + interval))
+  done
+  printf 'timeout\n'
+}
+
 # vLLM in a Docker container with NVIDIA GPUs. Reads cmd_run's flag locals.
 run_backend_vllm() {
   is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
@@ -903,6 +988,7 @@ run_backend_vllm() {
   [[ -z "$mem" ]] || is_mem_util "$mem" || die "Invalid --mem value: $mem" "Expected a number from 0.0 to 1.0"
   [[ -z "$max_len" ]] || is_positive_int "$max_len" || die "Invalid --max-len value: $max_len" "Expected a positive integer"
   [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto or fp8"
+  [[ -z "$max_num_seqs" ]] || is_positive_int "$max_num_seqs" || die "Invalid --max-num-seqs value: $max_num_seqs" "Expected a positive integer"
 
   local cname
   cname=$(container_name_for_model "$model")
@@ -1033,54 +1119,13 @@ run_backend_vllm() {
   ngc_image=$(detect_ngc_image)
   [[ -z "$ngc_image" ]] && die "No NGC vLLM container found" "Run: spark setup"
 
-  # Build vLLM flags
-  local vllm_args=(vllm serve "$model"
-    --trust-remote-code
-    --gpu-memory-utilization "$GPU_MEM_UTIL"
-    --max-model-len "$MAX_MODEL_LEN"
-    --port "$port")
-
-  [[ "$KV_CACHE_DTYPE" == "fp8" ]] && vllm_args+=(--kv-cache-dtype fp8)
-
-  if [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]]; then
-    vllm_args+=(--reasoning-parser "$REASONING_PARSER")
-  fi
-
-  if [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]]; then
-    vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
-  fi
-
-  if [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]]; then
-    vllm_args+=(--limit-mm-per-prompt image=0)
-  fi
-
-  # Hard memory ceiling (cgroup memory.max) so a model that overuses RAM reclaims/OOMs itself
-  # instead of thrashing the host. Unified memory only; discrete GPUs run their KV in VRAM.
-  local mem_limit_mib=""
-  if [[ "$ACCEL" != "cuda-discrete" && "$no_mem_limit" != "1" ]]; then
-    mem_limit_mib=$(awk -v n="$NEED_GB" -v p="$MEM_LIMIT_MARGIN_PCT" \
-      'BEGIN{ v=n*(1+p/100)*1024; iv=int(v); if(v>iv) iv++; printf "%d", iv }')
-  fi
-
-  # Build Docker command. Labels store the reservation on the container itself.
-  local docker_cmd=(docker run -d
-    --gpus all
-    --network host
-    --ipc=host
-    --ulimit memlock=-1
-    --ulimit stack=67108864
-    -v "${HF_CACHE_DIR}:/root/.cache/huggingface"
-    --name "$cname"
-    --label spark.managed=1
-    --label "spark.model=${model}"
-    --label "spark.port=${port}"
-    --label "spark.need_gb=${NEED_GB}"
-    --label "spark.weights_gb=${WEIGHTS_GB}"
-    --label "spark.kv_gb=${KV_GB}"
-    --label "spark.max_model_len=${MAX_MODEL_LEN}")
-  # --memory-swap == --memory disables the container's swap → clean self-OOM, no host thrash.
-  [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_limit_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
-  docker_cmd+=("$ngc_image")
+  # Concurrency cap: replace vLLM's default (256) with a sane ceiling so a tightly-sized hybrid
+  # (Mamba) model boots. Raise per-run with --max-num-seqs. The adaptive loop below lowers it
+  # only if even this doesn't fit. $margin_pct is the cgroup headroom (raised on a warmup OOM).
+  local seqs="${max_num_seqs:-$MAX_NUM_SEQS_DEFAULT}"
+  local margin_pct="$MEM_LIMIT_MARGIN_PCT"
+  local vllm_args=() docker_cmd=() mem_limit_mib=""
+  build_launch
 
   # Memory accounting breakdown (shown in dry-run and at launch).
   local reserved free
@@ -1095,30 +1140,86 @@ run_backend_vllm() {
     return 0
   fi
 
-  # Execute
-  printf "\n"
-  local run_log
-  run_log=$(mktemp)
-  local run_exit=0
-  "${docker_cmd[@]}" "${vllm_args[@]}" >"$run_log" 2>&1 || run_exit=$?
+  info "Serving up to ${seqs} concurrent requests. Raise with --max-num-seqs N (uses more memory)."
 
-  if [[ "$run_exit" -ne 0 ]]; then
-    err "docker run failed (exit $run_exit)"
-    if docker logs "$cname" >/dev/null 2>&1; then
-      printf "    ${DIM}Last logs:${NC}\n"
-      docker logs --tail 10 "$cname" 2>&1 | sed 's/^/    /'
-    elif [[ -s "$run_log" ]]; then
-      printf "    ${DIM}Output:${NC}\n"
-      tail -10 "$run_log" | sed 's/^/    /'
+  # Supervised adaptive launch: start the container, wait until it serves, and auto-retry
+  # recoverable startup failures. Levers: lower $seqs (concurrency) for cache-block errors;
+  # raise $margin_pct (cgroup headroom, capped by the 85% envelope) for a warmup OOM.
+  local attempt=0 serve_state="nowait"
+  while : ; do
+    docker rm -f "$cname" >/dev/null 2>&1 || true
+    printf "\n"
+    local run_log run_exit=0
+    run_log=$(mktemp)
+    "${docker_cmd[@]}" "${vllm_args[@]}" >"$run_log" 2>&1 || run_exit=$?
+    if [[ "$run_exit" -ne 0 ]]; then
+      err "docker run failed (exit $run_exit)"
+      if docker logs "$cname" >/dev/null 2>&1; then
+        printf "    ${DIM}Last logs:${NC}\n"
+        docker logs --tail 10 "$cname" 2>&1 | sed 's/^/    /'
+      elif [[ -s "$run_log" ]]; then
+        printf "    ${DIM}Output:${NC}\n"
+        tail -10 "$run_log" | sed 's/^/    /'
+      fi
+      rm -f "$run_log"
+      exit 1
     fi
     rm -f "$run_log"
-    exit 1
-  fi
-  rm -f "$run_log"
 
-  printf "\n"
-  printf "  Container '${BOLD}%s${NC}' started. Logs: ${BOLD}spark logs %s${NC}\n" "$cname" "$model"
-  printf "  Test: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$port"
+    if [[ "$no_wait" == "1" ]]; then
+      serve_state="nowait"
+      break
+    fi
+
+    printf "  Starting %s — waiting for it to serve (up to %ss)...\n" "$cname" "$STARTUP_TIMEOUT"
+    local status
+    status=$(await_startup "$cname" "$port" "$STARTUP_TIMEOUT")
+    case "$status" in
+      ready)
+        serve_state="ready"; break ;;
+      timeout)
+        serve_state="timeout"; break ;;
+      exit:mamba:*)
+        local n="${status##*:}"
+        if [[ "$attempt" -lt "$STARTUP_MAX_RETRIES" && "$n" =~ ^[0-9]+$ && "$n" -ge 1 && "$n" -lt "$seqs" ]]; then
+          attempt=$((attempt + 1)); seqs="$n"
+          info "This size only fits ${n} concurrent requests — retrying with --max-num-seqs ${n}."
+          build_launch
+          continue
+        fi
+        err "vLLM couldn't start within the concurrency this size allows."
+        docker logs --tail 15 "$cname" 2>&1 | sed 's/^/    /'
+        exit 1 ;;
+      exit:oom)
+        local m_max new_margin
+        m_max=$(awk -v f="$free" -v n="$NEED_GB" -v cap="$MEM_LIMIT_MARGIN_MAX_PCT" \
+          'BEGIN{ if(n<=0){print 0; exit} m=(f/n-1)*100; if(m>cap)m=cap; if(m<0)m=0; printf "%d", m }')
+        new_margin=$((margin_pct + 25))
+        if [[ "$attempt" -lt "$STARTUP_MAX_RETRIES" && "$new_margin" -le "$m_max" && "$m_max" -gt "$margin_pct" ]]; then
+          attempt=$((attempt + 1)); margin_pct="$new_margin"
+          info "Startup hit the memory ceiling — retrying with +${margin_pct}% headroom."
+          build_launch
+          continue
+        fi
+        err "Startup peak exceeds the safe memory cap for ${model}."
+        printf "    Reduce context (--max-len) or free memory (spark stop <model>).\n"
+        exit 1 ;;
+      *)
+        err "vLLM failed to start."
+        docker logs --tail 15 "$cname" 2>&1 | sed 's/^/    /'
+        exit 1 ;;
+    esac
+  done
+
+  printf "\n  Container '${BOLD}%s${NC}' started." "$cname"
+  case "$serve_state" in
+    ready)
+      printf " ${GREEN}✓ serving${NC}\n  Test: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$port" ;;
+    timeout)
+      printf "\n  ${YELLOW}⊘${NC} Still warming up after ${STARTUP_TIMEOUT}s — it may still come up. Follow: ${BOLD}spark logs %s${NC}\n\n" "$model" ;;
+    *)
+      printf "\n  Logs: ${BOLD}spark logs %s${NC}  ·  Test: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$model" "$port" ;;
+  esac
 
   # Auto-restart gateway if running so it picks up the new model
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
@@ -1257,7 +1358,8 @@ print_memory_plan() {
   printf "    Weights:   %s GB\n" "$WEIGHTS_GB"
   printf "    KV cache:  %s GB\n" "$KV_GB"
   printf "    ${BOLD}Need:${NC}      %s GB  →  --gpu-memory-utilization %s\n" "$NEED_GB" "$GPU_MEM_UTIL"
-  [[ -n "${mem_limit_mib:-}" ]] && printf "    Limit:     %s MiB  (hard cgroup cap, NEED +%s%%)\n" "$mem_limit_mib" "$MEM_LIMIT_MARGIN_PCT"
+  [[ -n "${mem_limit_mib:-}" ]] && printf "    Limit:     %s MiB  (hard cgroup cap, NEED +%s%%)\n" "$mem_limit_mib" "$margin_pct"
+  [[ -n "${seqs:-}" ]] && printf "    Concur.:   %s requests  (max-num-seqs)\n" "$seqs"
   printf "    API:       http://localhost:%s/v1\n" "$port"
   [[ -n "$REASONING_PARSER" ]] && printf "    Reasoning: %s parser\n" "$REASONING_PARSER"
   if [[ "$ACCEL" == "cuda-discrete" ]]; then
@@ -2678,12 +2780,14 @@ cmd_help() {
     --mem <float>          GPU memory utilization (0.0-1.0), overrides auto-sizing
     --max-len <int>        Context length (default: 128K, capped to model max)
     --kv-cache-dtype fp8   Halve KV cache memory
+    --max-num-seqs <int>   Max concurrent requests (default: 100; raise for more throughput)
     --port <int>           API port (default: auto from 8000)
     --tools                Enable tool calling
     --text-only            Skip vision encoder
     --no-reasoning         Disable reasoning parser
     --no-pull              Don't offer to download a missing model; just error
     --dry-run              Print the memory plan and Docker command only
+    --no-wait              Don't supervise startup (launch and return immediately)
     --tail                 Follow logs after launch
     --force                Replace this model if already running
     --regen-profile        Regenerate model profile
