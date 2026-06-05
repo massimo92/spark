@@ -9,7 +9,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.0.9"
+VERSION="0.0.10"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -316,12 +316,16 @@ _sudo_pw_ok() {
 ensure_sudo_pw() {
   [[ "$SUDO_READY" == "1" ]] && return 0
   if ctx_run 'sudo -n true 2>/dev/null'; then SUDO_PW=""; SUDO_READY=1; return 0; fi
+  # Read from the controlling terminal, NOT stdin — this is often called inside a pipeline
+  # (e.g. `printf config | ctx_sudo_write`), where stdin is the piped content, not the password.
+  [[ -r /dev/tty ]] || die "sudo needs a password but no terminal is available" \
+    "Configure passwordless sudo for non-interactive runs"
   local tries=0
   while [[ "$tries" -lt 3 ]]; do
-    printf "  Enter the sudo password for %s (asked once): " "$(ctx_user)"
-    read -rs SUDO_PW; printf "\n"
+    printf "  Enter the sudo password for %s (asked once): " "$(ctx_user)" >/dev/tty
+    IFS= read -rs SUDO_PW </dev/tty; printf "\n" >/dev/tty
     if _sudo_pw_ok; then SUDO_READY=1; return 0; fi
-    warn "Wrong sudo password — try again."
+    printf "  ${YELLOW}wrong sudo password — try again.${NC}\n" >/dev/tty
     tries=$((tries + 1))
   done
   SUDO_PW=""
