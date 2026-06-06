@@ -1248,39 +1248,71 @@ test_profile_schema_autoregen() {
   [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "2" ]]
 }
 
-# CUDA-graph calibration: a model cached as eager-but-never-tried-graphs speculatively tries CUDA
-# graphs once; one proven to OOM stays eager; one proven to fit uses graphs. Verified via the dry-run
-# launch command (--enforce-eager present or not) for the three cached states.
-_write_cal_profile() {  # $1=home $2=model $3=enforce_eager $4=cudagraph_oom
+# CUDA-graph calibration over the two-column peak table: eager peak on record + no graph peak →
+# calibrate (try graphs); graph peak "oom" → stay eager; numeric graph peak → use graphs. Verified
+# via the dry-run launch command (--enforce-eager present or not).
+# $3=eager_peak_gb (or ""), $4=cudagraph_peak_gb (number / "oom" / "")
+_write_cal_profile() {
   local pf
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
-  jq -n --arg m "$2" --arg e "$3" --arg c "$4" '{
+  jq -n --arg m "$2" --arg ep "$3" --arg cp "$4" '{
     schema_version:2, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
-    warmup: {"8192/auto": {peak_gb:"15", enforce_eager:$e, cudagraph_oom:$c, date:"2026-01-01"}}
+    warmup: {"8192/auto": ({date:"2026-01-01"}
+      + (if $ep != "" then {eager_peak_gb: $ep} else {} end)
+      + (if $cp != "" then {cudagraph_peak_gb: $cp} else {} end))}
   }' > "$pf"
+}
+# Legacy single-peak entry (pre-two-column), to verify migration-on-read.
+# $3=peak_gb $4=enforce_eager $5=cudagraph_oom
+_write_legacy_cal_profile() {
+  local pf
+  pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
+  mkdir -p "$(dirname "$pf")"
+  jq -n --arg m "$2" --arg p "$3" --arg e "$4" --arg c "$5" '{
+    schema_version:2, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
+    model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
+    warmup: {"8192/auto": {peak_gb:$p, enforce_eager:$e, cudagraph_oom:$c, date:"2026-01-01"}}
+  }' > "$pf"
+}
+_cal_dry() {  # $1=home $2=fake_bin — run dry-run, echo output
+  HOME="$1" PATH="$2:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Org/Cal --dry-run </dev/null 2>&1 || true
 }
 test_cudagraph_calibration() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin cal oom fit
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Org/Cal" "$KV_CONFIG"
-  # cached eager, graphs never tried → calibrate (try graphs: no --enforce-eager, announces it)
-  _write_cal_profile "${tmp}/home" "Org/Cal" "1" "0"
-  cal=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
-    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Org/Cal --dry-run </dev/null 2>&1 || true)
-  # graphs proven to OOM → stay eager
-  _write_cal_profile "${tmp}/home" "Org/Cal" "1" "1"
-  oom=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
-    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Org/Cal --dry-run </dev/null 2>&1 || true)
-  # graphs proven to fit → use graphs
-  _write_cal_profile "${tmp}/home" "Org/Cal" "0" "0"
-  fit=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
-    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Org/Cal --dry-run </dev/null 2>&1 || true)
+  _write_cal_profile "${tmp}/home" "Org/Cal" "15" ""      # eager peak only → calibrate
+  cal=$(_cal_dry "${tmp}/home" "$fake_bin")
+  _write_cal_profile "${tmp}/home" "Org/Cal" "15" "oom"   # graphs OOMed → stay eager
+  oom=$(_cal_dry "${tmp}/home" "$fake_bin")
+  _write_cal_profile "${tmp}/home" "Org/Cal" "" "20"      # graphs fit → use graphs
+  fit=$(_cal_dry "${tmp}/home" "$fake_bin")
   rm -rf "$tmp"
-  # Check the actual launch command line (grep 'vllm serve'), not the surrounding prose.
+  local cal_cmd oom_cmd fit_cmd
+  cal_cmd=$(printf '%s\n' "$cal" | grep 'vllm serve' || true)
+  oom_cmd=$(printf '%s\n' "$oom" | grep 'vllm serve' || true)
+  fit_cmd=$(printf '%s\n' "$fit" | grep 'vllm serve' || true)
+  [[ "$cal_cmd" != *"--enforce-eager"* ]] && [[ "$cal" == *"Calibrating"* ]] &&
+    [[ "$oom_cmd" == *"--enforce-eager"* ]] && [[ "$fit_cmd" != *"--enforce-eager"* ]]
+}
+test_warmup_legacy_migration() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin cal oom fit
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Cal" "$KV_CONFIG"
+  _write_legacy_cal_profile "${tmp}/home" "Org/Cal" "15" "1" "0"   # legacy eager, graphs untried → calibrate
+  cal=$(_cal_dry "${tmp}/home" "$fake_bin")
+  _write_legacy_cal_profile "${tmp}/home" "Org/Cal" "15" "1" "1"   # legacy eager + cudagraph_oom → eager
+  oom=$(_cal_dry "${tmp}/home" "$fake_bin")
+  _write_legacy_cal_profile "${tmp}/home" "Org/Cal" "20" "0" "0"   # legacy graphs-worked → use graphs
+  fit=$(_cal_dry "${tmp}/home" "$fake_bin")
+  rm -rf "$tmp"
   local cal_cmd oom_cmd fit_cmd
   cal_cmd=$(printf '%s\n' "$cal" | grep 'vllm serve' || true)
   oom_cmd=$(printf '%s\n' "$oom" | grep 'vllm serve' || true)
@@ -1521,6 +1553,7 @@ run_test "--no-wait launches without supervising" test_startup_no_wait
 run_test "enforce-eager auto for MoE, not for dense" test_enforce_eager_auto_for_moe
 run_test "stale profile schema auto-refreshes on run" test_profile_schema_autoregen
 run_test "CUDA-graph calibration: try / stay-eager / use-graphs" test_cudagraph_calibration
+run_test "warmup cache migrates legacy single-peak entries" test_warmup_legacy_migration
 run_test "budget blocks stacking past total − OS reserve" test_budget_blocks_when_stacking
 run_test "budget blocks a single model over the limit" test_budget_blocks_single_model
 run_test "budget is larger on discrete (smaller OS reserve)" test_budget_larger_on_discrete

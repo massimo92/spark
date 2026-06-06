@@ -87,6 +87,60 @@ spark setup          # pick [2] another machine → asks for user@host, configur
 spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
 ```
 
+## How spark works
+
+A short mental model of what spark does for you and the rules it follows. (Details and flags are in
+the sections below.)
+
+**1 — It detects your hardware and picks the engine.** On an NVIDIA box it serves with vLLM; on Apple
+Silicon or CPU it uses Ollama. Either way it puts a single **LiteLLM gateway on `:4000`**, so your
+apps always talk to one OpenAI-compatible endpoint no matter what's behind it.
+
+**2 — It sizes a model before starting it.** For vLLM, spark reads the model's config and estimates
+**NEED = weights + KV cache** (the KV cache is per-request memory that grows with context length),
+plus a small cushion. Then it checks an **admission budget**: it won't start a model unless
+*(memory already reserved by running models) + (this model's NEED)* fits within *total RAM − a reserve
+for the OS* (7 GB by default, `SPARK_OS_RESERVE_GB`). Models already running are never disturbed — if
+the new one doesn't fit, spark says so and stops. This lets you safely use ~90% of the box.
+
+**3 — It boxes each model in, so one can't take the machine down.** Every container gets a hard memory
+limit (a Linux *cgroup* cap) of `NEED + headroom`. Two different spikes matter, and spark handles both:
+- **The load spike:** reading the weights briefly needs about *twice* their size. spark lets that spill
+  into **swap** so the load finishes, then the model settles back into RAM.
+- **The startup spike:** vLLM compiles the model and records "CUDA graphs" at startup — a separate,
+  GPU-side peak (not the weights). spark **measures the real peak** the first time a model serves and
+  **caches it per model**, so later launches are sized exactly. If that peak won't fit, spark restarts
+  with **`--enforce-eager`**, which skips the CUDA-graph step — ~10–20% slower, but no spike.
+
+**4 — It learns the cheapest safe setting (calibration).** A model that first ran under `--enforce-eager`
+only revealed its *eager* peak. On a later run spark tries CUDA graphs once (with extra headroom); if
+they fit it remembers that and **switches the model to the faster CUDA-graph mode**, otherwise it stays
+on eager and stops retrying. It records **both peaks** — with and without CUDA graphs — in the model's
+profile. Disable with `SPARK_CALIBRATE_CUDAGRAPH=0`.
+
+**5 — It supervises the startup and adapts.** `docker run` only reports that the container *started* —
+vLLM can still crash during init. So spark waits until the model actually serves, and on a recoverable
+failure it retries with one change: **lower the concurrency** (`--max-num-seqs`, default **5**) if the
+model can't fit that many parallel requests, or **enforce-eager** if the startup peak overflowed.
+Concurrency is low by default because the KV cache grows with every parallel request — fewer requests,
+less memory. Raise it with `--max-num-seqs N` when you have room.
+
+**6 — It keeps the box reachable, always.** This comes from a real incident (2026-06-03): a model ran
+the machine out of memory and the kernel's OOM-killer, with nothing protected, killed `dbus` and
+`tailscaled` — and the box became unusable. The fix isn't to remove swap; it's to protect what you need
+to log back in. So `spark setup` (on Linux) configures three things:
+- **Swap stays on** with a low `vm.swappiness` — swap absorbs the one-time load spike, but the running
+  model stays in RAM (no constant disk paging at serve time).
+- **earlyoom** kills the offending *model* early — but only when **both RAM and swap** are nearly gone,
+  so a legitimate load can borrow swap for its spike without being killed.
+- **The control plane is made OOM-proof:** `sshd`, `dbus`, `tailscaled`, `systemd-logind` and
+  `systemd-resolved` are marked so the OOM-killer can never pick them. Whatever happens, you can still
+  SSH in and recover.
+
+**7 — If a model doesn't fit, it offers options instead of failing.** spark suggests a shorter context
+that fits, or **fp8 KV cache** (`--kv-cache-dtype fp8`), which stores the KV cache at 1 byte per value
+instead of 2 — roughly halving that part of the memory.
+
 ## Commands
 
 ### spark setup
@@ -145,10 +199,9 @@ serves** (showing live progress) and, on a recoverable startup failure, **fixes 
 retries**:
 
 - **Concurrency cap.** spark caps concurrent requests at **5** (`--max-num-seqs`, vs vLLM's default
-  256). On unified-memory boxes (GB10) a low cap is the documented sweet spot — it keeps the warmup
-  profiling/activation memory small and lets a tightly-sized **hybrid (Mamba) model** boot without
-  wasting memory. 5 is plenty for personal use; raise it with `--max-num-seqs N` (uses more memory)
-  or globally via `SPARK_MAX_NUM_SEQS`.
+  256). The KV cache grows with every parallel request, so a lower cap means less memory — which on a
+  single-box, unified-memory machine is what lets a large model fit. 5 is plenty for personal use;
+  raise it with `--max-num-seqs N` (uses more memory) or globally via `SPARK_MAX_NUM_SEQS`.
 - **Still doesn't fit?** If even that is too many for the cache, spark reads the exact limit from
   vLLM's own error and retries with a lower `--max-num-seqs` — keeping memory tight.
 - **Warm-up OOM?** If the startup peak hits the container's memory ceiling, spark retries with
@@ -349,41 +402,30 @@ manages memory itself, so spark just pulls the model and shows an advisory size.
 Run several models at once; each lands in its own container (`spark-vllm-<name>-<size>`) on its
 own port, and the LiteLLM gateway registers one route per model plus the `vllm/*` wildcard.
 
-Before launching, spark checks the new model fits: `sum(reserved by live models) + new need`
-must not exceed the **admission budget** = `total − OS reserve` (`SPARK_OS_RESERVE_GB`, default **7**
-on unified — the OS working set that keeps SSH/the kernel responsive). The running models are
-**never touched** by this check. There's no separate "utilization cap": the host is protected by
-the per-container limit + earlyoom + control-plane OOM protection below, so the budget can use ~90%+ of RAM.
+This is the precise reference for the memory model sketched in [How spark works](#how-spark-works).
 
-**Per-container enforcement.** Each container gets a hard `--memory` cgroup limit =
-`NEED + warmup headroom` (the room for the startup peak), with `--memory-swap` set higher so the
-one-time **load** peak (the loader transiently needs ~2× the weights) can spill into swap and finish
-instead of the container OOMing mid-load; the steady state then lives inside `--memory` (RAM). On
-cgroup v2 a model that overuses RAM at runtime **OOM-kills itself** instead of dragging the host down.
-The **startup peak** (`torch.compile` + CUDA-graph capture, pinned — *not* the weights) is what
-overflows; spark **measures the real peak** (cgroup `memory.peak`) on a successful launch and
-**caches it per model** (in the profile + a shipped community DB, `data/model_profiles.json`) so
-future launches size it exactly. If the peak still overflows, spark retries with **`--enforce-eager`**
-(disables CUDA-graph capture → no peak; ~10-20% slower) — automatic for large MoE models on the first
-launch. Disable per-run with `--no-mem-limit`.
+**Admission.** Before launching, spark checks `sum(reserved by live models) + new NEED ≤ total − OS
+reserve` (`SPARK_OS_RESERVE_GB`, default **7**). Running models are never touched; if the new one
+doesn't fit, spark says so and stops. There's no separate utilization cap — the per-container limit +
+earlyoom + control-plane protection keep the host safe, so the budget can use ~90% of RAM.
 
-A model that first launched under `--enforce-eager` has only revealed its *eager* peak, not whether
-CUDA graphs would fit. So spark **calibrates**: on a later run it tries CUDA graphs once (with generous
-headroom); if they fit it caches that and **graduates the model to CUDA graphs** (faster) — if they
-OOM, the cgroup cap + reactive retry catch it cleanly, it falls back to eager and records not to try
-again. Disable with `SPARK_CALIBRATE_CUDAGRAPH=0`.
+**Per-container limits.** Each container gets `--memory = NEED + warmup headroom` and `--memory-swap`
+set higher, so the one-time **load spike** (~2× the weights) spills into swap and finishes instead of
+OOMing mid-load; the steady state then lives inside `--memory` (RAM), and a model that overuses RAM at
+runtime OOM-kills itself instead of dragging the host down. The separate **startup peak**
+(`torch.compile` + CUDA-graph capture — not the weights) is **measured** on a successful launch (cgroup
+`memory.peak`) and **cached per model — both the eager peak and the CUDA-graph peak** — in the profile
+and a shipped community DB (`data/model_profiles.json`), so later launches size exactly and pick the
+faster mode when it fits. `--enforce-eager` (auto for big MoE on the first launch) removes the peak;
+calibration later tries CUDA graphs once and graduates the model if they fit (`SPARK_CALIBRATE_CUDAGRAPH=0`
+to disable). `--no-mem-limit` skips the cap.
 
-**Host hardening for an always-reachable 24/7 node.** A real memory-overcommit incident here (a model
-exhausted RAM; the kernel OOM-killer then took out **dbus + tailscaled**, wedging the box) showed the
-fix is *protecting the control plane*, not removing swap. So `spark setup` (Linux) configures,
-idempotently: **swap kept on** with a low `vm.swappiness` (absorbs the one-time load peak; the runtime
-working set stays in RAM, so no thrash — admission guarantees the model fits); **earlyoom** at
-`-m 5% -s 10%` (kills the offending model early — but only when RAM **and** swap are both nearly gone,
-so a legitimate load can borrow swap for its peak without being killed); and **control-plane
-protection** — `MemoryMin` + `OOMScoreAdjust=-1000` on `sshd`, `dbus`, `tailscaled`, `systemd-logind`
-and `systemd-resolved`, so the OOM killer can only ever hit the model, never the services you need to
-reconnect and recover. Together that makes a memory-overcommit freeze — the kind that needs a physical
-reboot — effectively impossible.
+**Host hardening** (`spark setup`, Linux, idempotent) keeps the box reachable under memory pressure:
+**swap on** + low `vm.swappiness`, **earlyoom** `-m 5% -s 10%`, and `MemoryMin` + `OOMScoreAdjust=-1000`
+on `sshd`, `dbus`, `tailscaled`, `systemd-logind` and `systemd-resolved`. See
+[How spark works](#how-spark-works) §6 for why (a real incident OOM-killed dbus + tailscaled and wedged
+the box). Together this makes a memory-overcommit freeze that needs a physical reboot effectively
+impossible.
 
 ```bash
 spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4              # worker
