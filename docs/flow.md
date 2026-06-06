@@ -60,7 +60,7 @@ flowchart TD
     override --> verify["verify_capacity\nreserved + need <= total - OS reserve\nif not: fit_options → menu (auto/fp8 ctx) or\nsuggest+abort (non-interactive) or show (dry-run)"]
     verify --> port["assign port (auto 8000+)\nname spark-vllm-<slug>"]
     port --> ngc["detect_ngc_image\ndocker images | grep vllm"]
-    ngc --> build["build_launch (rebuildable)\nvllm_args: serve, model, --max-num-seqs (100), --enforce-eager (auto)\ndocker_cmd: gpus, network, ipc, ulimits, volume, spark.* labels\n+ --memory/--memory-swap = NEED + warmup headroom (cached peak)"]
+    ngc --> build["build_launch (rebuildable)\nvllm_args: serve, model, --max-num-seqs (5), --enforce-eager (auto)\ndocker_cmd: gpus, network, ipc, ulimits, volume, spark.* labels\n+ --memory = NEED + warmup headroom; --memory-swap higher (load peak spills to swap)"]
 
     build --> plan["print memory plan\nweights, KV, need, fraction, concurrency, free"]
     plan --> dry{"--dry-run?"}
@@ -126,7 +126,7 @@ flowchart TD
         s_v --> s_jq
         s_o --> s_jq
         s_jq["jq (Linux)"] --> s_gw["gateway: pull LiteLLM\nproviders + start"]
-        s_gw --> s_hard["host hardening (Linux+systemd, idempotent):\nswap off · earlyoom -m5 · sshd MemoryMin + OOMScoreAdjust=-1000"]
+        s_gw --> s_hard["host hardening (Linux+systemd, idempotent):\nswap on + swappiness · earlyoom -m5 -s10 · control-plane OOM-protect (sshd/dbus/tailscaled/logind/resolved)"]
     end
 
     shared --> branch{"target?"}
