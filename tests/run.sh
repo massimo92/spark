@@ -123,13 +123,18 @@ esac
 EOF
   chmod +x "${dir}/curl"
 
-  # systemctl mock for spark setup OS-hardening checks.
+  # systemctl mock for spark setup OS-hardening checks. list-unit-files echoes a unit only if we
+  # pretend it's installed (a realistic control-plane subset); show -p returns the FAKE_* values,
+  # applied to every unit (so FAKE_SSHD_OOMSCORE=-1000 marks them all protected).
   cat > "${dir}/systemctl" <<'EOF'
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
   *is-active*earlyoom*)        exit "${FAKE_EARLYOOM_ACTIVE:-1}" ;;
-  *list-unit-files*)           echo "ssh.service enabled enabled" ;;
+  *list-unit-files*)
+    for u in ssh.service dbus.service tailscaled.service systemd-logind.service systemd-resolved.service; do
+      case "$args" in *"${u}"*) echo "${u} enabled enabled"; break ;; esac
+    done ;;
   *"show -p MemoryMin"*)       echo "${FAKE_SSHD_MEMORYMIN:-}" ;;
   *"show -p OOMScoreAdjust"*)  echo "${FAKE_SSHD_OOMSCORE:-}" ;;
   *)                           exit 0 ;;
@@ -137,13 +142,23 @@ esac
 EOF
   chmod +x "${dir}/systemctl"
 
-  # swapon mock: prints active swap devices. FAKE_SWAP_ON=1 → one device (swap on); default off.
+  # swapon mock: prints active swap devices. FAKE_SWAP_ON=1 → spark's swapfile present; default off.
   cat > "${dir}/swapon" <<'EOF'
 #!/usr/bin/env bash
-[[ "${FAKE_SWAP_ON:-0}" == "1" ]] && echo "/swapfile"
+[[ "${FAKE_SWAP_ON:-0}" == "1" ]] && echo "/swapfile.spark"
 exit 0
 EOF
   chmod +x "${dir}/swapon"
+
+  # sysctl mock: report vm.swappiness from FAKE_SWAPPINESS (empty = unset).
+  cat > "${dir}/sysctl" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *vm.swappiness*) echo "${FAKE_SWAPPINESS:-}" ;;
+esac
+exit 0
+EOF
+  chmod +x "${dir}/sysctl"
 
   cat > "${dir}/tailscale" <<'EOF'
 #!/usr/bin/env bash
@@ -793,15 +808,17 @@ test_host_check_hardening_missing() {
 test_host_check_hardening_present() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  printf 'EARLYOOM_ARGS="-m 5 -s 100"\n' > "${tmp}/earlyoom.conf"
+  printf 'EARLYOOM_ARGS="-m 5 -s 10"\n' > "${tmp}/earlyoom.conf"
   printf '#!/usr/bin/env bash\nexit 0\n' > "${fake_bin}/earlyoom"; chmod +x "${fake_bin}/earlyoom"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
-    SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SSHD_MEMORYMIN=536870912 FAKE_SSHD_OOMSCORE=-1000 \
+    SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SWAP_ON=1 FAKE_SWAPPINESS=10 \
+    FAKE_SSHD_MEMORYMIN=536870912 FAKE_SSHD_OOMSCORE=-1000 \
     EARLYOOM_DEFAULT_FILE="${tmp}/earlyoom.conf" \
     "$SPARK" setup --check </dev/null 2>&1) || true
   rm -rf "$tmp"
-  [[ "$out" == *"earlyoom active (-m 5%"* ]] && [[ "$out" == *"OOMScoreAdjust=-1000"* ]] &&
-    [[ "$out" != *"early-OOM not active"* ]]
+  [[ "$out" == *"earlyoom active (-m 5% -s 10%"* ]] && [[ "$out" == *"control-plane: OOM-protected"* ]] &&
+    [[ "$out" == *"swappiness=10"* ]] && [[ "$out" != *"early-OOM not active"* ]] &&
+    [[ "$out" != *"not fully protected"* ]]
 }
 
 # --- Unified setup wizard (host vs server picker, parity, bootstrap) ---
@@ -1051,12 +1068,15 @@ test_mem_limit_present_unified() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    SPARK_SWAP_GB=64 \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
     "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
   dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  # cgroup cap = NEED + WARMUP_HEADROOM (default 20): (28.1+20)×1024 = ceil(49254.4) = 49255 MiB.
-  [[ "$dargs" == *"--memory 49255m"* ]] && [[ "$dargs" == *"--memory-swap 49255m"* ]]
+  # --memory cap = NEED + WARMUP_HEADROOM (default 20): (28.1+20)×1024 = ceil(49254.4) = 49255 MiB.
+  # --memory-swap = cap + provisioned swap (64G): 49255 + 65536 = 114791 MiB (lets the load peak
+  # spill to swap instead of cgroup-OOMing mid-load).
+  [[ "$dargs" == *"--memory 49255m"* ]] && [[ "$dargs" == *"--memory-swap 114791m"* ]]
 }
 
 test_mem_limit_absent_discrete() {
@@ -1111,7 +1131,7 @@ test_max_num_seqs_default() {
     "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1 || true)
   dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$dargs" == *"--max-num-seqs 100"* ]] && [[ "$out" == *"up to 100 concurrent"* ]]
+  [[ "$dargs" == *"--max-num-seqs 5"* ]] && [[ "$out" == *"up to 5 concurrent"* ]]
 }
 
 test_max_num_seqs_override() {
@@ -1135,13 +1155,13 @@ test_startup_retry_mamba() {
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
-    FAKE_RETRY=mamba FAKE_MAMBA_N=64 \
+    FAKE_RETRY=mamba FAKE_MAMBA_N=2 \
     "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1 || true)
   last=$(tail -1 "${tmp}/d.txt" 2>/dev/null || echo "")
   local nruns; nruns=$(grep -c '^run ' "${tmp}/d.txt" 2>/dev/null || echo 0)
   rm -rf "$tmp"
-  [[ "$nruns" -eq 2 ]] && [[ "$last" == *"--max-num-seqs 64"* ]] &&
-    [[ "$out" == *"retrying with --max-num-seqs 64"* ]] && [[ "$out" == *"serving"* ]]
+  [[ "$nruns" -eq 2 ]] && [[ "$last" == *"--max-num-seqs 2"* ]] &&
+    [[ "$out" == *"retrying with --max-num-seqs 2"* ]] && [[ "$out" == *"serving"* ]]
 }
 
 # Warmup OOM → raise the cgroup margin (25%→50%) within the cap and retry.
@@ -1208,6 +1228,24 @@ test_enforce_eager_auto_for_moe() {
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Org/Dense --dry-run </dev/null 2>&1 || true)
   rm -rf "$tmp"
   [[ "$moe" == *"--enforce-eager"* ]] && [[ "$dense" != *"--enforce-eager"* ]]
+}
+
+# A cached profile from an older spark (no schema_version, missing fields like is_moe) is refreshed
+# automatically on the next run — so decisions that depend on the new fields work without user action.
+test_profile_schema_autoregen() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out pf sv
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  pf="${tmp}/home/.config/spark/profiles/Qwen--Qwen3-30B.json"
+  mkdir -p "$(dirname "$pf")"
+  # Stale profile: no schema_version, no is_moe (pre-MoE-detection schema).
+  printf '%s\n' '{"model":"Qwen/Qwen3-30B","max_model_len":4096,"gpu_memory_utilization":"0.5","weights_gb":"10","kv_gb":"1","need_gb":"11","kv_cache_dtype":"auto","is_multimodal":false}' > "$pf"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1 || true)
+  sv=$(jq -r '.schema_version // "none"' "$pf" 2>/dev/null || echo none)
+  rm -rf "$tmp"
+  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "2" ]]
 }
 
 # --- Admission budget (TOTAL − OS reserve) ---
@@ -1440,6 +1478,7 @@ run_test "startup retries warmup OOM with more headroom" test_startup_retry_oom
 run_test "unrecoverable startup aborts without retry" test_startup_unrecoverable_aborts
 run_test "--no-wait launches without supervising" test_startup_no_wait
 run_test "enforce-eager auto for MoE, not for dense" test_enforce_eager_auto_for_moe
+run_test "stale profile schema auto-refreshes on run" test_profile_schema_autoregen
 run_test "budget blocks stacking past total − OS reserve" test_budget_blocks_when_stacking
 run_test "budget blocks a single model over the limit" test_budget_blocks_single_model
 run_test "budget is larger on discrete (smaller OS reserve)" test_budget_larger_on_discrete

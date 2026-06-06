@@ -9,7 +9,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.0.12"
+VERSION="0.0.13"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -122,17 +122,19 @@ else
 fi
 MEM_HEADROOM_PCT="${SPARK_MEM_HEADROOM_PCT:-8}"     # per-model cushion (activations/fragmentation)
 # Admission budget = everything minus what the OS needs to stay responsive. The host stays safe via
-# the per-container cgroup cap (below) + swap-off + sshd OOM protection (spark setup), not a separate
-# arbitrary utilization cap. On a single 24/7 model you can use ~90%+ of RAM.
+# the per-container cgroup cap (below) + earlyoom + control-plane OOM protection (spark setup), not a
+# separate arbitrary utilization cap. On a single 24/7 model you can use ~90%+ of RAM.
 BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))
 # Per-container hard ceiling (Docker --memory / cgroup memory.max) = NEED + this, on unified memory
 # only. Confines a model's STARTUP PEAK to its own cgroup so it self-OOMs cleanly instead of
 # thrashing the host. The peak is torch.compile + CUDA-graph capture (pinned, non-swappable), not
 # the weights — measured per model and cached in the profile; else this conservative default.
 WARMUP_HEADROOM_GB="${SPARK_WARMUP_HEADROOM_GB:-20}"
-# Default cap on concurrent requests. vLLM's own default is 256, which can exceed the cache blocks a
-# tight hybrid (Mamba) model allocates and abort startup. Raise per-run with --max-num-seqs.
-MAX_NUM_SEQS_DEFAULT="${SPARK_MAX_NUM_SEQS:-100}"
+# Default cap on concurrent requests. vLLM's own default is 256, which both bloats the warmup
+# profiling/activation memory and can exceed the cache blocks a tight hybrid (Mamba) model allocates.
+# On unified-memory boxes (GB10) a low cap is the documented sweet spot. Raise per-run with
+# --max-num-seqs when you need more concurrency (uses more memory).
+MAX_NUM_SEQS_DEFAULT="${SPARK_MAX_NUM_SEQS:-5}"
 # Adaptive startup supervision: wait until the model serves; auto-retry recoverable startup failures
 # (concurrency too high for the cache → lower --max-num-seqs; warmup OOM → --enforce-eager).
 STARTUP_TIMEOUT="${SPARK_STARTUP_TIMEOUT:-600}"          # seconds to wait for the API to come up
@@ -140,6 +142,22 @@ STARTUP_MAX_RETRIES="${SPARK_STARTUP_MAX_RETRIES:-2}"    # auto-retries on a rec
 # earlyoom's emergency floor: kill the hog when free RAM drops below this %. The last-resort backstop
 # (the cgroup cap + admission keep normal operation far from it). spark setup configures earlyoom here.
 EARLYOOM_MIN_FREE_PCT="${SPARK_EARLYOOM_MIN_FREE_PCT:-5}"
+# earlyoom only fires when BOTH free RAM < -m AND free swap < -s. Keeping this LOW (not 100) is what
+# lets a legitimate model LOAD borrow swap for its transient peak without being killed — earlyoom
+# only acts when swap is also nearly exhausted (a real runaway, not a load spike).
+EARLYOOM_MIN_SWAP_PCT="${SPARK_EARLYOOM_MIN_SWAP_PCT:-10}"
+# Swap is KEPT ON (not disabled): it absorbs the one-time load-time peak of large models (the loader
+# transiently needs ~2x the weights) and is a cushion before the OOM killer. Runtime thrash is avoided
+# by a LOW swappiness + admission (one model fits in RAM), not by removing swap. If the box has no
+# swap, spark provisions a swapfile of this size (GB). Set to 0 to skip provisioning.
+SWAP_PROVISION_GB="${SPARK_SWAP_GB:-64}"
+# vm.swappiness: low so the runtime working set stays in RAM (good latency), while swap remains
+# available for load peaks and as an OOM cushion.
+SWAPPINESS="${SPARK_SWAPPINESS:-10}"
+# Profile cache schema. Bumped when new fields are added (e.g. is_moe). A cached profile older than
+# this is auto-refreshed on the next `spark run` so new fields (and the decisions that depend on them,
+# like auto enforce-eager) are populated — no user action needed.
+PROFILE_SCHEMA_VERSION=2
 
 # Detect the latest pulled NGC vLLM image
 detect_ngc_image() {
@@ -540,10 +558,19 @@ profile_model() {
 
   command -v jq >/dev/null 2>&1 || die "jq is required for model profiling" "Run: spark setup"
 
-  # Return cached profile if exists and not regenerating
+  # Return cached profile if it exists, is current-schema, and we're not forcing a regen. A profile
+  # written by an older spark (missing fields like is_moe) would silently disable the decisions that
+  # depend on them (e.g. auto enforce-eager), so an out-of-date schema is refreshed automatically —
+  # unless the model's config.json is gone (then the stale cache is the best we have).
   if [[ -f "$profile_file" && "${REGEN_PROFILE:-0}" != "1" ]]; then
-    load_profile "$profile_file"
-    return 0
+    local sv
+    sv="$(jq -r '.schema_version // 0' "$profile_file" 2>/dev/null || echo 0)"
+    [[ "$sv" =~ ^[0-9]+$ ]] || sv=0
+    if [[ "$sv" -ge "$PROFILE_SCHEMA_VERSION" || ! -f "${model_path}/config.json" ]]; then
+      load_profile "$profile_file"
+      return 0
+    fi
+    info "Refreshing model profile (schema v${sv} → v${PROFILE_SCHEMA_VERSION})"
   fi
 
   local config_json="${model_path}/config.json"
@@ -647,7 +674,9 @@ profile_model() {
     --arg need_gb "$NEED_GB" \
     --arg kv_cache_dtype "$KV_CACHE_DTYPE" \
     --arg is_moe "$IS_MOE" \
+    --argjson schema_version "$PROFILE_SCHEMA_VERSION" \
     '{
+      schema_version: $schema_version,
       model: $model,
       generated: $generated,
       reasoning_parser: $reasoning_parser,
@@ -868,7 +897,7 @@ is_interactive() { [[ -t 0 || -n "${SPARK_ASSUME_INTERACTIVE:-}" ]]; }
 #  - non-interactive: print the fitting options + command, then abort.
 #  - dry-run: print the verdict/options and continue (never prompts, never aborts).
 # Admission budget for the sum of model reservations = TOTAL − OS reserve. The host is protected by
-# the per-container cgroup cap + swap-off + sshd OOM protection, so there's no separate util cap.
+# the per-container cgroup cap + earlyoom + control-plane OOM protection, so there's no separate util cap.
 usable_budget() {
   printf '%s\n' "$BUDGET_GB"
 }
@@ -1041,12 +1070,17 @@ build_launch() {
   [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] && vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
   [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt image=0)
 
-  # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). If the real peak
-  # exceeds it, the container self-OOMs cleanly (OOMKilled) and the loop retries with --enforce-eager.
+  # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
+  # set higher (by the provisioned swap) so the LOAD-time peak — the loader transiently needs ~2x the
+  # weights — can spill into host swap and complete, instead of the container cgroup-OOMing mid-load.
+  # The steady state still lives inside --memory (RAM); admission guarantees it fits.
   mem_limit_mib=""
+  mem_swap_mib=""
   if [[ "$ACCEL" != "cuda-discrete" && "$no_mem_limit" != "1" ]]; then
     mem_limit_mib=$(awk -v n="$NEED_GB" -v h="$headroom_gb" \
       'BEGIN{ v=(n+h)*1024; iv=int(v); if(v>iv) iv++; printf "%d", iv }')
+    mem_swap_mib=$(awk -v m="$mem_limit_mib" -v s="$SWAP_PROVISION_GB" \
+      'BEGIN{ printf "%d", m + (s>0 ? s : 0)*1024 }')
   fi
   docker_cmd=(docker run -d
     --gpus all
@@ -1063,7 +1097,7 @@ build_launch() {
     --label "spark.weights_gb=${WEIGHTS_GB}"
     --label "spark.kv_gb=${KV_GB}"
     --label "spark.max_model_len=${MAX_MODEL_LEN}")
-  [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_limit_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
+  [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_swap_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
   docker_cmd+=("$ngc_image")
 }
 
@@ -2001,6 +2035,34 @@ doctor_checks_ollama() {
   [[ "$ACCEL" == "metal" ]] && info "Apple Silicon: Ollama uses MLX on 32 GB+ unified memory (have ${TOTAL_MEM_GB} GB)"
 }
 
+# Report host hardening drift (Linux + systemd). Shares cmd_doctor's passed/total via dynamic scope.
+doctor_checks_hardening() {
+  { [[ "$SPARK_OS" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; } || return 0
+  local sw swp oom_ssh oom_dbus
+  total=$((total + 1))
+  sw="$(swapon --show=NAME --noheadings 2>/dev/null | head -1 || true)"
+  swp="$(sysctl -n vm.swappiness 2>/dev/null || true)"
+  if [[ -n "$sw" && "$swp" == "$SWAPPINESS" ]]; then
+    info "Swap: on + swappiness=${swp} (absorbs load peaks)"; passed=$((passed + 1))
+  else
+    err "Swap/swappiness not configured (swap='${sw:-off}', swappiness='${swp:-?}') — run 'spark setup'"
+  fi
+  total=$((total + 1))
+  if systemctl is-active --quiet earlyoom 2>/dev/null; then
+    info "early-OOM: earlyoom active (runaway backstop)"; passed=$((passed + 1))
+  else
+    err "early-OOM: earlyoom not active — run 'spark setup'"
+  fi
+  total=$((total + 1))
+  oom_ssh="$(systemctl show -p OOMScoreAdjust --value ssh.service 2>/dev/null)"
+  oom_dbus="$(systemctl show -p OOMScoreAdjust --value dbus.service 2>/dev/null)"
+  if [[ "$oom_ssh" == "-1000" && "$oom_dbus" == "-1000" ]]; then
+    info "control-plane: sshd + dbus OOM-protected"; passed=$((passed + 1))
+  else
+    err "control-plane not fully OOM-protected (sshd='${oom_ssh:-?}', dbus='${oom_dbus:-?}') — run 'spark setup'"
+  fi
+}
+
 cmd_doctor() {
   printf "\n"
   local passed=0 total=0
@@ -2027,6 +2089,8 @@ cmd_doctor() {
   else
     doctor_checks_vllm
   fi
+
+  doctor_checks_hardening
 
   # Gateway
   if [[ -f "$GATEWAY_CONFIG" ]]; then
@@ -2388,36 +2452,44 @@ step_gateway() {
   fi
 }
 
-# OS hardening (Linux + systemd) so SSH always has room even if models exhaust RAM:
-#   1) early-OOM (earlyoom) kills the memory hog before the kernel deadlocks into swap thrash.
-#   2) MemoryMin protects sshd from reclaim so it never gets paged out / starved.
-# earlyoom is the emergency backstop. Declarative: reconciles to '-m $EARLYOOM_MIN_FREE_PCT -s 100'
-# regardless of any old/divergent config (e.g. a -m 8 / -m 3 left from experiments).
+# OS hardening (Linux + systemd) so you can ALWAYS reach + operate the box even if a model exhausts
+# RAM (real cause of the original wedge — see git history / docs):
+#   1) swap kept ON + low swappiness: absorbs the one-time load peak; runtime stays in RAM.
+#   2) early-OOM (earlyoom) kills the offending model early, before the kernel OOM-cascade.
+#   3) control-plane protection: MemoryMin + OOMScoreAdjust=-1000 on sshd/dbus/tailscaled/logind/
+#      resolved so the OOM killer can only hit the model, never the services you need to recover.
+# earlyoom is the emergency backstop. Declarative: reconciles to '-m $EARLYOOM_MIN_FREE_PCT
+# -s $EARLYOOM_MIN_SWAP_PCT' regardless of any old/divergent config (e.g. a -m 8 / -s 100 left from
+# experiments). The -s threshold is LOW on purpose: earlyoom kills only when free RAM AND free swap
+# are both nearly gone — so a legitimate load can borrow swap for its peak without being killed,
+# while a true runaway (RAM + swap exhausted) still gets killed early.
 step_earlyoom() {
-  local auto_yes="$1" check_only="$2" want="$EARLYOOM_MIN_FREE_PCT" installed=0 active=0 cur_m
+  local auto_yes="$1" check_only="$2" want="$EARLYOOM_MIN_FREE_PCT" wsw="$EARLYOOM_MIN_SWAP_PCT" installed=0 active=0 cur_m cur_s
   local ef="${EARLYOOM_DEFAULT_FILE:-/etc/default/earlyoom}"
   ctx_run 'command -v earlyoom >/dev/null 2>&1' && installed=1
   ctx_run 'systemctl is-active --quiet earlyoom' && active=1
   cur_m="$(ctx_run "grep -oE -- '-m[ =][0-9]+' '$ef' 2>/dev/null | grep -oE '[0-9]+' | head -1")"
-  if [[ "$installed" == "1" && "$active" == "1" && "$cur_m" == "$want" ]]; then
-    info "early-OOM: earlyoom active (-m ${want}%, reclaim-protected backstop)"
+  cur_s="$(ctx_run "grep -oE -- '-s[ =][0-9]+' '$ef' 2>/dev/null | grep -oE '[0-9]+' | head -1")"
+  if [[ "$installed" == "1" && "$active" == "1" && "$cur_m" == "$want" && "$cur_s" == "$wsw" ]]; then
+    info "early-OOM: earlyoom active (-m ${want}% -s ${wsw}%, reclaim-protected backstop)"
     return 0
   fi
   if [[ "$check_only" == "1" ]]; then
     if [[ "$installed" != "1" ]]; then setup_fail "early-OOM not active — install earlyoom so a runaway model is killed before the box freezes"
-    else setup_fail "earlyoom not at -m ${want}% (found '${cur_m:-none}') — re-run spark setup to reconcile"; fi
+    else setup_fail "earlyoom not at -m ${want}% -s ${wsw}% (found '-m ${cur_m:-none} -s ${cur_s:-none}') — re-run spark setup to reconcile"; fi
     return 0
   fi
-  printf "    ${DIM}What: install/configure 'earlyoom' (-m ${want}%%): kill the memory hog when free RAM is low.\n"
-  printf "    Why: it kills the offending model EARLY, while there's still free RAM, before the machine\n"
-  printf "    bogs down and locks you out. The cgroup cap + admission keep normal use far from this floor.${NC}\n"
-  if [[ "$auto_yes" == "1" ]] || confirm "Install/repair earlyoom at -m ${want}%?"; then
+  printf "    ${DIM}What: install/configure 'earlyoom' (-m ${want}%% -s ${wsw}%%): kill the memory hog when RAM is low.\n"
+  printf "    Why: it kills the offending model EARLY, before the machine bogs down and locks you out.\n"
+  printf "    The low -s lets a legitimate model LOAD borrow swap for its peak without being killed; it\n"
+  printf "    only fires when RAM and swap are both nearly gone (a real runaway).${NC}\n"
+  if [[ "$auto_yes" == "1" ]] || confirm "Install/repair earlyoom at -m ${want}% -s ${wsw}%?"; then
     if [[ "$installed" != "1" ]] && ! ctx_sudo 'apt-get update >/dev/null 2>&1 && apt-get install -y earlyoom >/dev/null 2>&1'; then
       setup_fail "Could not install earlyoom (apt)"; return 0
     fi
-    printf 'EARLYOOM_ARGS="-m %s -s 100 --avoid '\''(^|/)(systemd|sshd?|ssh|dbus)$'\'' --prefer '\''(^|/)(vllm|python|pt_main_thread)$'\''"\n' "$want" | ctx_sudo_write "$ef"
+    printf 'EARLYOOM_ARGS="-m %s -s %s --avoid '\''(^|/)(systemd|sshd?|ssh|dbus)$'\'' --prefer '\''(^|/)(vllm|python|pt_main_thread)$'\''"\n' "$want" "$wsw" | ctx_sudo_write "$ef"
     if ctx_sudo 'systemctl enable --now earlyoom >/dev/null 2>&1; systemctl restart earlyoom'; then
-      info "early-OOM: earlyoom set to -m ${want}%"
+      info "early-OOM: earlyoom set to -m ${want}% -s ${wsw}%"
     else
       setup_fail "Could not enable earlyoom"
     fi
@@ -2426,66 +2498,97 @@ step_earlyoom() {
   fi
 }
 
-# Protect SSH so you can ALWAYS connect: MemoryMin (reclaim-protected, stays responsive) +
-# OOMScoreAdjust=-1000 (the OOM killer never picks sshd). Declarative single drop-in, idempotent.
-step_sshd_memorymin() {
-  local auto_yes="$1" check_only="$2" unit mm oom
-  unit="$(ctx_run 'systemctl list-unit-files --no-legend ssh.service sshd.service 2>/dev/null | awk "NR==1{print \$1}"')"
-  [[ -z "$unit" ]] && unit="ssh.service"
-  mm="$(ctx_run "systemctl show -p MemoryMin --value ${unit} 2>/dev/null")"
-  oom="$(ctx_run "systemctl show -p OOMScoreAdjust --value ${unit} 2>/dev/null")"
-  if [[ "$mm" == "536870912" && "$oom" == "-1000" ]]; then
-    info "sshd: ${unit} MemoryMin=512M + OOMScoreAdjust=-1000 (always reachable)"
+# Protect the whole CONTROL PLANE so the OOM killer can only hit the model, never the services you
+# need to reach + operate the box. The 2026-06-03 incident OOM-killed dbus and tailscaled (not just
+# sshd), wedging the machine. Apply MemoryMin (reclaim-protected) + OOMScoreAdjust=-1000 (OOM-immune)
+# to every critical unit that's installed. Declarative single drop-in per unit, idempotent.
+step_control_plane_protect() {
+  local auto_yes="$1" check_only="$2" u state mm oom
+  local candidates=(ssh.service sshd.service dbus.service dbus-broker.service tailscaled.service systemd-logind.service systemd-resolved.service)
+  local -a present=() unprotected=()
+  for u in "${candidates[@]}"; do
+    state="$(ctx_run "systemctl list-unit-files --no-legend $u 2>/dev/null | awk 'NR==1{print \$1}'")"
+    [[ -z "$state" ]] && continue
+    present+=("$u")
+    mm="$(ctx_run "systemctl show -p MemoryMin --value $u 2>/dev/null")"
+    oom="$(ctx_run "systemctl show -p OOMScoreAdjust --value $u 2>/dev/null")"
+    [[ "$mm" == "536870912" && "$oom" == "-1000" ]] || unprotected+=("$u")
+  done
+  if [[ ${#present[@]} -eq 0 ]]; then
+    info "control-plane: no systemd units to protect"
+    return 0
+  fi
+  if [[ ${#unprotected[@]} -eq 0 ]]; then
+    info "control-plane: OOM-protected (${present[*]})"
     return 0
   fi
   if [[ "$check_only" == "1" ]]; then
-    setup_fail "sshd not fully protected (MemoryMin/OOMScoreAdjust) — it can be starved or OOM-killed"
+    setup_fail "control-plane not fully protected (${unprotected[*]}) — these can be OOM-killed and wedge the box"
     return 0
   fi
-  printf "    ${DIM}What: reserve 512 MB for sshd and make it OOM-immune (drop-in on ${unit}).\n"
-  printf "    Why: under memory pressure sshd stays resident AND the OOM killer never targets it, so\n"
-  printf "    you can always connect to fix things. Restarting ssh is safe (your session survives).${NC}\n"
-  if [[ "$auto_yes" == "1" ]] || confirm "Protect ${unit} (MemoryMin + OOM-immune)?"; then
-    ctx_sudo "mkdir -p /etc/systemd/system/${unit}.d"
-    printf '[Service]\nMemoryAccounting=yes\nMemoryMin=512M\nOOMScoreAdjust=-1000\n' | ctx_sudo_write "/etc/systemd/system/${unit}.d/10-spark-memory.conf"
+  printf "    ${DIM}What: reserve memory + make OOM-immune (OOMScoreAdjust=-1000) for the control plane\n"
+  printf "    (sshd, dbus, tailscaled, logind, resolved) via drop-ins.\n"
+  printf "    Why: when a model overruns memory the OOM killer must hit the MODEL, never the services you\n"
+  printf "    need to reach and run the box. Last incident it killed dbus + tailscaled and the machine\n"
+  printf "    became unusable. Protected, they stay alive so you can always connect and recover.${NC}\n"
+  if [[ "$auto_yes" == "1" ]] || confirm "Protect control-plane services (${unprotected[*]})?"; then
+    for u in "${unprotected[@]}"; do
+      ctx_sudo "mkdir -p /etc/systemd/system/${u}.d"
+      printf '[Service]\nMemoryAccounting=yes\nMemoryMin=512M\nOOMScoreAdjust=-1000\n' | ctx_sudo_write "/etc/systemd/system/${u}.d/10-spark-protect.conf"
+    done
     ctx_sudo 'systemctl daemon-reload'
-    if ctx_sudo "systemctl reload ${unit} || systemctl restart ${unit}"; then
-      info "sshd: ${unit} MemoryMin=512M + OOMScoreAdjust=-1000 set"
-    else
-      setup_fail "Could not protect ${unit}"
-    fi
+    for u in "${unprotected[@]}"; do
+      ctx_sudo "systemctl reload ${u} 2>/dev/null || systemctl try-restart ${u} 2>/dev/null || true"
+    done
+    info "control-plane: protected (${unprotected[*]})"
   else
-    setup_skip "sshd protection"
+    setup_skip "control-plane protection"
   fi
 }
 
-# Disable host swap so a memory spike can't thrash the box (the original freeze cause). With no swap
-# the kernel OOM-kills promptly instead of thrashing forever. Declarative + idempotent.
-step_swapoff() {
-  local auto_yes="$1" check_only="$2" swap_on
-  swap_on="$(ctx_run 'swapon --show=NAME --noheadings 2>/dev/null | head -1' 2>/dev/null)"
-  if [[ -z "$swap_on" ]]; then
-    info "Swap: off (no thrash risk)"
+# Keep swap ON (with a low swappiness), not off. A large model's LOAD transiently needs ~2x its
+# weights; swap absorbs that one-time peak so the load completes, then the steady state fits in RAM
+# (admission guarantees it) and swap goes idle — no runtime thrash. Removing swap was the wrong fix:
+# it blocked large-model loads while doing nothing the earlyoom + control-plane protection don't.
+# Declarative + idempotent: provisions /swapfile.spark if the box lacks swap, undoes any swap lines a
+# previous spark run commented out, and pins vm.swappiness.
+step_swap_ensure() {
+  local auto_yes="$1" check_only="$2" sf="/swapfile.spark" cur_sw active=""
+  cur_sw="$(ctx_run 'sysctl -n vm.swappiness 2>/dev/null' 2>/dev/null || true)"
+  if [[ "$SWAP_PROVISION_GB" -gt 0 ]]; then
+    active="$(ctx_run 'swapon --show=NAME --noheadings 2>/dev/null' 2>/dev/null | grep -Fx "$sf" || true)"
+  else
+    active="$(ctx_run 'swapon --show=NAME --noheadings 2>/dev/null | head -1' 2>/dev/null || true)"
+  fi
+  if [[ -n "$active" && "$cur_sw" == "$SWAPPINESS" ]]; then
+    info "Swap: on + swappiness=${SWAPPINESS} (absorbs load peaks; runtime stays in RAM)"
     return 0
   fi
   if [[ "$check_only" == "1" ]]; then
-    setup_fail "Swap is on — a memory spike can thrash the box; spark setup disables it"
+    [[ -z "$active" ]] && setup_fail "Swap not provisioned — large-model loads need it for their transient peak; spark setup provisions it"
+    [[ "$cur_sw" != "$SWAPPINESS" ]] && setup_fail "vm.swappiness=${cur_sw:-?} (want ${SWAPPINESS}) — runtime may swap the working set"
     return 0
   fi
-  printf "    ${DIM}What: turn off swap (swapoff -a) and comment swap lines in /etc/fstab.\n"
-  printf "    Why: if RAM fills up, swap pages memory out to disk — the whole machine crawls and can\n"
-  printf "    stop answering SSH for minutes. With no swap the kernel instead kills just the over-using\n"
-  printf "    process at once and the box stays responsive. Inference servers run swapless.${NC}\n"
-  if [[ "$auto_yes" == "1" ]] || confirm "Disable swap now and persist it?"; then
-    ctx_sudo 'swapoff -a'
-    ctx_sudo "sed -ri.spark-bak 's@^([^#].*[[:space:]]swap[[:space:]])@#\\1@' /etc/fstab"
-    if [[ -z "$(ctx_run 'swapon --show=NAME --noheadings 2>/dev/null | head -1' 2>/dev/null)" ]]; then
-      info "Swap: disabled"
+  printf "    ${DIM}What: keep swap on (provision ${sf} at ${SWAP_PROVISION_GB}G if missing) + vm.swappiness=${SWAPPINESS}.\n"
+  printf "    Why: loading a big model briefly needs about twice its weights; swap absorbs that one-time\n"
+  printf "    peak so the load finishes. The steady model fits in RAM (admission ensures it) and a low\n"
+  printf "    swappiness keeps it there, so swap stays idle at runtime — no thrash. earlyoom + protected\n"
+  printf "    system services handle a genuine runaway.${NC}\n"
+  if [[ "$auto_yes" == "1" ]] || confirm "Ensure swap on (${SWAP_PROVISION_GB}G) + swappiness=${SWAPPINESS}?"; then
+    # Undo any swap lines a previous spark run commented out, then re-enable fstab swap.
+    ctx_sudo "sed -ri 's@^#([^#]*[[:space:]]swap[[:space:]])@\\1@' /etc/fstab; swapon -a 2>/dev/null || true"
+    if [[ "$SWAP_PROVISION_GB" -gt 0 ]]; then
+      ctx_sudo "if ! swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq '$sf'; then test -f '$sf' || fallocate -l ${SWAP_PROVISION_GB}G '$sf' || dd if=/dev/zero of='$sf' bs=1M count=$((SWAP_PROVISION_GB*1024)) status=none; chmod 600 '$sf'; mkswap '$sf' >/dev/null 2>&1 || true; swapon '$sf'; fi; grep -q '^$sf ' /etc/fstab || printf '%s none swap sw 0 0\\n' '$sf' >> /etc/fstab"
+    fi
+    printf 'vm.swappiness=%s\n' "$SWAPPINESS" | ctx_sudo_write /etc/sysctl.d/99-spark.conf
+    ctx_sudo 'sysctl --system >/dev/null 2>&1 || true'
+    if [[ -n "$(ctx_run 'swapon --show=NAME --noheadings 2>/dev/null | head -1' 2>/dev/null)" ]]; then
+      info "Swap: on + swappiness=${SWAPPINESS}"
     else
-      setup_fail "Could not disable swap"
+      setup_fail "Could not enable swap"
     fi
   else
-    setup_skip "Swap off"
+    setup_skip "Swap configuration"
   fi
 }
 
@@ -2509,9 +2612,9 @@ run_install_set() {
   step_jq "$auto_yes" "$check_only"
   step_gateway "$auto_yes" "$check_only"
   if [[ "$TGT_OS" == "Linux" ]] && ctx_has systemctl; then
-    step_swapoff "$auto_yes" "$check_only"
+    step_swap_ensure "$auto_yes" "$check_only"
     step_earlyoom "$auto_yes" "$check_only"
-    step_sshd_memorymin "$auto_yes" "$check_only"
+    step_control_plane_protect "$auto_yes" "$check_only"
   fi
 }
 
@@ -2970,7 +3073,7 @@ cmd_help() {
     --mem <float>          GPU memory utilization (0.0-1.0), overrides auto-sizing
     --max-len <int>        Context length (default: 128K, capped to model max)
     --kv-cache-dtype fp8   Halve KV cache memory
-    --max-num-seqs <int>   Max concurrent requests (default: 100; raise for more throughput)
+    --max-num-seqs <int>   Max concurrent requests (default: 5; raise for more throughput)
     --enforce-eager        Disable CUDA graphs (smaller startup peak; ~10-20% slower). Auto for big MoE.
     --no-enforce-eager     Force CUDA graphs on
     --port <int>           API port (default: auto from 8000)
