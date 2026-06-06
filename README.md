@@ -130,7 +130,8 @@ the machine out of memory and the kernel's OOM-killer, with nothing protected, k
 `tailscaled` — and the box became unusable. The fix isn't to remove swap; it's to protect what you need
 to log back in. So `spark setup` (on Linux) configures three things:
 - **Swap stays on** with a low `vm.swappiness` — swap absorbs the one-time load spike, but the running
-  model stays in RAM (no constant disk paging at serve time).
+  model stays in RAM (no constant disk paging at serve time). spark tops the box up to ~64 GB of swap
+  (`SPARK_SWAP_GB`), complementing any swap the OS already has — it never removes or stacks on it.
 - **earlyoom** kills the offending *model* early — but only when **both RAM and swap** are nearly gone,
   so a legitimate load can borrow swap for its spike without being killed.
 - **The control plane is made OOM-proof:** `sshd`, `dbus`, `tailscaled`, `systemd-logind` and
@@ -279,8 +280,9 @@ spark logs <model> -f  # Follow logs
 
 `spark status` prints a table of running models — the memory each reserves (need = weights + KV
 cache, in GB), its port, uptime, and a `GW` column (✓ = routed through the gateway). It ends with
-a machine memory summary and the endpoints (direct `http://localhost:<port>/v1`, and the gateway
-where you call a model as `vllm/<model>`):
+a machine memory summary, a **live** line (host RAM/swap actually in use, plus each model's current
+and peak cgroup usage vs what it reserved), and the endpoints (direct `http://localhost:<port>/v1`,
+and the gateway where you call a model as `vllm/<model>`):
 
 ```
   MODEL                                          NEED  WEIGHTS      KV   PORT  UP        GW

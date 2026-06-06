@@ -66,6 +66,13 @@ case "${1:-}" in
       [[ -n "${FAKE_DOCKER_LOGS:-}" ]] && echo "${FAKE_DOCKER_LOGS}"
     fi
     ;;
+  exec)
+    # cgroup memory reads for `spark status` live block.
+    case "$args" in
+      *memory.current*) [[ -n "${FAKE_MEM_CURRENT:-}" ]] && echo "${FAKE_MEM_CURRENT}" ;;
+      *memory.peak*)    [[ -n "${FAKE_MEM_PEAK:-}" ]] && echo "${FAKE_MEM_PEAK}" ;;
+    esac
+    ;;
   manifest)
     exit 0
     ;;
@@ -149,6 +156,16 @@ EOF
 exit 0
 EOF
   chmod +x "${dir}/swapon"
+
+  # free mock (free -g): Mem + Swap lines from FAKE_* (GB). Swap total default 0 (off).
+  cat > "${dir}/free" <<'EOF'
+#!/usr/bin/env bash
+st="${FAKE_SWAP_TOTAL_GB:-0}"; su="${FAKE_SWAP_USED_GB:-0}"
+printf '               total        used        free      shared  buff/cache   available\n'
+printf 'Mem:    %11d %11d %11d %11d %11d %11d\n' "${FAKE_RAM_TOTAL_GB:-121}" "${FAKE_RAM_USED_GB:-40}" "${FAKE_RAM_FREE_GB:-50}" 0 28 "${FAKE_RAM_AVAIL_GB:-78}"
+printf 'Swap:   %11d %11d %11d\n' "$st" "$su" "$(( st - su ))"
+EOF
+  chmod +x "${dir}/free"
 
   # sysctl mock: report vm.swappiness from FAKE_SWAPPINESS (empty = unset).
   cat > "${dir}/sysctl" <<'EOF'
@@ -811,14 +828,45 @@ test_host_check_hardening_present() {
   printf 'EARLYOOM_ARGS="-m 5 -s 10"\n' > "${tmp}/earlyoom.conf"
   printf '#!/usr/bin/env bash\nexit 0\n' > "${fake_bin}/earlyoom"; chmod +x "${fake_bin}/earlyoom"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
-    SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SWAP_ON=1 FAKE_SWAPPINESS=10 \
+    SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SWAP_TOTAL_GB=64 FAKE_SWAPPINESS=10 \
     FAKE_SSHD_MEMORYMIN=536870912 FAKE_SSHD_OOMSCORE=-1000 \
     EARLYOOM_DEFAULT_FILE="${tmp}/earlyoom.conf" \
     "$SPARK" setup --check </dev/null 2>&1) || true
   rm -rf "$tmp"
   [[ "$out" == *"earlyoom active (-m 5% -s 10%"* ]] && [[ "$out" == *"control-plane: OOM-protected"* ]] &&
     [[ "$out" == *"swappiness=10"* ]] && [[ "$out" != *"early-OOM not active"* ]] &&
-    [[ "$out" != *"not fully protected"* ]]
+    [[ "$out" != *"not fully protected"* ]] && [[ "$out" != *"Swap too small"* ]]
+}
+
+# Swap is reconciled by TOTAL active swap: ≥ target → no-op (no extra file); < target → flags it.
+test_swap_reconcile_by_total() {
+  local tmp fake_bin enough small
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  enough=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_SWAP_TOTAL_GB=80 FAKE_SWAPPINESS=10 \
+    "$SPARK" setup --check </dev/null 2>&1 || true)
+  small=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_SWAP_TOTAL_GB=16 FAKE_SWAPPINESS=10 \
+    "$SPARK" setup --check </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$enough" == *"Swap: on (80G total)"* ]] && [[ "$enough" != *"Swap too small"* ]] &&
+    [[ "$small" == *"Swap too small"* ]]
+}
+
+# spark status shows a live block: host RAM/swap + per-model reserved/now/peak from the cgroup.
+test_status_live_memory() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_TOTAL_MEM_GB=121 \
+    FAKE_MANAGED="spark-vllm-q\tOrg/Q\t8000\t80.1\t71.2\t6.0\n" \
+    FAKE_RAM_TOTAL_GB=121 FAKE_RAM_USED_GB=108 FAKE_RAM_AVAIL_GB=13 \
+    FAKE_SWAP_TOTAL_GB=176 FAKE_SWAP_USED_GB=2 \
+    FAKE_MEM_CURRENT=$((84 * 1073741824)) FAKE_MEM_PEAK=$((90 * 1073741824)) \
+    "$SPARK" status 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Live:"* ]] && [[ "$out" == *"RAM 108/121 GB used"* ]] && [[ "$out" == *"swap 2/176 GB"* ]] &&
+    [[ "$out" == *"reserved 80.1"* ]] && [[ "$out" == *"now 84.0"* ]] && [[ "$out" == *"peak 90.0"* ]]
 }
 
 # --- Unified setup wizard (host vs server picker, parity, bootstrap) ---
@@ -1564,6 +1612,8 @@ run_test "setup --host (ollama) reports ready" test_host_check_ollama_ready
 run_test "setup --host (vllm) flags a missing GPU" test_host_check_vllm_no_gpu
 run_test "setup --host flags missing OS hardening" test_host_check_hardening_missing
 run_test "setup --host passes with hardening present" test_host_check_hardening_present
+run_test "swap reconciled by total active swap" test_swap_reconcile_by_total
+run_test "spark status shows live memory" test_status_live_memory
 run_test "setup picker [1] routes to this machine" test_setup_picker_routes_to_host
 run_test "setup --host never disables password SSH" test_setup_host_no_disable_password
 run_test "setup --server installs the same set (parity)" test_setup_server_check_parity

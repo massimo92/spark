@@ -789,6 +789,14 @@ container_peak_gb() {
   awk -v b="$bytes" 'BEGIN{ printf "%.1f", b/1073741824 }'
 }
 
+# A container's CURRENT cgroup v2 memory usage in GB (live). Empty if unavailable.
+container_current_gb() {
+  local bytes
+  bytes=$(docker exec "$1" cat /sys/fs/cgroup/memory.current 2>/dev/null | tr -d '[:space:]')
+  [[ "$bytes" =~ ^[0-9]+$ ]] || return 0
+  awk -v b="$bytes" 'BEGIN{ printf "%.1f", b/1073741824 }'
+}
+
 # Recompute KV + need + fraction from config.json using the current MAX_MODEL_LEN
 # and KV_CACHE_DTYPE. Used after applying --max-len / --kv-cache-dtype overrides so
 # a cached profile still reflects the requested settings. WEIGHTS_GB is reused as-is.
@@ -1878,14 +1886,14 @@ cmd_status() {
   fi
 
   # Collect rows first so the MODEL column width fits the longest name.
-  local models=() needs=() wts=() kvs=() ports=() ups=() routed=()
+  local models=() needs=() wts=() kvs=() ports=() ups=() routed=() cnames=()
   local reserved=0 maxw=5   # len("MODEL")
   local name model port need wt kv
   while IFS=$'\t' read -r name model port need wt kv; do
     [[ -z "$name" ]] && continue
     model="${model:-unknown}"
     models+=("$model"); needs+=("${need:-?}"); wts+=("${wt:-?}"); kvs+=("${kv:-?}")
-    ports+=("${port:-?}"); ups+=("$(container_uptime "$name")")
+    ports+=("${port:-?}"); ups+=("$(container_uptime "$name")"); cnames+=("$name")
     if [[ "$gw_running" -eq 1 && "$gw_vllm" -eq 1 ]]; then routed+=("yes"); else routed+=("no"); fi
     [[ "${need:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] && reserved=$(awk -v a="$reserved" -v b="$need" 'BEGIN{printf "%.1f", a+b}')
     [[ ${#model} -gt $maxw ]] && maxw=${#model}
@@ -1898,7 +1906,7 @@ cmd_status() {
     lmodel=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null | sed -n 's/.*serve \([^ ]*\).*/\1/p' || echo "unknown")
     lport=$(docker inspect "$CONTAINER_NAME" --format '{{join .Args " "}}' 2>/dev/null | sed -n 's/.*--port \([0-9]*\).*/\1/p' || echo "8000")
     models+=("$lmodel"); needs+=("?"); wts+=("?"); kvs+=("?"); ports+=("$lport")
-    ups+=("$(container_uptime "$CONTAINER_NAME")"); routed+=("no")
+    ups+=("$(container_uptime "$CONTAINER_NAME")"); routed+=("no"); cnames+=("$CONTAINER_NAME")
     [[ ${#lmodel} -gt $maxw ]] && maxw=${#lmodel}
   fi
 
@@ -1923,6 +1931,23 @@ cmd_status() {
   if [[ "$ACCEL" == "cuda-discrete" ]]; then mem_label="VRAM (GB):  "; os_label="headroom"; fi
   printf "\n  ${DIM}%s %s total · %s %s · %s reserved · %s free${NC}\n" \
     "$mem_label" "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$os_label" "$reserved" "$free"
+
+  # Live usage (best-effort): host RAM/swap from `free`, per-model cgroup usage from the container.
+  local host_line
+  host_line=$(free -g 2>/dev/null | awk '
+    /^Mem:/  { m=sprintf("RAM %d/%d GB used · %d avail", $3, $2, $7) }
+    /^Swap:/ { if ($2+0>0) s=sprintf("swap %d/%d GB", $3, $2) }
+    END      { if (m!="") printf "%s%s", m, (s!="" ? " · " s : "") }')
+  if [[ -n "$host_line" ]]; then
+    printf "  ${DIM}Live:        %s${NC}\n" "$host_line"
+    local now pk
+    for i in "${!models[@]}"; do
+      now=$(container_current_gb "${cnames[$i]}"); pk=$(container_peak_gb "${cnames[$i]}")
+      [[ -z "$now" && -z "$pk" ]] && continue
+      printf "  ${DIM}  %-${maxw}s  reserved %s · now %s · peak %s GB${NC}\n" \
+        "${models[$i]}" "${needs[$i]}" "${now:-—}" "${pk:-—}"
+    done
+  fi
   printf "  ${DIM}Direct API: http://localhost:<port>/v1${NC}\n"
   if [[ "$gw_running" -eq 1 && "$gw_vllm" -eq 1 ]]; then
     printf "  ${DIM}Gateway (✓): http://localhost:%s/v1 — call a model as ${NC}${BOLD}vllm/<model>${NC}\n" "$gw_port"
@@ -2606,40 +2631,48 @@ step_control_plane_protect() {
 # weights; swap absorbs that one-time peak so the load completes, then the steady state fits in RAM
 # (admission guarantees it) and swap goes idle — no runtime thrash. Removing swap was the wrong fix:
 # it blocked large-model loads while doing nothing the earlyoom + control-plane protection don't.
-# Declarative + idempotent: provisions /swapfile.spark if the box lacks swap, undoes any swap lines a
-# previous spark run commented out, and pins vm.swappiness.
+# Declarative + idempotent, and it reconciles by TOTAL active swap (not by its own file): if the box
+# already has ≥ SWAP_PROVISION_GB of swap (e.g. the distro's), it's a no-op — it never stacks its own
+# file on top. If there's less, it tops up the gap with /swapfile.spark. It also undoes any swap lines
+# a previous spark run commented out and pins vm.swappiness. It never removes/resizes existing swap
+# (swapoff of in-use swap is risky while a model is loaded).
 step_swap_ensure() {
-  local auto_yes="$1" check_only="$2" sf="/swapfile.spark" cur_sw active=""
+  local auto_yes="$1" check_only="$2" sf="/swapfile.spark" cur_sw total_gb gap enough=0
   cur_sw="$(ctx_run 'sysctl -n vm.swappiness 2>/dev/null' 2>/dev/null || true)"
-  if [[ "$SWAP_PROVISION_GB" -gt 0 ]]; then
-    active="$(ctx_run 'swapon --show=NAME --noheadings 2>/dev/null' 2>/dev/null | grep -Fx "$sf" || true)"
+  total_gb="$(ctx_run "free -g 2>/dev/null | awk '/^Swap:/{print \$2}'" 2>/dev/null || true)"
+  [[ "$total_gb" =~ ^[0-9]+$ ]] || total_gb=0
+  if [[ "$SWAP_PROVISION_GB" -le 0 ]]; then
+    [[ "$total_gb" -gt 0 ]] && enough=1
   else
-    active="$(ctx_run 'swapon --show=NAME --noheadings 2>/dev/null | head -1' 2>/dev/null || true)"
+    [[ "$total_gb" -ge "$SWAP_PROVISION_GB" ]] && enough=1
   fi
-  if [[ -n "$active" && "$cur_sw" == "$SWAPPINESS" ]]; then
-    info "Swap: on + swappiness=${SWAPPINESS} (absorbs load peaks; runtime stays in RAM)"
+  if [[ "$enough" == "1" && "$cur_sw" == "$SWAPPINESS" ]]; then
+    info "Swap: on (${total_gb}G total) + swappiness=${SWAPPINESS} (absorbs load peaks; runtime stays in RAM)"
     return 0
   fi
   if [[ "$check_only" == "1" ]]; then
-    [[ -z "$active" ]] && setup_fail "Swap not provisioned — large-model loads need it for their transient peak; spark setup provisions it"
+    [[ "$enough" != "1" ]] && setup_fail "Swap too small (${total_gb}G, want ≥${SWAP_PROVISION_GB}G) — large-model loads need it for their transient peak"
     [[ "$cur_sw" != "$SWAPPINESS" ]] && setup_fail "vm.swappiness=${cur_sw:-?} (want ${SWAPPINESS}) — runtime may swap the working set"
     return 0
   fi
-  printf "    ${DIM}What: keep swap on (provision ${sf} at ${SWAP_PROVISION_GB}G if missing) + vm.swappiness=${SWAPPINESS}.\n"
+  gap=$(( SWAP_PROVISION_GB - total_gb )); [[ "$gap" -lt 0 ]] && gap=0
+  printf "    ${DIM}What: ensure ≥${SWAP_PROVISION_GB}G of swap (top up with ${sf} if needed) + vm.swappiness=${SWAPPINESS}.\n"
   printf "    Why: loading a big model briefly needs about twice its weights; swap absorbs that one-time\n"
   printf "    peak so the load finishes. The steady model fits in RAM (admission ensures it) and a low\n"
   printf "    swappiness keeps it there, so swap stays idle at runtime — no thrash. earlyoom + protected\n"
-  printf "    system services handle a genuine runaway.${NC}\n"
-  if [[ "$auto_yes" == "1" ]] || confirm "Ensure swap on (${SWAP_PROVISION_GB}G) + swappiness=${SWAPPINESS}?"; then
+  printf "    system services handle a genuine runaway. (Complements any existing swap — never replaces it.)${NC}\n"
+  if [[ "$auto_yes" == "1" ]] || confirm "Ensure ≥${SWAP_PROVISION_GB}G swap + swappiness=${SWAPPINESS}?"; then
     # Undo any swap lines a previous spark run commented out, then re-enable fstab swap.
     ctx_sudo "sed -ri 's@^#([^#]*[[:space:]]swap[[:space:]])@\\1@' /etc/fstab; swapon -a 2>/dev/null || true"
-    if [[ "$SWAP_PROVISION_GB" -gt 0 ]]; then
-      ctx_sudo "if ! swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq '$sf'; then test -f '$sf' || fallocate -l ${SWAP_PROVISION_GB}G '$sf' || dd if=/dev/zero of='$sf' bs=1M count=$((SWAP_PROVISION_GB*1024)) status=none; chmod 600 '$sf'; mkswap '$sf' >/dev/null 2>&1 || true; swapon '$sf'; fi; grep -q '^$sf ' /etc/fstab || printf '%s none swap sw 0 0\\n' '$sf' >> /etc/fstab"
+    if [[ "$SWAP_PROVISION_GB" -gt 0 && "$gap" -gt 0 ]]; then
+      ctx_sudo "if ! swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq '$sf'; then test -f '$sf' || fallocate -l ${gap}G '$sf' || dd if=/dev/zero of='$sf' bs=1M count=$((gap*1024)) status=none; chmod 600 '$sf'; mkswap '$sf' >/dev/null 2>&1 || true; swapon '$sf'; fi; grep -q '^$sf ' /etc/fstab || printf '%s none swap sw 0 0\\n' '$sf' >> /etc/fstab"
     fi
     printf 'vm.swappiness=%s\n' "$SWAPPINESS" | ctx_sudo_write /etc/sysctl.d/99-spark.conf
     ctx_sudo 'sysctl --system >/dev/null 2>&1 || true'
-    if [[ -n "$(ctx_run 'swapon --show=NAME --noheadings 2>/dev/null | head -1' 2>/dev/null)" ]]; then
-      info "Swap: on + swappiness=${SWAPPINESS}"
+    total_gb="$(ctx_run "free -g 2>/dev/null | awk '/^Swap:/{print \$2}'" 2>/dev/null || true)"
+    [[ "$total_gb" =~ ^[0-9]+$ ]] || total_gb=0
+    if [[ "$total_gb" -gt 0 ]]; then
+      info "Swap: on (${total_gb}G total) + swappiness=${SWAPPINESS}"
     else
       setup_fail "Could not enable swap"
     fi
