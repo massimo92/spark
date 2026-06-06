@@ -367,6 +367,12 @@ future launches size it exactly. If the peak still overflows, spark retries with
 (disables CUDA-graph capture → no peak; ~10-20% slower) — automatic for large MoE models on the first
 launch. Disable per-run with `--no-mem-limit`.
 
+A model that first launched under `--enforce-eager` has only revealed its *eager* peak, not whether
+CUDA graphs would fit. So spark **calibrates**: on a later run it tries CUDA graphs once (with generous
+headroom); if they fit it caches that and **graduates the model to CUDA graphs** (faster) — if they
+OOM, the cgroup cap + reactive retry catch it cleanly, it falls back to eager and records not to try
+again. Disable with `SPARK_CALIBRATE_CUDAGRAPH=0`.
+
 **Host hardening for an always-reachable 24/7 node.** A real memory-overcommit incident here (a model
 exhausted RAM; the kernel OOM-killer then took out **dbus + tailscaled**, wedging the box) showed the
 fix is *protecting the control plane*, not removing swap. So `spark setup` (Linux) configures,

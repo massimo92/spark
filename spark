@@ -9,7 +9,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.0.14"
+VERSION="0.0.15"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -130,6 +130,11 @@ BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))
 # thrashing the host. The peak is torch.compile + CUDA-graph capture (pinned, non-swappable), not
 # the weights — measured per model and cached in the profile; else this conservative default.
 WARMUP_HEADROOM_GB="${SPARK_WARMUP_HEADROOM_GB:-20}"
+# Calibration: a model that first loaded with --enforce-eager (a safe default for MoE) has only ever
+# revealed its EAGER peak — not whether CUDA graphs would fit. When 1, spark tries CUDA graphs ONCE on
+# a later run to measure the real peak; if it fits it "graduates" the model to CUDA graphs (faster),
+# else it falls back to eager (cgroup cap + reactive retry make the attempt safe) and stops trying.
+CALIBRATE_CUDAGRAPH="${SPARK_CALIBRATE_CUDAGRAPH:-1}"
 # Default cap on concurrent requests. vLLM's own default is 256, which both bloats the warmup
 # profiling/activation memory and can exceed the cache blocks a tight hybrid (Mamba) model allocates.
 # On unified-memory boxes (GB10) a low cap is the documented sweet spot. Raise per-run with
@@ -702,12 +707,13 @@ profile_file_for() {
 # community DB (data/model_profiles.json) is consulted as a fallback hint when there's no local one.
 load_warmup_cache() {
   local model="$1" pf key
-  WARMUP_PEAK_GB=""; PROFILE_ENFORCE_EAGER=""
+  WARMUP_PEAK_GB=""; PROFILE_ENFORCE_EAGER=""; PROFILE_CUDAGRAPH_OOM=""
   key="${MAX_MODEL_LEN}/${KV_CACHE_DTYPE}"
   pf=$(profile_file_for "$model")
   if [[ -f "$pf" ]]; then
     WARMUP_PEAK_GB=$(jq -r --arg k "$key" '(.warmup // {})[$k].peak_gb // ""' "$pf" 2>/dev/null || echo "")
     PROFILE_ENFORCE_EAGER=$(jq -r --arg k "$key" '(.warmup // {})[$k].enforce_eager // ""' "$pf" 2>/dev/null || echo "")
+    PROFILE_CUDAGRAPH_OOM=$(jq -r --arg k "$key" '(.warmup // {})[$k].cudagraph_oom // ""' "$pf" 2>/dev/null || echo "")
   fi
   [[ -n "$WARMUP_PEAK_GB" ]] && return 0
   community_warmup_hint "$model"   # may set WARMUP_PEAK_GB / PROFILE_ENFORCE_EAGER as a hint
@@ -732,13 +738,13 @@ community_warmup_hint() {
 
 # Record the measured warmup peak for THIS model+config into its local profile (keyed by ctx/kv).
 save_warmup_peak() {
-  local model="$1" peak_gb="$2" eager="$3" pf tmp key
+  local model="$1" peak_gb="$2" eager="$3" cgoom="${4:-0}" pf tmp key
   pf=$(profile_file_for "$model")
   [[ -f "$pf" ]] || return 0
   key="${MAX_MODEL_LEN}/${KV_CACHE_DTYPE}"
   tmp=$(mktemp)
-  if jq --arg k "$key" --arg p "$peak_gb" --arg e "$eager" --arg d "$(date +%Y-%m-%d)" \
-      '.warmup = ((.warmup // {}) + {($k): {peak_gb: $p, enforce_eager: $e, date: $d}})' \
+  if jq --arg k "$key" --arg p "$peak_gb" --arg e "$eager" --arg c "$cgoom" --arg d "$(date +%Y-%m-%d)" \
+      '.warmup = ((.warmup // {}) + {($k): {peak_gb: $p, enforce_eager: $e, cudagraph_oom: $c, date: $d}})' \
       "$pf" > "$tmp" 2>/dev/null; then
     mv "$tmp" "$pf"
   else
@@ -1044,14 +1050,27 @@ cmd_run() {
 # Decide whether to launch with --enforce-eager (no CUDA-graph capture → no startup peak).
 # Manual flag wins; otherwise: a cached profile that needed eager → eager; a large MoE with no
 # measurement (vLLM under-profiles these → big peak) → eager; else off (CUDA graphs, faster).
+# Decide --enforce-eager. Sets globals ENFORCE_EAGER (0/1) and EAGER_CALIBRATING (1 when it's
+# speculatively trying CUDA graphs to measure the real peak). Sets globals rather than printing so the
+# calibration flag propagates to the caller (a command substitution would run in a subshell).
 resolve_enforce_eager() {
+  EAGER_CALIBRATING=0
   case "${enforce_eager_flag:-auto}" in
-    1|yes|on|true)  printf '1'; return 0 ;;
-    0|no|off|false) printf '0'; return 0 ;;
+    1|yes|on|true)  ENFORCE_EAGER=1; return 0 ;;
+    0|no|off|false) ENFORCE_EAGER=0; return 0 ;;
   esac
-  [[ -n "${PROFILE_ENFORCE_EAGER:-}" ]] && { printf '%s' "$PROFILE_ENFORCE_EAGER"; return 0; }
-  if [[ -z "${WARMUP_PEAK_GB:-}" && "${IS_MOE:-0}" == "1" ]]; then printf '1'; return 0; fi
-  printf '0'
+  # CUDA graphs already proven to FIT for this config → fastest path.
+  [[ "${PROFILE_ENFORCE_EAGER:-}" == "0" ]] && { ENFORCE_EAGER=0; return 0; }
+  # CUDA graphs already proven to OOM here → stay eager.
+  [[ "${PROFILE_CUDAGRAPH_OOM:-}" == "1" ]] && { ENFORCE_EAGER=1; return 0; }
+  # Cached eager that worked, but CUDA graphs were never tried → calibrate once: try CUDA graphs. The
+  # cgroup cap + reactive fallback make it safe; on OOM we record it and stop retrying.
+  if [[ "${PROFILE_ENFORCE_EAGER:-}" == "1" && "${CALIBRATE_CUDAGRAPH:-1}" == "1" ]]; then
+    EAGER_CALIBRATING=1; ENFORCE_EAGER=0; return 0
+  fi
+  # No measurement yet + MoE (vLLM under-profiles its warmup) → conservative eager on the first launch.
+  if [[ -z "${WARMUP_PEAK_GB:-}" && "${IS_MOE:-0}" == "1" ]]; then ENFORCE_EAGER=1; return 0; fi
+  ENFORCE_EAGER=0
 }
 
 # (Re)build vllm_args + docker_cmd from the current $seqs (concurrency), $headroom_gb (cgroup cap
@@ -1276,13 +1295,17 @@ run_backend_vllm() {
   # model, else default); and enforce-eager (kills the torch.compile/CUDA-graph peak). The adaptive
   # loop below lowers $seqs for cache-block errors and flips $enforce_eager on a warmup OOM.
   local seqs="${max_num_seqs:-$MAX_NUM_SEQS_DEFAULT}"
-  load_warmup_cache "$model"   # sets WARMUP_PEAK_GB / PROFILE_ENFORCE_EAGER for the final ctx/kv
-  # Cgroup headroom above NEED: from the cached measured peak if we have one, else the default.
-  local headroom_gb
-  headroom_gb=$(awk -v p="${WARMUP_PEAK_GB:-}" -v n="$NEED_GB" -v d="$WARMUP_HEADROOM_GB" \
-    'BEGIN{ if(p=="" || p+0<=0){ printf "%d", d; exit } h=p-n; if(h<4)h=4; printf "%.0f", h }')
+  load_warmup_cache "$model"   # sets WARMUP_PEAK_GB / PROFILE_ENFORCE_EAGER / PROFILE_CUDAGRAPH_OOM
   local enforce_eager
-  enforce_eager=$(resolve_enforce_eager)
+  resolve_enforce_eager   # sets ENFORCE_EAGER + EAGER_CALIBRATING (globals, propagate to here)
+  enforce_eager="$ENFORCE_EAGER"
+  # Cgroup headroom above NEED: from the cached measured peak if we have one, else the default. During
+  # a calibration attempt the cached peak is the EAGER peak (too small for CUDA graphs), so use the
+  # generous default instead — otherwise the cap would OOM the attempt before we learn anything.
+  local headroom_gb cudagraph_oomed=0
+  headroom_gb=$(awk -v p="${WARMUP_PEAK_GB:-}" -v n="$NEED_GB" -v d="$WARMUP_HEADROOM_GB" -v cal="${EAGER_CALIBRATING:-0}" \
+    'BEGIN{ if(cal=="1" || p=="" || p+0<=0){ printf "%d", d; exit } h=p-n; if(h<4)h=4; printf "%.0f", h }')
+  [[ "${EAGER_CALIBRATING:-0}" == "1" ]] && info "Calibrating: trying CUDA graphs once to measure the real peak (auto-falls back to eager if it doesn't fit)."
   local vllm_args=() docker_cmd=() mem_limit_mib=""
   build_launch
 
@@ -1353,7 +1376,7 @@ run_backend_vllm() {
         # The startup peak (torch.compile + CUDA-graph capture) overflowed the container cap. The
         # principled fix is --enforce-eager: it removes that peak entirely (no graph capture).
         if [[ "$attempt" -lt "$STARTUP_MAX_RETRIES" && "$enforce_eager" != "1" ]]; then
-          attempt=$((attempt + 1)); enforce_eager=1
+          attempt=$((attempt + 1)); enforce_eager=1; cudagraph_oomed=1
           info "Startup peak too big — retrying with --enforce-eager (no CUDA graphs; ~10-20% slower)."
           build_launch
           continue
@@ -1373,7 +1396,7 @@ run_backend_vllm() {
   if [[ "$serve_state" == "ready" ]]; then
     local measured
     measured=$(container_peak_gb "$cname")
-    [[ -n "$measured" ]] && save_warmup_peak "$model" "$measured" "$enforce_eager"
+    [[ -n "$measured" ]] && save_warmup_peak "$model" "$measured" "$enforce_eager" "$cudagraph_oomed"
   fi
 
   printf "\n  Container '${BOLD}%s${NC}' started." "$cname"
