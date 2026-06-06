@@ -9,7 +9,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.0.16"
+VERSION="0.1.0"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -702,21 +702,36 @@ profile_file_for() {
   printf '%s/%s.json' "$PROFILES_DIR" "$(printf '%s' "$1" | sed 's/\//--/g')"
 }
 
-# Load a cached warmup measurement (peak + the enforce-eager that worked) for THIS model at the
-# final launch config (ctx/kv). Sets WARMUP_PEAK_GB / PROFILE_ENFORCE_EAGER (empty if none). The
+# Load the cached startup peaks for THIS model at the final launch config (ctx/kv). Sets two globals:
+#   WARMUP_PEAK_EAGER_GB      — peak measured with --enforce-eager (CUDA graphs OFF), or ""
+#   WARMUP_PEAK_CUDAGRAPH_GB  — peak measured with CUDA graphs ON; the literal "oom" if they were
+#                               tried and didn't fit; "" if never tried.
+# Reads the new two-column shape and MIGRATES a legacy single-peak entry (peak_gb + enforce_eager
+# [+ cudagraph_oom]) on the fly, so measurements taken by older spark versions aren't lost. The
 # community DB (data/model_profiles.json) is consulted as a fallback hint when there's no local one.
 load_warmup_cache() {
-  local model="$1" pf key
-  WARMUP_PEAK_GB=""; PROFILE_ENFORCE_EAGER=""; PROFILE_CUDAGRAPH_OOM=""
+  local model="$1" pf key lp le lo
+  WARMUP_PEAK_EAGER_GB=""; WARMUP_PEAK_CUDAGRAPH_GB=""
   key="${MAX_MODEL_LEN}/${KV_CACHE_DTYPE}"
   pf=$(profile_file_for "$model")
   if [[ -f "$pf" ]]; then
-    WARMUP_PEAK_GB=$(jq -r --arg k "$key" '(.warmup // {})[$k].peak_gb // ""' "$pf" 2>/dev/null || echo "")
-    PROFILE_ENFORCE_EAGER=$(jq -r --arg k "$key" '(.warmup // {})[$k].enforce_eager // ""' "$pf" 2>/dev/null || echo "")
-    PROFILE_CUDAGRAPH_OOM=$(jq -r --arg k "$key" '(.warmup // {})[$k].cudagraph_oom // ""' "$pf" 2>/dev/null || echo "")
+    WARMUP_PEAK_EAGER_GB=$(jq -r --arg k "$key" '(.warmup // {})[$k].eager_peak_gb // ""' "$pf" 2>/dev/null || echo "")
+    WARMUP_PEAK_CUDAGRAPH_GB=$(jq -r --arg k "$key" '(.warmup // {})[$k].cudagraph_peak_gb // ""' "$pf" 2>/dev/null || echo "")
+    if [[ -z "$WARMUP_PEAK_EAGER_GB" && -z "$WARMUP_PEAK_CUDAGRAPH_GB" ]]; then
+      lp=$(jq -r --arg k "$key" '(.warmup // {})[$k].peak_gb // ""' "$pf" 2>/dev/null || echo "")
+      le=$(jq -r --arg k "$key" '(.warmup // {})[$k].enforce_eager // ""' "$pf" 2>/dev/null || echo "")
+      lo=$(jq -r --arg k "$key" '(.warmup // {})[$k].cudagraph_oom // ""' "$pf" 2>/dev/null || echo "")
+      if [[ -n "$lp" ]]; then
+        if [[ "$le" == "1" ]]; then
+          WARMUP_PEAK_EAGER_GB="$lp"; [[ "$lo" == "1" ]] && WARMUP_PEAK_CUDAGRAPH_GB="oom"
+        else
+          WARMUP_PEAK_CUDAGRAPH_GB="$lp"
+        fi
+      fi
+    fi
   fi
-  [[ -n "$WARMUP_PEAK_GB" ]] && return 0
-  community_warmup_hint "$model"   # may set WARMUP_PEAK_GB / PROFILE_ENFORCE_EAGER as a hint
+  [[ -n "$WARMUP_PEAK_EAGER_GB" || -n "$WARMUP_PEAK_CUDAGRAPH_GB" ]] && return 0
+  community_warmup_hint "$model"   # may set the two globals as a hint
 }
 
 # Look up a shipped community profile (data/model_profiles.json) keyed by the dimensions that affect
@@ -728,23 +743,37 @@ community_warmup_hint() {
   [[ -f "$db" ]] || return 0
   ngc=$(detect_ngc_image 2>/dev/null); tag="${ngc##*:}"
   key="${MAX_MODEL_LEN}/${KV_CACHE_DTYPE}"
-  WARMUP_PEAK_GB=$(jq -r --arg m "$model" --arg a "$ACCEL" --arg t "$tag" --arg k "$key" \
-    '[.[] | select(.model==$m and .accel==$a and .vllm_tag==$t and .config==$k)][0].warmup_peak_gb // ""' \
+  # New two-column shape (eager_peak_gb / cudagraph_peak_gb); falls back to the legacy single peak
+  # (warmup_peak_gb + enforce_eager) so an older DB still gives a hint.
+  WARMUP_PEAK_EAGER_GB=$(jq -r --arg m "$model" --arg a "$ACCEL" --arg t "$tag" --arg k "$key" \
+    '([.[] | select(.model==$m and .accel==$a and .vllm_tag==$t and .config==$k)][0]) as $r
+     | ($r.eager_peak_gb // (if ($r.enforce_eager)=="1" then $r.warmup_peak_gb else null end) // "")' \
     "$db" 2>/dev/null || echo "")
-  PROFILE_ENFORCE_EAGER=$(jq -r --arg m "$model" --arg a "$ACCEL" --arg t "$tag" --arg k "$key" \
-    '[.[] | select(.model==$m and .accel==$a and .vllm_tag==$t and .config==$k)][0].enforce_eager // ""' \
+  WARMUP_PEAK_CUDAGRAPH_GB=$(jq -r --arg m "$model" --arg a "$ACCEL" --arg t "$tag" --arg k "$key" \
+    '([.[] | select(.model==$m and .accel==$a and .vllm_tag==$t and .config==$k)][0]) as $r
+     | ($r.cudagraph_peak_gb // (if ($r.enforce_eager)=="0" then $r.warmup_peak_gb else null end) // "")' \
     "$db" 2>/dev/null || echo "")
 }
 
-# Record the measured warmup peak for THIS model+config into its local profile (keyed by ctx/kv).
+# Record a measured startup peak into THIS model's profile (keyed by ctx/kv), in the column for the
+# mode that actually ran — eager_peak_gb (eager run) or cudagraph_peak_gb (CUDA-graph run, or "oom"
+# if graphs were tried this run and didn't fit). Merges so the OTHER column is preserved, and strips
+# any legacy single-peak fields. Args: model, measured_gb, enforce_eager(0/1), cudagraph_oomed(0/1).
 save_warmup_peak() {
-  local model="$1" peak_gb="$2" eager="$3" cgoom="${4:-0}" pf tmp key
+  local model="$1" measured="$2" eager="$3" cgoom="${4:-0}" pf tmp key eager_val="" cg_val=""
   pf=$(profile_file_for "$model")
   [[ -f "$pf" ]] || return 0
   key="${MAX_MODEL_LEN}/${KV_CACHE_DTYPE}"
+  if [[ "$eager" == "0" ]]; then cg_val="$measured"          # CUDA graphs served → record their peak
+  elif [[ "$cgoom" == "1" ]]; then eager_val="$measured"; cg_val="oom"  # graphs OOMed, eager served
+  else eager_val="$measured"; fi                            # plain eager run
   tmp=$(mktemp)
-  if jq --arg k "$key" --arg p "$peak_gb" --arg e "$eager" --arg c "$cgoom" --arg d "$(date +%Y-%m-%d)" \
-      '.warmup = ((.warmup // {}) + {($k): {peak_gb: $p, enforce_eager: $e, cudagraph_oom: $c, date: $d}})' \
+  if jq --arg k "$key" --arg ev "$eager_val" --arg cv "$cg_val" --arg d "$(date +%Y-%m-%d)" \
+      '.warmup[$k] = ((.warmup[$k] // {})
+        + (if $ev != "" then {eager_peak_gb: $ev} else {} end)
+        + (if $cv != "" then {cudagraph_peak_gb: $cv} else {} end)
+        + {date: $d})
+       | .warmup[$k] |= del(.peak_gb, .enforce_eager, .cudagraph_oom)' \
       "$pf" > "$tmp" 2>/dev/null; then
     mv "$tmp" "$pf"
   else
@@ -1059,17 +1088,19 @@ resolve_enforce_eager() {
     1|yes|on|true)  ENFORCE_EAGER=1; return 0 ;;
     0|no|off|false) ENFORCE_EAGER=0; return 0 ;;
   esac
-  # CUDA graphs already proven to FIT for this config → fastest path.
-  [[ "${PROFILE_ENFORCE_EAGER:-}" == "0" ]] && { ENFORCE_EAGER=0; return 0; }
-  # CUDA graphs already proven to OOM here → stay eager.
-  [[ "${PROFILE_CUDAGRAPH_OOM:-}" == "1" ]] && { ENFORCE_EAGER=1; return 0; }
-  # Cached eager that worked, but CUDA graphs were never tried → calibrate once: try CUDA graphs. The
-  # cgroup cap + reactive fallback make it safe; on OOM we record it and stop retrying.
-  if [[ "${PROFILE_ENFORCE_EAGER:-}" == "1" && "${CALIBRATE_CUDAGRAPH:-1}" == "1" ]]; then
-    EAGER_CALIBRATING=1; ENFORCE_EAGER=0; return 0
+  # CUDA graphs measured to FIT (a numeric peak on record) → use them (fastest).
+  [[ "${WARMUP_PEAK_CUDAGRAPH_GB:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] && { ENFORCE_EAGER=0; return 0; }
+  # CUDA graphs tried and didn't fit → stay eager.
+  [[ "${WARMUP_PEAK_CUDAGRAPH_GB:-}" == "oom" ]] && { ENFORCE_EAGER=1; return 0; }
+  # Only an EAGER peak on record (graphs never tried): calibrate once — try CUDA graphs to learn their
+  # peak (cgroup cap + reactive fallback make it safe). If calibration is disabled, stick with eager.
+  if [[ -n "${WARMUP_PEAK_EAGER_GB:-}" ]]; then
+    if [[ "${CALIBRATE_CUDAGRAPH:-1}" == "1" ]]; then EAGER_CALIBRATING=1; ENFORCE_EAGER=0
+    else ENFORCE_EAGER=1; fi
+    return 0
   fi
-  # No measurement yet + MoE (vLLM under-profiles its warmup) → conservative eager on the first launch.
-  if [[ -z "${WARMUP_PEAK_GB:-}" && "${IS_MOE:-0}" == "1" ]]; then ENFORCE_EAGER=1; return 0; fi
+  # No measurement at all + MoE (vLLM under-profiles its warmup) → conservative eager on first launch.
+  [[ "${IS_MOE:-0}" == "1" ]] && { ENFORCE_EAGER=1; return 0; }
   ENFORCE_EAGER=0
 }
 
@@ -1295,16 +1326,18 @@ run_backend_vllm() {
   # model, else default); and enforce-eager (kills the torch.compile/CUDA-graph peak). The adaptive
   # loop below lowers $seqs for cache-block errors and flips $enforce_eager on a warmup OOM.
   local seqs="${max_num_seqs:-$MAX_NUM_SEQS_DEFAULT}"
-  load_warmup_cache "$model"   # sets WARMUP_PEAK_GB / PROFILE_ENFORCE_EAGER / PROFILE_CUDAGRAPH_OOM
+  load_warmup_cache "$model"   # sets WARMUP_PEAK_EAGER_GB / WARMUP_PEAK_CUDAGRAPH_GB
   local enforce_eager
   resolve_enforce_eager   # sets ENFORCE_EAGER + EAGER_CALIBRATING (globals, propagate to here)
   enforce_eager="$ENFORCE_EAGER"
-  # Cgroup headroom above NEED: from the cached measured peak if we have one, else the default. During
-  # a calibration attempt the cached peak is the EAGER peak (too small for CUDA graphs), so use the
-  # generous default instead — otherwise the cap would OOM the attempt before we learn anything.
-  local headroom_gb cudagraph_oomed=0
-  headroom_gb=$(awk -v p="${WARMUP_PEAK_GB:-}" -v n="$NEED_GB" -v d="$WARMUP_HEADROOM_GB" -v cal="${EAGER_CALIBRATING:-0}" \
-    'BEGIN{ if(cal=="1" || p=="" || p+0<=0){ printf "%d", d; exit } h=p-n; if(h<4)h=4; printf "%.0f", h }')
+  # Cgroup headroom above NEED: from the measured peak of the mode we're about to run (eager peak for
+  # an eager run, CUDA-graph peak for a graph run). A non-numeric value — "" (no measurement) or "oom",
+  # or a calibration attempt with no graph peak yet — falls back to the generous default, so the cap
+  # never OOMs an attempt before we've learned its real peak.
+  local headroom_gb cudagraph_oomed=0 mode_peak=""
+  if [[ "$enforce_eager" == "1" ]]; then mode_peak="${WARMUP_PEAK_EAGER_GB:-}"; else mode_peak="${WARMUP_PEAK_CUDAGRAPH_GB:-}"; fi
+  headroom_gb=$(awk -v p="$mode_peak" -v n="$NEED_GB" -v d="$WARMUP_HEADROOM_GB" \
+    'BEGIN{ if(p+0<=0){ printf "%d", d; exit } h=p-n; if(h<4)h=4; printf "%.0f", h }')
   [[ "${EAGER_CALIBRATING:-0}" == "1" ]] && info "Calibrating: trying CUDA graphs once to measure the real peak (auto-falls back to eager if it doesn't fit)."
   local vllm_args=() docker_cmd=() mem_limit_mib=""
   build_launch
