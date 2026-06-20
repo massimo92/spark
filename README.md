@@ -266,7 +266,7 @@ spark stop --all            # every running model
 ```bash
 spark pull <model>   # Download model from HuggingFace
 spark list           # List downloaded models with sizes
-spark rm <model>     # Remove a model (with confirmation)
+spark rm <model> [...] # Remove one or more models (with confirmation)
 ```
 
 ### spark status / logs
@@ -504,7 +504,9 @@ largest context windows that would fit and lets you pick one — see
 on demand. Either way the gateway routes to all of them; stop one with `spark stop <model>`.
 
 **Q: Where are models stored?**
-A: Standard HuggingFace cache at `~/.cache/huggingface`. Use `hf scan-cache` and `hf delete-cache` normally.
+A: Standard HuggingFace cache at `~/.cache/huggingface`. vLLM containers run as your host user so
+the cache stays removable by `spark rm`. If `spark doctor` reports bad cache ownership, fix those
+permissions manually once.
 
 **Q: How do I use a different vLLM version?**
 A: Run `spark update` — it pulls a new container. `spark run` always uses the latest pulled image.

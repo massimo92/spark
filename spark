@@ -197,6 +197,34 @@ confirm() {
   [[ "$ans" =~ ^[Yy] ]]
 }
 
+model_cache_dir() {
+  local model="$1"
+  printf '%s/hub/models--%s\n' "$HF_CACHE_DIR" "${model//\//--}"
+}
+
+ensure_hf_cache_writable() {
+  mkdir -p "$HF_CACHE_DIR" 2>/dev/null \
+    || die "Cannot create HF cache at ${HF_CACHE_DIR}" "Fix the directory permissions, then retry."
+  [[ -w "$HF_CACHE_DIR" ]] \
+    || die "HF cache is not writable: ${HF_CACHE_DIR}" "Fix ownership/permissions, then retry."
+}
+
+hf_cache_first_unwritable() {
+  local dir="${1:-$HF_CACHE_DIR}" p
+  [[ -e "$dir" ]] || return 1
+  if [[ ! -w "$dir" ]]; then
+    printf '%s\n' "$dir"
+    return 0
+  fi
+  while IFS= read -r -d '' p; do
+    if [[ ! -w "$p" ]]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done < <(find "$dir" -mindepth 1 -print0 2>/dev/null)
+  return 1
+}
+
 is_positive_int() {
   [[ "${1:-}" =~ ^[0-9]+$ && "$1" -gt 0 ]]
 }
@@ -1116,6 +1144,7 @@ resolve_enforce_eager() {
 # above NEED) and $enforce_eager. Called once and again on each adaptive-startup retry. Reads/writes
 # run_backend_vllm locals via dynamic scope (same pattern as the backend reading cmd_run's flags).
 build_launch() {
+  ensure_hf_cache_writable
   vllm_args=(vllm serve "$model"
     --trust-remote-code
     --gpu-memory-utilization "$GPU_MEM_UTIL"
@@ -1144,9 +1173,14 @@ build_launch() {
     --gpus all
     --network host
     --ipc=host
+    --user "$(id -u):$(id -g)"
+    --workdir /tmp
+    -e HOME=/tmp
+    -e HF_HOME=/tmp/huggingface
+    -e HF_HUB_CACHE=/tmp/huggingface/hub
     --ulimit memlock=-1
     --ulimit stack=67108864
-    -v "${HF_CACHE_DIR}:/root/.cache/huggingface"
+    -v "${HF_CACHE_DIR}:/tmp/huggingface"
     --name "$cname"
     --label spark.managed=1
     --label "spark.model=${model}"
@@ -1794,27 +1828,54 @@ cmd_list() {
 }
 
 cmd_rm() {
-  local model="${1:-}"
-  [[ -z "$model" ]] && die "No model specified" "Usage: spark rm <model>"
-  is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
+  [[ "$#" -eq 0 ]] && die "No model specified" "Usage: spark rm <model> [model...]"
 
-  local cache_dir="${HF_CACHE_DIR}/hub"
-  local model_dir
-  model_dir="${cache_dir}/models--$(echo "$model" | sed 's/\//--/g')"
+  local model model_dir size i
+  local models=("$@")
+  local model_dirs=()
+  local sizes=()
 
-  if [[ ! -d "$model_dir" ]]; then
-    die "Model '${model}' not found in cache"
-  fi
+  for model in "${models[@]}"; do
+    is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
+    model_dir="$(model_cache_dir "$model")"
+    if [[ ! -d "$model_dir" ]]; then
+      die "Model '${model}' not found in cache"
+    fi
+    size=$(du -sh "$model_dir" 2>/dev/null | awk '{print $1}')
+    model_dirs+=("$model_dir")
+    sizes+=("${size:-unknown size}")
+  done
 
-  local size
-  size=$(du -sh "$model_dir" 2>/dev/null | awk '{print $1}')
-
-  if confirm "Remove ${model} (${size})? This cannot be undone."; then
-    rm -rf "$model_dir"
-    info "Removed ${model}"
+  if [[ "${#models[@]}" -eq 1 ]]; then
+    if ! confirm "Remove ${models[0]} (${sizes[0]})? This cannot be undone."; then
+      warn "Cancelled"
+      return 0
+    fi
   else
-    warn "Cancelled"
+    printf "\n  Models to remove:\n"
+    for i in "${!models[@]}"; do
+      printf "    - %s (%s)\n" "${models[$i]}" "${sizes[$i]}"
+    done
+    if ! confirm "Remove ${#models[@]} models? This cannot be undone."; then
+      warn "Cancelled"
+      return 0
+    fi
   fi
+
+  local failed=0 rm_out
+  for i in "${!models[@]}"; do
+    rm_out=""
+    if rm_out=$(rm -rf "${model_dirs[$i]}" 2>&1); then
+      info "Removed ${models[$i]}"
+    else
+      failed=1
+      err "Failed to remove ${models[$i]}"
+      [[ -n "$rm_out" ]] && printf "    %s\n" "$rm_out"
+      printf "    Cache path: %s\n" "${model_dirs[$i]}"
+      printf "    Fix ownership/permissions manually, then retry.\n"
+    fi
+  done
+  return "$failed"
 }
 
 # Human uptime for a running container.
@@ -2050,6 +2111,18 @@ doctor_checks_vllm() {
     passed=$((passed + 1))
   else
     err "HF CLI: not installed — run 'uv tool install huggingface-hub[cli]'"
+  fi
+
+  # HF cache permissions
+  total=$((total + 1))
+  local bad_cache_path=""
+  bad_cache_path=$(hf_cache_first_unwritable "$HF_CACHE_DIR" || true)
+  if [[ -n "$bad_cache_path" ]]; then
+    err "HF cache permissions: not writable at ${bad_cache_path}"
+    printf "    Fix manually, then retry. Example: sudo chown -R %s:%s %s\n" "$(id -u)" "$(id -g)" "$HF_CACHE_DIR"
+  else
+    info "HF cache permissions: writable"
+    passed=$((passed + 1))
   fi
 
   # NGC container
@@ -3151,7 +3224,7 @@ cmd_help() {
     stop [<model>]   Stop a model (no arg: the only one; --all: every one)
     pull <model>     Download a model from HuggingFace
     list             List downloaded models
-    rm <model>       Remove a downloaded model
+    rm <model> [...] Remove downloaded model(s)
     status           Show running models, their reservation, and free memory
     logs [<model>]   Show container logs (-f to follow)
     gateway          Manage LiteLLM gateway (start|stop|status|logs)

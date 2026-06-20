@@ -263,6 +263,23 @@ test_doctor_reports_no_ngc_image() {
     [[ "$output" == *"checks passed"* ]]
 }
 
+test_doctor_reports_bad_hf_cache_permissions() {
+  local tmp fake_bin output bad
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  bad="${tmp}/home/.cache/huggingface/hub/models--Org--Bad/.no_exist/x"
+  mkdir -p "$(dirname "$bad")"
+  : > "$bad"
+  chmod a-w "$bad"
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" doctor 2>&1)
+  chmod u+w "$bad"
+  rm -rf "$tmp"
+
+  [[ "$output" == *"HF cache permissions: not writable"* ]] &&
+    [[ "$output" == *"Fix manually"* ]]
+}
+
 test_setup_check_reports_incomplete() {
   local tmp fake_bin output status
   tmp=$(mktemp -d)
@@ -1153,6 +1170,25 @@ test_mem_limit_absent_with_flag() {
   [[ "$dargs" == *"vllm serve"* ]] && [[ "$dargs" != *"--memory"* ]]
 }
 
+test_vllm_runs_as_host_user_with_user_cache() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs uid gid
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  uid=$(id -u); gid=$(id -g)
+  rm -rf "$tmp"
+  [[ "$dargs" == *"--user ${uid}:${gid}"* ]] &&
+    [[ "$dargs" == *"-e HOME=/tmp"* ]] &&
+    [[ "$dargs" == *"-e HF_HOME=/tmp/huggingface"* ]] &&
+    [[ "$dargs" == *"-e HF_HUB_CACHE=/tmp/huggingface/hub"* ]] &&
+    [[ "$dargs" == *":/tmp/huggingface"* ]] &&
+    [[ "$dargs" != *":/root/.cache/huggingface"* ]]
+}
+
 test_mem_limit_headroom_env() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin dargs
@@ -1464,6 +1500,40 @@ test_rm_removes_the_right_dir() {
   [[ "$out" == *"Removed Org/Gone"* ]] && [[ "$gone" -eq 1 ]]
 }
 
+test_rm_removes_multiple_models() {
+  local tmp fake_bin out a b
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  a="${tmp}/home/.cache/huggingface/hub/models--Org--A"; mkdir -p "${a}/snapshots/1"
+  b="${tmp}/home/.cache/huggingface/hub/models--Org--B"; mkdir -p "${b}/snapshots/1"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 "$SPARK" rm Org/A Org/B 2>&1)
+  local gone=1; { [[ -d "$a" ]] || [[ -d "$b" ]]; } && gone=0
+  rm -rf "$tmp"
+  [[ "$out" == *"Remove 2 models"* ]] && [[ "$out" == *"Removed Org/A"* ]] && [[ "$out" == *"Removed Org/B"* ]] && [[ "$gone" -eq 1 ]]
+}
+
+test_rm_missing_model_deletes_none() {
+  local tmp fake_bin out a status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  a="${tmp}/home/.cache/huggingface/hub/models--Org--A"; mkdir -p "${a}/snapshots/1"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 "$SPARK" rm Org/A Org/Missing 2>&1) && status=0 || status=$?
+  local still_exists=0; [[ -d "$a" ]] && still_exists=1
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] && [[ "$out" == *"Model 'Org/Missing' not found"* ]] && [[ "$out" != *"Removed Org/A"* ]] && [[ "$still_exists" -eq 1 ]]
+}
+
+test_rm_reports_delete_failure() {
+  local tmp fake_bin out d hub status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  hub="${tmp}/home/.cache/huggingface/hub"
+  d="${hub}/models--Org--Stuck"; mkdir -p "${d}/snapshots/1"
+  chmod a-w "$hub"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 "$SPARK" rm Org/Stuck 2>&1) && status=0 || status=$?
+  chmod u+w "$hub"
+  local still_exists=0; [[ -d "$d" ]] && still_exists=1
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] && [[ "$out" == *"Failed to remove Org/Stuck"* ]] && [[ "$out" != *"Removed Org/Stuck"* ]] && [[ "$still_exists" -eq 1 ]]
+}
+
 test_rm_not_found() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -1536,6 +1606,7 @@ test_stop_ollama_unloads() {
 }
 
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
+run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
 run_test "dry-run uses JSON profiles without executing model data" test_dry_run_uses_json_profile_safely
@@ -1563,6 +1634,9 @@ run_test "pull routes to Ollama on the ollama backend" test_pull_ollama_routes
 run_test "list shows downloaded models" test_list_shows_models
 run_test "list reports empty cache" test_list_empty
 run_test "rm removes the right model dir" test_rm_removes_the_right_dir
+run_test "rm removes multiple models" test_rm_removes_multiple_models
+run_test "rm missing model deletes none" test_rm_missing_model_deletes_none
+run_test "rm reports delete failure" test_rm_reports_delete_failure
 run_test "rm errors on a model not in cache" test_rm_not_found
 run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
@@ -1591,6 +1665,7 @@ run_test "--mem too high suggests a smaller --mem" test_mem_override_suggests_me
 run_test "per-container --memory limit present on unified" test_mem_limit_present_unified
 run_test "per-container --memory limit absent on discrete" test_mem_limit_absent_discrete
 run_test "per-container --memory limit absent with --no-mem-limit" test_mem_limit_absent_with_flag
+run_test "vLLM runs as host user with user cache" test_vllm_runs_as_host_user_with_user_cache
 run_test "per-container --memory limit honors warmup headroom env" test_mem_limit_headroom_env
 run_test "default max-num-seqs cap is 100 (announced)" test_max_num_seqs_default
 run_test "--max-num-seqs overrides the default" test_max_num_seqs_override
