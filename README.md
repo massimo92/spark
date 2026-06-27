@@ -144,6 +144,31 @@ instead of 2 — roughly halving that part of the memory.
 
 ## Commands
 
+### CLI reference
+
+| Command | Mutates? | What it does | Main flags |
+|---|---:|---|---|
+| `spark setup` | Yes, unless `--check` | Sets up local/remote model server: engine, Docker/Ollama, LiteLLM gateway, Linux hardening, optional Tailscale. | `--check`, `--yes`, `--funnel-action reset\|abort` |
+| `spark doctor` | No | Diagnoses the model server and global Tailscale Funnel risk. | `--help` |
+| `spark run <model>` | Yes, unless `--dry-run` | Starts a model on vLLM or Ollama, sizes memory, assigns port, refreshes gateway. | `--mem`, `--max-len`, `--kv-cache-dtype`, `--max-num-seqs`, `--port`, `--tools`, `--dry-run`, `--force` |
+| `spark stop [model\|--all]` | Yes | Stops running model containers or unloads Ollama models. | `--all` |
+| `spark pull <model>` | Yes | Downloads model weights through HuggingFace or Ollama. | none |
+| `spark list` | No | Lists downloaded HuggingFace models. | none |
+| `spark rm <model> [...]` | Yes | Removes downloaded HuggingFace model cache directories. | none |
+| `spark status` | No | Shows running models, memory reservation, ports, and LiteLLM gateway routing. | none |
+| `spark logs [model]` | No | Shows model logs; `-f` follows. | `-f` |
+| `spark gateway <subcommand>` | Depends | Manages LiteLLM gateway. | `start`, `stop`, `status`, `logs`, `add`, `remove` |
+| `spark ws setup` | Yes, unless `--check` | Installs/reconciles private workspace: Vikunja, n8n, Postgres, Hermes/NemoClaw, private Tailscale access. | `--check`, `--yes`, `--remote`, `--model`, `--tailscale-mode`, `--funnel-action`, image/credential flags |
+| `spark ws status` | No | Shows workspace services, URLs, health, gateway, Hermes, and Tailscale Serve status. | none |
+| `spark ws doctor` | No | Full workspace diagnosis. | `--json`, `--strict`, `--model`, `--remote` |
+| `spark ws logs <service>` | No | Follows logs for workspace services. | `vikunja`, `n8n`, `postgres`, `hermes`, `gateway` |
+| `spark ws backup` | Yes | Writes/verifies private backup of workspace state. | `--verify DIR` |
+| `spark update` | Yes | Updates spark CLI and/or NGC vLLM image after confirmation. | none |
+| `spark config` | Yes when setting | Shows or sets spark config. | `auto-update on\|off` |
+
+Use `--help` on command groups for exact flags: `spark run --help`, `spark setup --help`,
+`spark ws --help`, `spark ws setup --help`, `spark ws doctor --help`.
+
 ### spark setup
 
 One guided wizard for both local and remote setup. It asks two questions, then runs the **same
@@ -154,6 +179,7 @@ secured SSH connection (remote).
 spark setup           # interactive wizard
 spark setup --check   # read-only: report what's missing, install nothing
 spark setup --yes     # auto-confirm install prompts (secrets/hostnames still require input)
+spark setup --funnel-action reset
 ```
 
 **Question 1 — where?**
@@ -177,6 +203,181 @@ it only warns, so you don't get locked out if your key isn't installed.
 
 `--check` exits non-zero if required items are missing and prints an incomplete-setup summary instead
 of reporting success.
+
+`--funnel-action` is only relevant when `tailscale funnel status` shows public internet exposure:
+
+| Choice | Use when | Effect |
+|---|---|---|
+| no flag, interactive | You want to decide at runtime. | Shows menu: reset, show status, or abort. |
+| `--funnel-action reset` | This server should be private-only and any Funnel config on it is unwanted/stale. | Runs `tailscale funnel reset`, re-checks, then continues only if Funnel is gone. |
+| `--funnel-action abort` | Funnel may belong to another service, or you want to inspect before changing network exposure. | Fails without changing Funnel. |
+| `--check` | CI/preflight. | Reports active Funnel but never resets it. |
+| `--yes` without `--funnel-action reset` | Non-interactive safety. | Still aborts; `--yes` never resets Funnel by itself. |
+
+### spark ws
+
+Sets up a private agent workspace alongside the model gateway:
+
+- **Vikunja + PostgreSQL** for tasks.
+- **n8n + the same PostgreSQL service** for future event/workflow automation, using a separate DB/user.
+- **Hermes under NemoClaw/OpenShell**, configured to use the selected LiteLLM model.
+
+Design rationale and source notes live in [docs/workspace-setup-research.md](docs/workspace-setup-research.md).
+
+```bash
+spark ws setup
+spark ws setup --check
+spark ws setup --remote user@host --model Org/Model
+spark ws setup --tailscale-mode ports
+spark ws setup --funnel-action reset
+spark ws setup --vikunja-token TOKEN
+spark ws setup --model Org/Model --vikunja-username massimo --vikunja-email m@example.com --n8n-email m@example.com
+spark ws setup --postgres-image postgres:18.1 --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0
+spark ws status
+spark ws doctor
+spark ws doctor --strict
+spark ws doctor --json
+spark ws logs postgres
+spark ws backup
+spark ws backup --verify ~/.local/share/spark/workspace/backups/<timestamp>
+```
+
+`ws setup --check` is read-only and runs the same workspace checklist as `ws doctor`.
+It also preflights the local tools needed for a real install: Docker with the Compose v2 plugin,
+`curl`, and `jq`.
+`ws setup` asks for the Vikunja human username/email/password, creates a generated-password
+`hermes` Vikunja user, asks for n8n admin credentials, tries to bootstrap the n8n owner/admin, then
+lets you choose the Hermes model from the same downloaded models shown by `spark list`. If the
+selected model is not running through LiteLLM, spark offers to start it. If n8n is not ready during
+first boot, re-run `spark ws setup`; spark only marks the owner/admin as ready after a verified login.
+For non-interactive or remote setup, pass non-secret values with `--vikunja-username`,
+`--vikunja-email`, and `--n8n-email`. Prefer prompts or `SPARK_WORKSPACE_*` env vars for passwords;
+`--vikunja-password` and `--n8n-password` are meant for controlled non-interactive runs where shell
+history/process-list exposure is acceptable. For `--remote`, spark prompts locally when values are
+missing and sends them to the remote command over SSH stdin rather than as remote command arguments.
+Remote `--check` and `doctor` do not forward local workspace credential env vars.
+After creating `hermes`, setup logs in as that user and tries to create a scoped Vikunja API token
+through Vikunja's documented `/api/v1/tokens` API. If that fails, create a token in Vikunja as user
+`hermes`, then re-run `spark ws setup --vikunja-token TOKEN` or set
+`SPARK_WORKSPACE_VIKUNJA_TOKEN`.
+Hermes onboarding uses NemoClaw's restricted policy tier by default and fixes the Hermes dashboard on
+loopback port `18789`, which is the port exposed through the `hermes.<tailnet>.ts.net` Tailscale
+Service. spark configures NemoHermes with the OpenAI-compatible endpoint provider against
+`http://127.0.0.1:4000/v1`, sets `NEMOCLAW_PREFERRED_API=openai-completions` for local LiteLLM compatibility, and
+uses sandbox name `hermes`. The Hermes `CHAT_UI_URL` passed to NemoClaw is the same final URL stored
+in `HERMES_URL`, so Services and MagicDNS ports mode do not drift. spark only onboards Hermes after
+Tailscale private access is configured; if Services/ports setup is manual, Hermes onboarding is left
+manual too. If NemoHermes is installed but onboarding fails, setup is marked
+incomplete and `HERMES_ONBOARD_STATUS=manual`.
+
+The Docker Compose project is named `workspace` and uses short service names: `postgres`,
+`vikunja`, and `n8n`. The shared Postgres container creates separate `vikunja` and `n8n`
+databases/users at first boot; setup also re-checks and repairs those roles/databases after Compose
+starts, so reruns and migrated volumes do not rely only on Docker's one-time init scripts. Persistent data lives under
+`~/.local/share/spark/workspace/`; config and secrets live under `~/.config/spark/workspace/`, with
+`secrets.env` written as owner-readable only. Re-running setup preserves existing DB passwords,
+Hermes/Vikunja secrets, and stored API tokens so existing volumes keep working. The human Vikunja
+password is used only in memory during setup and is not written to `secrets.env`.
+User-provided env values, passwords, and tokens must be single-line values; setup rejects multiline
+input before writing any workspace env files. `ws doctor` also fails on invalid env syntax,
+CRLF, or duplicate keys in `secrets.env` and scoped service env files.
+Image refs are stored in `secrets.env` as `WORKSPACE_POSTGRES_IMAGE`, `WORKSPACE_VIKUNJA_IMAGE`, and
+`WORKSPACE_N8N_IMAGE`. Override them with `--postgres-image`, `--vikunja-image`, and `--n8n-image`
+or with `SPARK_WORKSPACE_POSTGRES_IMAGE`, `SPARK_WORKSPACE_VIKUNJA_IMAGE`, and
+`SPARK_WORKSPACE_N8N_IMAGE`; for production, use fixed tags or digest refs instead of `latest`.
+Compose uses scoped `postgres.env`, `vikunja.env`, and `n8n.env` files so containers do not receive
+unrelated workspace secrets. On Linux, setup also attempts to prepare the Vikunja/n8n writable data
+directories for the container user `1000:1000`, matching Vikunja's Docker guidance.
+Each Compose service also uses Docker `no-new-privileges` and json-file log rotation to reduce
+privilege escalation risk and avoid unbounded local log growth.
+
+Access is private by default. Vikunja, n8n, Hermes, and LiteLLM bind to loopback or an internal Docker
+network; spark configures Tailscale Serve/Services for friendly tailnet URLs when available:
+`https://vikunja.<tailnet>.ts.net`, `https://n8n.<tailnet>.ts.net`, and
+`https://hermes.<tailnet>.ts.net`. It refuses to treat Tailscale Funnel as acceptable exposure.
+Tailscale Services require Tailscale 1.86+, a tag-based host identity, and may need admin approval in
+the Tailscale admin console. spark uses the official
+`tailscale serve --service=svc:name --https=443 --yes http://127.0.0.1:port` form and records
+`WORKSPACE_TAILSCALE_MODE=services` when it succeeds. If the local Tailscale version is older than
+1.86, setup first attempts to update Tailscale with `tailscale update`, then falls back to the
+supported Linux package manager path (`apt-get`, `dnf`, `yum`, or `zypper`) before configuring
+Services. `ws setup --check` stays read-only and only reports that setup would update
+Tailscale. For environments where Services cannot be enabled, use
+`--tailscale-mode ports` or `SPARK_WORKSPACE_TAILSCALE_MODE=ports`. That fallback uses the machine
+MagicDNS name plus separate ports, binds Vikunja/n8n only to the host Tailscale IPv4 address, and
+does not call `tailscale serve`. `ws doctor` also curls the final `*.ts.net` URLs and checks
+either Services config or the MagicDNS/ports fallback, not just local loopback endpoints.
+If spark cannot detect a tailnet suffix or MagicDNS/IPv4 pair, the workspace is marked incomplete
+instead of falling back to localhost URLs.
+n8n is hardened for agent workflows: task runners are enabled, env/file access from nodes is blocked,
+Git hooks/bare repos are blocked, personal-space sharing/publishing is disabled, and high-risk
+command/file nodes plus community package installs are excluded. `N8N_SECURE_COOKIE` follows the selected URL scheme: enabled for
+Tailscale Services HTTPS, disabled for HTTP MagicDNS ports mode so first-login and editor cookies work.
+`spark ws status` shows Compose state, configured URLs/integration state, and a compact health
+summary. `spark ws doctor` prints the full goal checklist: config/secrets mode, Compose services, shared
+Postgres DB initialization plus live roles/databases, generated Compose config validation, scoped service env files, loopback ports, local Vikunja/n8n HTTP
+readiness, Compose runtime hardening/process limits/log rotation, friendly URLs, Vikunja registration/link-sharing locks, n8n hardening, Vikunja
+human/Hermes users, host listener exposure, Tailscale/Funnel state, LiteLLM, model, Hermes, and n8n
+owner login.
+Stored setup state is not enough for the token/login checks: doctor verifies the Hermes Vikunja API
+token and n8n owner login live against the running services.
+It also fails if a human Vikunja password is ever found in `secrets.env`.
+It runs Vikunja's own `vikunja doctor` inside the container so file-permission and rootless-Docker
+issues are surfaced by the application, not only inferred by spark.
+Use `spark ws doctor --json` for machine-readable validation in CI or after remote setup.
+Use `spark ws doctor --strict` as the production gate for the MVP: it runs the base checks plus
+pinned image refs.
+For Hermes, the checklist verifies both the local model container and that LiteLLM `/v1/models`
+advertises the exact `HERMES_LITELLM_MODEL` route.
+It also checks that NemoClaw reports the Hermes dashboard URL for the configured workspace port and
+that NemoHermes reports the selected LiteLLM model as its active inference route. `ws doctor`
+also runs `nemohermes hermes doctor` so sandbox-level health issues fail the checklist.
+`spark ws backup` writes a private backup directory with workspace config, Vikunja dump,
+Vikunja/n8n Postgres dumps, Hermes/NemoClaw completion markers, and `manifest.env`;
+it exits non-zero if any required backup component fails. `spark ws backup --verify DIR`
+checks the manifest, restore-critical files, and private backup permissions (`0700` directory,
+`0600` files).
+`ws logs` and `ws backup` require an existing workspace config and fail before touching Docker or
+NemoClaw if `ws setup` has not run yet.
+
+If `tailscale funnel status` reports public exposure, setup does not continue silently. Interactive
+setup offers three choices: reset Funnel, show status, or abort. Non-interactive setup aborts unless
+`--funnel-action reset` is passed. `--check` never mutates. Spark uses `tailscale funnel reset`, not
+`tailscale serve reset`, because Serve is the private tailnet path used by the workspace.
+
+Acceptance checklist for a real server:
+
+- [ ] Branch `codex/workspace-setup` exists and contains `spark ws`.
+- [ ] `spark ws setup --check` is read-only and reports missing prerequisites without writing config/data.
+- [ ] Hermes model selection comes from the same downloaded model list used by `spark list`.
+- [ ] Selected model is running and exposed by LiteLLM at `127.0.0.1:4000/v1`.
+- [ ] Docker Compose project `workspace` starts services `postgres`, `vikunja`, and `n8n`.
+- [ ] Compose services have `no-new-privileges`, `init`, graceful stop, process limits, and bounded json-file logs.
+- [ ] Production image refs are fixed tags or digests, not `latest`.
+- [ ] The single `postgres` service contains separate `vikunja` and `n8n` DB/users.
+- [ ] Vikunja starts with registration and link sharing disabled.
+- [ ] Human Vikunja user exists.
+- [ ] Vikunja user `hermes` exists.
+- [ ] Hermes Vikunja API token is stored and verified, or the manual token step is shown.
+- [ ] n8n starts, uses the shared Postgres service, and the owner/admin login works.
+- [ ] n8n hardening checks pass.
+- [ ] Hermes is installed/onboarded under NemoClaw/OpenShell.
+- [ ] `nemohermes hermes doctor` passes.
+- [ ] NemoHermes reports the selected LiteLLM model as its active inference route.
+- [ ] `spark ws doctor --strict` passes with pinned image refs.
+- [ ] Tailscale Services expose `vikunja.<tailnet>.ts.net`, `n8n.<tailnet>.ts.net`, and `hermes.<tailnet>.ts.net`, or MagicDNS ports mode binds only to the Tailscale IPv4 address.
+- [ ] `tailscale funnel status` shows no public Funnel exposure.
+- [ ] No workspace or gateway service listens on `0.0.0.0`.
+- [ ] `spark ws doctor` passes.
+- [ ] `spark ws backup` and `spark ws backup --verify DIR` pass.
+
+Current scope: workflows are **not** created yet. The intended next step is an n8n workflow where a
+Vikunja mention or assignment notifies Hermes with a task id, and Hermes acts as the `hermes` Vikunja
+user through Vikunja's API. Vikunja documents an n8n community node, but this setup intentionally
+avoids installing it by default so startup does not depend on an unverified npm package.
+
+Phase 2 candidates: n8n workflow import/activation, GitHub repo access for Hermes, WhatsApp or other
+chat channels, and richer task-agent routines.
 
 ### spark run
 
