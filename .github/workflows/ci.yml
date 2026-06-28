@@ -22,11 +22,14 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install jq shellcheck
 
+      - name: Check generated spark artifact
+        run: scripts/build-single-file.sh --check
+
       - name: Check shell syntax
-        run: bash -n spark install.sh tests/run.sh
+        run: bash -n spark install.sh tests/run.sh scripts/build-single-file.sh
 
       - name: Run ShellCheck
-        run: shellcheck --exclude=SC2059,SC2015,SC2016 spark install.sh tests/run.sh
+        run: shellcheck --exclude=SC2059,SC2015,SC2016 spark install.sh tests/run.sh scripts/build-single-file.sh
 
       - name: Run tests
         run: bash tests/run.sh

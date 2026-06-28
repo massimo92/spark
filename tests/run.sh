@@ -424,9 +424,14 @@ test_architecture_command_maps_core_boundaries() {
 
   [[ "$output" == *"Packaging invariant:"* ]] &&
     [[ "$output" == *"Runtime domains:"* ]] &&
+    [[ "$output" == *"src/commands/*.sh"* ]] &&
     [[ "$output" == *"workspace"* ]] &&
     [[ "$output" == *"gateway"* ]] &&
     [[ "$output" == *"docs/architecture.md"* ]]
+}
+
+test_single_file_build_matches_modules() {
+  "${ROOT_DIR}/scripts/build-single-file.sh" --check
 }
 
 test_source_guard_loads_without_dispatch() {
@@ -939,6 +944,41 @@ test_status_renders_table() {
     [[ "$output" == *"org/Alpha"* ]] && [[ "$output" == *"Memory (GB):"* ]]
 }
 
+test_dashboard_web_once_writes_product_ui() {
+  local tmp fake_bin out html
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"vllm":{"enabled":true}}}' > "${tmp}/home/.config/spark/gateway.json"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_TOTAL_MEM_GB=121 \
+    FAKE_MANAGED="$TWO_MODELS" FAKE_NAMES='spark-litellm\n' "$SPARK" dashboard --once 2>&1)
+  html=$(cat "${tmp}/home/.config/spark/dashboard/index.html" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$out" == *"Dashboard written:"* ]] &&
+    [[ "$html" == *"spark dashboard"* ]] &&
+    [[ "$html" == *"private agent stack"* ]] &&
+    [[ "$html" == *"Setup"* ]] &&
+    [[ "$html" == *"Services"* ]] &&
+    [[ "$html" == *"Models"* ]] &&
+    [[ "$html" == *"Agent workspace"* ]] &&
+    [[ "$html" == *"Next steps"* ]]
+}
+
+test_dashboard_terminal_still_renders_snapshot() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"vllm":{"enabled":true}}}' > "${tmp}/home/.config/spark/gateway.json"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_TOTAL_MEM_GB=121 \
+    FAKE_MANAGED="$TWO_MODELS" FAKE_NAMES='spark-litellm\n' "$SPARK" dashboard --terminal --no-clear 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"spark dashboard"* ]] &&
+    [[ "$out" == *"Setup"* ]] &&
+    [[ "$out" == *"Services"* ]] &&
+    [[ "$out" == *"Models"* ]] &&
+    [[ "$out" == *"Agent workspace"* ]] &&
+    [[ "$out" == *"Next steps"* ]]
+}
+
 test_gateway_add_remove_provider() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin add_out rm_out enabled disabled
@@ -1162,6 +1202,19 @@ test_setup_unknown_flag_fails() {
   out=$("$SPARK" setup --bogus </dev/null 2>&1); status=$?
   set -e
   [[ "$status" -ne 0 ]] && [[ "$out" == *"Unknown flag"* ]]
+}
+
+test_setup_full_check_runs_workspace_phase() {
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" setup --check --full </dev/null 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"spark setup --full"* ]] &&
+    [[ "$out" == *"spark ws setup"* ]]
 }
 
 # --- spark ws ---
@@ -3965,6 +4018,41 @@ test_config_set_and_show() {
   [[ "$set_out" == *"Auto-update enabled"* ]] && [[ "$show_out" == *"auto-update: true"* ]]
 }
 
+test_models_recommend_vllm() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_TOTAL_MEM_GB=121 "$SPARK" models recommend 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Recommended models"* ]] &&
+    [[ "$out" == *"RedHatAI/Qwen3.6-35B-A3B-NVFP4"* ]] &&
+    [[ "$out" == *"spark run"* ]]
+}
+
+test_uninstall_purge_removes_state() {
+  local tmp fake_bin out gone
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark/workspace" \
+    "${tmp}/home/.local/share/spark/workspace" \
+    "${tmp}/home/.cache/huggingface/hub/models--Org--Alpha/snapshots/1"
+  printf '%s\n' 'x' > "${tmp}/home/.config/spark/workspace/secrets.env"
+  printf '%s\n' 'services: {}' > "${tmp}/home/.config/spark/workspace/docker-compose.yml"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" uninstall --yes --purge-models --keep-binary 2>&1)
+  [[ ! -e "${tmp}/home/.config/spark" && ! -e "${tmp}/home/.local/share/spark/workspace" && ! -e "${tmp}/home/.cache/huggingface/hub/models--Org--Alpha" ]] && gone=1 || gone=0
+  rm -rf "$tmp"
+  [[ "$gone" -eq 1 ]] && [[ "$out" == *"spark-managed state removed"* ]]
+}
+
+test_reinstall_dry_run() {
+  local tmp fake_bin out mutated=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" reinstall --dry-run --yes --purge-models 2>&1)
+  [[ ! -d "${tmp}/home/.config/spark" ]] && mutated=1
+  rm -rf "$tmp"
+  [[ "$mutated" -eq 0 ]] && [[ "$out" == *"spark reinstall dry run"* ]] && [[ "$out" == *"would run: spark setup --yes"* ]]
+}
+
 test_gateway_stop_when_none() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -4003,6 +4091,7 @@ test_stop_ollama_unloads() {
 }
 
 run_test "architecture command maps core boundaries" test_architecture_command_maps_core_boundaries
+run_test "single-file build matches modules" test_single_file_build_matches_modules
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions
@@ -4029,6 +4118,8 @@ run_test "stop <model> stops only that model" test_stop_specific_model
 run_test "stop --all stops every model" test_stop_all
 run_test "stop with no arg and many models asks which" test_stop_ambiguous_requires_target
 run_test "status renders a table" test_status_renders_table
+run_test "dashboard web writes product UI" test_dashboard_web_once_writes_product_ui
+run_test "dashboard terminal renders product snapshot" test_dashboard_terminal_still_renders_snapshot
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
 run_test "pull (vllm) reports ready" test_pull_vllm_ready
 run_test "pull routes to Ollama on the ollama backend" test_pull_ollama_routes
@@ -4042,6 +4133,9 @@ run_test "rm errors on a model not in cache" test_rm_not_found
 run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
+run_test "models recommend suggests vLLM models" test_models_recommend_vllm
+run_test "uninstall --purge-models removes spark state" test_uninstall_purge_removes_state
+run_test "reinstall --dry-run plans clean setup" test_reinstall_dry_run
 run_test "gateway stop reports when none running" test_gateway_stop_when_none
 run_test "gateway status shows running + providers" test_gateway_status_running
 run_test "status (ollama) lists pulled models" test_status_ollama_lists
@@ -4094,6 +4188,7 @@ run_test "setup picker [1] routes to this machine" test_setup_picker_routes_to_h
 run_test "setup --host never disables password SSH" test_setup_host_no_disable_password
 run_test "setup --server installs the same set (parity)" test_setup_server_check_parity
 run_test "setup rejects unknown flags" test_setup_unknown_flag_fails
+run_test "setup --full --check runs workspace phase" test_setup_full_check_runs_workspace_phase
 run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace setup --check does not write files" test_workspace_check_no_mutation
 run_test "workspace setup --check preserves existing config" test_workspace_check_existing_config_no_mutation
