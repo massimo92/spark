@@ -213,7 +213,7 @@ workspace_ensure_gateway() {
     if [[ "$check_only" == "1" ]]; then
       setup_fail "Model not running for Hermes: $model"
     elif [[ "$auto_yes" == "1" ]] || confirm "Start ${model} now with spark run?"; then
-      cmd_run "$model"
+      cmd_run "$model" --no-wait
     else
       setup_fail "Hermes model not started: $model"
     fi
@@ -2307,4 +2307,3 @@ cmd_workspace() {
     *) die "Unknown ws command: $subcmd" "Run 'spark ws help'" ;;
   esac
 }
-
