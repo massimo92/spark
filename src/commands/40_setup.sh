@@ -556,11 +556,66 @@ step_control_plane_protect() {
 # it blocked large-model loads while doing nothing the earlyoom + control-plane protection don't.
 # Declarative + idempotent: if the box already has enough active swap and the requested swappiness,
 # it is a no-op. If not, it only manages /swapfile.spark as a top-up and never swapoffs an in-use file.
-swap_total_mib() {
+swap_clean_mib() {
+  local value="$1"
+  value="${value//[!0-9]/}"
+  [[ "$value" =~ ^[0-9]+$ ]] || value=0
+  printf "%s\n" "$value"
+}
+
+swap_swapon_total_mib() {
+  local total
+  total="$(ctx_run "swapon --show=SIZE --bytes --noheadings 2>/dev/null | awk 'BEGIN{seen=0; sum=0} /^[0-9]+$/ {seen=1; sum+=\$1} END{if (seen) printf \"%d\", int((sum + 1048575) / 1048576); else exit 1}'" 2>/dev/null)" || return 1
+  swap_clean_mib "$total"
+}
+
+swap_proc_total_mib() {
+  local total proc_file="${SPARK_PROC_SWAPS_FILE:-/proc/swaps}"
+  total="$(ctx_run "awk 'NR > 1 && \$3 ~ /^[0-9]+$/ {seen=1; sum+=\$3} END{if (seen) printf \"%d\", int((sum + 1023) / 1024); else exit 1}' '$proc_file' 2>/dev/null" 2>/dev/null)" || return 1
+  swap_clean_mib "$total"
+}
+
+swap_free_total_mib() {
   local total
   total="$(ctx_run "free -m 2>/dev/null | awk '/^Swap:/{print \$2}'" 2>/dev/null || true)"
-  total="${total//[!0-9]/}"
-  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  swap_clean_mib "$total"
+}
+
+swap_total_probe() {
+  local total source free_total diag=""
+  if total="$(swap_swapon_total_mib)"; then
+    source="swapon"
+  elif total="$(swap_proc_total_mib)"; then
+    source="/proc/swaps"
+  else
+    total="$(swap_free_total_mib)"
+    source="free"
+  fi
+  free_total="$(swap_free_total_mib)"
+  if [[ "$source" != "free" && "$total" -gt 0 && "$free_total" -ne "$total" ]]; then
+    diag="free=${free_total}MiB"
+  fi
+  printf "%s\t%s\t%s\n" "$total" "$source" "$diag"
+}
+
+swap_read_total() {
+  local __mib="$1" __source="$2" __diag="$3" probe mib source diag
+  probe="$(swap_total_probe)"
+  IFS=$'\t' read -r mib source diag <<< "$probe"
+  printf -v "$__mib" "%s" "${mib:-0}"
+  printf -v "$__source" "%s" "${source:-unknown}"
+  printf -v "$__diag" "%s" "${diag:-}"
+}
+
+swap_total_context() {
+  local source="$1" diag="${2:-}"
+  printf "via %s" "$source"
+  [[ -n "$diag" ]] && printf " (%s)" "$diag"
+}
+
+swap_total_mib() {
+  local total source diag
+  swap_read_total total source diag
   printf "%s\n" "$total"
 }
 
@@ -619,9 +674,9 @@ swap_file_state() {
 }
 
 swap_fail_reconcile() {
-  local total_mib="$1" target_mib="$2" cur_sw="$3" sf="$4" next="$5" state
+  local total_mib="$1" target_mib="$2" cur_sw="$3" sf="$4" next="$5" source="$6" diag="${7:-}" state
   state="$(swap_file_state "$sf")"
-  setup_fail "Could not reconcile swap: total=${total_mib}MiB, target≥${target_mib}MiB, swappiness=${cur_sw:-?}/${SWAPPINESS}, ${sf}=(${state}); next: ${next}"
+  setup_fail "Could not reconcile swap: total=${total_mib}MiB $(swap_total_context "$source" "$diag"), target≥${target_mib}MiB, swappiness=${cur_sw:-?}/${SWAPPINESS}, ${sf}=(${state}); next: ${next}"
 }
 
 swap_ensure_fstab_entry() {
@@ -641,17 +696,17 @@ swap_activate_existing_file() {
 
 step_swap_ensure() {
   local auto_yes="$1" check_only="$2" sf="/swapfile.spark"
-  local cur_sw total_mib target_mib size_mib used_mib active gap_mib desired_mib next_action
+  local cur_sw total_mib total_source total_diag target_mib size_mib used_mib active gap_mib desired_mib next_action
   cur_sw="$(swap_cur_swappiness)"
-  total_mib="$(swap_total_mib)"
+  swap_read_total total_mib total_source total_diag
   target_mib="$(swap_target_mib)"
   if swap_total_satisfies_target "$total_mib" "$target_mib" && [[ "$cur_sw" == "$SWAPPINESS" ]]; then
-    info "Swap: on (${total_mib}MiB total) + swappiness=${SWAPPINESS} (absorbs load peaks; runtime stays in RAM)"
+    info "Swap: on (${total_mib}MiB total) $(swap_total_context "$total_source" "$total_diag") + swappiness=${SWAPPINESS} (absorbs load peaks; runtime stays in RAM)"
     return 0
   fi
   if [[ "$check_only" == "1" ]]; then
     if ! swap_total_satisfies_target "$total_mib" "$target_mib"; then
-      setup_fail "Swap too small (${total_mib}MiB, want ≥${target_mib}MiB) — large-model loads need it for their transient peak"
+      setup_fail "Swap too small (${total_mib}MiB $(swap_total_context "$total_source" "$total_diag"), want ≥${target_mib}MiB) — large-model loads need it for their transient peak"
     fi
     [[ "$cur_sw" != "$SWAPPINESS" ]] && setup_fail "vm.swappiness=${cur_sw:-?} (want ${SWAPPINESS}) — runtime may swap the working set"
     return 0
@@ -672,39 +727,39 @@ step_swap_ensure() {
       desired_mib="$gap_mib"
       [[ "$active" == "1" ]] && desired_mib=$(( size_mib + gap_mib ))
       if [[ "$active" == "1" && "$used_mib" -gt 0 ]]; then
-        swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "stop memory pressure or reboot, then rerun spark setup so ${sf} can be resized safely"
+        swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "stop memory pressure or reboot, then rerun spark setup so ${sf} can be resized safely" "$total_source" "$total_diag"
         return 0
       elif [[ "$size_mib" -le 0 || "$size_mib" -ne "$desired_mib" ]]; then
         next_action="create ${sf} at ${desired_mib}MiB and activate it"
         [[ "$active" == "1" ]] && next_action="recreate ${sf} at ${desired_mib}MiB and reactivate it"
         if ! swap_recreate_and_activate_file "$sf" "$desired_mib" "$active"; then
-          swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "$next_action"
+          swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "$next_action" "$total_source" "$total_diag"
           return 0
         fi
       elif [[ "$active" != "1" ]]; then
         if ! swap_activate_existing_file "$sf"; then
-          swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "activate existing ${sf}"
+          swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "activate existing ${sf}" "$total_source" "$total_diag"
           return 0
         fi
       fi
       if ! swap_ensure_fstab_entry "$sf"; then
-        swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "ensure one ${sf} entry in /etc/fstab"
+        swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "ensure one ${sf} entry in /etc/fstab" "$total_source" "$total_diag"
         return 0
       fi
     fi
     if [[ "$cur_sw" != "$SWAPPINESS" ]]; then
       printf 'vm.swappiness=%s\n' "$SWAPPINESS" | ctx_sudo_write /etc/sysctl.d/99-spark.conf
       if ! ctx_sudo "sysctl --system >/dev/null 2>&1 || sysctl -w vm.swappiness=${SWAPPINESS} >/dev/null"; then
-        swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "apply vm.swappiness=${SWAPPINESS}"
+        swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "apply vm.swappiness=${SWAPPINESS}" "$total_source" "$total_diag"
         return 0
       fi
     fi
-    total_mib="$(swap_total_mib)"
+    swap_read_total total_mib total_source total_diag
     cur_sw="$(swap_cur_swappiness)"
     if swap_total_satisfies_target "$total_mib" "$target_mib" && [[ "$cur_sw" == "$SWAPPINESS" ]]; then
-      info "Swap: on (${total_mib}MiB total) + swappiness=${SWAPPINESS}"
+      info "Swap: on (${total_mib}MiB total) $(swap_total_context "$total_source" "$total_diag") + swappiness=${SWAPPINESS}"
     else
-      swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "inspect sudo command output above and rerun spark setup"
+      swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "inspect sudo command output above and rerun spark setup" "$total_source" "$total_diag"
     fi
   else
     setup_skip "Swap configuration"
