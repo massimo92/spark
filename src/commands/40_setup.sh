@@ -554,50 +554,157 @@ step_control_plane_protect() {
 # weights; swap absorbs that one-time peak so the load completes, then the steady state fits in RAM
 # (admission guarantees it) and swap goes idle — no runtime thrash. Removing swap was the wrong fix:
 # it blocked large-model loads while doing nothing the earlyoom + control-plane protection don't.
-# Declarative + idempotent, and it reconciles by TOTAL active swap (not by its own file): if the box
-# already has ≥ SWAP_PROVISION_GB of swap (e.g. the distro's), it's a no-op — it never stacks its own
-# file on top. If there's less, it tops up the gap with /swapfile.spark. It also undoes any swap lines
-# a previous spark run commented out and pins vm.swappiness. It never removes/resizes existing swap
-# (swapoff of in-use swap is risky while a model is loaded).
-step_swap_ensure() {
-  local auto_yes="$1" check_only="$2" sf="/swapfile.spark" cur_sw total_gb gap enough=0
-  cur_sw="$(ctx_run 'sysctl -n vm.swappiness 2>/dev/null' 2>/dev/null || true)"
-  total_gb="$(ctx_run "free -g 2>/dev/null | awk '/^Swap:/{print \$2}'" 2>/dev/null || true)"
-  [[ "$total_gb" =~ ^[0-9]+$ ]] || total_gb=0
-  if [[ "$SWAP_PROVISION_GB" -le 0 ]]; then
-    [[ "$total_gb" -gt 0 ]] && enough=1
+# Declarative + idempotent: if the box already has enough active swap and the requested swappiness,
+# it is a no-op. If not, it only manages /swapfile.spark as a top-up and never swapoffs an in-use file.
+swap_total_mib() {
+  local total
+  total="$(ctx_run "free -m 2>/dev/null | awk '/^Swap:/{print \$2}'" 2>/dev/null || true)"
+  total="${total//[!0-9]/}"
+  [[ "$total" =~ ^[0-9]+$ ]] || total=0
+  printf "%s\n" "$total"
+}
+
+swap_cur_swappiness() {
+  ctx_run 'sysctl -n vm.swappiness 2>/dev/null' 2>/dev/null | tr -d '[:space:]' || true
+}
+
+swap_target_mib() {
+  printf "%s\n" $(( SWAP_PROVISION_GB * 1024 ))
+}
+
+swap_total_satisfies_target() {
+  local total_mib="$1" target_mib="$2"
+  if [[ "$target_mib" -le 0 ]]; then
+    [[ "$total_mib" -gt 0 ]]
   else
-    [[ "$total_gb" -ge "$SWAP_PROVISION_GB" ]] && enough=1
+    [[ "$total_mib" -ge "$target_mib" ]]
   fi
-  if [[ "$enough" == "1" && "$cur_sw" == "$SWAPPINESS" ]]; then
-    info "Swap: on (${total_gb}G total) + swappiness=${SWAPPINESS} (absorbs load peaks; runtime stays in RAM)"
+}
+
+swap_file_size_mib() {
+  local sf="$1" bytes
+  bytes="$(ctx_run "stat -c%s '$sf' 2>/dev/null || stat -f%z '$sf' 2>/dev/null" 2>/dev/null | head -1 || true)"
+  bytes="${bytes//[!0-9]/}"
+  if [[ "$bytes" =~ ^[0-9]+$ && "$bytes" -gt 0 ]]; then
+    printf "%s\n" $(( (bytes + 1048575) / 1048576 ))
+  else
+    printf "0\n"
+  fi
+}
+
+swap_file_active() {
+  local sf="$1"
+  ctx_run "swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq '$sf'" >/dev/null 2>&1
+}
+
+swap_file_used_mib() {
+  local sf="$1" bytes
+  bytes="$(ctx_run "swapon --show=NAME,USED --bytes --noheadings 2>/dev/null | awk -v sf='$sf' '\$1 == sf {print \$2; found=1} END {if (!found) print 0}'" 2>/dev/null | head -1 || true)"
+  bytes="${bytes//[!0-9]/}"
+  [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+  printf "%s\n" $(( (bytes + 1048575) / 1048576 ))
+}
+
+swap_file_state() {
+  local sf="$1" size_mib active used_mib
+  size_mib="$(swap_file_size_mib "$sf")"
+  active="inactive"
+  swap_file_active "$sf" && active="active"
+  used_mib="$(swap_file_used_mib "$sf")"
+  if [[ "$size_mib" -gt 0 ]]; then
+    printf "%s, %sMiB, used %sMiB\n" "$active" "$size_mib" "$used_mib"
+  else
+    printf "missing\n"
+  fi
+}
+
+swap_fail_reconcile() {
+  local total_mib="$1" target_mib="$2" cur_sw="$3" sf="$4" next="$5" state
+  state="$(swap_file_state "$sf")"
+  setup_fail "Could not reconcile swap: total=${total_mib}MiB, target≥${target_mib}MiB, swappiness=${cur_sw:-?}/${SWAPPINESS}, ${sf}=(${state}); next: ${next}"
+}
+
+swap_ensure_fstab_entry() {
+  local sf="$1"
+  ctx_sudo "set -e; tmp=\$(mktemp); if [ -f /etc/fstab ]; then awk -v sf='$sf' '\$1 != sf {print}' /etc/fstab > \"\$tmp\"; else : > \"\$tmp\"; fi; printf '%s none swap sw 0 0\n' '$sf' >> \"\$tmp\"; cat \"\$tmp\" > /etc/fstab; rm -f \"\$tmp\""
+}
+
+swap_recreate_and_activate_file() {
+  local sf="$1" desired_mib="$2" was_active="$3"
+  ctx_sudo "set -e; if [ '$was_active' = '1' ]; then swapoff '$sf'; fi; rm -f '$sf'; fallocate -l ${desired_mib}M '$sf' || dd if=/dev/zero of='$sf' bs=1M count=${desired_mib} status=none; chmod 600 '$sf'; mkswap '$sf' >/dev/null; swapon '$sf'"
+}
+
+swap_activate_existing_file() {
+  local sf="$1"
+  ctx_sudo "set -e; chmod 600 '$sf'; mkswap '$sf' >/dev/null 2>&1 || true; swapon '$sf'"
+}
+
+step_swap_ensure() {
+  local auto_yes="$1" check_only="$2" sf="/swapfile.spark"
+  local cur_sw total_mib target_mib size_mib used_mib active gap_mib desired_mib next_action
+  cur_sw="$(swap_cur_swappiness)"
+  total_mib="$(swap_total_mib)"
+  target_mib="$(swap_target_mib)"
+  if swap_total_satisfies_target "$total_mib" "$target_mib" && [[ "$cur_sw" == "$SWAPPINESS" ]]; then
+    info "Swap: on (${total_mib}MiB total) + swappiness=${SWAPPINESS} (absorbs load peaks; runtime stays in RAM)"
     return 0
   fi
   if [[ "$check_only" == "1" ]]; then
-    [[ "$enough" != "1" ]] && setup_fail "Swap too small (${total_gb}G, want ≥${SWAP_PROVISION_GB}G) — large-model loads need it for their transient peak"
+    if ! swap_total_satisfies_target "$total_mib" "$target_mib"; then
+      setup_fail "Swap too small (${total_mib}MiB, want ≥${target_mib}MiB) — large-model loads need it for their transient peak"
+    fi
     [[ "$cur_sw" != "$SWAPPINESS" ]] && setup_fail "vm.swappiness=${cur_sw:-?} (want ${SWAPPINESS}) — runtime may swap the working set"
     return 0
   fi
-  gap=$(( SWAP_PROVISION_GB - total_gb )); [[ "$gap" -lt 0 ]] && gap=0
   printf "    ${DIM}What: ensure ≥${SWAP_PROVISION_GB}G of swap (top up with ${sf} if needed) + vm.swappiness=${SWAPPINESS}.\n"
   printf "    Why: loading a big model briefly needs about twice its weights; swap absorbs that one-time\n"
   printf "    peak so the load finishes. The steady model fits in RAM (admission ensures it) and a low\n"
   printf "    swappiness keeps it there, so swap stays idle at runtime — no thrash. earlyoom + protected\n"
   printf "    system services handle a genuine runaway. (Complements any existing swap — never replaces it.)${NC}\n"
   if [[ "$auto_yes" == "1" ]] || confirm "Ensure ≥${SWAP_PROVISION_GB}G swap + swappiness=${SWAPPINESS}?"; then
-    # Undo any swap lines a previous spark run commented out, then re-enable fstab swap.
-    ctx_sudo "sed -ri 's@^#([^#]*[[:space:]]swap[[:space:]])@\\1@' /etc/fstab; swapon -a 2>/dev/null || true"
-    if [[ "$SWAP_PROVISION_GB" -gt 0 && "$gap" -gt 0 ]]; then
-      ctx_sudo "if ! swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq '$sf'; then test -f '$sf' || fallocate -l ${gap}G '$sf' || dd if=/dev/zero of='$sf' bs=1M count=$((gap*1024)) status=none; chmod 600 '$sf'; mkswap '$sf' >/dev/null 2>&1 || true; swapon '$sf'; fi; grep -q '^$sf ' /etc/fstab || printf '%s none swap sw 0 0\\n' '$sf' >> /etc/fstab"
+    if ! swap_total_satisfies_target "$total_mib" "$target_mib" && [[ "$target_mib" -gt 0 ]]; then
+      gap_mib=$(( target_mib - total_mib ))
+      [[ "$gap_mib" -lt 0 ]] && gap_mib=0
+      size_mib="$(swap_file_size_mib "$sf")"
+      used_mib="$(swap_file_used_mib "$sf")"
+      active=0
+      swap_file_active "$sf" && active=1
+      desired_mib="$gap_mib"
+      [[ "$active" == "1" ]] && desired_mib=$(( size_mib + gap_mib ))
+      if [[ "$active" == "1" && "$used_mib" -gt 0 ]]; then
+        swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "stop memory pressure or reboot, then rerun spark setup so ${sf} can be resized safely"
+        return 0
+      elif [[ "$size_mib" -le 0 || "$size_mib" -ne "$desired_mib" ]]; then
+        next_action="create ${sf} at ${desired_mib}MiB and activate it"
+        [[ "$active" == "1" ]] && next_action="recreate ${sf} at ${desired_mib}MiB and reactivate it"
+        if ! swap_recreate_and_activate_file "$sf" "$desired_mib" "$active"; then
+          swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "$next_action"
+          return 0
+        fi
+      elif [[ "$active" != "1" ]]; then
+        if ! swap_activate_existing_file "$sf"; then
+          swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "activate existing ${sf}"
+          return 0
+        fi
+      fi
+      if ! swap_ensure_fstab_entry "$sf"; then
+        swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "ensure one ${sf} entry in /etc/fstab"
+        return 0
+      fi
     fi
-    printf 'vm.swappiness=%s\n' "$SWAPPINESS" | ctx_sudo_write /etc/sysctl.d/99-spark.conf
-    ctx_sudo 'sysctl --system >/dev/null 2>&1 || true'
-    total_gb="$(ctx_run "free -g 2>/dev/null | awk '/^Swap:/{print \$2}'" 2>/dev/null || true)"
-    [[ "$total_gb" =~ ^[0-9]+$ ]] || total_gb=0
-    if [[ "$total_gb" -gt 0 ]]; then
-      info "Swap: on (${total_gb}G total) + swappiness=${SWAPPINESS}"
+    if [[ "$cur_sw" != "$SWAPPINESS" ]]; then
+      printf 'vm.swappiness=%s\n' "$SWAPPINESS" | ctx_sudo_write /etc/sysctl.d/99-spark.conf
+      if ! ctx_sudo "sysctl --system >/dev/null 2>&1 || sysctl -w vm.swappiness=${SWAPPINESS} >/dev/null"; then
+        swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "apply vm.swappiness=${SWAPPINESS}"
+        return 0
+      fi
+    fi
+    total_mib="$(swap_total_mib)"
+    cur_sw="$(swap_cur_swappiness)"
+    if swap_total_satisfies_target "$total_mib" "$target_mib" && [[ "$cur_sw" == "$SWAPPINESS" ]]; then
+      info "Swap: on (${total_mib}MiB total) + swappiness=${SWAPPINESS}"
     else
-      setup_fail "Could not enable swap"
+      swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "inspect sudo command output above and rerun spark setup"
     fi
   else
     setup_skip "Swap configuration"
@@ -988,6 +1095,7 @@ cmd_setup() {
   setup_summary || setup_rc=$?
   if [[ "$full" == "1" ]]; then
     if [[ "$setup_rc" -ne 0 && "$check_only" != "1" ]]; then
+      printf "  ${YELLOW}Workspace setup skipped because base setup still has unresolved issue(s).${NC}\n\n"
       return "$setup_rc"
     fi
     cmd_setup_full_workspace "$auto_yes" "$check_only" "$funnel_action" "$full_model" "$full_tail_mode" || workspace_rc=$?
@@ -1046,4 +1154,3 @@ setup_manual_step() {
     esac
   done
 }
-

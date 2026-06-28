@@ -240,14 +240,17 @@ doctor_checks_ollama() {
 # Report host hardening drift (Linux + systemd). Shares cmd_doctor's passed/total via dynamic scope.
 doctor_checks_hardening() {
   { [[ "$SPARK_OS" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; } || return 0
-  local sw swp oom_ssh oom_dbus
+  local sw_mib swp target_mib oom_ssh oom_dbus
   total=$((total + 1))
-  sw="$(swapon --show=NAME --noheadings 2>/dev/null | head -1 || true)"
+  sw_mib="$(free -m 2>/dev/null | awk '/^Swap:/{print $2}' || true)"
+  sw_mib="${sw_mib//[!0-9]/}"
+  [[ "$sw_mib" =~ ^[0-9]+$ ]] || sw_mib=0
+  target_mib=$(( SWAP_PROVISION_GB * 1024 ))
   swp="$(sysctl -n vm.swappiness 2>/dev/null || true)"
-  if [[ -n "$sw" && "$swp" == "$SWAPPINESS" ]]; then
-    info "Swap: on + swappiness=${swp} (absorbs load peaks)"; passed=$((passed + 1))
+  if { [[ "$target_mib" -le 0 && "$sw_mib" -gt 0 ]] || [[ "$target_mib" -gt 0 && "$sw_mib" -ge "$target_mib" ]]; } && [[ "$swp" == "$SWAPPINESS" ]]; then
+    info "Swap: on (${sw_mib}MiB total) + swappiness=${swp} (absorbs load peaks)"; passed=$((passed + 1))
   else
-    err "Swap/swappiness not configured (swap='${sw:-off}', swappiness='${swp:-?}') — run 'spark setup'"
+    err "Swap/swappiness not configured (swap=${sw_mib}MiB, target≥${target_mib}MiB, swappiness='${swp:-?}') — run 'spark setup'"
   fi
   total=$((total + 1))
   if systemctl is-active --quiet earlyoom 2>/dev/null; then
@@ -344,4 +347,3 @@ cmd_doctor() {
   fi
   printf "\n\n"
 }
-
