@@ -76,7 +76,7 @@ case "${1:-}" in
     esac
     ;;
   images)
-    [[ -n "${FAKE_DOCKER_IMAGE:-}" ]] && echo "${FAKE_DOCKER_IMAGE}"
+    [[ -n "${FAKE_DOCKER_IMAGE:-}" ]] && printf '%b\n' "${FAKE_DOCKER_IMAGE}"
     ;;
   ps)
     # Managed-container listing (TSV rows via FAKE_MANAGED); plain name listing otherwise.
@@ -151,6 +151,30 @@ case "$args" in
 esac
 EOF
   chmod +x "${dir}/nvidia-smi"
+
+  cat > "${dir}/nvidia-ctk" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "${dir}/nvidia-ctk"
+
+  cat > "${dir}/groups" <<'EOF'
+#!/usr/bin/env bash
+echo "${FAKE_GROUPS:-massimo docker}"
+EOF
+  chmod +x "${dir}/groups"
+
+  cat > "${dir}/uv" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "${dir}/uv"
+
+  cat > "${dir}/nvitop" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "${dir}/nvitop"
 
   # ollama mock: list/ps from FAKE_OLLAMA_LIST/FAKE_OLLAMA_PS; pull records to a file.
   cat > "${dir}/ollama" <<'EOF'
@@ -235,20 +259,201 @@ esac
 EOF
   chmod +x "${dir}/systemctl"
 
+  cat > "${dir}/sudo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+read_value() {
+  local env_name="$1" file_name="$2" fallback="$3" file_path=""
+  file_path="${!file_name:-}"
+  if [[ -n "$file_path" && -f "$file_path" ]]; then
+    cat "$file_path"
+  elif [[ -n "${!env_name:-}" ]]; then
+    printf '%s\n' "${!env_name}"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+write_value() {
+  local file_name="$1" value="$2" file_path=""
+  file_path="${!file_name:-}"
+  [[ -n "$file_path" ]] && printf '%s\n' "$value" > "$file_path"
+}
+
+swap_total_mib() {
+  local v
+  v="$(read_value FAKE_SWAP_TOTAL_MIB FAKE_SWAP_TOTAL_MIB_FILE "")"
+  if [[ -z "$v" ]]; then
+    v="$(read_value FAKE_SWAP_TOTAL_GB FAKE_SWAP_TOTAL_GB_FILE 0)"
+    v=$(( v * 1024 ))
+  fi
+  printf '%s\n' "$v"
+}
+
+swap_size_mib() {
+  read_value FAKE_SWAPFILE_SIZE_MIB FAKE_SWAPFILE_SIZE_MIB_FILE 0
+}
+
+swap_used_mib() {
+  local v
+  v="$(read_value FAKE_SWAPFILE_USED_MIB FAKE_SWAPFILE_USED_MIB_FILE "")"
+  if [[ -z "$v" ]]; then
+    v="$(read_value FAKE_SWAP_USED_GB FAKE_SWAP_USED_GB_FILE 0)"
+    v=$(( v * 1024 ))
+  fi
+  printf '%s\n' "$v"
+}
+
+swap_on() {
+  read_value FAKE_SWAP_ON FAKE_SWAP_ON_FILE 0
+}
+
+record() {
+  [[ -n "${FAKE_SUDO_LOG:-}" ]] && printf '%s\n' "$*" >> "$FAKE_SUDO_LOG"
+}
+
+args=("$@")
+while [[ ${#args[@]} -gt 0 ]]; do
+  case "${args[0]}" in
+    -n|-S) args=("${args[@]:1}") ;;
+    -p) args=("${args[@]:2}") ;;
+    *) break ;;
+  esac
+done
+
+if [[ "${args[0]:-}" == "true" ]]; then
+  exit 0
+fi
+
+if [[ "${args[0]:-}" == "tee" ]]; then
+  target="${args[1]:-}"
+  content="$(cat)"
+  record "tee ${target}: ${content}"
+  if [[ "$target" == "/etc/sysctl.d/99-spark.conf" && "$content" =~ vm.swappiness=([0-9]+) ]]; then
+    write_value FAKE_SWAPPINESS_FILE "${BASH_REMATCH[1]}"
+  fi
+  exit 0
+fi
+
+if [[ "${args[0]:-}" == "bash" && "${args[1]:-}" == "-c" ]]; then
+  cmd="${args[2]:-}"
+  record "$cmd"
+  if [[ "$cmd" == *"/swapfile.spark"* && "$cmd" == *"fallocate -l "* ]]; then
+    desired="$(sed -n 's/.*fallocate -l \([0-9][0-9]*\)M .*/\1/p' <<<"$cmd")"
+    total="$(swap_total_mib)"
+    size="$(swap_size_mib)"
+    on="$(swap_on)"
+    base="$total"
+    if [[ "$on" == "1" && "$size" -gt 0 ]]; then
+      base=$(( total - size ))
+      [[ "$base" -lt 0 ]] && base=0
+    fi
+    write_value FAKE_SWAPFILE_SIZE_MIB_FILE "$desired"
+    write_value FAKE_SWAP_ON_FILE 1
+    write_value FAKE_SWAPFILE_USED_MIB_FILE 0
+    write_value FAKE_SWAP_TOTAL_MIB_FILE $(( base + desired ))
+  elif [[ "$cmd" == *"swapon '/swapfile.spark'"* || "$cmd" == *"swapon /swapfile.spark"* ]]; then
+    total="$(swap_total_mib)"
+    size="$(swap_size_mib)"
+    on="$(swap_on)"
+    if [[ "$on" != "1" ]]; then
+      write_value FAKE_SWAP_TOTAL_MIB_FILE $(( total + size ))
+    fi
+    write_value FAKE_SWAP_ON_FILE 1
+  fi
+  exit "${FAKE_SUDO_EXIT:-0}"
+fi
+
+record "${args[*]}"
+exit "${FAKE_SUDO_EXIT:-0}"
+EOF
+  chmod +x "${dir}/sudo"
+
+  cat > "${dir}/stat" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${*: -1}" == "/swapfile.spark" && "$*" == *"-c%s"* || "${*: -1}" == "/swapfile.spark" && "$*" == *"-f%z"* ]]; then
+  if [[ -n "${FAKE_SWAPFILE_SIZE_MIB_FILE:-}" && -f "$FAKE_SWAPFILE_SIZE_MIB_FILE" ]]; then
+    mib=$(cat "$FAKE_SWAPFILE_SIZE_MIB_FILE")
+  else
+    mib="${FAKE_SWAPFILE_SIZE_MIB:-0}"
+  fi
+  [[ "$mib" -gt 0 ]] || exit 1
+  printf '%s\n' $(( mib * 1048576 ))
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+EOF
+  chmod +x "${dir}/stat"
+
   # swapon mock: prints active swap devices. FAKE_SWAP_ON=1 → spark's swapfile present; default off.
   cat > "${dir}/swapon" <<'EOF'
 #!/usr/bin/env bash
-[[ "${FAKE_SWAP_ON:-0}" == "1" ]] && echo "/swapfile.spark"
+read_value() {
+  local env_name="$1" file_name="$2" fallback="$3" file_path=""
+  file_path="${!file_name:-}"
+  if [[ -n "$file_path" && -f "$file_path" ]]; then
+    cat "$file_path"
+  elif [[ -n "${!env_name:-}" ]]; then
+    printf '%s\n' "${!env_name}"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+on="$(read_value FAKE_SWAP_ON FAKE_SWAP_ON_FILE 0)"
+used_mib="$(read_value FAKE_SWAPFILE_USED_MIB FAKE_SWAPFILE_USED_MIB_FILE "")"
+if [[ -z "$used_mib" ]]; then
+  used_gb="$(read_value FAKE_SWAP_USED_GB FAKE_SWAP_USED_GB_FILE 0)"
+  used_mib=$(( used_gb * 1024 ))
+fi
+case "$*" in
+  *"--show=NAME,USED"*|*"--show=NAME,USED --bytes"*)
+    [[ "$on" == "1" ]] && printf '/swapfile.spark %s\n' $(( used_mib * 1048576 ))
+    ;;
+  *"--show=NAME"*)
+    [[ "$on" == "1" ]] && echo "/swapfile.spark"
+    ;;
+esac
 exit 0
 EOF
   chmod +x "${dir}/swapon"
 
-  # free mock (free -g): Mem + Swap lines from FAKE_* (GB). Swap total default 0 (off).
+  # free mock: supports free -g and free -m. Swap total default 0 (off).
   cat > "${dir}/free" <<'EOF'
 #!/usr/bin/env bash
-st="${FAKE_SWAP_TOTAL_GB:-0}"; su="${FAKE_SWAP_USED_GB:-0}"
+read_value() {
+  local env_name="$1" file_name="$2" fallback="$3" file_path=""
+  file_path="${!file_name:-}"
+  if [[ -n "$file_path" && -f "$file_path" ]]; then
+    cat "$file_path"
+  elif [[ -n "${!env_name:-}" ]]; then
+    printf '%s\n' "${!env_name}"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+st_mib="$(read_value FAKE_SWAP_TOTAL_MIB FAKE_SWAP_TOTAL_MIB_FILE "")"
+if [[ -z "$st_mib" ]]; then
+  st_gb="$(read_value FAKE_SWAP_TOTAL_GB FAKE_SWAP_TOTAL_GB_FILE 0)"
+  st_mib=$(( st_gb * 1024 ))
+fi
+su_mib="$(read_value FAKE_SWAP_USED_MIB FAKE_SWAP_USED_MIB_FILE "")"
+if [[ -z "$su_mib" ]]; then
+  su_gb="$(read_value FAKE_SWAP_USED_GB FAKE_SWAP_USED_GB_FILE 0)"
+  su_mib=$(( su_gb * 1024 ))
+fi
+if [[ "$*" == *"-m"* ]]; then
+  div=1
+else
+  div=1024
+fi
+st=$(( st_mib / div )); su=$(( su_mib / div ))
+rt="${FAKE_RAM_TOTAL_GB:-121}"; ru="${FAKE_RAM_USED_GB:-40}"; rf="${FAKE_RAM_FREE_GB:-50}"; ra="${FAKE_RAM_AVAIL_GB:-78}"
+if [[ "$div" -eq 1 ]]; then
+  rt=$(( rt * 1024 )); ru=$(( ru * 1024 )); rf=$(( rf * 1024 )); ra=$(( ra * 1024 ))
+fi
 printf '               total        used        free      shared  buff/cache   available\n'
-printf 'Mem:    %11d %11d %11d %11d %11d %11d\n' "${FAKE_RAM_TOTAL_GB:-121}" "${FAKE_RAM_USED_GB:-40}" "${FAKE_RAM_FREE_GB:-50}" 0 28 "${FAKE_RAM_AVAIL_GB:-78}"
+printf 'Mem:    %11d %11d %11d %11d %11d %11d\n' "$rt" "$ru" "$rf" 0 28 "$ra"
 printf 'Swap:   %11d %11d %11d\n' "$st" "$su" "$(( st - su ))"
 EOF
   chmod +x "${dir}/free"
@@ -256,8 +461,15 @@ EOF
   # sysctl mock: report vm.swappiness from FAKE_SWAPPINESS (empty = unset).
   cat > "${dir}/sysctl" <<'EOF'
 #!/usr/bin/env bash
+read_swappiness() {
+  if [[ -n "${FAKE_SWAPPINESS_FILE:-}" && -f "$FAKE_SWAPPINESS_FILE" ]]; then
+    cat "$FAKE_SWAPPINESS_FILE"
+  else
+    printf '%s\n' "${FAKE_SWAPPINESS:-}"
+  fi
+}
 case "$*" in
-  *vm.swappiness*) echo "${FAKE_SWAPPINESS:-}" ;;
+  *vm.swappiness*) read_swappiness ;;
 esac
 exit 0
 EOF
@@ -1140,8 +1352,127 @@ test_swap_reconcile_by_total() {
     SPARK_OS_OVERRIDE=Linux FAKE_SWAP_TOTAL_GB=16 FAKE_SWAPPINESS=10 \
     "$SPARK" setup --check </dev/null 2>&1 || true)
   rm -rf "$tmp"
-  [[ "$enough" == *"Swap: on (80G total)"* ]] && [[ "$enough" != *"Swap too small"* ]] &&
+  [[ "$enough" == *"Swap: on (81920MiB total)"* ]] && [[ "$enough" != *"Swap too small"* ]] &&
     [[ "$small" == *"Swap too small"* ]]
+}
+
+run_swap_step_fixture() {
+  local fake_bin="$1" home="$2" auto_yes="${3:-1}" check_only="${4:-0}"
+  export FAKE_SWAP_TOTAL_MIB FAKE_SWAP_TOTAL_MIB_FILE FAKE_SWAP_TOTAL_GB FAKE_SWAP_TOTAL_GB_FILE
+  export FAKE_SWAPFILE_SIZE_MIB FAKE_SWAPFILE_SIZE_MIB_FILE FAKE_SWAP_ON FAKE_SWAP_ON_FILE
+  export FAKE_SWAPFILE_USED_MIB FAKE_SWAPFILE_USED_MIB_FILE FAKE_SWAP_USED_MIB FAKE_SWAP_USED_MIB_FILE
+  export FAKE_SWAP_USED_GB FAKE_SWAP_USED_GB_FILE FAKE_SWAPPINESS FAKE_SWAPPINESS_FILE FAKE_SUDO_LOG
+  HOME="$home" PATH="${fake_bin}:$PATH" bash -c '
+    script="$1"; auto_yes="$2"; check_only="$3"
+    source "$script"
+    SETUP_TARGET=local
+    SETUP_FAILED=()
+    SETUP_SKIPPED=()
+    SUDO_PW=""
+    SUDO_READY=0
+    step_swap_ensure "$auto_yes" "$check_only"
+    printf "failed=%s skipped=%s\n" "${#SETUP_FAILED[@]}" "${#SETUP_SKIPPED[@]}"
+  ' _ "$SPARK" "$auto_yes" "$check_only" 2>&1
+}
+
+test_swap_ready_no_mutation() {
+  local tmp fake_bin out log
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; log="${tmp}/sudo.log"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_SWAP_TOTAL_MIB=65536 FAKE_SWAPPINESS=10 FAKE_SUDO_LOG="$log" \
+    run_swap_step_fixture "$fake_bin" "${tmp}/home")
+  [[ ! -s "$log" ]] || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  [[ "$out" == *"Swap: on (65536MiB total)"* ]] && [[ "$out" == *"failed=0"* ]]
+}
+
+test_swap_wrong_swappiness_reconciles() {
+  local tmp fake_bin out log sw_file
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; log="${tmp}/sudo.log"; sw_file="${tmp}/swappiness"
+  printf '60\n' > "$sw_file"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_SWAP_TOTAL_MIB=65536 FAKE_SWAPPINESS_FILE="$sw_file" FAKE_SUDO_LOG="$log" \
+    run_swap_step_fixture "$fake_bin" "${tmp}/home")
+  [[ "$(cat "$sw_file")" == "10" ]] || { rm -rf "$tmp"; return 1; }
+  [[ "$(cat "$log")" != *"/swapfile.spark"* ]] || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  [[ "$out" == *"Swap: on (65536MiB total) + swappiness=10"* ]] && [[ "$out" == *"failed=0"* ]]
+}
+
+test_swap_missing_file_creates_topup() {
+  local tmp fake_bin out total_file size_file on_file used_file sw_file log
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  total_file="${tmp}/swap-total"; size_file="${tmp}/swap-size"; on_file="${tmp}/swap-on"; used_file="${tmp}/swap-used"; sw_file="${tmp}/swappiness"; log="${tmp}/sudo.log"
+  printf '16384\n' > "$total_file"; printf '0\n' > "$size_file"; printf '0\n' > "$on_file"; printf '0\n' > "$used_file"; printf '10\n' > "$sw_file"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_SWAP_TOTAL_MIB_FILE="$total_file" FAKE_SWAPFILE_SIZE_MIB_FILE="$size_file" FAKE_SWAP_ON_FILE="$on_file" \
+    FAKE_SWAPFILE_USED_MIB_FILE="$used_file" FAKE_SWAPPINESS_FILE="$sw_file" FAKE_SUDO_LOG="$log" \
+    run_swap_step_fixture "$fake_bin" "${tmp}/home")
+  [[ "$(cat "$total_file")" == "65536" && "$(cat "$size_file")" == "49152" && "$(cat "$on_file")" == "1" ]] || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  [[ "$out" == *"Swap: on (65536MiB total)"* ]] && [[ "$out" == *"failed=0"* ]]
+}
+
+test_swap_existing_inactive_file_activates() {
+  local tmp fake_bin out total_file size_file on_file used_file sw_file log
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  total_file="${tmp}/swap-total"; size_file="${tmp}/swap-size"; on_file="${tmp}/swap-on"; used_file="${tmp}/swap-used"; sw_file="${tmp}/swappiness"; log="${tmp}/sudo.log"
+  printf '16384\n' > "$total_file"; printf '49152\n' > "$size_file"; printf '0\n' > "$on_file"; printf '0\n' > "$used_file"; printf '10\n' > "$sw_file"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_SWAP_TOTAL_MIB_FILE="$total_file" FAKE_SWAPFILE_SIZE_MIB_FILE="$size_file" FAKE_SWAP_ON_FILE="$on_file" \
+    FAKE_SWAPFILE_USED_MIB_FILE="$used_file" FAKE_SWAPPINESS_FILE="$sw_file" FAKE_SUDO_LOG="$log" \
+    run_swap_step_fixture "$fake_bin" "${tmp}/home")
+  [[ "$(cat "$total_file")" == "65536" && "$(cat "$on_file")" == "1" && "$(cat "$log")" != *"fallocate"* ]] || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  [[ "$out" == *"Swap: on (65536MiB total)"* ]] && [[ "$out" == *"failed=0"* ]]
+}
+
+test_swap_active_unused_wrong_size_recreates() {
+  local tmp fake_bin out total_file size_file on_file used_file sw_file log
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  total_file="${tmp}/swap-total"; size_file="${tmp}/swap-size"; on_file="${tmp}/swap-on"; used_file="${tmp}/swap-used"; sw_file="${tmp}/swappiness"; log="${tmp}/sudo.log"
+  printf '32768\n' > "$total_file"; printf '16384\n' > "$size_file"; printf '1\n' > "$on_file"; printf '0\n' > "$used_file"; printf '10\n' > "$sw_file"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_SWAP_TOTAL_MIB_FILE="$total_file" FAKE_SWAPFILE_SIZE_MIB_FILE="$size_file" FAKE_SWAP_ON_FILE="$on_file" \
+    FAKE_SWAPFILE_USED_MIB_FILE="$used_file" FAKE_SWAPPINESS_FILE="$sw_file" FAKE_SUDO_LOG="$log" \
+    run_swap_step_fixture "$fake_bin" "${tmp}/home")
+  [[ "$(cat "$total_file")" == "65536" && "$(cat "$size_file")" == "49152" && "$(cat "$log")" == *"swapoff"* ]] || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  [[ "$out" == *"Swap: on (65536MiB total)"* ]] && [[ "$out" == *"failed=0"* ]]
+}
+
+test_swap_active_used_wrong_size_fails_safely() {
+  local tmp fake_bin out total_file size_file on_file used_file sw_file log
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  total_file="${tmp}/swap-total"; size_file="${tmp}/swap-size"; on_file="${tmp}/swap-on"; used_file="${tmp}/swap-used"; sw_file="${tmp}/swappiness"; log="${tmp}/sudo.log"
+  printf '32768\n' > "$total_file"; printf '16384\n' > "$size_file"; printf '1\n' > "$on_file"; printf '1024\n' > "$used_file"; printf '10\n' > "$sw_file"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_SWAP_TOTAL_MIB_FILE="$total_file" FAKE_SWAPFILE_SIZE_MIB_FILE="$size_file" FAKE_SWAP_ON_FILE="$on_file" \
+    FAKE_SWAPFILE_USED_MIB_FILE="$used_file" FAKE_SWAPPINESS_FILE="$sw_file" FAKE_SUDO_LOG="$log" \
+    run_swap_step_fixture "$fake_bin" "${tmp}/home")
+  [[ ! -s "$log" && "$(cat "$size_file")" == "16384" ]] || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  [[ "$out" == *"Could not reconcile swap"* ]] && [[ "$out" == *"stop memory pressure"* ]] && [[ "$out" == *"failed=1"* ]]
+}
+
+test_setup_full_continues_after_swap_reconcile() {
+  local tmp fake_bin out total_file size_file on_file used_file sw_file log status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  total_file="${tmp}/swap-total"; size_file="${tmp}/swap-size"; on_file="${tmp}/swap-on"; used_file="${tmp}/swap-used"; sw_file="${tmp}/swappiness"; log="${tmp}/sudo.log"
+  printf '16384\n' > "$total_file"; printf '0\n' > "$size_file"; printf '0\n' > "$on_file"; printf '0\n' > "$used_file"; printf '10\n' > "$sw_file"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_SWAP_TOTAL_MIB_FILE="$total_file" FAKE_SWAPFILE_SIZE_MIB_FILE="$size_file" FAKE_SWAP_ON_FILE="$on_file" \
+    FAKE_SWAPFILE_USED_MIB_FILE="$used_file" FAKE_SWAPPINESS_FILE="$sw_file" FAKE_SUDO_LOG="$log" \
+    bash -c '
+      script="$1"
+      source "$script"
+      run_setup_wizard() { step_swap_ensure 1 0; }
+      cmd_setup_full_workspace() { echo "workspace reached"; }
+      cmd_setup --yes --full
+    ' _ "$SPARK" 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ "$out" == *"workspace reached"* ]] && [[ "$out" != *"Workspace setup skipped"* ]]
 }
 
 # spark status shows a live block: host RAM/swap + per-model reserved/now/peak from the cgroup.
@@ -4183,12 +4514,19 @@ run_test "setup --host (vllm) flags a missing GPU" test_host_check_vllm_no_gpu
 run_test "setup --host flags missing OS hardening" test_host_check_hardening_missing
 run_test "setup --host passes with hardening present" test_host_check_hardening_present
 run_test "swap reconciled by total active swap" test_swap_reconcile_by_total
+run_test "swap ready state is a no-op" test_swap_ready_no_mutation
+run_test "swap fixes swappiness only" test_swap_wrong_swappiness_reconciles
+run_test "swap creates missing spark top-up" test_swap_missing_file_creates_topup
+run_test "swap activates existing inactive spark file" test_swap_existing_inactive_file_activates
+run_test "swap recreates active unused wrong-size file" test_swap_active_unused_wrong_size_recreates
+run_test "swap refuses to resize active used file" test_swap_active_used_wrong_size_fails_safely
 run_test "spark status shows live memory" test_status_live_memory
 run_test "setup picker [1] routes to this machine" test_setup_picker_routes_to_host
 run_test "setup --host never disables password SSH" test_setup_host_no_disable_password
 run_test "setup --server installs the same set (parity)" test_setup_server_check_parity
 run_test "setup rejects unknown flags" test_setup_unknown_flag_fails
 run_test "setup --full --check runs workspace phase" test_setup_full_check_runs_workspace_phase
+run_test "setup --full continues after swap reconcile" test_setup_full_continues_after_swap_reconcile
 run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace setup --check does not write files" test_workspace_check_no_mutation
 run_test "workspace setup --check preserves existing config" test_workspace_check_existing_config_no_mutation
