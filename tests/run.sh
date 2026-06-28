@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SPARK="${ROOT_DIR}/spark"
+SPARK_VERSION="$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$SPARK" | head -1)"
 
 # These tests target the vLLM/NVIDIA path; default detection to it so the no-GPU CI
 # runners don't fall through to the Ollama backend. Backend-specific tests override
@@ -413,6 +414,36 @@ run_test() {
     printf "not ok - %s\n" "$name"
     failed=$((failed + 1))
   fi
+}
+
+test_architecture_command_maps_core_boundaries() {
+  local tmp output
+  tmp=$(mktemp -d)
+  output=$(HOME="${tmp}/home" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified "$SPARK" architecture 2>&1)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"Packaging invariant:"* ]] &&
+    [[ "$output" == *"Runtime domains:"* ]] &&
+    [[ "$output" == *"workspace"* ]] &&
+    [[ "$output" == *"gateway"* ]] &&
+    [[ "$output" == *"docs/architecture.md"* ]]
+}
+
+test_source_guard_loads_without_dispatch() {
+  local tmp output status
+  tmp=$(mktemp -d)
+  output=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=x86_64 SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+    script="$1"
+    set -- unknown
+    source "$script"
+    declare -F main >/dev/null
+    declare -F cmd_architecture >/dev/null
+    printf "loaded:%s:%s\n" "$VERSION" "$BACKEND"
+  ' _ "$SPARK" 2>&1)
+  status=$?
+  rm -rf "$tmp"
+
+  [[ "$status" -eq 0 ]] && [[ "$output" == loaded:*:ollama ]]
 }
 
 test_doctor_reports_no_ngc_image() {
@@ -1787,31 +1818,31 @@ test_workspace_setup_preserves_existing_secrets() {
 test_workspace_remote_delegates() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_REMOTE_SPARK_VERSION=0.1.3 \
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_REMOTE_SPARK_VERSION="$SPARK_VERSION" \
     "$SPARK" ws setup --check --remote me@10.0.0.5 --model Org/Alpha \
       --tailscale-mode ports --postgres-image postgres:18.1 \
       --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0 2>&1 || true)
   rm -rf "$tmp"
-  [[ "$out" == *"Installed spark CLI v0.1.3"* ]] && [[ "$out" == *"remote workspace with opts ok"* ]]
+  [[ "$out" == *"Installed spark CLI v${SPARK_VERSION}"* ]] && [[ "$out" == *"remote workspace with opts ok"* ]]
 }
 
 test_workspace_remote_delegates_credentials() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_REMOTE_SPARK_VERSION=0.1.3 \
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_REMOTE_SPARK_VERSION="$SPARK_VERSION" \
     "$SPARK" ws setup --yes --remote me@10.0.0.5 --model Org/Alpha \
       --tailscale-mode ports --postgres-image postgres:18.1 \
       --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0 \
       --vikunja-username massimo --vikunja-email m@example.com --vikunja-password secret123 \
       --n8n-email n8n@example.com --n8n-password secret456 2>&1 || true)
   rm -rf "$tmp"
-  [[ "$out" == *"Installed spark CLI v0.1.3"* ]] && [[ "$out" == *"remote workspace with creds ok"* ]]
+  [[ "$out" == *"Installed spark CLI v${SPARK_VERSION}"* ]] && [[ "$out" == *"remote workspace with creds ok"* ]]
 }
 
 test_workspace_remote_check_does_not_forward_credentials() {
   local tmp fake_bin out script
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_REMOTE_SPARK_VERSION=0.1.3 \
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_REMOTE_SPARK_VERSION="$SPARK_VERSION" \
     FAKE_SSH_SCRIPT_FILE="${tmp}/remote-script.log" \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=n8n@example.com \
@@ -1832,10 +1863,10 @@ test_workspace_remote_check_does_not_forward_credentials() {
 test_workspace_doctor_remote_delegates_doctor() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_REMOTE_SPARK_VERSION=0.1.3 \
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_REMOTE_SPARK_VERSION="$SPARK_VERSION" \
     "$SPARK" ws doctor --remote me@10.0.0.5 --model Org/Alpha 2>&1 || true)
   rm -rf "$tmp"
-  [[ "$out" == *"Installed spark CLI v0.1.3"* ]] &&
+  [[ "$out" == *"Installed spark CLI v${SPARK_VERSION}"* ]] &&
     [[ "$out" == *"remote doctor ok"* ]] &&
     [[ "$out" != *"remote workspace ok"* ]]
 }
@@ -1843,10 +1874,10 @@ test_workspace_doctor_remote_delegates_doctor() {
 test_workspace_doctor_remote_delegates_strict() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_REMOTE_SPARK_VERSION=0.1.3 \
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_REMOTE_SPARK_VERSION="$SPARK_VERSION" \
     "$SPARK" ws doctor --strict --remote me@10.0.0.5 --model Org/Alpha 2>&1 || true)
   rm -rf "$tmp"
-  [[ "$out" == *"Installed spark CLI v0.1.3"* ]] &&
+  [[ "$out" == *"Installed spark CLI v${SPARK_VERSION}"* ]] &&
     [[ "$out" == *"remote strict doctor ok"* ]]
 }
 
@@ -3971,6 +4002,8 @@ test_stop_ollama_unloads() {
   [[ "$out" == *"Unloaded qwen3:30b"* ]]
 }
 
+run_test "architecture command maps core boundaries" test_architecture_command_maps_core_boundaries
+run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete

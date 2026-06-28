@@ -5732,6 +5732,42 @@ cmd_update() {
   printf "\n"
 }
 
+cmd_architecture() {
+  cat <<EOF
+
+  ${BOLD}spark architecture${NC}
+
+  ${BOLD}Packaging invariant:${NC}
+    spark is intentionally one executable Bash file. install.sh, spark update,
+    and remote setup copy/download this file only. Split runtime files only if
+    those install/update/deploy paths are changed together.
+
+  ${BOLD}Runtime domains:${NC}
+    platform      detect OS/arch/accelerator/backend and memory pool
+    profile       read model metadata, compute weights/KV/need, cache JSON
+    vllm          Docker launch, capacity admission, startup supervision
+    ollama        native Ollama launch/pull/status path
+    setup         local/remote install through ctx_* target abstraction
+    workspace     Vikunja+n8n+Postgres+Hermes compose lifecycle and doctor
+    gateway       LiteLLM provider config, YAML generation, container runtime
+    cli           command parsing, help, config, update, dispatch
+
+  ${BOLD}Boundary rules:${NC}
+    run_backend_* reads cmd_run locals via Bash dynamic scope.
+    build_launch reads run_backend_vllm locals and rebuilds docker args.
+    setup steps must use ctx_* helpers so local and remote stay equivalent.
+    workspace setup --check and doctor must stay read-only.
+    gateway config is JSON; generated LiteLLM YAML is derived state.
+
+  ${BOLD}Developer map:${NC}
+    docs/architecture.md        audit, module map, maintenance plan
+    docs/flow.md                execution flows
+    tests/run.sh                fake-bin integration tests
+    .github/workflows/ci.yml    syntax, shellcheck, full test suite
+
+EOF
+}
+
 cmd_help() {
   cat <<EOF
 
@@ -5754,6 +5790,7 @@ cmd_help() {
     gateway          Manage LiteLLM gateway (start|stop|status|logs)
     update           Update spark CLI and NGC vLLM container
     config           Configure spark settings (e.g. auto-update)
+    architecture     Show developer architecture map and invariants
 
   ${BOLD}Run flags:${NC}
     --mem <float>          GPU memory utilization (0.0-1.0), overrides auto-sizing
@@ -5798,6 +5835,7 @@ cmd_help() {
     spark status
     spark stop RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark gateway start
+    spark architecture
 
 EOF
 }
@@ -6320,24 +6358,31 @@ gateway_remove() {
 }
 
 # --- Main ---
-check_for_updates
+main() {
+  check_for_updates
 
-case "${1:-}" in
-  run)     shift; cmd_run "$@" ;;
-  stop)    shift; cmd_stop "$@" ;;
-  pull)    shift; cmd_pull "$@" ;;
-  list)    cmd_list ;;
-  rm)      shift; cmd_rm "$@" ;;
-  status)  cmd_status ;;
-  logs)    shift; cmd_logs "$@" ;;
-  doctor)  shift; cmd_doctor "$@" ;;
-  setup)   shift; cmd_setup "$@" ;;
-  ws)      shift; cmd_workspace "$@" ;;
-  update)  cmd_update ;;
-  gateway) shift; cmd_gateway "$@" ;;
-  config)  shift; cmd_config "$@" ;;
-  version) printf "spark v%s\n" "$VERSION" ;;
-  __detect) printf 'os=%s arch=%s accel=%s backend=%s\n' "$SPARK_OS" "$SPARK_ARCH" "$ACCEL" "$BACKEND" ;;
-  help|--help|-h|"") cmd_help ;;
-  *)       die "Unknown command: $1" "Run 'spark help' for usage" ;;
-esac
+  case "${1:-}" in
+    run)          shift; cmd_run "$@" ;;
+    stop)         shift; cmd_stop "$@" ;;
+    pull)         shift; cmd_pull "$@" ;;
+    list)         cmd_list ;;
+    rm)           shift; cmd_rm "$@" ;;
+    status)       cmd_status ;;
+    logs)         shift; cmd_logs "$@" ;;
+    doctor)       shift; cmd_doctor "$@" ;;
+    setup)        shift; cmd_setup "$@" ;;
+    ws)           shift; cmd_workspace "$@" ;;
+    update)       cmd_update ;;
+    gateway)      shift; cmd_gateway "$@" ;;
+    config)       shift; cmd_config "$@" ;;
+    architecture) cmd_architecture ;;
+    version)      printf "spark v%s\n" "$VERSION" ;;
+    __detect)     printf 'os=%s arch=%s accel=%s backend=%s\n' "$SPARK_OS" "$SPARK_ARCH" "$ACCEL" "$BACKEND" ;;
+    help|--help|-h|"") cmd_help ;;
+    *)            die "Unknown command: $1" "Run 'spark help' for usage" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

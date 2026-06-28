@@ -165,9 +165,12 @@ instead of 2 — roughly halving that part of the memory.
 | `spark ws backup` | Yes | Writes/verifies private backup of workspace state. | `--verify DIR` |
 | `spark update` | Yes | Updates spark CLI and/or NGC vLLM image after confirmation. | none |
 | `spark config` | Yes when setting | Shows or sets spark config. | `auto-update on\|off` |
+| `spark architecture` | No | Shows the developer module map, packaging invariant, and boundary rules. | none |
 
 Use `--help` on command groups for exact flags: `spark run --help`, `spark setup --help`,
 `spark ws --help`, `spark ws setup --help`, `spark ws doctor --help`.
+
+For contributor orientation, start with `spark architecture` and `docs/architecture.md`.
 
 ### spark setup
 
