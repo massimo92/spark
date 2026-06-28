@@ -9,7 +9,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.1.10"
+VERSION="0.1.11"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -4309,7 +4309,7 @@ workspace_ensure_gateway() {
     if [[ "$check_only" == "1" ]]; then
       setup_fail "Model not running for Hermes: $model"
     elif [[ "$auto_yes" == "1" ]] || confirm "Start ${model} now with spark run?"; then
-      cmd_run "$model"
+      cmd_run "$model" --no-wait
     else
       setup_fail "Hermes model not started: $model"
     fi
@@ -6403,7 +6403,6 @@ cmd_workspace() {
     *) die "Unknown ws command: $subcmd" "Run 'spark ws help'" ;;
   esac
 }
-
 cmd_models_recommend() {
   local json=0
   while [[ $# -gt 0 ]]; do

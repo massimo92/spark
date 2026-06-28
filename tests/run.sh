@@ -1734,6 +1734,23 @@ test_workspace_model_tui_uses_list() {
   [[ "$out" == *"Choose the model Hermes will use"* ]] && [[ "$out" == *"Org/Alpha"* ]] && [[ "$out" == *"Org/Beta"* ]]
 }
 
+test_workspace_setup_starts_model_detached() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Alpha" "$KV_CONFIG"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_TOTAL_MEM_GB=121 \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.05-py3" FAKE_NAMES='spark-litellm\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Container '"*"started"* ]] &&
+    [[ "$out" == *"Logs: "*"spark logs Org/Alpha"* ]] &&
+    [[ "$out" != *"waiting for it to serve"* ]]
+}
+
 test_workspace_setup_writes_compose_names() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out compose init tailscale_calls nemo_calls env postgres_env vikunja_env n8n_env workspace_mode compose_mode gateway_mode litellm_mode
@@ -4564,6 +4581,7 @@ run_test "workspace setup --check does not write files" test_workspace_check_no_
 run_test "workspace setup --check preserves existing config" test_workspace_check_existing_config_no_mutation
 run_test "workspace setup --check reports missing Compose plugin" test_workspace_check_reports_missing_compose_plugin
 run_test "workspace setup model picker uses spark list data" test_workspace_model_tui_uses_list
+run_test "workspace setup starts Hermes model detached" test_workspace_setup_starts_model_detached
 run_test "workspace setup rejects invalid Tailscale mode" test_workspace_setup_rejects_bad_tailscale_mode
 run_test "workspace setup rejects invalid Docker image refs" test_workspace_setup_rejects_bad_image_ref
 run_test "workspace setup rejects multiline secrets" test_workspace_setup_rejects_multiline_secret
