@@ -401,12 +401,25 @@ read_value() {
   fi
 }
 on="$(read_value FAKE_SWAP_ON FAKE_SWAP_ON_FILE 0)"
+total_mib="$(read_value FAKE_SWAP_TOTAL_MIB FAKE_SWAP_TOTAL_MIB_FILE "")"
+if [[ -z "$total_mib" ]]; then
+  total_gb="$(read_value FAKE_SWAP_TOTAL_GB FAKE_SWAP_TOTAL_GB_FILE 0)"
+  total_mib=$(( total_gb * 1024 ))
+fi
+size_mib="$(read_value FAKE_SWAPFILE_SIZE_MIB FAKE_SWAPFILE_SIZE_MIB_FILE 0)"
 used_mib="$(read_value FAKE_SWAPFILE_USED_MIB FAKE_SWAPFILE_USED_MIB_FILE "")"
 if [[ -z "$used_mib" ]]; then
   used_gb="$(read_value FAKE_SWAP_USED_GB FAKE_SWAP_USED_GB_FILE 0)"
   used_mib=$(( used_gb * 1024 ))
 fi
 case "$*" in
+  *"--show=SIZE"*|*"--show SIZE"*)
+    if [[ "$total_mib" -gt 0 ]]; then
+      printf '%s\n' $(( total_mib * 1048576 ))
+    elif [[ "$on" == "1" && "$size_mib" -gt 0 ]]; then
+      printf '%s\n' $(( size_mib * 1048576 ))
+    fi
+    ;;
   *"--show=NAME,USED"*|*"--show=NAME,USED --bytes"*)
     [[ "$on" == "1" ]] && printf '/swapfile.spark %s\n' $(( used_mib * 1048576 ))
     ;;
@@ -1385,6 +1398,24 @@ test_swap_ready_no_mutation() {
   [[ "$out" == *"Swap: on (65536MiB total)"* ]] && [[ "$out" == *"failed=0"* ]]
 }
 
+test_swap_swapon_wins_when_free_reports_zero() {
+  local tmp fake_bin setup_out doctor_out log
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; log="${tmp}/sudo.log"
+  setup_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_SWAP_TOTAL_MIB=0 FAKE_SWAP_ON=1 FAKE_SWAPFILE_SIZE_MIB=131072 FAKE_SWAPFILE_USED_MIB=0 \
+    FAKE_SWAPPINESS=10 FAKE_SUDO_LOG="$log" \
+    run_swap_step_fixture "$fake_bin" "${tmp}/home")
+  [[ ! -s "$log" ]] || { rm -rf "$tmp"; return 1; }
+  doctor_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_SWAP_TOTAL_MIB=0 FAKE_SWAP_ON=1 FAKE_SWAPFILE_SIZE_MIB=131072 \
+    FAKE_SWAPFILE_USED_MIB=0 FAKE_SWAPPINESS=10 "$SPARK" doctor 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$setup_out" == *"Swap: on (131072MiB total) via swapon (free=0MiB)"* ]] &&
+    [[ "$setup_out" == *"failed=0"* ]] &&
+    [[ "$doctor_out" == *"Swap: on (131072MiB total) via swapon (free=0MiB)"* ]] &&
+    [[ "$doctor_out" != *"Swap/swappiness not configured"* ]]
+}
+
 test_swap_wrong_swappiness_reconciles() {
   local tmp fake_bin out log sw_file
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; log="${tmp}/sudo.log"; sw_file="${tmp}/swappiness"
@@ -1394,7 +1425,7 @@ test_swap_wrong_swappiness_reconciles() {
   [[ "$(cat "$sw_file")" == "10" ]] || { rm -rf "$tmp"; return 1; }
   [[ "$(cat "$log")" != *"/swapfile.spark"* ]] || { rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
-  [[ "$out" == *"Swap: on (65536MiB total) + swappiness=10"* ]] && [[ "$out" == *"failed=0"* ]]
+  [[ "$out" == *"Swap: on (65536MiB total)"* ]] && [[ "$out" == *"swappiness=10"* ]] && [[ "$out" == *"failed=0"* ]]
 }
 
 test_swap_missing_file_creates_topup() {
@@ -4515,6 +4546,7 @@ run_test "setup --host flags missing OS hardening" test_host_check_hardening_mis
 run_test "setup --host passes with hardening present" test_host_check_hardening_present
 run_test "swap reconciled by total active swap" test_swap_reconcile_by_total
 run_test "swap ready state is a no-op" test_swap_ready_no_mutation
+run_test "swap trusts swapon when free reports zero" test_swap_swapon_wins_when_free_reports_zero
 run_test "swap fixes swappiness only" test_swap_wrong_swappiness_reconciles
 run_test "swap creates missing spark top-up" test_swap_missing_file_creates_topup
 run_test "swap activates existing inactive spark file" test_swap_existing_inactive_file_activates
