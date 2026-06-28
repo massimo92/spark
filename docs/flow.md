@@ -2,6 +2,9 @@
 
 Open in any Mermaid viewer (GitHub renders it, or paste in mermaid.live).
 
+For the current developer module map and source-boundary rules, run `spark architecture`.
+The audit and refactor plan live in `docs/architecture.md`.
+
 ## Main dispatcher
 
 ```mermaid
@@ -19,6 +22,7 @@ flowchart LR
     dispatch -->|doctor| doctor["cmd_doctor"]
     dispatch -->|update| update["cmd_update"]
     dispatch -->|gateway| gateway["cmd_gateway"]
+    dispatch -->|architecture| arch["cmd_architecture\nmodule map + invariants"]
     dispatch -->|help| help["cmd_help"]
 ```
 
