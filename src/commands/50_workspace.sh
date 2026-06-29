@@ -28,6 +28,77 @@ workspace_env_or_value() {
   fi
 }
 
+workspace_install_file() {
+  local file="$1" mode="$2" tmp
+  tmp="${file}.tmp"
+  mkdir -p "$(dirname "$file")"
+  cat > "$tmp"
+  chmod "$mode" "$tmp"
+  if [[ -f "$file" ]] && cmp -s "$tmp" "$file"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$file"
+  fi
+}
+
+workspace_data_dir_has_content() {
+  local dir
+  for dir in "$@"; do
+    [[ -d "$dir" ]] || continue
+    find "$dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q . && return 0
+  done
+  return 1
+}
+
+workspace_backup_invalid_env_file() {
+  local file="$1" suffix backup
+  [[ -f "$file" ]] || return 0
+  workspace_env_file_syntax_valid "$file" && return 0
+  suffix="${SPARK_WORKSPACE_BACKUP_SUFFIX:-$(date +%Y%m%d%H%M%S)}"
+  backup="${file}.bak.${suffix}"
+  cp "$file" "$backup" 2>/dev/null || return 0
+  chmod 600 "$backup" 2>/dev/null || true
+  warn "Backed up invalid env file: ${backup}"
+}
+
+workspace_env_or_generated_guarded() {
+  local key="$1" val=""
+  shift
+  val=$(workspace_read_env "$key" 2>/dev/null || true)
+  if [[ -n "$val" ]]; then
+    printf '%s\n' "$val"
+    return 0
+  fi
+  if workspace_data_dir_has_content "$@"; then
+    return 1
+  fi
+  workspace_random_secret
+}
+
+workspace_doctor_passes_quiet() {
+  local model="$1" old_read_only="${SPARK_WORKSPACE_READ_ONLY:-}" rc
+  SPARK_WORKSPACE_READ_ONLY=1 cmd_workspace_doctor --json --model "$model" >/dev/null 2>&1
+  rc=$?
+  if [[ -n "$old_read_only" ]]; then
+    SPARK_WORKSPACE_READ_ONLY="$old_read_only"
+  else
+    unset SPARK_WORKSPACE_READ_ONLY
+  fi
+  return "$rc"
+}
+
+workspace_doctor_failed_ids_quiet() {
+  local model="$1" old_read_only="${SPARK_WORKSPACE_READ_ONLY:-}" out
+  SPARK_WORKSPACE_READ_ONLY=1
+  out=$(cmd_workspace_doctor --json --model "$model" 2>/dev/null || true)
+  if [[ -n "$old_read_only" ]]; then
+    SPARK_WORKSPACE_READ_ONLY="$old_read_only"
+  else
+    unset SPARK_WORKSPACE_READ_ONLY
+  fi
+  printf '%s\n' "$out" | jq -r '[.checks[]? | select(.ok == false) | .id] | join(",")' 2>/dev/null || true
+}
+
 workspace_compose() {
   docker compose --env-file "$WORKSPACE_ENV_FILE" -p "$WORKSPACE_PROJECT" -f "$WORKSPACE_COMPOSE_FILE" "$@"
 }
@@ -297,12 +368,19 @@ workspace_write_files() {
     fi
   fi
   litellm_model=$(workspace_litellm_model_name "$model")
-  postgres_pass=$(workspace_env_or_generated POSTGRES_PASSWORD)
+  workspace_backup_invalid_env_file "$WORKSPACE_ENV_FILE"
+  workspace_backup_invalid_env_file "$WORKSPACE_POSTGRES_ENV_FILE"
+  workspace_backup_invalid_env_file "$WORKSPACE_VIKUNJA_ENV_FILE"
+  workspace_backup_invalid_env_file "$WORKSPACE_N8N_ENV_FILE"
+  postgres_pass=$(workspace_env_or_generated_guarded POSTGRES_PASSWORD "${WORKSPACE_DATA_DIR}/postgres") \
+    || { setup_fail "Missing Postgres password (POSTGRES_PASSWORD) while existing workspace data is present; restore it before rerun"; return 1; }
   vikunja_db_pass=$(workspace_env_or_generated VIKUNJA_DATABASE_PASSWORD)
-  vikunja_secret=$(workspace_env_or_generated VIKUNJA_SERVICE_SECRET)
+  vikunja_secret=$(workspace_env_or_generated_guarded VIKUNJA_SERVICE_SECRET "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/vikunja-files") \
+    || { setup_fail "Missing Vikunja service secret (VIKUNJA_SERVICE_SECRET) while existing workspace data is present; restore it before rerun"; return 1; }
   hermes_pass=$(workspace_env_or_value VIKUNJA_HERMES_PASSWORD "$hermes_pass")
   n8n_db_pass=$(workspace_env_or_generated DB_POSTGRESDB_PASSWORD)
-  n8n_key=$(workspace_env_or_generated N8N_ENCRYPTION_KEY)
+  n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
+    || { setup_fail "Missing n8n encryption key (N8N_ENCRYPTION_KEY) while existing workspace data is present; restore it before rerun"; return 1; }
   n8n_owner_status=$(workspace_env_or_value N8N_OWNER_SETUP_STATUS pending)
   mention_secret=$(workspace_env_or_generated WORKSPACE_MENTION_SECRET)
   if [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]]; then
@@ -358,7 +436,7 @@ workspace_write_files() {
   workspace_prepare_data_dirs
   old_umask=$(umask)
   umask 077
-  cat > "$WORKSPACE_ENV_FILE" <<EOF
+  workspace_install_file "$WORKSPACE_ENV_FILE" 600 <<EOF
 POSTGRES_DB=workspace
 POSTGRES_USER=workspace
 POSTGRES_PASSWORD=${postgres_pass}
@@ -419,16 +497,14 @@ WORKSPACE_POSTGRES_IMAGE=${postgres_image}
 WORKSPACE_VIKUNJA_IMAGE=${vikunja_image}
 WORKSPACE_N8N_IMAGE=${n8n_image}
 EOF
-  chmod 600 "$WORKSPACE_ENV_FILE"
-  cat > "$WORKSPACE_POSTGRES_ENV_FILE" <<EOF
+  workspace_install_file "$WORKSPACE_POSTGRES_ENV_FILE" 600 <<EOF
 POSTGRES_DB=workspace
 POSTGRES_USER=workspace
 POSTGRES_PASSWORD=${postgres_pass}
 VIKUNJA_DATABASE_PASSWORD=${vikunja_db_pass}
 DB_POSTGRESDB_PASSWORD=${n8n_db_pass}
 EOF
-  chmod 600 "$WORKSPACE_POSTGRES_ENV_FILE"
-  cat > "$WORKSPACE_VIKUNJA_ENV_FILE" <<EOF
+  workspace_install_file "$WORKSPACE_VIKUNJA_ENV_FILE" 600 <<EOF
 VIKUNJA_DATABASE_TYPE=postgres
 VIKUNJA_DATABASE_HOST=postgres
 VIKUNJA_DATABASE_DATABASE=vikunja
@@ -440,8 +516,7 @@ VIKUNJA_SERVICE_ENABLEREGISTRATION=false
 VIKUNJA_SERVICE_ENABLELINKSHARING=false
 VIKUNJA_SERVICE_INTERFACE=:3456
 EOF
-  chmod 600 "$WORKSPACE_VIKUNJA_ENV_FILE"
-  cat > "$WORKSPACE_N8N_ENV_FILE" <<EOF
+  workspace_install_file "$WORKSPACE_N8N_ENV_FILE" 600 <<EOF
 DB_TYPE=postgresdb
 DB_POSTGRESDB_HOST=postgres
 DB_POSTGRESDB_DATABASE=n8n
@@ -473,8 +548,7 @@ N8N_COMMUNITY_PACKAGES=[]
 N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
 NODES_EXCLUDE=["n8n-nodes-base.executeCommand","n8n-nodes-base.readWriteFile"]
 EOF
-  chmod 600 "$WORKSPACE_N8N_ENV_FILE"
-  cat > "${WORKSPACE_CONFIG_DIR}/init-db.sh" <<'EOF'
+  workspace_install_file "${WORKSPACE_CONFIG_DIR}/init-db.sh" 700 <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -499,9 +573,8 @@ ALTER DATABASE vikunja OWNER TO vikunja;
 ALTER DATABASE n8n OWNER TO n8n;
 SQL
 EOF
-  chmod 700 "${WORKSPACE_CONFIG_DIR}/init-db.sh"
   umask 022
-  cat > "$WORKSPACE_COMPOSE_FILE" <<EOF
+  workspace_install_file "$WORKSPACE_COMPOSE_FILE" 644 <<EOF
 services:
   postgres:
     image: ${postgres_image}
@@ -574,7 +647,7 @@ services:
       - ${WORKSPACE_DATA_DIR}/n8n:/home/node/.n8n
 EOF
   umask "$old_umask"
-  info "Workspace files written"
+  info "Workspace files reconciled"
 }
 
 workspace_read_env() {
@@ -705,7 +778,7 @@ workspace_create_vikunja_users() {
 }
 
 workspace_set_env_key() {
-  local key="$1" value="$2" tmp
+  local key="$1" value="$2" tmp count current
   [[ "${SPARK_WORKSPACE_READ_ONLY:-0}" == "1" ]] && return 0
   [[ -n "$key" ]] || die "Empty env key"
   [[ "$key" =~ ^[A-Z0-9_]+$ ]] || die "Invalid env key: ${key}"
@@ -713,6 +786,11 @@ workspace_set_env_key() {
   mkdir -p "$WORKSPACE_CONFIG_DIR"
   touch "$WORKSPACE_ENV_FILE"
   chmod 600 "$WORKSPACE_ENV_FILE"
+  count=$(grep -c "^${key}=" "$WORKSPACE_ENV_FILE" 2>/dev/null || true)
+  current=$(workspace_read_env "$key" 2>/dev/null || true)
+  if [[ "$count" == "1" && "$current" == "$value" ]]; then
+    return 0
+  fi
   tmp="${WORKSPACE_ENV_FILE}.tmp"
   grep -v "^${key}=" "$WORKSPACE_ENV_FILE" > "$tmp" || true
   printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -1020,6 +1098,17 @@ workspace_configure_tailscale() {
   fi
 }
 
+workspace_hermes_config_ready() {
+  local litellm_model="$1" configured_model=""
+  configured_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  [[ "$configured_model" == "$litellm_model" ]] || return 1
+  workspace_hermes_running || return 1
+  workspace_hermes_nemoclaw_configured || return 1
+  workspace_hermes_doctor_ready || return 1
+  workspace_hermes_inference_route_ready || return 1
+  workspace_hermes_dashboard_url_ready || return 1
+}
+
 workspace_setup_hermes() {
   local model="$1" tailnet="$2" check_only="$3" hermes_url litellm_model
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
@@ -1032,6 +1121,10 @@ workspace_setup_hermes() {
   if command -v nemohermes >/dev/null 2>&1; then
     info "NemoHermes: installed"
     [[ "$check_only" == "1" ]] && return 0
+    if workspace_hermes_config_ready "$litellm_model"; then
+      info "Hermes already configured with ${litellm_model}"
+      return 0
+    fi
     NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1 \
       NEMOCLAW_NON_INTERACTIVE=1 \
       NEMOCLAW_YES=1 \
@@ -1150,6 +1243,7 @@ workspace_setup() {
   local auto_yes=0 check_only=0 requested_model="" remote_spec="" requested_tail_mode=""
   local postgres_image="" vikunja_image="" n8n_image="" model tailnet
   local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_token="" n8n_email_arg="" n8n_password_arg="" funnel_action=""
+  local existing_model="" setup_overrides=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --yes) auto_yes=1; shift ;;
@@ -1217,7 +1311,32 @@ workspace_setup() {
   SETUP_SKIPPED=()
   printf "\n  ${BOLD}spark ws setup${NC} — Vikunja + n8n + Hermes\n\n"
   workspace_preflight "$check_only" || true
-  if [[ "$check_only" == "1" && -z "$requested_model" ]] && ! is_interactive; then
+  existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  if [[ -n "$requested_model" || -n "$requested_tail_mode" || -n "$postgres_image" || -n "$vikunja_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" ]]; then
+    setup_overrides=1
+  fi
+  if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
+    setup_overrides=1
+  fi
+  if [[ "$check_only" != "1" && "$setup_overrides" == "0" && -n "$existing_model" ]] && workspace_configured; then
+    if workspace_doctor_passes_quiet "$existing_model"; then
+      info "Workspace already configured"
+      return 0
+    fi
+    local failed_ids
+    failed_ids=$(workspace_doctor_failed_ids_quiet "$existing_model")
+    if [[ -n "$failed_ids" ]]; then
+      info "Workspace drift detected; reconciling: ${failed_ids}"
+    else
+      info "Workspace drift detected; reconciling"
+    fi
+  fi
+  if [[ -n "$requested_model" ]]; then
+    model=$(workspace_select_model "$requested_model")
+  elif [[ -n "$existing_model" ]]; then
+    model="$existing_model"
+    info "Hermes model: ${model} (configured)"
+  elif [[ "$check_only" == "1" ]] && ! is_interactive; then
     collect_downloaded_models
     if [[ ${#MODEL_LIST_MODELS[@]} -eq 0 ]]; then
       setup_fail "No downloaded models found for Hermes"
@@ -1249,14 +1368,34 @@ workspace_setup() {
     return $?
   fi
   local human_user human_email human_pass n8n_email n8n_pass hermes_pass
-  human_user=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_USERNAME "Vikunja human username" "$(whoami)")
-  human_email=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Vikunja human email")
-  human_pass=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_PASSWORD "Vikunja human password" "" 1)
-  n8n_email=$(workspace_prompt SPARK_WORKSPACE_N8N_EMAIL "n8n admin email" "$human_email")
-  n8n_pass=$(workspace_prompt SPARK_WORKSPACE_N8N_PASSWORD "n8n admin/basic-auth password" "" 1)
+  local existing_human_user existing_human_email existing_n8n_email existing_n8n_pass
+  existing_human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
+  existing_human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
+  existing_n8n_email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
+  existing_n8n_pass=$(workspace_read_env N8N_BASIC_AUTH_PASSWORD 2>/dev/null || true)
+  [[ -z "${SPARK_WORKSPACE_VIKUNJA_USERNAME:-}" && -n "$existing_human_user" ]] && SPARK_WORKSPACE_VIKUNJA_USERNAME="$existing_human_user"
+  [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "$existing_human_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$existing_human_email"
+  [[ -z "${SPARK_WORKSPACE_N8N_EMAIL:-}" && -n "$existing_n8n_email" ]] && SPARK_WORKSPACE_N8N_EMAIL="$existing_n8n_email"
+  [[ -z "${SPARK_WORKSPACE_N8N_PASSWORD:-}" && -n "$existing_n8n_pass" ]] && SPARK_WORKSPACE_N8N_PASSWORD="$existing_n8n_pass"
+  human_user=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_USERNAME "Vikunja human username" "${existing_human_user:-$(whoami)}")
+  human_email=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Vikunja human email" "$existing_human_email")
+  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" || -z "$existing_human_user" ]]; then
+    human_pass=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_PASSWORD "Vikunja human password" "" 1)
+  else
+    human_pass=""
+  fi
+  n8n_email=$(workspace_prompt SPARK_WORKSPACE_N8N_EMAIL "n8n admin email" "${existing_n8n_email:-$human_email}")
+  if [[ -n "${SPARK_WORKSPACE_N8N_PASSWORD:-}" || -z "$existing_n8n_pass" ]]; then
+    n8n_pass=$(workspace_prompt SPARK_WORKSPACE_N8N_PASSWORD "n8n admin/basic-auth password" "" 1)
+  else
+    n8n_pass="$existing_n8n_pass"
+  fi
   hermes_pass=$(workspace_random_secret)
-  workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$hermes_pass" "$model"
-  workspace_compose up -d && info "Compose project ${WORKSPACE_PROJECT} started" || setup_fail "Could not start workspace compose"
+  workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$hermes_pass" "$model" || {
+    workspace_summary
+    return $?
+  }
+  workspace_compose up -d --remove-orphans && info "Compose project ${WORKSPACE_PROJECT} started" || setup_fail "Could not start workspace compose"
   workspace_ensure_postgres_databases
   workspace_configure_tailscale "$tailnet" "$check_only" "$funnel_action" "$auto_yes"
   if workspace_tailscale_services_mode; then
@@ -1520,18 +1659,25 @@ workspace_doctor_fail() {
   WORKSPACE_DOCTOR_FAILED=$((WORKSPACE_DOCTOR_FAILED + 1))
 }
 
+workspace_doctor_id_from_label() {
+  LC_ALL=C printf '%s\n' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9]\{1,\}/_/g; s/^_//; s/_$//'
+}
+
 workspace_doctor_check() {
-  local label="$1"
+  local label="$1" id
   shift
+  id=$(workspace_doctor_id_from_label "$label")
   if "$@"; then
     if [[ "$WORKSPACE_DOCTOR_JSON" == "1" ]]; then
-      WORKSPACE_DOCTOR_JSON_ITEMS+=("{\"label\":\"$(workspace_doctor_json_escape "$label")\",\"ok\":true}")
+      WORKSPACE_DOCTOR_JSON_ITEMS+=("{\"id\":\"$(workspace_doctor_json_escape "$id")\",\"label\":\"$(workspace_doctor_json_escape "$label")\",\"ok\":true}")
     else
       workspace_doctor_pass "$label"
     fi
   else
     if [[ "$WORKSPACE_DOCTOR_JSON" == "1" ]]; then
-      WORKSPACE_DOCTOR_JSON_ITEMS+=("{\"label\":\"$(workspace_doctor_json_escape "$label")\",\"ok\":false}")
+      WORKSPACE_DOCTOR_JSON_ITEMS+=("{\"id\":\"$(workspace_doctor_json_escape "$id")\",\"label\":\"$(workspace_doctor_json_escape "$label")\",\"ok\":false}")
       WORKSPACE_DOCTOR_FAILED=$((WORKSPACE_DOCTOR_FAILED + 1))
     else
       workspace_doctor_fail "$label"
@@ -2162,7 +2308,8 @@ cmd_workspace_doctor() {
   workspace_doctor_check "n8n owner/admin login ready" workspace_n8n_owner_ready
   workspace_doctor_check "Workspace URLs configured" workspace_urls_configured
   workspace_doctor_check "Workspace secrets include human, hermes, n8n, token, Hermes model" workspace_env_has \
-    VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HERMES_PASSWORD N8N_BASIC_AUTH_USER \
+    POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD VIKUNJA_SERVICE_SECRET DB_POSTGRESDB_PASSWORD \
+    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HERMES_PASSWORD N8N_BASIC_AUTH_USER \
     N8N_BASIC_AUTH_PASSWORD N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
     HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
     VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_USER_STATUS
