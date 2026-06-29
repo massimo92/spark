@@ -1125,10 +1125,13 @@ workspace_setup_hermes() {
       info "Hermes already configured with ${litellm_model}"
       return 0
     fi
-    NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1 \
+    NEMOCLAW_AGENT=hermes \
+      NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1 \
       NEMOCLAW_NON_INTERACTIVE=1 \
       NEMOCLAW_YES=1 \
       NEMOCLAW_SANDBOX_NAME=hermes \
+      NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=300 \
+      NEMOCLAW_SANDBOX_READY_TIMEOUT=600 \
       NEMOCLAW_PROVIDER=custom \
       NEMOCLAW_ENDPOINT_URL="http://127.0.0.1:${GATEWAY_PORT}/v1" \
       NEMOCLAW_MODEL="$litellm_model" \
@@ -1152,6 +1155,8 @@ workspace_setup_hermes() {
       NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1 \
       NEMOCLAW_YES=1 \
       NEMOCLAW_SANDBOX_NAME=hermes \
+      NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=300 \
+      NEMOCLAW_SANDBOX_READY_TIMEOUT=600 \
       NEMOCLAW_PROVIDER=custom \
       NEMOCLAW_ENDPOINT_URL="http://127.0.0.1:${GATEWAY_PORT}/v1" \
       NEMOCLAW_MODEL="$litellm_model" \
