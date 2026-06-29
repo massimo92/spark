@@ -1,8 +1,9 @@
 name: Version bump
 
-# Auto-increment the patch version in `spark` whenever the CLI changes on main,
-# so `spark update` can detect a newer version. Only runs when `spark` itself
-# changes; the bump commit carries [skip ci] so it never re-triggers itself.
+# Auto-increment the patch version in `spark` and `src/00_bootstrap.sh` whenever
+# the CLI changes on main, so `spark update` can detect a newer version. Only
+# runs when `spark` itself changes; the bump commit carries [skip ci] so it never
+# re-triggers itself.
 on:
   push:
     branches: [main]
@@ -29,7 +30,8 @@ jobs:
           fi
           IFS=. read -r major minor patch <<< "$cur"
           new="${major}.${minor}.$((patch + 1))"
-          sed -i -E "s/^VERSION=\"[0-9]+\.[0-9]+\.[0-9]+\"/VERSION=\"${new}\"/" spark
+          sed -i -E "s/^VERSION=\"[0-9]+\.[0-9]+\.[0-9]+\"/VERSION=\"${new}\"/" spark src/00_bootstrap.sh
+          scripts/build-single-file.sh --check
           echo "VERSION ${cur} -> ${new}"
           echo "NEW_VERSION=${new}" >> "$GITHUB_ENV"
 
@@ -37,7 +39,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add spark
+          git add spark src/00_bootstrap.sh
           git commit -m "chore: bump version to ${NEW_VERSION} [skip ci]"
           git tag "v${NEW_VERSION}"
           git push origin HEAD:main --follow-tags
