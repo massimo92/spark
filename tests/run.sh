@@ -31,6 +31,7 @@ case "${1:-}" in
     ;;
   compose)
     shift
+    [[ -n "${FAKE_COMPOSE_FILE:-}" ]] && printf '%s\n' "$*" >> "${FAKE_COMPOSE_FILE}"
     case "$*" in
       version) exit "${FAKE_COMPOSE_VERSION_EXIT:-0}" ;;
       *" ps --services --status running"*) [[ -n "${FAKE_COMPOSE_SERVICES:-}" ]] && printf '%b' "${FAKE_COMPOSE_SERVICES}" || true ;;
@@ -1834,6 +1835,145 @@ test_workspace_setup_writes_compose_names() {
     [[ "$compose_mode" == "644" ]] &&
     [[ "$gateway_mode" == "600" ]] &&
     [[ "$litellm_mode" == "600" ]]
+}
+
+test_workspace_setup_healthy_fast_path_no_mutation() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env_file compose_file env_before compose_before env_after compose_after compose_calls nemo_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env_file="${tmp}/home/.config/spark/workspace/secrets.env"
+  compose_file="${tmp}/home/.config/spark/workspace/docker-compose.yml"
+  env_before=$(cksum "$env_file")
+  compose_before=$(cksum "$compose_file")
+  : > "${tmp}/compose.log"
+  : > "${tmp}/nemohermes.log"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_COMPOSE_FILE="${tmp}/compose.log" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes 2>&1)
+  status=$?
+  set -e
+  env_after=$(cksum "$env_file")
+  compose_after=$(cksum "$compose_file")
+  compose_calls=$(cat "${tmp}/compose.log" 2>/dev/null || echo "")
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$out" == *"Workspace already configured"* ]] &&
+    [[ "$env_before" == "$env_after" ]] &&
+    [[ "$compose_before" == "$compose_after" ]] &&
+    [[ "$compose_calls" != *" up -d"* ]] &&
+    [[ "$nemo_calls" != *"onboard"* ]]
+}
+
+test_workspace_setup_repairs_compose_drift_without_hermes_onboard() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status compose_file tmp_compose compose compose_calls nemo_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  compose_file="${tmp}/home/.config/spark/workspace/docker-compose.yml"
+  tmp_compose="${compose_file}.tmp"
+  grep -v 'init: true' "$compose_file" > "$tmp_compose"
+  mv "$tmp_compose" "$compose_file"
+  : > "${tmp}/compose.log"
+  : > "${tmp}/nemohermes.log"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_COMPOSE_FILE="${tmp}/compose.log" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes 2>&1)
+  status=$?
+  set -e
+  compose=$(cat "$compose_file" 2>/dev/null || echo "")
+  compose_calls=$(cat "${tmp}/compose.log" 2>/dev/null || echo "")
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$out" == *"Workspace drift detected; reconciling"* ]] &&
+    [[ "$(grep -c 'init: true' <<< "$compose")" -ge 3 ]] &&
+    [[ "$compose_calls" == *" up -d --remove-orphans"* ]] &&
+    [[ "$nemo_calls" != *"onboard"* ]]
+}
+
+test_workspace_setup_backs_up_and_normalizes_invalid_env() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env_file backups env_text
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env_file="${tmp}/home/.config/spark/workspace/secrets.env"
+  printf '%s\n' 'POSTGRES_PASSWORD=duplicate' 'BROKEN LINE' >> "$env_file"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_BACKUP_SUFFIX=testbackup \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes 2>&1)
+  status=$?
+  set -e
+  backups=$(find "${tmp}/home/.config/spark/workspace" -name 'secrets.env.bak.testbackup' -print 2>/dev/null || true)
+  env_text=$(cat "$env_file" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$out" == *"Backed up invalid env file"* ]] &&
+    [[ -n "$backups" ]] &&
+    [[ "$env_text" != *"BROKEN LINE"* ]] &&
+    [[ "$(grep -c '^POSTGRES_PASSWORD=' <<< "$env_text")" -eq 1 ]]
+}
+
+test_workspace_setup_refuses_missing_secret_with_data() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env_file tmp_env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env_file="${tmp}/home/.config/spark/workspace/secrets.env"
+  tmp_env="${env_file}.tmp"
+  grep -v '^POSTGRES_PASSWORD=' "$env_file" > "$tmp_env"
+  mv "$tmp_env" "$env_file"
+  chmod 600 "$env_file"
+  mkdir -p "${tmp}/home/.local/share/spark/workspace/postgres"
+  printf '%s\n' data > "${tmp}/home/.local/share/spark/workspace/postgres/PG_VERSION"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Missing Postgres password (POSTGRES_PASSWORD) while existing workspace data is present"* ]]
 }
 
 test_workspace_setup_fails_when_hermes_onboard_fails() {
@@ -4586,6 +4726,10 @@ run_test "workspace setup rejects invalid Tailscale mode" test_workspace_setup_r
 run_test "workspace setup rejects invalid Docker image refs" test_workspace_setup_rejects_bad_image_ref
 run_test "workspace setup rejects multiline secrets" test_workspace_setup_rejects_multiline_secret
 run_test "workspace setup writes compose services without spark prefix" test_workspace_setup_writes_compose_names
+run_test "workspace setup fast-paths healthy workspace" test_workspace_setup_healthy_fast_path_no_mutation
+run_test "workspace setup repairs compose drift without Hermes onboard" test_workspace_setup_repairs_compose_drift_without_hermes_onboard
+run_test "workspace setup backs up and normalizes invalid env" test_workspace_setup_backs_up_and_normalizes_invalid_env
+run_test "workspace setup refuses missing secret with data" test_workspace_setup_refuses_missing_secret_with_data
 run_test "workspace setup fails when Hermes onboard fails" test_workspace_setup_fails_when_hermes_onboard_fails
 run_test "workspace derives tailnet from Tailscale self DNSName" test_workspace_tailnet_from_self_dnsname
 run_test "workspace setup requires tailnet URLs" test_workspace_setup_requires_tailnet_urls
