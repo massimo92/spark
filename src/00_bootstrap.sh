@@ -197,12 +197,12 @@ detect_ngc_image() {
 
 # --- Helpers ---
 info()  { printf "  ${GREEN}✓${NC} %s\n" "$*"; }
-warn()  { printf "  ${YELLOW}⊘${NC} %s\n" "$*"; }
-err()   { printf "  ${RED}✗${NC} %s\n" "$*"; }
+warn()  { printf "  ${YELLOW}⊘${NC} %s\n" "$*" >&2; }
+err()   { printf "  ${RED}✗${NC} %s\n" "$*" >&2; }
 
 die() {
   err "$1"
-  [[ -n "${2:-}" ]] && printf "    %s\n" "$2"
+  [[ -n "${2:-}" ]] && printf "    %s\n" "$2" >&2
   exit 1
 }
 
