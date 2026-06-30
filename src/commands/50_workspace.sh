@@ -1434,7 +1434,8 @@ workspace_setup() {
   existing_human_user=$(workspace_existing_prompt_value VIKUNJA_HUMAN_USERNAME "Vikunja human username" username || true)
   existing_human_email=$(workspace_existing_prompt_value VIKUNJA_HUMAN_EMAIL "Vikunja human email" email || true)
   existing_n8n_email=$(workspace_existing_prompt_value N8N_BASIC_AUTH_USER "n8n admin email" email || true)
-  existing_n8n_pass=$(workspace_read_env N8N_BASIC_AUTH_PASSWORD 2>/dev/null || true)
+  existing_n8n_pass=$(workspace_existing_prompt_value N8N_BASIC_AUTH_PASSWORD "n8n admin/basic-auth password" text || true)
+  workspace_existing_prompt_value N8N_OWNER_FIRST_NAME "n8n owner first name" username >/dev/null || true
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_USERNAME:-}" && -n "$existing_human_user" ]] && SPARK_WORKSPACE_VIKUNJA_USERNAME="$existing_human_user"
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "$existing_human_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$existing_human_email"
   [[ -z "${SPARK_WORKSPACE_N8N_EMAIL:-}" && -n "$existing_n8n_email" ]] && SPARK_WORKSPACE_N8N_EMAIL="$existing_n8n_email"
