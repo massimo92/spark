@@ -318,6 +318,40 @@ workspace_require_single_line_value() {
     || die "${label} must be a single line"
 }
 
+workspace_value_looks_like_spark_error() {
+  local value="${1-}"
+  [[ "$value" == *"✗"* || "$value" == *" is required"* || "$value" == *" must be "* ]]
+}
+
+workspace_required_prompt_value_valid() {
+  local kind="$1" value="${2-}"
+  [[ -n "$value" ]] || return 1
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+  workspace_value_looks_like_spark_error "$value" && return 1
+  case "$kind" in
+    username) [[ "$value" =~ ^[A-Za-z0-9_.-]+$ ]] ;;
+    email) [[ "$value" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ;;
+    *) return 0 ;;
+  esac
+}
+
+workspace_require_prompt_value() {
+  local label="$1" value="${2-}" kind="${3:-text}"
+  workspace_required_prompt_value_valid "$kind" "$value" || die "${label} is invalid or missing"
+}
+
+workspace_existing_prompt_value() {
+  local key="$1" label="$2" kind="$3" value
+  value=$(workspace_read_env "$key" 2>/dev/null || true)
+  [[ -n "$value" ]] || return 0
+  if workspace_required_prompt_value_valid "$kind" "$value"; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+  warn "Ignoring invalid stored ${label}; setup will ask again"
+  workspace_set_env_key "$key" ""
+}
+
 workspace_validate_image_ref() {
   local label="$1" value="$2"
   workspace_require_single_line_value "$label" "$value"
@@ -690,13 +724,25 @@ workspace_postgres_db_exists() {
 
 workspace_postgres_ensure_role_db() {
   local role="$1" db="$2" password_key="$3" pass
+  [[ "$role" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$db" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+    || die "Invalid Postgres role/database name"
   pass=$(workspace_read_env "$password_key")
   if workspace_postgres_role_exists "$role"; then
-    workspace_postgres_psql -v password="$pass" -c "ALTER USER ${role} WITH PASSWORD :'password';" >/dev/null 2>&1 \
-      || { setup_fail "Could not update Postgres role: ${role}"; return 1; }
+    if ! workspace_postgres_psql -v password="$pass" >/dev/null 2>&1 <<SQL
+ALTER USER ${role} WITH PASSWORD :'password';
+SQL
+    then
+      setup_fail "Could not update Postgres role: ${role}"
+      return 1
+    fi
   else
-    workspace_postgres_psql -v password="$pass" -c "CREATE USER ${role} WITH PASSWORD :'password';" >/dev/null 2>&1 \
-      || { setup_fail "Could not create Postgres role: ${role}"; return 1; }
+    if ! workspace_postgres_psql -v password="$pass" >/dev/null 2>&1 <<SQL
+CREATE USER ${role} WITH PASSWORD :'password';
+SQL
+    then
+      setup_fail "Could not create Postgres role: ${role}"
+      return 1
+    fi
   fi
   if workspace_postgres_db_exists "$db"; then
     workspace_postgres_psql -c "ALTER DATABASE ${db} OWNER TO ${role};" >/dev/null 2>&1 \
@@ -1175,14 +1221,22 @@ workspace_setup_hermes() {
 workspace_prompt() {
   local var="$1" prompt="$2" default="${3:-}" secret="${4:-0}" value
   value="${!var:-}"
-  if [[ -n "$value" ]]; then printf '%s\n' "$value"; return 0; fi
+  if [[ -n "$value" ]]; then
+    if workspace_value_looks_like_spark_error "$value"; then
+      warn "Ignoring invalid ${prompt}; setup will ask again"
+      value=""
+    else
+      printf '%s\n' "$value"
+      return 0
+    fi
+  fi
   is_interactive || die "$prompt is required"
   if [[ -n "$default" ]]; then
-    printf "  %s [%s]: " "$prompt" "$default"
+    printf "  %s [%s]: " "$prompt" "$default" >&2
   else
-    printf "  %s: " "$prompt"
+    printf "  %s: " "$prompt" >&2
   fi
-  if [[ "$secret" == "1" ]]; then read -rs value; printf "\n"; else read -r value; fi
+  if [[ "$secret" == "1" ]]; then read -rs value; printf "\n" >&2; else read -r value; fi
   [[ -z "$value" ]] && value="$default"
   [[ -n "$value" ]] || die "$prompt is required"
   printf '%s\n' "$value"
@@ -1300,6 +1354,9 @@ workspace_setup() {
       SPARK_WORKSPACE_VIKUNJA_PASSWORD=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_PASSWORD "Vikunja human password" "" 1)
       SPARK_WORKSPACE_N8N_EMAIL=$(workspace_prompt SPARK_WORKSPACE_N8N_EMAIL "n8n admin email" "$SPARK_WORKSPACE_VIKUNJA_EMAIL")
       SPARK_WORKSPACE_N8N_PASSWORD=$(workspace_prompt SPARK_WORKSPACE_N8N_PASSWORD "n8n admin/basic-auth password" "" 1)
+      workspace_require_prompt_value "Vikunja human username" "$SPARK_WORKSPACE_VIKUNJA_USERNAME" username
+      workspace_require_prompt_value "Vikunja human email" "$SPARK_WORKSPACE_VIKUNJA_EMAIL" email
+      workspace_require_prompt_value "n8n admin email" "$SPARK_WORKSPACE_N8N_EMAIL" email
       export SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL SPARK_WORKSPACE_VIKUNJA_PASSWORD
       [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && export SPARK_WORKSPACE_VIKUNJA_TOKEN
       export SPARK_WORKSPACE_N8N_EMAIL SPARK_WORKSPACE_N8N_PASSWORD
@@ -1374,9 +1431,9 @@ workspace_setup() {
   fi
   local human_user human_email human_pass n8n_email n8n_pass hermes_pass
   local existing_human_user existing_human_email existing_n8n_email existing_n8n_pass
-  existing_human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
-  existing_human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
-  existing_n8n_email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
+  existing_human_user=$(workspace_existing_prompt_value VIKUNJA_HUMAN_USERNAME "Vikunja human username" username || true)
+  existing_human_email=$(workspace_existing_prompt_value VIKUNJA_HUMAN_EMAIL "Vikunja human email" email || true)
+  existing_n8n_email=$(workspace_existing_prompt_value N8N_BASIC_AUTH_USER "n8n admin email" email || true)
   existing_n8n_pass=$(workspace_read_env N8N_BASIC_AUTH_PASSWORD 2>/dev/null || true)
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_USERNAME:-}" && -n "$existing_human_user" ]] && SPARK_WORKSPACE_VIKUNJA_USERNAME="$existing_human_user"
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "$existing_human_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$existing_human_email"
@@ -1395,6 +1452,11 @@ workspace_setup() {
   else
     n8n_pass="$existing_n8n_pass"
   fi
+  workspace_require_prompt_value "Vikunja human username" "$human_user" username
+  workspace_require_prompt_value "Vikunja human email" "$human_email" email
+  workspace_require_prompt_value "n8n admin email" "$n8n_email" email
+  workspace_require_single_line_value "n8n admin/basic-auth password" "$n8n_pass"
+  [[ -n "$n8n_pass" ]] || die "n8n admin/basic-auth password is required"
   hermes_pass=$(workspace_random_secret)
   workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$hermes_pass" "$model" || {
     workspace_summary

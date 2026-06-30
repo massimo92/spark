@@ -39,10 +39,17 @@ case "${1:-}" in
       *" config --quiet"*) exit "${FAKE_COMPOSE_CONFIG_EXIT:-0}" ;;
       *" up -d"*|*" up"*) exit "${FAKE_COMPOSE_UP_EXIT:-0}" ;;
       *exec*)
+        stdin_payload=""
+        if [[ ! -t 0 ]]; then
+          stdin_payload=$(cat || true)
+        fi
+        match_payload="$*
+${stdin_payload}"
         if [[ -n "${FAKE_COMPOSE_EXEC_FILE:-}" ]]; then
           printf '%s\n' "$*" >> "${FAKE_COMPOSE_EXEC_FILE}"
+          [[ -n "$stdin_payload" ]] && printf '%s\n' "$stdin_payload" >> "${FAKE_COMPOSE_EXEC_FILE}"
         fi
-        case "$*" in
+        case "$match_payload" in
           *"/app/vikunja/vikunja doctor"*) exit "${FAKE_VIKUNJA_DOCTOR_EXIT:-0}" ;;
           *"pg_roles WHERE rolname='vikunja'"*) [[ "${FAKE_PG_ROLE_VIKUNJA:-1}" == "1" ]] && printf '1\n' ;;
           *"pg_roles WHERE rolname='n8n'"*) [[ "${FAKE_PG_ROLE_N8N:-1}" == "1" ]] && printf '1\n' ;;
@@ -2391,6 +2398,64 @@ test_workspace_setup_preserves_existing_secrets() {
     [[ "$vdb_before" == "$vdb_after" ]] &&
     [[ "$n8n_before" == "$n8n_after" ]] &&
     [[ "$token_after" == "vk_keep" ]]
+}
+
+test_workspace_setup_missing_required_values_do_not_pollute_env() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env_file env=""
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  env_file="${tmp}/home/.config/spark/workspace/secrets.env"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha </dev/null 2>&1)
+  status=$?
+  set -e
+  [[ -f "$env_file" ]] && env=$(cat "$env_file")
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Vikunja human username is required"* ]] &&
+    [[ "$env" != *"✗"* ]] &&
+    [[ "$env" != *"is required"* ]]
+}
+
+test_workspace_setup_repairs_polluted_required_env_values() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env_file env out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env_file="${tmp}/home/.config/spark/workspace/secrets.env"
+  grep -Ev '^(VIKUNJA_HUMAN_USERNAME|VIKUNJA_HUMAN_EMAIL|N8N_BASIC_AUTH_USER|N8N_OWNER_FIRST_NAME)=' "$env_file" > "${env_file}.tmp"
+  cat >> "${env_file}.tmp" <<'EOF_ENV'
+VIKUNJA_HUMAN_USERNAME=  ✗ Vikunja human username is required
+VIKUNJA_HUMAN_EMAIL=  ✗ Vikunja human email is required
+N8N_BASIC_AUTH_USER=  ✗ n8n admin email is required
+N8N_OWNER_FIRST_NAME=  ✗ Vikunja human username is required
+EOF_ENV
+  mv "${env_file}.tmp" "$env_file"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1 || true)
+  env=$(cat "$env_file")
+  rm -rf "$tmp"
+  [[ "$out" == *"Ignoring invalid stored Vikunja human username"* ]] &&
+    [[ "$env" == *"VIKUNJA_HUMAN_USERNAME=massimo"* ]] &&
+    [[ "$env" == *"VIKUNJA_HUMAN_EMAIL=m@example.com"* ]] &&
+    [[ "$env" == *"N8N_BASIC_AUTH_USER=m@example.com"* ]] &&
+    [[ "$env" == *"N8N_OWNER_FIRST_NAME=massimo"* ]] &&
+    [[ "$env" != *"✗"* ]] &&
+    [[ "$env" != *"is required"* ]]
 }
 
 test_workspace_remote_delegates() {
@@ -4751,6 +4816,8 @@ run_test "workspace setup falls back to manual Vikunja token" test_workspace_set
 run_test "workspace setup waits for Vikunja CLI" test_workspace_setup_waits_for_vikunja_cli
 run_test "workspace setup never persists human password on Vikunja failure" test_workspace_setup_never_persists_human_password_on_vikunja_failure
 run_test "workspace setup preserves existing secrets" test_workspace_setup_preserves_existing_secrets
+run_test "workspace setup missing required values does not pollute env" test_workspace_setup_missing_required_values_do_not_pollute_env
+run_test "workspace setup repairs polluted required env values" test_workspace_setup_repairs_polluted_required_env_values
 run_test "workspace setup --remote delegates to remote spark" test_workspace_remote_delegates
 run_test "workspace setup --remote delegates credentials safely" test_workspace_remote_delegates_credentials
 run_test "workspace setup --remote --check does not forward credentials" test_workspace_remote_check_does_not_forward_credentials
