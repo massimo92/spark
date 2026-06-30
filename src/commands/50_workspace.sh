@@ -1204,6 +1204,7 @@ workspace_setup_hermes() {
       NEMOCLAW_SANDBOX_NAME=hermes \
       NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=300 \
       NEMOCLAW_SANDBOX_READY_TIMEOUT=600 \
+      NEMOCLAW_NO_GPU=1 \
       NEMOCLAW_PROVIDER=custom \
       NEMOCLAW_ENDPOINT_URL="http://127.0.0.1:${GATEWAY_PORT}/v1" \
       NEMOCLAW_MODEL="$litellm_model" \
@@ -1215,6 +1216,7 @@ workspace_setup_hermes() {
       CHAT_UI_URL="$hermes_url" \
       nemohermes onboard --non-interactive --yes-i-accept-third-party-software \
         --yes \
+        --no-gpu \
         --control-ui-port "$WORKSPACE_HERMES_PORT" >/dev/null 2>&1 \
       && { workspace_set_env_key HERMES_ONBOARD_STATUS configured; info "Hermes onboarded with ${litellm_model}"; } \
       || { workspace_set_env_key HERMES_ONBOARD_STATUS manual; setup_fail "Hermes onboarding failed; run nemohermes onboard manually"; }
@@ -1229,6 +1231,7 @@ workspace_setup_hermes() {
       NEMOCLAW_SANDBOX_NAME=hermes \
       NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=300 \
       NEMOCLAW_SANDBOX_READY_TIMEOUT=600 \
+      NEMOCLAW_NO_GPU=1 \
       NEMOCLAW_PROVIDER=custom \
       NEMOCLAW_ENDPOINT_URL="http://127.0.0.1:${GATEWAY_PORT}/v1" \
       NEMOCLAW_MODEL="$litellm_model" \
