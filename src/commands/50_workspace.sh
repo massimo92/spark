@@ -1,5 +1,7 @@
 # --- Workspace setup: Vikunja + n8n + Hermes/NemoClaw behind Tailscale ---
 
+WORKSPACE_VIKUNJA_HERMES_EMAIL="${WORKSPACE_VIKUNJA_HERMES_EMAIL:-hermes@spark.invalid}"
+
 workspace_random_secret() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -base64 32 | tr -d '\n'
@@ -842,7 +844,7 @@ workspace_create_vikunja_users() {
   workspace_vikunja_cli user set-admin "$human_user" --admin >/dev/null 2>&1 \
     && { workspace_set_env_key VIKUNJA_HUMAN_ADMIN_STATUS enabled; info "Vikunja admin set: ${human_user}"; } \
     || { workspace_set_env_key VIKUNJA_HUMAN_ADMIN_STATUS manual; warn "Could not promote ${human_user}; set admin manually if needed"; }
-  workspace_ensure_vikunja_user hermes "hermes@local" "$hermes_pass" VIKUNJA_HERMES_USER_STATUS || true
+  workspace_ensure_vikunja_user hermes "$WORKSPACE_VIKUNJA_HERMES_EMAIL" "$hermes_pass" VIKUNJA_HERMES_USER_STATUS || true
   workspace_create_vikunja_hermes_token \
     || warn "Create a Vikunja API token for user 'hermes' in the UI, then rerun: spark ws setup --vikunja-token TOKEN"
 }
@@ -2232,7 +2234,7 @@ workspace_vikunja_human_ready() {
 }
 
 workspace_vikunja_hermes_ready() {
-  workspace_vikunja_user_ready hermes "hermes@local" VIKUNJA_HERMES_USER_STATUS
+  workspace_vikunja_user_ready hermes "$WORKSPACE_VIKUNJA_HERMES_EMAIL" VIKUNJA_HERMES_USER_STATUS
 }
 
 workspace_vikunja_hermes_api_ready() {
