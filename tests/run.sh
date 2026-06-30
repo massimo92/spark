@@ -551,6 +551,7 @@ EOF
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_PREFERRED_API=%s\n' "${NEMOCLAW_PREFERRED_API:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=%s\n' "${NEMOCLAW_LOCAL_INFERENCE_TIMEOUT:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_SANDBOX_READY_TIMEOUT=%s\n' "${NEMOCLAW_SANDBOX_READY_TIMEOUT:-}" >> "${FAKE_NEMOHERMES_FILE}"
+[[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_NO_GPU=%s\n' "${NEMOCLAW_NO_GPU:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'CHAT_UI_URL=%s\n' "${CHAT_UI_URL:-}" >> "${FAKE_NEMOHERMES_FILE}"
 case "$*" in
   *dashboard-url*) echo "${FAKE_NEMOHERMES_DASHBOARD_URL:-http://127.0.0.1:18789}" ;;
@@ -1804,11 +1805,12 @@ test_workspace_setup_writes_compose_names() {
     [[ "$(grep -c 'max-file: "5"' <<< "$compose")" -ge 3 ]] &&
     [[ "$tailscale_calls" == *"serve --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456"* ]] &&
     [[ "$tailscale_calls" != *"--bg"* ]] &&
-    [[ "$nemo_calls" == *"onboard --non-interactive --yes-i-accept-third-party-software --yes --control-ui-port 18789"* ]] &&
+    [[ "$nemo_calls" == *"onboard --non-interactive --yes-i-accept-third-party-software --yes --no-gpu --control-ui-port 18789"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_AGENT=hermes"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_PREFERRED_API=openai-completions"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=300"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_SANDBOX_READY_TIMEOUT=600"* ]] &&
+    [[ "$nemo_calls" == *"NEMOCLAW_NO_GPU=1"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$env" == *"HERMES_DASHBOARD_PORT=18789"* ]] &&
