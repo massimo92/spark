@@ -289,6 +289,15 @@ is_safe_ngc_tag() {
   [[ "${1:-}" =~ ^[A-Za-z0-9._+:-]+$ ]]
 }
 
+ngc_vllm_tag_newer_than() {
+  local candidate="$1" current="$2" cand_num current_num
+  [[ "$candidate" =~ ^([0-9]{2})\.([0-9]{2})-py3$ ]] || return 1
+  cand_num=$((10#${BASH_REMATCH[1]} * 100 + 10#${BASH_REMATCH[2]}))
+  [[ "$current" =~ ^([0-9]{2})\.([0-9]{2})-py3$ ]] || return 0
+  current_num=$((10#${BASH_REMATCH[1]} * 100 + 10#${BASH_REMATCH[2]}))
+  [[ "$cand_num" -gt "$current_num" ]]
+}
+
 shell_join() {
   local arg
   for arg in "$@"; do

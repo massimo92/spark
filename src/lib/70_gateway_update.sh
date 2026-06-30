@@ -187,7 +187,7 @@ check_for_updates() {
     year=$(date +%y)
     month=$(date +%m)
     next_tag="${year}.$(printf '%02d' "$month")-py3"
-    if [[ "$next_tag" != "$current_tag" ]]; then
+    if ngc_vllm_tag_newer_than "$next_tag" "$current_tag"; then
       if docker manifest inspect "nvcr.io/nvidia/vllm:${next_tag}" >/dev/null 2>&1; then
         updates+=("NGC vLLM: ${current_tag} → ${next_tag}")
       fi
@@ -514,4 +514,3 @@ gateway_remove() {
     printf "  Restart gateway to apply: ${BOLD}spark gateway stop && spark gateway start${NC}\n"
   fi
 }
-

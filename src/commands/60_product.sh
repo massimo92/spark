@@ -129,7 +129,7 @@ cmd_update() {
   for m in "$month" "$(printf '%02d' $(( 10#$month - 1 )))"; do
     [[ "$m" == "00" ]] && continue
     local candidate="${year}.${m}-py3"
-    if [[ "$candidate" != "$current_tag" ]] && \
+    if { [[ -z "$current_tag" ]] || ngc_vllm_tag_newer_than "$candidate" "$current_tag"; } && \
        docker manifest inspect "nvcr.io/nvidia/vllm:${candidate}" >/dev/null 2>&1; then
       latest_tag="$candidate"
       break
