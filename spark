@@ -4571,7 +4571,7 @@ workspace_write_files() {
   fi
   workspace_require_env_value "Vikunja human username" "$human_user"
   workspace_require_env_value "Vikunja human email" "$human_email"
-  workspace_require_env_value "Vikunja human password" "$human_pass"
+  workspace_require_env_value "Vikunja human recovery password" "$human_pass"
   workspace_require_env_value "Vikunja Hermes password" "$hermes_pass"
   workspace_require_env_value "n8n admin email" "$n8n_email"
   workspace_require_env_value "n8n admin/basic-auth password" "$n8n_pass"
@@ -4602,6 +4602,7 @@ VIKUNJA_DATABASE_PASSWORD=${vikunja_db_pass}
 VIKUNJA_SERVICE_SECRET=${vikunja_secret}
 VIKUNJA_HUMAN_USERNAME=${human_user}
 VIKUNJA_HUMAN_EMAIL=${human_email}
+VIKUNJA_HUMAN_RECOVERY_PASSWORD=${human_pass}
 VIKUNJA_HUMAN_PASSWORD=
 VIKUNJA_HUMAN_USER_STATUS=${vikunja_human_status}
 VIKUNJA_HUMAN_ADMIN_STATUS=${vikunja_human_admin_status}
@@ -4806,6 +4807,9 @@ services:
 EOF
   umask "$old_umask"
   info "Workspace files reconciled"
+  info "Generated secure workspace credentials"
+  info "Stored workspace credentials locally with 0600 permissions"
+  info "Workspace access restricted to Tailscale/private bindings"
 }
 
 workspace_read_env() {
@@ -4935,6 +4939,7 @@ workspace_create_vikunja_users() {
   human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME)
   human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL)
   hermes_pass=$(workspace_read_env VIKUNJA_HERMES_PASSWORD)
+  [[ -n "$human_pass" ]] || human_pass=$(workspace_read_env VIKUNJA_HUMAN_RECOVERY_PASSWORD 2>/dev/null || true)
   [[ -n "$human_pass" ]] || human_pass=$(workspace_read_env VIKUNJA_HUMAN_PASSWORD 2>/dev/null || true)
   workspace_ensure_vikunja_user "$human_user" "$human_email" "$human_pass" VIKUNJA_HUMAN_USER_STATUS || true
   [[ "$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)" =~ ^(created|exists)$ ]] \
@@ -5436,19 +5441,10 @@ workspace_reconcile_identity_overrides() {
     warn "Using Workspace email for both Vikunja and n8n"
     SPARK_WORKSPACE_N8N_EMAIL="$SPARK_WORKSPACE_VIKUNJA_EMAIL"
   fi
-  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" && -n "${SPARK_WORKSPACE_N8N_PASSWORD:-}" \
-    && "$SPARK_WORKSPACE_VIKUNJA_PASSWORD" != "$SPARK_WORKSPACE_N8N_PASSWORD" ]]; then
-    warn "Using Workspace password for both Vikunja and n8n"
-    SPARK_WORKSPACE_N8N_PASSWORD="$SPARK_WORKSPACE_VIKUNJA_PASSWORD"
-  fi
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "${SPARK_WORKSPACE_N8N_EMAIL:-}" ]] \
     && SPARK_WORKSPACE_VIKUNJA_EMAIL="$SPARK_WORKSPACE_N8N_EMAIL"
   [[ -z "${SPARK_WORKSPACE_N8N_EMAIL:-}" && -n "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" ]] \
     && SPARK_WORKSPACE_N8N_EMAIL="$SPARK_WORKSPACE_VIKUNJA_EMAIL"
-  [[ -z "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" && -n "${SPARK_WORKSPACE_N8N_PASSWORD:-}" ]] \
-    && SPARK_WORKSPACE_VIKUNJA_PASSWORD="$SPARK_WORKSPACE_N8N_PASSWORD"
-  [[ -z "${SPARK_WORKSPACE_N8N_PASSWORD:-}" && -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" ]] \
-    && SPARK_WORKSPACE_N8N_PASSWORD="$SPARK_WORKSPACE_VIKUNJA_PASSWORD"
   return 0
 }
 
@@ -5470,8 +5466,8 @@ workspace_remote_workspace_cmd() {
   fi
   if [[ "$send_workspace_env" == "1" ]]; then
     for key in \
-      SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL SPARK_WORKSPACE_VIKUNJA_PASSWORD SPARK_WORKSPACE_VIKUNJA_TOKEN \
-      SPARK_WORKSPACE_N8N_EMAIL SPARK_WORKSPACE_N8N_PASSWORD; do
+      SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL SPARK_WORKSPACE_VIKUNJA_TOKEN \
+      SPARK_WORKSPACE_N8N_EMAIL; do
       value="${!key:-}"
       if [[ -n "$value" ]]; then
         printf -v q '%q' "$value"
@@ -5548,10 +5544,18 @@ workspace_setup() {
   done
   [[ -n "$vikunja_username" ]] && SPARK_WORKSPACE_VIKUNJA_USERNAME="$vikunja_username"
   [[ -n "$vikunja_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$vikunja_email"
-  [[ -n "$vikunja_password" ]] && SPARK_WORKSPACE_VIKUNJA_PASSWORD="$vikunja_password"
+  [[ -n "$vikunja_password" ]] && warn "--vikunja-password is ignored; spark generates a recovery secret"
   [[ -n "$vikunja_token" ]] && SPARK_WORKSPACE_VIKUNJA_TOKEN="$vikunja_token"
   [[ -n "$n8n_email_arg" ]] && SPARK_WORKSPACE_N8N_EMAIL="$n8n_email_arg"
-  [[ -n "$n8n_password_arg" ]] && SPARK_WORKSPACE_N8N_PASSWORD="$n8n_password_arg"
+  [[ -n "$n8n_password_arg" ]] && warn "--n8n-password is ignored; spark generates a recovery secret"
+  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" ]]; then
+    warn "SPARK_WORKSPACE_VIKUNJA_PASSWORD is ignored; spark generates a recovery secret"
+    unset SPARK_WORKSPACE_VIKUNJA_PASSWORD
+  fi
+  if [[ -n "${SPARK_WORKSPACE_N8N_PASSWORD:-}" ]]; then
+    warn "SPARK_WORKSPACE_N8N_PASSWORD is ignored; spark generates a recovery secret"
+    unset SPARK_WORKSPACE_N8N_PASSWORD
+  fi
   workspace_reconcile_identity_overrides
   [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && workspace_require_env_value "Vikunja Hermes API token" "$SPARK_WORKSPACE_VIKUNJA_TOKEN"
   [[ -n "$postgres_image" ]] && workspace_validate_image_ref "Postgres image" "$postgres_image"
@@ -5563,14 +5567,12 @@ workspace_setup() {
       SPARK_WORKSPACE_VIKUNJA_USERNAME=$(workspace_prompt_username_choice SPARK_WORKSPACE_VIKUNJA_USERNAME "Workspace username" "$(whoami)")
       SPARK_WORKSPACE_VIKUNJA_EMAIL=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Workspace email" "" 0 email)
       SPARK_WORKSPACE_N8N_EMAIL="$SPARK_WORKSPACE_VIKUNJA_EMAIL"
-      SPARK_WORKSPACE_VIKUNJA_PASSWORD=$(workspace_prompt_secret_confirm SPARK_WORKSPACE_VIKUNJA_PASSWORD "Workspace password")
-      SPARK_WORKSPACE_N8N_PASSWORD="$SPARK_WORKSPACE_VIKUNJA_PASSWORD"
       workspace_require_prompt_value "Vikunja human username" "$SPARK_WORKSPACE_VIKUNJA_USERNAME" username
       workspace_require_prompt_value "Vikunja human email" "$SPARK_WORKSPACE_VIKUNJA_EMAIL" email
       workspace_require_prompt_value "n8n admin email" "$SPARK_WORKSPACE_N8N_EMAIL" email
-      export SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL SPARK_WORKSPACE_VIKUNJA_PASSWORD
+      export SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL
       [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && export SPARK_WORKSPACE_VIKUNJA_TOKEN
-      export SPARK_WORKSPACE_N8N_EMAIL SPARK_WORKSPACE_N8N_PASSWORD
+      export SPARK_WORKSPACE_N8N_EMAIL
     fi
     workspace_setup_remote "$remote_spec" "$check_only" "$auto_yes" "$requested_model" \
       "$requested_tail_mode" "$postgres_image" "$vikunja_image" "$n8n_image" "$funnel_action"
@@ -5640,10 +5642,11 @@ workspace_setup() {
     workspace_summary
     return $?
   fi
-  local human_user human_email human_pass n8n_email n8n_pass hermes_pass workspace_pass
-  local existing_human_user existing_human_email existing_n8n_email existing_n8n_pass
+  local human_user human_email human_pass n8n_email n8n_pass hermes_pass
+  local existing_human_user existing_human_email existing_human_pass existing_n8n_email existing_n8n_pass
   existing_human_user=$(workspace_existing_prompt_value VIKUNJA_HUMAN_USERNAME "Vikunja human username" username || true)
   existing_human_email=$(workspace_existing_prompt_value VIKUNJA_HUMAN_EMAIL "Vikunja human email" email || true)
+  existing_human_pass=$(workspace_existing_prompt_value VIKUNJA_HUMAN_RECOVERY_PASSWORD "Vikunja human recovery password" text || true)
   existing_n8n_email=$(workspace_existing_prompt_value N8N_BASIC_AUTH_USER "n8n admin email" email || true)
   existing_n8n_pass=$(workspace_existing_prompt_value N8N_BASIC_AUTH_PASSWORD "n8n admin/basic-auth password" text || true)
   workspace_existing_prompt_value N8N_OWNER_FIRST_NAME "n8n owner first name" username >/dev/null || true
@@ -5651,28 +5654,16 @@ workspace_setup() {
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "$existing_human_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$existing_human_email"
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "$existing_n8n_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$existing_n8n_email"
   [[ -z "${SPARK_WORKSPACE_N8N_EMAIL:-}" && -n "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" ]] && SPARK_WORKSPACE_N8N_EMAIL="$SPARK_WORKSPACE_VIKUNJA_EMAIL"
-  [[ -z "${SPARK_WORKSPACE_N8N_PASSWORD:-}" && -n "$existing_n8n_pass" ]] && SPARK_WORKSPACE_N8N_PASSWORD="$existing_n8n_pass"
   workspace_reconcile_identity_overrides
   human_user=$(workspace_prompt_username_choice SPARK_WORKSPACE_VIKUNJA_USERNAME "Workspace username" "${existing_human_user:-$(whoami)}")
   human_email=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Workspace email" "$existing_human_email" 0 email)
   n8n_email="$human_email"
   SPARK_WORKSPACE_N8N_EMAIL="$n8n_email"
-  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" || -n "${SPARK_WORKSPACE_N8N_PASSWORD:-}" ]]; then
-    workspace_reconcile_identity_overrides
-    workspace_pass=$(workspace_prompt_secret_confirm SPARK_WORKSPACE_VIKUNJA_PASSWORD "Workspace password")
-  elif [[ -n "$existing_n8n_pass" ]]; then
-    workspace_pass="$existing_n8n_pass"
-  else
-    workspace_pass=$(workspace_prompt_secret_confirm SPARK_WORKSPACE_VIKUNJA_PASSWORD "Workspace password")
-  fi
-  human_pass="$workspace_pass"
-  n8n_pass="$workspace_pass"
-  SPARK_WORKSPACE_VIKUNJA_PASSWORD="$workspace_pass"
-  SPARK_WORKSPACE_N8N_PASSWORD="$workspace_pass"
+  human_pass="${existing_human_pass:-$(workspace_random_secret)}"
+  n8n_pass="${existing_n8n_pass:-$(workspace_random_secret)}"
   workspace_require_prompt_value "Vikunja human username" "$human_user" username
   workspace_require_prompt_value "Vikunja human email" "$human_email" email
   workspace_require_prompt_value "n8n admin email" "$n8n_email" email
-  workspace_require_prompt_value "Workspace password" "$workspace_pass" text
   hermes_pass=$(workspace_random_secret)
   workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$hermes_pass" "$model" || {
     workspace_summary
@@ -5690,6 +5681,119 @@ workspace_setup() {
   workspace_create_vikunja_users "$human_pass"
   workspace_create_n8n_owner || true
   workspace_summary
+}
+
+cmd_workspace_credentials_help() {
+  cat <<EOF
+
+  ${BOLD}Usage:${NC} spark ws credentials <show|rotate|reset> [target]
+
+  Shows or rotates local recovery credentials generated by spark.
+  These are technical recovery secrets stored on the server, not human passwords.
+
+  ${BOLD}Commands:${NC}
+    show              Show workspace URLs and recovery credentials
+    rotate            Rotate all supported recovery credentials
+    reset vikunja     Rotate Vikunja human recovery secret
+    reset n8n         Rotate n8n recovery/basic-auth secret
+
+EOF
+}
+
+workspace_credentials_require_config() {
+  [[ -f "$WORKSPACE_ENV_FILE" ]] || die "Workspace is not configured" "Run 'spark ws setup' first"
+}
+
+workspace_credentials_read() {
+  workspace_read_env "$1" 2>/dev/null || true
+}
+
+cmd_workspace_credentials_show() {
+  workspace_credentials_require_config
+  local vikunja_url n8n_url hermes_url human_user human_email human_pass n8n_user n8n_pass hermes_user hermes_pass token
+  vikunja_url=$(workspace_credentials_read VIKUNJA_URL)
+  n8n_url=$(workspace_credentials_read N8N_URL)
+  hermes_url=$(workspace_credentials_read HERMES_URL)
+  human_user=$(workspace_credentials_read VIKUNJA_HUMAN_USERNAME)
+  human_email=$(workspace_credentials_read VIKUNJA_HUMAN_EMAIL)
+  human_pass=$(workspace_credentials_read VIKUNJA_HUMAN_RECOVERY_PASSWORD)
+  n8n_user=$(workspace_credentials_read N8N_BASIC_AUTH_USER)
+  n8n_pass=$(workspace_credentials_read N8N_BASIC_AUTH_PASSWORD)
+  hermes_user=$(workspace_credentials_read VIKUNJA_HERMES_USERNAME)
+  hermes_pass=$(workspace_credentials_read VIKUNJA_HERMES_PASSWORD)
+  token=$(workspace_credentials_read VIKUNJA_HERMES_API_TOKEN)
+  cat <<EOF
+
+  ${BOLD}spark ws credentials${NC}
+
+  Vikunja
+    URL:               ${vikunja_url:-n/a}
+    username:          ${human_user:-n/a}
+    email:             ${human_email:-n/a}
+    recovery password: ${human_pass:-n/a}
+
+  n8n
+    URL:               ${n8n_url:-n/a}
+    email:             ${n8n_user:-n/a}
+    recovery password: ${n8n_pass:-n/a}
+
+  Hermes/Vikunja
+    dashboard:         ${hermes_url:-n/a}
+    username:          ${hermes_user:-hermes}
+    password:          ${hermes_pass:-n/a}
+    API token:         ${token:-n/a}
+
+EOF
+}
+
+cmd_workspace_credentials_reset() {
+  local target="${1:-}" secret
+  workspace_credentials_require_config
+  [[ -n "$target" ]] || die "credentials reset requires a target" "Use vikunja, n8n, or all"
+  case "$target" in
+    all)
+      cmd_workspace_credentials_reset vikunja
+      cmd_workspace_credentials_reset n8n
+      return 0
+      ;;
+    vikunja)
+      secret=$(workspace_random_secret)
+      workspace_set_env_key VIKUNJA_HUMAN_RECOVERY_PASSWORD "$secret"
+      workspace_set_env_key VIKUNJA_HUMAN_USER_STATUS manual
+      info "Vikunja human recovery secret rotated locally"
+      warn "If the Vikunja user already exists, update that user's password in Vikunja or recreate it, then rerun spark ws setup"
+      ;;
+    n8n)
+      secret=$(workspace_random_secret)
+      workspace_set_env_key N8N_BASIC_AUTH_PASSWORD "$secret"
+      workspace_set_env_file_key "$WORKSPACE_N8N_ENV_FILE" N8N_BASIC_AUTH_PASSWORD "$secret"
+      workspace_set_env_key N8N_OWNER_SETUP_STATUS manual
+      info "n8n recovery/basic-auth secret rotated locally"
+      warn "If the n8n owner already exists, update that owner's password in n8n or finish owner setup, then rerun spark ws setup"
+      ;;
+    *)
+      die "Unknown credentials target: $target" "Use vikunja, n8n, or all"
+      ;;
+  esac
+}
+
+cmd_workspace_credentials() {
+  local subcmd="${1:-show}" target
+  [[ -n "${1:-}" ]] && shift || true
+  case "$subcmd" in
+    show) cmd_workspace_credentials_show "$@" ;;
+    rotate)
+      [[ $# -eq 0 ]] || die "credentials rotate does not take extra arguments"
+      cmd_workspace_credentials_reset all
+      ;;
+    reset)
+      target="${1:-}"
+      [[ $# -le 1 ]] || die "credentials reset accepts one target"
+      cmd_workspace_credentials_reset "$target"
+      ;;
+    help|--help|-h) cmd_workspace_credentials_help ;;
+    *) die "Unknown ws credentials command: $subcmd" "Run 'spark ws credentials help'" ;;
+  esac
 }
 
 cmd_workspace_status() {
@@ -5992,6 +6096,23 @@ workspace_env_has() {
 workspace_human_password_not_stored() {
   [[ -f "$WORKSPACE_ENV_FILE" ]] || return 1
   ! grep -Eq '^VIKUNJA_HUMAN_PASSWORD=.+$' "$WORKSPACE_ENV_FILE"
+}
+
+workspace_credentials_are_distinct() {
+  local key val seen
+  seen=""
+  for key in \
+    POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD DB_POSTGRESDB_PASSWORD VIKUNJA_SERVICE_SECRET \
+    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_RECOVERY_PASSWORD \
+    VIKUNJA_HERMES_PASSWORD N8N_BASIC_AUTH_PASSWORD VIKUNJA_HERMES_API_TOKEN; do
+    val=$(workspace_read_env "$key" || true)
+    [[ -n "$val" ]] || return 1
+    if printf '%s\n' "$seen" | grep -Fqx -- "$val"; then
+      return 1
+    fi
+    seen="${seen}${val}"$'\n'
+  done
+  return 0
 }
 
 workspace_env_file_syntax_valid() {
@@ -6600,12 +6721,13 @@ cmd_workspace_doctor() {
   workspace_doctor_check "n8n hardened for private agent workflows" workspace_n8n_hardened
   workspace_doctor_check "n8n owner/admin login ready" workspace_n8n_owner_ready
   workspace_doctor_check "Workspace URLs configured" workspace_urls_configured
-  workspace_doctor_check "Workspace secrets include human, hermes, n8n, token, Hermes model" workspace_env_has \
+  workspace_doctor_check "Workspace secrets include human recovery, hermes, n8n, token, Hermes model" workspace_env_has \
     POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD VIKUNJA_SERVICE_SECRET DB_POSTGRESDB_PASSWORD \
-    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HERMES_PASSWORD N8N_BASIC_AUTH_USER \
+    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HUMAN_RECOVERY_PASSWORD VIKUNJA_HERMES_PASSWORD N8N_BASIC_AUTH_USER \
     N8N_BASIC_AUTH_PASSWORD N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
     HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
     VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_USER_STATUS
+  workspace_doctor_check "Workspace credentials are unique per service" workspace_credentials_are_distinct
   workspace_doctor_check "Compose service running: postgres" workspace_compose_service_running postgres
   workspace_doctor_check "Shared Postgres runtime has Vikunja and n8n roles/databases" workspace_postgres_shared_runtime_ready
   workspace_doctor_check "Compose service running: vikunja" workspace_compose_service_running vikunja
@@ -6687,10 +6809,10 @@ cmd_workspace_setup_help() {
     --n8n-image IMAGE           Override n8n image ref.
     --vikunja-username NAME     Human Vikunja username.
     --vikunja-email EMAIL       Human Vikunja email.
-    --vikunja-password PASS     Human Vikunja password; prefer prompt/env.
     --vikunja-token TOKEN       Store/verify Hermes' Vikunja API token.
     --n8n-email EMAIL           n8n owner/admin email.
-    --n8n-password PASS         n8n owner/basic-auth password; prefer prompt/env.
+    --vikunja-password PASS     Deprecated: ignored; spark generates recovery secrets.
+    --n8n-password PASS         Deprecated: ignored; spark generates recovery secrets.
 
   ${BOLD}Funnel rule:${NC}
     reset = this host should have no public Funnel exposure.
@@ -6710,6 +6832,8 @@ cmd_workspace_help() {
     logs       Follow logs for vikunja, n8n, postgres, hermes, or gateway
     doctor     Read-only workspace check
     backup     Back up Vikunja, n8n, and Hermes state
+    credentials
+              Show or rotate local workspace recovery credentials
 
   Run ${BOLD}spark ws <command> --help${NC} for command-specific flags.
 
@@ -6726,10 +6850,10 @@ cmd_workspace_help() {
     --n8n-image IMAGE           Override n8n image ref
     --vikunja-username NAME     Human Vikunja username
     --vikunja-email EMAIL       Human Vikunja email
-    --vikunja-password PASS     Human Vikunja password (prefer prompt/env)
     --vikunja-token TOKEN       Store/verify Hermes' Vikunja API token
     --n8n-email EMAIL           n8n owner/admin email
-    --n8n-password PASS         n8n owner/basic-auth password (prefer prompt/env)
+    --vikunja-password PASS     Deprecated: ignored; spark generates recovery secrets
+    --n8n-password PASS         Deprecated: ignored; spark generates recovery secrets
 
 EOF
 }
@@ -6743,6 +6867,7 @@ cmd_workspace() {
     logs)   cmd_workspace_logs "$@" ;;
     doctor) cmd_workspace_doctor "$@" ;;
     backup) cmd_workspace_backup "$@" ;;
+    credentials) cmd_workspace_credentials "$@" ;;
     help|--help|-h|"") cmd_workspace_help ;;
     *) die "Unknown ws command: $subcmd" "Run 'spark ws help'" ;;
   esac
