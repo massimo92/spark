@@ -71,7 +71,7 @@ ${stdin_payload}"
                 exit 2
               fi
             fi
-            printf '%b' "${FAKE_VIKUNJA_USER_LIST:-| 1 | massimo | m@example.com | active |\n| 2 | hermes | hermes@local | active |\n}" ;;
+            printf '%b' "${FAKE_VIKUNJA_USER_LIST:-| 1 | massimo | m@example.com | active |\n| 2 | hermes | hermes@spark.invalid | active |\n}" ;;
         esac
         exit "${FAKE_COMPOSE_EXEC_EXIT:-0}" ;;
       *" cp vikunja:/tmp/vikunja.zip "*)
@@ -215,7 +215,7 @@ case "$*" in
   *:3456/api/v1/login*) echo '{"token":"jwt_hermes"}'; exit "${FAKE_VIKUNJA_LOGIN_EXIT:-0}" ;;
   *:3456/api/v1/routes*) echo '{"tasks":{"read_all":{},"create":{},"update":{},"delete":{}},"projects":{"read_all":{},"create":{},"update":{},"delete":{}},"comments":{"read_all":{},"create":{},"update":{},"delete":{}},"labels":{"read_all":{},"create":{},"update":{},"delete":{}},"webhooks":{"read_all":{},"create":{},"update":{},"delete":{}}}'; exit "${FAKE_VIKUNJA_ROUTES_EXIT:-0}" ;;
   *:3456/api/v1/tokens*) echo "{\"token\":\"${FAKE_VIKUNJA_CREATED_TOKEN:-vk_auto_hermes}\"}"; exit "${FAKE_VIKUNJA_TOKEN_CREATE_EXIT:-0}" ;;
-  *:3456/api/v1/user*) echo "${FAKE_VIKUNJA_USER_JSON:-{\"username\":\"hermes\",\"email\":\"hermes@local\"}}"; exit "${FAKE_VIKUNJA_USER_EXIT:-0}" ;;
+  *:3456/api/v1/user*) echo "${FAKE_VIKUNJA_USER_JSON:-{\"username\":\"hermes\",\"email\":\"hermes@spark.invalid\"}}"; exit "${FAKE_VIKUNJA_USER_EXIT:-0}" ;;
   *:5678/healthz*) exit "${FAKE_N8N_HEALTH_EXIT:-0}" ;;
   *:5678/rest/owner/setup*) [[ -n "${FAKE_N8N_OWNER_MARKER:-}" ]] && : > "$FAKE_N8N_OWNER_MARKER"; echo '{"data":{"id":"owner"}}'; exit "${FAKE_N8N_OWNER_EXIT:-0}" ;;
   *:5678/rest/login*)
@@ -2343,6 +2343,24 @@ test_workspace_setup_waits_for_vikunja_cli() {
     [[ "$env" != *"VIKUNJA_HUMAN_PASSWORD=secret123"* ]]
 }
 
+test_workspace_setup_creates_hermes_with_valid_email() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_COMPOSE_EXEC_FILE="${tmp}/compose-exec.log" \
+    FAKE_VIKUNJA_USER_LIST='| 1 | massimo | m@example.com | active |\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  calls=$(cat "${tmp}/compose-exec.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$calls" == *"user create -u hermes -e hermes@spark.invalid"* ]] &&
+    [[ "$calls" != *"hermes@local"* ]]
+}
+
 test_workspace_setup_never_persists_human_password_on_vikunja_failure() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin env out
@@ -2455,7 +2473,7 @@ test_workspace_setup_interactive_shared_credentials() {
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ASSUME_INTERACTIVE=1 \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_COMPOSE_EXEC_FILE="${tmp}/compose-exec.log" \
     FAKE_NAMES='spark-litellm\n' \
-    FAKE_VIKUNJA_USER_LIST='| 2 | hermes | hermes@local | active |\n' \
+    FAKE_VIKUNJA_USER_LIST='| 2 | hermes | hermes@spark.invalid | active |\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --model Org/Alpha <<< "$input" >/dev/null 2>&1 || true
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
@@ -3097,7 +3115,7 @@ test_workspace_doctor_requires_vikunja_user_and_email_same_row() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_VIKUNJA_USER_LIST='| 1 | massimo | other@example.com | active |\n| 2 | other | m@example.com | active |\n| 3 | hermes | hermes@local | active |\n' \
+    FAKE_VIKUNJA_USER_LIST='| 1 | massimo | other@example.com | active |\n| 2 | other | m@example.com | active |\n| 3 | hermes | hermes@spark.invalid | active |\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -3122,7 +3140,7 @@ test_workspace_doctor_rejects_vikunja_user_substring_match() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_VIKUNJA_USER_LIST='| 1 | massimox | m@example.com | active |\n| 2 | hermes | hermes@local | active |\n' \
+    FAKE_VIKUNJA_USER_LIST='| 1 | massimox | m@example.com | active |\n| 2 | hermes | hermes@spark.invalid | active |\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -5003,6 +5021,7 @@ run_test "workspace setup --check reports Funnel without reset" test_workspace_s
 run_test "workspace setup repairs shared Postgres runtime" test_workspace_setup_repairs_shared_postgres_runtime
 run_test "workspace setup falls back to manual Vikunja token" test_workspace_setup_manual_token_fallback
 run_test "workspace setup waits for Vikunja CLI" test_workspace_setup_waits_for_vikunja_cli
+run_test "workspace setup creates Hermes with valid email" test_workspace_setup_creates_hermes_with_valid_email
 run_test "workspace setup never persists human password on Vikunja failure" test_workspace_setup_never_persists_human_password_on_vikunja_failure
 run_test "workspace setup preserves existing secrets" test_workspace_setup_preserves_existing_secrets
 run_test "workspace setup missing required values does not pollute env" test_workspace_setup_missing_required_values_do_not_pollute_env
