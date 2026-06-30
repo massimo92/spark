@@ -598,8 +598,8 @@ case "$cmd" in
   *"export SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo"*\
 *"export SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com"*\
 *"export SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123"*\
-*"export SPARK_WORKSPACE_N8N_EMAIL=n8n@example.com"*\
-*"export SPARK_WORKSPACE_N8N_PASSWORD=secret456"*\
+*"export SPARK_WORKSPACE_N8N_EMAIL=m@example.com"*\
+*"export SPARK_WORKSPACE_N8N_PASSWORD=secret123"*\
 *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --yes --model Org/Alpha --tailscale-mode ports --postgres-image postgres:18.1 --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0"*) echo "remote workspace with creds ok" ;;
   *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --check --model Org/Alpha --tailscale-mode ports --postgres-image postgres:18.1 --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0"*) echo "remote workspace with opts ok" ;;
   *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --check --model Org/Alpha"*) echo "remote workspace ok" ;;
@@ -1655,7 +1655,7 @@ test_workspace_setup_rejects_multiline_secret() {
   [[ -e "${tmp}/home/.config/spark/workspace/secrets.env" ]] && mutated=1
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"Vikunja human password must be a single line"* ]] &&
+    [[ "$out" == *"Ignoring invalid Workspace password"* ]] &&
     [[ "$mutated" -eq 0 ]]
 }
 
@@ -2416,9 +2416,56 @@ test_workspace_setup_missing_required_values_do_not_pollute_env() {
   [[ -f "$env_file" ]] && env=$(cat "$env_file")
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"Vikunja human username is required"* ]] &&
+    [[ "$out" == *"Workspace username is required"* ]] &&
     [[ "$env" != *"✗"* ]] &&
     [[ "$env" != *"is required"* ]]
+}
+
+test_workspace_setup_rejects_dotenv_unsafe_password() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status mutated=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD='bad"secret' SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD='bad"secret' FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha </dev/null 2>&1)
+  status=$?
+  set -e
+  [[ -e "${tmp}/home/.config/spark/workspace/secrets.env" ]] && mutated=1
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Ignoring invalid Workspace password"* ]] &&
+    [[ "$mutated" -eq 0 ]]
+}
+
+test_workspace_setup_interactive_shared_credentials() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin input env n8n_env calls user
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  user=$(whoami)
+  input=$'y\nm@example.com\nsecret123\nsecret123\n'
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ASSUME_INTERACTIVE=1 \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_COMPOSE_EXEC_FILE="${tmp}/compose-exec.log" \
+    FAKE_NAMES='spark-litellm\n' \
+    FAKE_VIKUNJA_USER_LIST='| 2 | hermes | hermes@local | active |\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --model Org/Alpha <<< "$input" >/dev/null 2>&1 || true
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env" 2>/dev/null || echo "")
+  calls=$(cat "${tmp}/compose-exec.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$env" == *"VIKUNJA_HUMAN_USERNAME=${user}"* ]] &&
+    [[ "$env" == *"VIKUNJA_HUMAN_EMAIL=m@example.com"* ]] &&
+    [[ "$env" == *"N8N_BASIC_AUTH_USER=m@example.com"* ]] &&
+    [[ "$env" == *"N8N_BASIC_AUTH_PASSWORD=secret123"* ]] &&
+    [[ "$n8n_env" == *"N8N_BASIC_AUTH_USER=m@example.com"* ]] &&
+    [[ "$n8n_env" == *"N8N_BASIC_AUTH_PASSWORD=secret123"* ]] &&
+    [[ "$calls" == *"user create -u ${user} -e m@example.com -p secret123"* ]]
 }
 
 test_workspace_setup_repairs_polluted_required_env_values() {
@@ -2485,7 +2532,7 @@ EOF_ENV
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
     [[ "$out" == *"Ignoring invalid stored n8n admin/basic-auth password"* ]] &&
-    [[ "$out" == *"Vikunja human username is required"* ]] &&
+    [[ "$out" == *"Workspace username is required"* ]] &&
     [[ "$env" != *"✗"* ]] &&
     [[ "$env" != *"is required"* ]]
 }
@@ -2509,7 +2556,7 @@ test_workspace_remote_delegates_credentials() {
       --tailscale-mode ports --postgres-image postgres:18.1 \
       --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0 \
       --vikunja-username massimo --vikunja-email m@example.com --vikunja-password secret123 \
-      --n8n-email n8n@example.com --n8n-password secret456 2>&1 || true)
+      --n8n-email m@example.com --n8n-password secret123 2>&1 || true)
   rm -rf "$tmp"
   [[ "$out" == *"Installed spark CLI v${SPARK_VERSION}"* ]] && [[ "$out" == *"remote workspace with creds ok"* ]]
 }
@@ -4867,6 +4914,8 @@ run_test "workspace setup waits for Vikunja CLI" test_workspace_setup_waits_for_
 run_test "workspace setup never persists human password on Vikunja failure" test_workspace_setup_never_persists_human_password_on_vikunja_failure
 run_test "workspace setup preserves existing secrets" test_workspace_setup_preserves_existing_secrets
 run_test "workspace setup missing required values does not pollute env" test_workspace_setup_missing_required_values_do_not_pollute_env
+run_test "workspace setup rejects dotenv-unsafe password" test_workspace_setup_rejects_dotenv_unsafe_password
+run_test "workspace setup interactive credentials are shared" test_workspace_setup_interactive_shared_credentials
 run_test "workspace setup repairs polluted required env values" test_workspace_setup_repairs_polluted_required_env_values
 run_test "workspace setup cleans polluted env before missing value abort" test_workspace_setup_cleans_polluted_env_before_missing_value_abort
 run_test "workspace setup --remote delegates to remote spark" test_workspace_remote_delegates

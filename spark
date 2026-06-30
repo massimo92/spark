@@ -4423,6 +4423,24 @@ workspace_require_single_line_value() {
     || die "${label} must be a single line"
 }
 
+workspace_env_value_valid() {
+  local value="${1-}"
+  case "$value" in
+    *$'\n'*|*$'\r'*|*[[:space:]]*|*\"*|*"'"*|*\\*|*'$'*|*'`'*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+workspace_env_value_hint() {
+  printf "use one line with no spaces, quotes, backslashes, dollar signs, or backticks"
+}
+
+workspace_require_env_value() {
+  local label="$1" value="${2-}"
+  workspace_require_single_line_value "$label" "$value"
+  workspace_env_value_valid "$value" || die "${label} is not safe for Docker env files; $(workspace_env_value_hint)"
+}
+
 workspace_value_looks_like_spark_error() {
   local value="${1-}"
   [[ "$value" == *"✗"* || "$value" == *" is required"* || "$value" == *" must be "* ]]
@@ -4433,6 +4451,7 @@ workspace_required_prompt_value_valid() {
   [[ -n "$value" ]] || return 1
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
   workspace_value_looks_like_spark_error "$value" && return 1
+  workspace_env_value_valid "$value" || return 1
   case "$kind" in
     username) [[ "$value" =~ ^[A-Za-z0-9_.-]+$ ]] ;;
     email) [[ "$value" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] ;;
@@ -4550,26 +4569,26 @@ workspace_write_files() {
     n8n_protocol="http"
     n8n_secure_cookie=false
   fi
-  workspace_require_single_line_value "Vikunja human username" "$human_user"
-  workspace_require_single_line_value "Vikunja human email" "$human_email"
-  workspace_require_single_line_value "Vikunja human password" "$human_pass"
-  workspace_require_single_line_value "Vikunja Hermes password" "$hermes_pass"
-  workspace_require_single_line_value "n8n admin email" "$n8n_email"
-  workspace_require_single_line_value "n8n admin/basic-auth password" "$n8n_pass"
-  workspace_require_single_line_value "Hermes model" "$model"
-  workspace_require_single_line_value "Postgres password" "$postgres_pass"
-  workspace_require_single_line_value "Vikunja database password" "$vikunja_db_pass"
-  workspace_require_single_line_value "Vikunja service secret" "$vikunja_secret"
-  workspace_require_single_line_value "n8n database password" "$n8n_db_pass"
-  workspace_require_single_line_value "n8n encryption key" "$n8n_key"
-  workspace_require_single_line_value "workspace mention secret" "$mention_secret"
-  workspace_require_single_line_value "Vikunja Hermes API token" "$vikunja_token"
-  workspace_require_single_line_value "workspace Tailscale mode" "$tailscale_mode"
-  workspace_require_single_line_value "workspace Tailscale bind address" "$tailscale_bind_addr"
-  workspace_require_single_line_value "workspace Tailscale DNS name" "$tailscale_dns_name"
-  workspace_require_single_line_value "workspace Postgres image" "$postgres_image"
-  workspace_require_single_line_value "workspace Vikunja image" "$vikunja_image"
-  workspace_require_single_line_value "workspace n8n image" "$n8n_image"
+  workspace_require_env_value "Vikunja human username" "$human_user"
+  workspace_require_env_value "Vikunja human email" "$human_email"
+  workspace_require_env_value "Vikunja human password" "$human_pass"
+  workspace_require_env_value "Vikunja Hermes password" "$hermes_pass"
+  workspace_require_env_value "n8n admin email" "$n8n_email"
+  workspace_require_env_value "n8n admin/basic-auth password" "$n8n_pass"
+  workspace_require_env_value "Hermes model" "$model"
+  workspace_require_env_value "Postgres password" "$postgres_pass"
+  workspace_require_env_value "Vikunja database password" "$vikunja_db_pass"
+  workspace_require_env_value "Vikunja service secret" "$vikunja_secret"
+  workspace_require_env_value "n8n database password" "$n8n_db_pass"
+  workspace_require_env_value "n8n encryption key" "$n8n_key"
+  workspace_require_env_value "workspace mention secret" "$mention_secret"
+  workspace_require_env_value "Vikunja Hermes API token" "$vikunja_token"
+  workspace_require_env_value "workspace Tailscale mode" "$tailscale_mode"
+  workspace_require_env_value "workspace Tailscale bind address" "$tailscale_bind_addr"
+  workspace_require_env_value "workspace Tailscale DNS name" "$tailscale_dns_name"
+  workspace_require_env_value "workspace Postgres image" "$postgres_image"
+  workspace_require_env_value "workspace Vikunja image" "$vikunja_image"
+  workspace_require_env_value "workspace n8n image" "$n8n_image"
   mkdir -p "$WORKSPACE_CONFIG_DIR" "$WORKSPACE_DATA_DIR"/{vikunja-files,postgres,n8n,backups}
   chmod 700 "$WORKSPACE_CONFIG_DIR"
   workspace_prepare_data_dirs
@@ -4933,7 +4952,7 @@ workspace_set_env_key() {
   [[ "${SPARK_WORKSPACE_READ_ONLY:-0}" == "1" ]] && return 0
   [[ -n "$key" ]] || die "Empty env key"
   [[ "$key" =~ ^[A-Z0-9_]+$ ]] || die "Invalid env key: ${key}"
-  workspace_require_single_line_value "$key" "$value"
+  workspace_require_env_value "$key" "$value"
   mkdir -p "$WORKSPACE_CONFIG_DIR"
   touch "$WORKSPACE_ENV_FILE"
   chmod 600 "$WORKSPACE_ENV_FILE"
@@ -4955,7 +4974,7 @@ workspace_set_env_file_key() {
   [[ -f "$file" ]] || return 0
   [[ -n "$key" ]] || die "Empty env key"
   [[ "$key" =~ ^[A-Z0-9_]+$ ]] || die "Invalid env key: ${key}"
-  workspace_require_single_line_value "$key" "$value"
+  workspace_require_env_value "$key" "$value"
   tmp="${file}.tmp"
   grep -v "^${key}=" "$file" > "$tmp" || true
   printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -5324,10 +5343,10 @@ workspace_setup_hermes() {
 }
 
 workspace_prompt() {
-  local var="$1" prompt="$2" default="${3:-}" secret="${4:-0}" value
+  local var="$1" prompt="$2" default="${3:-}" secret="${4:-0}" kind="${5:-text}" value
   value="${!var:-}"
   if [[ -n "$value" ]]; then
-    if workspace_value_looks_like_spark_error "$value"; then
+    if ! workspace_required_prompt_value_valid "$kind" "$value"; then
       warn "Ignoring invalid ${prompt}; setup will ask again"
       value=""
     else
@@ -5336,15 +5355,101 @@ workspace_prompt() {
     fi
   fi
   is_interactive || die "$prompt is required"
-  if [[ -n "$default" ]]; then
-    printf "  %s [%s]: " "$prompt" "$default" >&2
-  else
-    printf "  %s: " "$prompt" >&2
+  while true; do
+    if [[ -n "$default" ]]; then
+      printf "  %s [%s]: " "$prompt" "$default" >&2
+    else
+      printf "  %s: " "$prompt" >&2
+    fi
+    if [[ "$secret" == "1" ]]; then
+      read -rs value || die "$prompt is required"
+      printf "\n" >&2
+    else
+      read -r value || die "$prompt is required"
+    fi
+    [[ -z "$value" ]] && value="$default"
+    if workspace_required_prompt_value_valid "$kind" "$value"; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    warn "${prompt} is invalid; $(workspace_env_value_hint)"
+  done
+}
+
+workspace_prompt_username_choice() {
+  local var="$1" prompt="$2" default="${3:-}" value choice
+  value="${!var:-}"
+  if [[ -n "$value" ]]; then
+    workspace_prompt "$var" "$prompt" "$default" 0 username
+    return 0
   fi
-  if [[ "$secret" == "1" ]]; then read -rs value; printf "\n" >&2; else read -r value; fi
-  [[ -z "$value" ]] && value="$default"
-  [[ -n "$value" ]] || die "$prompt is required"
-  printf '%s\n' "$value"
+  is_interactive || die "$prompt is required"
+  while true; do
+    printf "  %s [%s] (y to accept): " "$prompt" "$default" >&2
+    read -r choice || die "$prompt is required"
+    case "$choice" in
+      ""|y|Y|yes|YES|Yes) value="$default" ;;
+      *) value="$choice" ;;
+    esac
+    if workspace_required_prompt_value_valid username "$value"; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    warn "${prompt} is invalid; use letters, numbers, dot, dash, or underscore"
+  done
+}
+
+workspace_prompt_secret_confirm() {
+  local var="$1" prompt="$2" value confirm
+  value="${!var:-}"
+  if [[ -n "$value" ]]; then
+    if workspace_required_prompt_value_valid text "$value"; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    warn "Ignoring invalid ${prompt}; setup will ask again"
+    value=""
+  fi
+  is_interactive || die "$prompt is required"
+  while true; do
+    printf "  %s: " "$prompt" >&2
+    read -rs value || die "$prompt is required"
+    printf "\n" >&2
+    printf "  Confirm %s: " "$prompt" >&2
+    read -rs confirm || die "$prompt is required"
+    printf "\n" >&2
+    if [[ "$value" != "$confirm" ]]; then
+      warn "${prompt} did not match; try again"
+      continue
+    fi
+    if workspace_required_prompt_value_valid text "$value"; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    warn "${prompt} is invalid; $(workspace_env_value_hint)"
+  done
+}
+
+workspace_reconcile_identity_overrides() {
+  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "${SPARK_WORKSPACE_N8N_EMAIL:-}" \
+    && "$SPARK_WORKSPACE_VIKUNJA_EMAIL" != "$SPARK_WORKSPACE_N8N_EMAIL" ]]; then
+    warn "Using Workspace email for both Vikunja and n8n"
+    SPARK_WORKSPACE_N8N_EMAIL="$SPARK_WORKSPACE_VIKUNJA_EMAIL"
+  fi
+  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" && -n "${SPARK_WORKSPACE_N8N_PASSWORD:-}" \
+    && "$SPARK_WORKSPACE_VIKUNJA_PASSWORD" != "$SPARK_WORKSPACE_N8N_PASSWORD" ]]; then
+    warn "Using Workspace password for both Vikunja and n8n"
+    SPARK_WORKSPACE_N8N_PASSWORD="$SPARK_WORKSPACE_VIKUNJA_PASSWORD"
+  fi
+  [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "${SPARK_WORKSPACE_N8N_EMAIL:-}" ]] \
+    && SPARK_WORKSPACE_VIKUNJA_EMAIL="$SPARK_WORKSPACE_N8N_EMAIL"
+  [[ -z "${SPARK_WORKSPACE_N8N_EMAIL:-}" && -n "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" ]] \
+    && SPARK_WORKSPACE_N8N_EMAIL="$SPARK_WORKSPACE_VIKUNJA_EMAIL"
+  [[ -z "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" && -n "${SPARK_WORKSPACE_N8N_PASSWORD:-}" ]] \
+    && SPARK_WORKSPACE_VIKUNJA_PASSWORD="$SPARK_WORKSPACE_N8N_PASSWORD"
+  [[ -z "${SPARK_WORKSPACE_N8N_PASSWORD:-}" && -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" ]] \
+    && SPARK_WORKSPACE_N8N_PASSWORD="$SPARK_WORKSPACE_VIKUNJA_PASSWORD"
+  return 0
 }
 
 workspace_remote_workspace_cmd() {
@@ -5447,18 +5552,19 @@ workspace_setup() {
   [[ -n "$vikunja_token" ]] && SPARK_WORKSPACE_VIKUNJA_TOKEN="$vikunja_token"
   [[ -n "$n8n_email_arg" ]] && SPARK_WORKSPACE_N8N_EMAIL="$n8n_email_arg"
   [[ -n "$n8n_password_arg" ]] && SPARK_WORKSPACE_N8N_PASSWORD="$n8n_password_arg"
-  [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && workspace_require_single_line_value "Vikunja Hermes API token" "$SPARK_WORKSPACE_VIKUNJA_TOKEN"
+  workspace_reconcile_identity_overrides
+  [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && workspace_require_env_value "Vikunja Hermes API token" "$SPARK_WORKSPACE_VIKUNJA_TOKEN"
   [[ -n "$postgres_image" ]] && workspace_validate_image_ref "Postgres image" "$postgres_image"
   [[ -n "$vikunja_image" ]] && workspace_validate_image_ref "Vikunja image" "$vikunja_image"
   [[ -n "$n8n_image" ]] && workspace_validate_image_ref "n8n image" "$n8n_image"
   [[ -z "$remote_spec" ]] || {
     if [[ "$check_only" != "1" ]]; then
       [[ -n "$requested_model" ]] || die "--model is required with --remote ws setup"
-      SPARK_WORKSPACE_VIKUNJA_USERNAME=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_USERNAME "Vikunja human username" "$(whoami)")
-      SPARK_WORKSPACE_VIKUNJA_EMAIL=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Vikunja human email")
-      SPARK_WORKSPACE_VIKUNJA_PASSWORD=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_PASSWORD "Vikunja human password" "" 1)
-      SPARK_WORKSPACE_N8N_EMAIL=$(workspace_prompt SPARK_WORKSPACE_N8N_EMAIL "n8n admin email" "$SPARK_WORKSPACE_VIKUNJA_EMAIL")
-      SPARK_WORKSPACE_N8N_PASSWORD=$(workspace_prompt SPARK_WORKSPACE_N8N_PASSWORD "n8n admin/basic-auth password" "" 1)
+      SPARK_WORKSPACE_VIKUNJA_USERNAME=$(workspace_prompt_username_choice SPARK_WORKSPACE_VIKUNJA_USERNAME "Workspace username" "$(whoami)")
+      SPARK_WORKSPACE_VIKUNJA_EMAIL=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Workspace email" "" 0 email)
+      SPARK_WORKSPACE_N8N_EMAIL="$SPARK_WORKSPACE_VIKUNJA_EMAIL"
+      SPARK_WORKSPACE_VIKUNJA_PASSWORD=$(workspace_prompt_secret_confirm SPARK_WORKSPACE_VIKUNJA_PASSWORD "Workspace password")
+      SPARK_WORKSPACE_N8N_PASSWORD="$SPARK_WORKSPACE_VIKUNJA_PASSWORD"
       workspace_require_prompt_value "Vikunja human username" "$SPARK_WORKSPACE_VIKUNJA_USERNAME" username
       workspace_require_prompt_value "Vikunja human email" "$SPARK_WORKSPACE_VIKUNJA_EMAIL" email
       workspace_require_prompt_value "n8n admin email" "$SPARK_WORKSPACE_N8N_EMAIL" email
@@ -5534,7 +5640,7 @@ workspace_setup() {
     workspace_summary
     return $?
   fi
-  local human_user human_email human_pass n8n_email n8n_pass hermes_pass
+  local human_user human_email human_pass n8n_email n8n_pass hermes_pass workspace_pass
   local existing_human_user existing_human_email existing_n8n_email existing_n8n_pass
   existing_human_user=$(workspace_existing_prompt_value VIKUNJA_HUMAN_USERNAME "Vikunja human username" username || true)
   existing_human_email=$(workspace_existing_prompt_value VIKUNJA_HUMAN_EMAIL "Vikunja human email" email || true)
@@ -5543,26 +5649,30 @@ workspace_setup() {
   workspace_existing_prompt_value N8N_OWNER_FIRST_NAME "n8n owner first name" username >/dev/null || true
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_USERNAME:-}" && -n "$existing_human_user" ]] && SPARK_WORKSPACE_VIKUNJA_USERNAME="$existing_human_user"
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "$existing_human_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$existing_human_email"
-  [[ -z "${SPARK_WORKSPACE_N8N_EMAIL:-}" && -n "$existing_n8n_email" ]] && SPARK_WORKSPACE_N8N_EMAIL="$existing_n8n_email"
+  [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "$existing_n8n_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$existing_n8n_email"
+  [[ -z "${SPARK_WORKSPACE_N8N_EMAIL:-}" && -n "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" ]] && SPARK_WORKSPACE_N8N_EMAIL="$SPARK_WORKSPACE_VIKUNJA_EMAIL"
   [[ -z "${SPARK_WORKSPACE_N8N_PASSWORD:-}" && -n "$existing_n8n_pass" ]] && SPARK_WORKSPACE_N8N_PASSWORD="$existing_n8n_pass"
-  human_user=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_USERNAME "Vikunja human username" "${existing_human_user:-$(whoami)}")
-  human_email=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Vikunja human email" "$existing_human_email")
-  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" || -z "$existing_human_user" ]]; then
-    human_pass=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_PASSWORD "Vikunja human password" "" 1)
+  workspace_reconcile_identity_overrides
+  human_user=$(workspace_prompt_username_choice SPARK_WORKSPACE_VIKUNJA_USERNAME "Workspace username" "${existing_human_user:-$(whoami)}")
+  human_email=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Workspace email" "$existing_human_email" 0 email)
+  n8n_email="$human_email"
+  SPARK_WORKSPACE_N8N_EMAIL="$n8n_email"
+  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" || -n "${SPARK_WORKSPACE_N8N_PASSWORD:-}" ]]; then
+    workspace_reconcile_identity_overrides
+    workspace_pass=$(workspace_prompt_secret_confirm SPARK_WORKSPACE_VIKUNJA_PASSWORD "Workspace password")
+  elif [[ -n "$existing_n8n_pass" ]]; then
+    workspace_pass="$existing_n8n_pass"
   else
-    human_pass=""
+    workspace_pass=$(workspace_prompt_secret_confirm SPARK_WORKSPACE_VIKUNJA_PASSWORD "Workspace password")
   fi
-  n8n_email=$(workspace_prompt SPARK_WORKSPACE_N8N_EMAIL "n8n admin email" "${existing_n8n_email:-$human_email}")
-  if [[ -n "${SPARK_WORKSPACE_N8N_PASSWORD:-}" || -z "$existing_n8n_pass" ]]; then
-    n8n_pass=$(workspace_prompt SPARK_WORKSPACE_N8N_PASSWORD "n8n admin/basic-auth password" "" 1)
-  else
-    n8n_pass="$existing_n8n_pass"
-  fi
+  human_pass="$workspace_pass"
+  n8n_pass="$workspace_pass"
+  SPARK_WORKSPACE_VIKUNJA_PASSWORD="$workspace_pass"
+  SPARK_WORKSPACE_N8N_PASSWORD="$workspace_pass"
   workspace_require_prompt_value "Vikunja human username" "$human_user" username
   workspace_require_prompt_value "Vikunja human email" "$human_email" email
   workspace_require_prompt_value "n8n admin email" "$n8n_email" email
-  workspace_require_single_line_value "n8n admin/basic-auth password" "$n8n_pass"
-  [[ -n "$n8n_pass" ]] || die "n8n admin/basic-auth password is required"
+  workspace_require_prompt_value "Workspace password" "$workspace_pass" text
   hermes_pass=$(workspace_random_secret)
   workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$hermes_pass" "$model" || {
     workspace_summary
@@ -5888,9 +5998,19 @@ workspace_env_file_syntax_valid() {
   local file="$1"
   [[ -f "$file" ]] || return 1
   awk -F= '
+    BEGIN { sq=sprintf("%c",39) }
     /^[[:space:]]*$/ { next }
     index($0, "\r") { bad=1; next }
-    /^[A-Z0-9_]+=/{ if (seen[$1]++) bad=1; next }
+    /^[A-Z0-9_]+=/{
+      if (seen[$1]++) bad=1
+      value=$0
+      sub(/^[^=]*=/, "", value)
+      double_value=value
+      single_value=value
+      if (gsub(/"/, "", double_value) % 2) bad=1
+      if (gsub(sq, "", single_value) % 2) bad=1
+      next
+    }
     { bad=1 }
     END { exit bad }
   ' "$file"
