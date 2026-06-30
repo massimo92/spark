@@ -597,9 +597,7 @@ case "$cmd" in
   *'grep -m1 "^VERSION="'*) echo "${FAKE_REMOTE_SPARK_VERSION:-0.0.0}" ;;
   *"export SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo"*\
 *"export SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com"*\
-*"export SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123"*\
 *"export SPARK_WORKSPACE_N8N_EMAIL=m@example.com"*\
-*"export SPARK_WORKSPACE_N8N_PASSWORD=secret123"*\
 *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --yes --model Org/Alpha --tailscale-mode ports --postgres-image postgres:18.1 --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0"*) echo "remote workspace with creds ok" ;;
   *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --check --model Org/Alpha --tailscale-mode ports --postgres-image postgres:18.1 --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0"*) echo "remote workspace with opts ok" ;;
   *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --check --model Org/Alpha"*) echo "remote workspace ok" ;;
@@ -1645,9 +1643,8 @@ test_workspace_setup_rejects_multiline_secret() {
   make_cached_model "${tmp}/home" "Org/Alpha"
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
-    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
-    SPARK_WORKSPACE_VIKUNJA_PASSWORD=$'secret\nbad' SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
-    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=$'massimo\nbad' SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
   status=$?
@@ -1655,7 +1652,8 @@ test_workspace_setup_rejects_multiline_secret() {
   [[ -e "${tmp}/home/.config/spark/workspace/secrets.env" ]] && mutated=1
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"Ignoring invalid Workspace password"* ]] &&
+    [[ "$out" == *"Ignoring invalid Workspace username"* ]] &&
+    [[ "$out" == *"Workspace username is required"* ]] &&
     [[ "$mutated" -eq 0 ]]
 }
 
@@ -2421,34 +2419,39 @@ test_workspace_setup_missing_required_values_do_not_pollute_env() {
     [[ "$env" != *"is required"* ]]
 }
 
-test_workspace_setup_rejects_dotenv_unsafe_password() {
+test_workspace_setup_ignores_password_overrides_and_generates_secrets() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out status mutated=0
+  local tmp fake_bin out env human_pass n8n_pass
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
-  set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD='bad"secret' SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD='bad"secret' FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws setup --yes --model Org/Alpha </dev/null 2>&1)
-  status=$?
-  set -e
-  [[ -e "${tmp}/home/.config/spark/workspace/secrets.env" ]] && mutated=1
+    "$SPARK" ws setup --yes --model Org/Alpha </dev/null 2>&1 || true)
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  human_pass=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
+  n8n_pass=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
   rm -rf "$tmp"
-  [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"Ignoring invalid Workspace password"* ]] &&
-    [[ "$mutated" -eq 0 ]]
+  [[ "$out" == *"SPARK_WORKSPACE_VIKUNJA_PASSWORD is ignored"* ]] &&
+    [[ "$out" == *"SPARK_WORKSPACE_N8N_PASSWORD is ignored"* ]] &&
+    [[ -n "$human_pass" ]] &&
+    [[ -n "$n8n_pass" ]] &&
+    [[ "$human_pass" != 'bad"secret' ]] &&
+    [[ "$n8n_pass" != 'bad"secret' ]] &&
+    [[ "$human_pass" != "$n8n_pass" ]] &&
+    [[ "$env" == *"VIKUNJA_HUMAN_PASSWORD="* ]] &&
+    [[ "$env" != *"VIKUNJA_HUMAN_PASSWORD=bad"* ]]
 }
 
 test_workspace_setup_interactive_shared_credentials() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin input env n8n_env calls user
+  local tmp fake_bin input env n8n_env calls user human_pass n8n_pass
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   user=$(whoami)
-  input=$'y\nm@example.com\nsecret123\nsecret123\n'
+  input=$'y\nm@example.com\n'
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ASSUME_INTERACTIVE=1 \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_COMPOSE_EXEC_FILE="${tmp}/compose-exec.log" \
     FAKE_NAMES='spark-litellm\n' \
@@ -2458,14 +2461,72 @@ test_workspace_setup_interactive_shared_credentials() {
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
   n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env" 2>/dev/null || echo "")
   calls=$(cat "${tmp}/compose-exec.log" 2>/dev/null || echo "")
+  human_pass=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
+  n8n_pass=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
   rm -rf "$tmp"
   [[ "$env" == *"VIKUNJA_HUMAN_USERNAME=${user}"* ]] &&
     [[ "$env" == *"VIKUNJA_HUMAN_EMAIL=m@example.com"* ]] &&
+    [[ "$env" == *"VIKUNJA_HUMAN_RECOVERY_PASSWORD="* ]] &&
     [[ "$env" == *"N8N_BASIC_AUTH_USER=m@example.com"* ]] &&
-    [[ "$env" == *"N8N_BASIC_AUTH_PASSWORD=secret123"* ]] &&
+    [[ -n "$human_pass" ]] &&
+    [[ -n "$n8n_pass" ]] &&
+    [[ "$human_pass" != "$n8n_pass" ]] &&
     [[ "$n8n_env" == *"N8N_BASIC_AUTH_USER=m@example.com"* ]] &&
-    [[ "$n8n_env" == *"N8N_BASIC_AUTH_PASSWORD=secret123"* ]] &&
-    [[ "$calls" == *"user create -u ${user} -e m@example.com -p secret123"* ]]
+    [[ "$n8n_env" == *"N8N_BASIC_AUTH_PASSWORD=${n8n_pass}"* ]] &&
+    [[ "$calls" == *"user create -u ${user} -e m@example.com -p ${human_pass}"* ]]
+}
+
+test_workspace_credentials_show_outputs_recovery_secrets() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env out human_pass n8n_pass
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  human_pass=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
+  n8n_pass=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws credentials show 2>&1)
+  rm -rf "$tmp"
+  [[ -n "$human_pass" ]] &&
+    [[ -n "$n8n_pass" ]] &&
+    [[ "$out" == *"spark ws credentials"* ]] &&
+    [[ "$out" == *"recovery password: ${human_pass}"* ]] &&
+    [[ "$out" == *"recovery password: ${n8n_pass}"* ]]
+}
+
+test_workspace_credentials_reset_rotates_local_secrets() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env n8n_env old_human old_n8n new_human new_n8n
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  old_human=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
+  old_n8n=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws credentials reset vikunja >/dev/null 2>&1
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws credentials reset n8n >/dev/null 2>&1
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env")
+  new_human=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
+  new_n8n=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
+  rm -rf "$tmp"
+  [[ -n "$old_human" ]] &&
+    [[ -n "$old_n8n" ]] &&
+    [[ -n "$new_human" ]] &&
+    [[ -n "$new_n8n" ]] &&
+    [[ "$old_human" != "$new_human" ]] &&
+    [[ "$old_n8n" != "$new_n8n" ]] &&
+    [[ "$n8n_env" == *"N8N_BASIC_AUTH_PASSWORD=${new_n8n}"* ]] &&
+    [[ "$env" == *"VIKUNJA_HUMAN_USER_STATUS=manual"* ]] &&
+    [[ "$env" == *"N8N_OWNER_SETUP_STATUS=manual"* ]]
 }
 
 test_workspace_setup_repairs_polluted_required_env_values() {
@@ -2635,6 +2696,7 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Vikunja HTTP endpoint ready"* ]] &&
     [[ "$out" == *"[x] n8n HTTP endpoint ready"* ]] &&
     [[ "$out" == *"[x] Workspace URLs configured"* ]] &&
+    [[ "$out" == *"[x] Workspace credentials are unique per service"* ]] &&
     [[ "$out" == *"[x] Vikunja human user exists"* ]] &&
     [[ "$out" == *"[x] Vikunja hermes user exists"* ]] &&
     [[ "$out" == *"[x] Vikunja hermes API token works"* ]] &&
@@ -3308,6 +3370,36 @@ test_workspace_doctor_flags_stored_human_password() {
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
     [[ "$out" == *"[ ] Human Vikunja password is not stored"* ]]
+}
+
+test_workspace_doctor_flags_duplicate_credentials() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env_file secret
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env_file="${tmp}/home/.config/spark/workspace/secrets.env"
+  secret=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' "$env_file")
+  SECRET="$secret" awk '
+    /^N8N_BASIC_AUTH_PASSWORD=/ { print "N8N_BASIC_AUTH_PASSWORD=" ENVIRON["SECRET"]; next }
+    { print }
+  ' "$env_file" > "${env_file}.tmp"
+  mv "${env_file}.tmp" "$env_file"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] Workspace credentials are unique per service"* ]]
 }
 
 test_workspace_doctor_flags_invalid_secrets_env() {
@@ -4914,8 +5006,10 @@ run_test "workspace setup waits for Vikunja CLI" test_workspace_setup_waits_for_
 run_test "workspace setup never persists human password on Vikunja failure" test_workspace_setup_never_persists_human_password_on_vikunja_failure
 run_test "workspace setup preserves existing secrets" test_workspace_setup_preserves_existing_secrets
 run_test "workspace setup missing required values does not pollute env" test_workspace_setup_missing_required_values_do_not_pollute_env
-run_test "workspace setup rejects dotenv-unsafe password" test_workspace_setup_rejects_dotenv_unsafe_password
-run_test "workspace setup interactive credentials are shared" test_workspace_setup_interactive_shared_credentials
+run_test "workspace setup ignores password overrides and generates secrets" test_workspace_setup_ignores_password_overrides_and_generates_secrets
+run_test "workspace setup interactive credentials are generated" test_workspace_setup_interactive_shared_credentials
+run_test "workspace credentials show outputs recovery secrets" test_workspace_credentials_show_outputs_recovery_secrets
+run_test "workspace credentials reset rotates local secrets" test_workspace_credentials_reset_rotates_local_secrets
 run_test "workspace setup repairs polluted required env values" test_workspace_setup_repairs_polluted_required_env_values
 run_test "workspace setup cleans polluted env before missing value abort" test_workspace_setup_cleans_polluted_env_before_missing_value_abort
 run_test "workspace setup --remote delegates to remote spark" test_workspace_remote_delegates
@@ -4946,6 +5040,7 @@ run_test "workspace doctor rejects stale ports URLs" test_workspace_doctor_rejec
 run_test "workspace doctor rejects stale ports DNS name" test_workspace_doctor_rejects_stale_ports_dns_name
 run_test "workspace doctor flags stale n8n owner status" test_workspace_doctor_flags_stale_n8n_owner_status
 run_test "workspace doctor flags stored human password" test_workspace_doctor_flags_stored_human_password
+run_test "workspace doctor flags duplicate credentials" test_workspace_doctor_flags_duplicate_credentials
 run_test "workspace doctor flags invalid secrets env" test_workspace_doctor_flags_invalid_secrets_env
 run_test "workspace doctor flags invalid service env" test_workspace_doctor_flags_invalid_service_env
 run_test "workspace doctor flags wrong n8n cookie mode" test_workspace_doctor_flags_wrong_n8n_cookie_mode
