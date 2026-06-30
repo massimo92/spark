@@ -978,7 +978,7 @@ workspace_create_vikunja_hermes_token() {
   }
   perms=$(workspace_vikunja_api_permissions_json "$jwt")
   base_url=$(workspace_vikunja_api_base_url) || return 1
-  payload=$(printf '{"title":"spark-hermes","permissions":%s}' "$perms")
+  payload=$(printf '{"title":"spark-hermes","expires_at":"2099-12-31T23:59:59Z","permissions":%s}' "$perms")
   out=$(curl -fsS --max-time 10 \
     -H "Authorization: Bearer ${jwt}" \
     -H 'Content-Type: application/json' \
