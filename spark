@@ -289,6 +289,15 @@ is_safe_ngc_tag() {
   [[ "${1:-}" =~ ^[A-Za-z0-9._+:-]+$ ]]
 }
 
+ngc_vllm_tag_newer_than() {
+  local candidate="$1" current="$2" cand_num current_num
+  [[ "$candidate" =~ ^([0-9]{2})\.([0-9]{2})-py3$ ]] || return 1
+  cand_num=$((10#${BASH_REMATCH[1]} * 100 + 10#${BASH_REMATCH[2]}))
+  [[ "$current" =~ ^([0-9]{2})\.([0-9]{2})-py3$ ]] || return 0
+  current_num=$((10#${BASH_REMATCH[1]} * 100 + 10#${BASH_REMATCH[2]}))
+  [[ "$cand_num" -gt "$current_num" ]]
+}
+
 shell_join() {
   local arg
   for arg in "$@"; do
@@ -6749,7 +6758,7 @@ cmd_update() {
   for m in "$month" "$(printf '%02d' $(( 10#$month - 1 )))"; do
     [[ "$m" == "00" ]] && continue
     local candidate="${year}.${m}-py3"
-    if [[ "$candidate" != "$current_tag" ]] && \
+    if { [[ -z "$current_tag" ]] || ngc_vllm_tag_newer_than "$candidate" "$current_tag"; } && \
        docker manifest inspect "nvcr.io/nvidia/vllm:${candidate}" >/dev/null 2>&1; then
       latest_tag="$candidate"
       break
@@ -7245,7 +7254,7 @@ check_for_updates() {
     year=$(date +%y)
     month=$(date +%m)
     next_tag="${year}.$(printf '%02d' "$month")-py3"
-    if [[ "$next_tag" != "$current_tag" ]]; then
+    if ngc_vllm_tag_newer_than "$next_tag" "$current_tag"; then
       if docker manifest inspect "nvcr.io/nvidia/vllm:${next_tag}" >/dev/null 2>&1; then
         updates+=("NGC vLLM: ${current_tag} → ${next_tag}")
       fi
@@ -7572,7 +7581,6 @@ gateway_remove() {
     printf "  Restart gateway to apply: ${BOLD}spark gateway stop && spark gateway start${NC}\n"
   fi
 }
-
 # --- Main ---
 main() {
   check_for_updates

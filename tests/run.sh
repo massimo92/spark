@@ -4640,6 +4640,23 @@ test_config_set_and_show() {
   [[ "$set_out" == *"Auto-update enabled"* ]] && [[ "$show_out" == *"auto-update: true"* ]]
 }
 
+test_update_does_not_suggest_ngc_downgrade() {
+  local tmp fake_bin out current_tag
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  current_tag="$(date +%y.%m)-py3"
+  cat > "${fake_bin}/curl" <<EOF
+#!/usr/bin/env bash
+printf 'VERSION="%s"\\n' "$SPARK_VERSION"
+EOF
+  chmod +x "${fake_bin}/curl"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:${current_tag}" \
+    "$SPARK" update </dev/null 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"NGC vLLM is up to date (${current_tag})"* ]] &&
+    [[ "$out" != *"NGC vLLM: ${current_tag} →"* ]]
+}
+
 test_models_recommend_vllm() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -4755,6 +4772,7 @@ run_test "rm errors on a model not in cache" test_rm_not_found
 run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
+run_test "update does not suggest NGC downgrade" test_update_does_not_suggest_ngc_downgrade
 run_test "models recommend suggests vLLM models" test_models_recommend_vllm
 run_test "uninstall --purge-models removes spark state" test_uninstall_purge_removes_state
 run_test "reinstall --dry-run plans clean setup" test_reinstall_dry_run
