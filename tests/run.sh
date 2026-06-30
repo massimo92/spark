@@ -214,7 +214,7 @@ case "$*" in
   *:3456/api/v1/info*) exit "${FAKE_VIKUNJA_INFO_EXIT:-0}" ;;
   *:3456/api/v1/login*) echo '{"token":"jwt_hermes"}'; exit "${FAKE_VIKUNJA_LOGIN_EXIT:-0}" ;;
   *:3456/api/v1/routes*) echo '{"tasks":{"read_all":{},"create":{},"update":{},"delete":{}},"projects":{"read_all":{},"create":{},"update":{},"delete":{}},"comments":{"read_all":{},"create":{},"update":{},"delete":{}},"labels":{"read_all":{},"create":{},"update":{},"delete":{}},"webhooks":{"read_all":{},"create":{},"update":{},"delete":{}}}'; exit "${FAKE_VIKUNJA_ROUTES_EXIT:-0}" ;;
-  *:3456/api/v1/tokens*) echo "{\"token\":\"${FAKE_VIKUNJA_CREATED_TOKEN:-vk_auto_hermes}\"}"; exit "${FAKE_VIKUNJA_TOKEN_CREATE_EXIT:-0}" ;;
+  *:3456/api/v1/tokens*) [[ -n "${FAKE_CURL_FILE:-}" ]] && printf '%s\n' "$*" >> "${FAKE_CURL_FILE}"; echo "{\"token\":\"${FAKE_VIKUNJA_CREATED_TOKEN:-vk_auto_hermes}\"}"; exit "${FAKE_VIKUNJA_TOKEN_CREATE_EXIT:-0}" ;;
   *:3456/api/v1/user*) echo "${FAKE_VIKUNJA_USER_JSON:-{\"username\":\"hermes\",\"email\":\"hermes@spark.invalid\"}}"; exit "${FAKE_VIKUNJA_USER_EXIT:-0}" ;;
   *:5678/healthz*) exit "${FAKE_N8N_HEALTH_EXIT:-0}" ;;
   *:5678/rest/owner/setup*) [[ -n "${FAKE_N8N_OWNER_MARKER:-}" ]] && : > "$FAKE_N8N_OWNER_MARKER"; echo '{"data":{"id":"owner"}}'; exit "${FAKE_N8N_OWNER_EXIT:-0}" ;;
@@ -1763,7 +1763,7 @@ test_workspace_setup_starts_model_detached() {
 
 test_workspace_setup_writes_compose_names() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out compose init tailscale_calls nemo_calls env postgres_env vikunja_env n8n_env workspace_mode compose_mode gateway_mode litellm_mode
+  local tmp fake_bin out compose init tailscale_calls nemo_calls curl_calls env postgres_env vikunja_env n8n_env workspace_mode compose_mode gateway_mode litellm_mode
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
@@ -1772,12 +1772,14 @@ test_workspace_setup_writes_compose_names() {
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_CURL_FILE="${tmp}/curl.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1 || true)
   compose=$(cat "${tmp}/home/.config/spark/workspace/docker-compose.yml" 2>/dev/null || echo "")
   init=$(cat "${tmp}/home/.config/spark/workspace/init-db.sh" 2>/dev/null || echo "")
   tailscale_calls=$(cat "${tmp}/tailscale.log" 2>/dev/null || echo "")
   nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  curl_calls=$(cat "${tmp}/curl.log" 2>/dev/null || echo "")
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
   postgres_env=$(cat "${tmp}/home/.config/spark/workspace/postgres.env" 2>/dev/null || echo "")
   vikunja_env=$(cat "${tmp}/home/.config/spark/workspace/vikunja.env" 2>/dev/null || echo "")
@@ -1812,6 +1814,7 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"NEMOCLAW_SANDBOX_READY_TIMEOUT=600"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_NO_GPU=1"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
+    [[ "$curl_calls" == *'"expires_at":"2099-12-31T23:59:59Z"'* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$env" == *"HERMES_DASHBOARD_PORT=18789"* ]] &&
     [[ "$env" == *"HERMES_LITELLM_MODEL=vllm/Org/Alpha"* ]] &&
