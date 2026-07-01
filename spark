@@ -5168,8 +5168,6 @@ workspace_n8n_login() {
   pass=$(workspace_read_env N8N_BASIC_AUTH_PASSWORD 2>/dev/null || true)
   [[ -n "$email" && -n "$pass" ]] || return 1
   payload=$(printf '{"emailOrLdapLoginId":"%s","password":"%s"}' "$(workspace_json_escape "$email")" "$(workspace_json_escape "$pass")")
-  workspace_n8n_post_json /rest/login "$payload" && return 0
-  payload=$(printf '{"email":"%s","password":"%s"}' "$(workspace_json_escape "$email")" "$(workspace_json_escape "$pass")")
   workspace_n8n_post_json /rest/login "$payload"
 }
 
@@ -7076,52 +7074,40 @@ cmd_update() {
   command -v curl >/dev/null 2>&1 || die "curl is required for updates"
 
   local did_update=0
+  local spark_update=0 spark_remote_version=""
+  local ngc_update=0 current_ngc="" current_tag="" latest_tag=""
+  local gateway_update=0 gateway_config=""
+  local postgres_update=0 vikunja_update=0 n8n_update=0
+  local postgres_image="" vikunja_image="" n8n_image=""
+  local tailscale_update=0 tailscale_version=""
+  local nemohermes_update=0 nemohermes_status="" nemohermes_update_line=""
+  local update_count=0
+
+  printf "  Checking updates...\n"
 
   # --- spark CLI ---
-  printf "  Checking spark CLI...\n"
-  local remote_version
-  remote_version=$(curl -fsSL --max-time 5 \
+  spark_remote_version=$(curl -fsSL --max-time 5 \
     "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" 2>/dev/null \
     | grep -m1 '^VERSION=' | sed 's/VERSION="//' | sed 's/"//' || true)
 
-  if [[ -z "$remote_version" ]]; then
+  if [[ -z "$spark_remote_version" ]]; then
     warn "Could not check latest spark version"
-  elif [[ "$remote_version" == "$VERSION" ]]; then
+  elif [[ "$spark_remote_version" == "$VERSION" ]]; then
     info "spark CLI is up to date (v${VERSION})"
   else
-    printf "  spark CLI: v${VERSION} → v${remote_version}\n"
-    if confirm "Update spark CLI?"; then
-      local self
-      self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
-      curl -fsSL --max-time 10 \
-        "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" -o "${self}.tmp" 2>/dev/null
-      if [[ -s "${self}.tmp" ]] && bash -n "${self}.tmp" 2>/dev/null; then
-        chmod +x "${self}.tmp" && mv "${self}.tmp" "$self" \
-          && info "Updated spark CLI to v${remote_version}" \
-          || { rm -f "${self}.tmp"; err "Failed to replace spark binary"; }
-      else
-        rm -f "${self}.tmp"
-        err "Downloaded file is invalid, skipping"
-      fi
-      did_update=1
-    fi
+    spark_update=1
   fi
 
   # --- NGC vLLM container ---
-  printf "  Checking NGC vLLM container...\n"
-  local current_ngc
   current_ngc=$(detect_ngc_image)
-
-  local current_tag=""
   [[ -n "$current_ngc" ]] && current_tag="${current_ngc##*:}"
 
-  local latest_tag="" year month
+  local year month m candidate
   year=$(date +%y)
   month=$(date +%m)
-  # Probe current month and previous month tags
   for m in "$month" "$(printf '%02d' $(( 10#$month - 1 )))"; do
     [[ "$m" == "00" ]] && continue
-    local candidate="${year}.${m}-py3"
+    candidate="${year}.${m}-py3"
     if { [[ -z "$current_tag" ]] || ngc_vllm_tag_newer_than "$candidate" "$current_tag"; } && \
        docker manifest inspect "nvcr.io/nvidia/vllm:${candidate}" >/dev/null 2>&1; then
       latest_tag="$candidate"
@@ -7134,17 +7120,130 @@ cmd_update() {
   elif [[ -z "$latest_tag" ]]; then
     info "NGC vLLM is up to date (${current_tag})"
   else
+    ngc_update=1
+  fi
+
+  # --- LiteLLM gateway image ---
+  if command -v docker >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    gateway_config=$(gateway_load_config 2>/dev/null || echo '{}')
+    if [[ "$(printf '%s' "$gateway_config" | jq -r '.enabled // false' 2>/dev/null)" == "true" ]]; then
+      gateway_update=1
+    fi
+  fi
+
+  # --- Workspace Compose images ---
+  if [[ -f "$WORKSPACE_ENV_FILE" && -f "$WORKSPACE_COMPOSE_FILE" ]] && command -v docker >/dev/null 2>&1; then
+    postgres_image=$(workspace_read_env WORKSPACE_POSTGRES_IMAGE 2>/dev/null || true)
+    vikunja_image=$(workspace_read_env WORKSPACE_VIKUNJA_IMAGE 2>/dev/null || true)
+    n8n_image=$(workspace_read_env WORKSPACE_N8N_IMAGE 2>/dev/null || true)
+    [[ -n "$postgres_image" ]] && postgres_update=1
+    [[ -n "$vikunja_image" ]] && vikunja_update=1
+    [[ -n "$n8n_image" ]] && n8n_update=1
+  fi
+
+  # --- NemoHermes sandbox ---
+  if command -v nemohermes >/dev/null 2>&1; then
+    nemohermes_status=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes status 2>/dev/null || \
+      NEMOCLAW_SANDBOX_NAME=hermes nemohermes status 2>/dev/null || true)
+    nemohermes_update_line=$(printf '%s\n' "$nemohermes_status" | grep -i 'update:.*available' | head -1 || true)
+    [[ -n "$nemohermes_update_line" ]] && nemohermes_update=1
+  fi
+
+  # --- Tailscale self-update ---
+  if command -v tailscale >/dev/null 2>&1; then
+    tailscale_version=$(tailscale version 2>/dev/null | awk 'NR==1 {print $1}')
+    tailscale_update=1
+  fi
+
+  update_count=$(( spark_update + ngc_update + gateway_update + postgres_update + vikunja_update + n8n_update + nemohermes_update + tailscale_update ))
+
+  printf "\n  Available update actions:\n"
+  if [[ "$update_count" -eq 0 ]]; then
+    printf "    none\n"
+    printf "  No updates applied.\n\n"
+    return 0
+  fi
+  [[ "$spark_update" -eq 1 ]] && printf "    - spark CLI: v%s → v%s\n" "$VERSION" "$spark_remote_version"
+  if [[ "$ngc_update" -eq 1 ]]; then
     if [[ -n "$current_tag" ]]; then
-      printf "  NGC vLLM: ${current_tag} → ${latest_tag}\n"
+      printf "    - NGC vLLM: %s → %s\n" "$current_tag" "$latest_tag"
     else
-      printf "  NGC vLLM: ${latest_tag} available\n"
+      printf "    - NGC vLLM: %s available\n" "$latest_tag"
     fi
-    if confirm "Pull nvcr.io/nvidia/vllm:${latest_tag}?"; then
-      docker pull "nvcr.io/nvidia/vllm:${latest_tag}" \
-        && info "Pulled nvcr.io/nvidia/vllm:${latest_tag}" \
-        || err "Failed to pull NGC container"
+  fi
+  [[ "$gateway_update" -eq 1 ]] && printf "    - LiteLLM gateway image: %s\n" "$LITELLM_IMAGE"
+  [[ "$postgres_update" -eq 1 ]] && printf "    - Postgres image: %s\n" "$postgres_image"
+  [[ "$vikunja_update" -eq 1 ]] && printf "    - Vikunja image: %s\n" "$vikunja_image"
+  [[ "$n8n_update" -eq 1 ]] && printf "    - n8n image: %s\n" "$n8n_image"
+  [[ "$nemohermes_update" -eq 1 ]] && printf "    - NemoHermes: %s\n" "$(workspace_trim "$nemohermes_update_line")"
+  [[ "$tailscale_update" -eq 1 ]] && printf "    - Tailscale self-update check%s\n" "${tailscale_version:+ (current ${tailscale_version})}"
+  printf "\n"
+
+  if [[ "$spark_update" -eq 1 ]] && confirm "Update spark CLI to v${spark_remote_version}?"; then
+    local self
+    self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
+    curl -fsSL --max-time 10 \
+      "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" -o "${self}.tmp" 2>/dev/null
+    if [[ -s "${self}.tmp" ]] && bash -n "${self}.tmp" 2>/dev/null; then
+      chmod +x "${self}.tmp" && mv "${self}.tmp" "$self" \
+        && info "Updated spark CLI to v${spark_remote_version}" \
+        || { rm -f "${self}.tmp"; err "Failed to replace spark binary"; }
+    else
+      rm -f "${self}.tmp"
+      err "Downloaded file is invalid, skipping"
+    fi
+    did_update=1
+  fi
+
+  if [[ "$ngc_update" -eq 1 ]] && confirm "Pull nvcr.io/nvidia/vllm:${latest_tag}?"; then
+    docker pull "nvcr.io/nvidia/vllm:${latest_tag}" \
+      && info "Pulled nvcr.io/nvidia/vllm:${latest_tag}" \
+      || err "Failed to pull NGC container"
+    did_update=1
+  fi
+
+  if [[ "$gateway_update" -eq 1 ]] && confirm "Update LiteLLM gateway image?"; then
+    if docker pull "$LITELLM_IMAGE"; then
+      if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$GATEWAY_CONTAINER"; then
+        docker rm -f "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+        gateway_start >/dev/null 2>&1 && info "LiteLLM gateway restarted with updated image" || err "Failed to restart LiteLLM gateway"
+      else
+        info "Pulled ${LITELLM_IMAGE}"
+      fi
       did_update=1
+    else
+      err "Failed to pull LiteLLM gateway image"
     fi
+  fi
+
+  local workspace_images_updated=0
+  if [[ "$postgres_update" -eq 1 ]] && confirm "Update Postgres image (${postgres_image})?"; then
+    workspace_compose pull postgres && workspace_images_updated=1 && did_update=1 || err "Failed to pull Postgres image"
+  fi
+  if [[ "$vikunja_update" -eq 1 ]] && confirm "Update Vikunja image (${vikunja_image})?"; then
+    workspace_compose pull vikunja && workspace_images_updated=1 && did_update=1 || err "Failed to pull Vikunja image"
+  fi
+  if [[ "$n8n_update" -eq 1 ]] && confirm "Update n8n image (${n8n_image})?"; then
+    workspace_compose pull n8n && workspace_images_updated=1 && did_update=1 || err "Failed to pull n8n image"
+  fi
+  if [[ "$workspace_images_updated" -eq 1 ]]; then
+    workspace_compose up -d --remove-orphans \
+      && info "Workspace compose reconciled with updated images" \
+      || err "Failed to restart workspace compose"
+  fi
+
+  if [[ "$nemohermes_update" -eq 1 ]] && confirm "Update NemoHermes sandbox?"; then
+    NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes rebuild \
+      && info "NemoHermes sandbox updated" \
+      || err "Failed to update NemoHermes sandbox"
+    did_update=1
+  fi
+
+  if [[ "$tailscale_update" -eq 1 ]] && confirm "Run Tailscale self-update?"; then
+    tailscale update \
+      && info "Tailscale update completed" \
+      || err "Failed to update Tailscale"
+    did_update=1
   fi
 
   if [[ "$did_update" -eq 0 ]]; then
@@ -7375,7 +7474,7 @@ cmd_help() {
     gateway          Manage LiteLLM gateway (start|stop|status|logs)
     reinstall        Remove spark state and run setup again
     uninstall        Remove spark-managed runtime/config/data
-    update           Update spark CLI and NGC vLLM container
+    update           Check and apply Spark, model, workspace, and tool updates
     config           Configure spark settings (e.g. auto-update)
     architecture     Show developer architecture map and invariants
 

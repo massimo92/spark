@@ -1062,8 +1062,6 @@ workspace_n8n_login() {
   pass=$(workspace_read_env N8N_BASIC_AUTH_PASSWORD 2>/dev/null || true)
   [[ -n "$email" && -n "$pass" ]] || return 1
   payload=$(printf '{"emailOrLdapLoginId":"%s","password":"%s"}' "$(workspace_json_escape "$email")" "$(workspace_json_escape "$pass")")
-  workspace_n8n_post_json /rest/login "$payload" && return 0
-  payload=$(printf '{"email":"%s","password":"%s"}' "$(workspace_json_escape "$email")" "$(workspace_json_escape "$pass")")
   workspace_n8n_post_json /rest/login "$payload"
 }
 
