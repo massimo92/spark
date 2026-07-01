@@ -4911,6 +4911,8 @@ EOF
     [[ "$nemo_log" == *"hermes rebuild"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_ENDPOINT_URL=http://127.0.0.1:4000/v1"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_MODEL=vllm/Org/Alpha"* ]] &&
+    [[ "$nemo_log" == *"NEMOCLAW_NO_GPU=1"* ]] &&
+    [[ "$nemo_log" == *"NEMOCLAW_SANDBOX_GPU=0"* ]] &&
     [[ "$nemo_log" == *"COMPATIBLE_API_KEY=dummy"* ]]
 }
 
