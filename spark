@@ -7074,7 +7074,6 @@ nemohermes_rebuild_with_workspace_env() {
 
   compatible_api_key="${COMPATIBLE_API_KEY:-}"
   [[ -n "$compatible_api_key" ]] || compatible_api_key=$(workspace_read_env COMPATIBLE_API_KEY 2>/dev/null || true)
-  [[ -n "$compatible_api_key" ]] || compatible_api_key=$(workspace_read_env HERMES_COMPATIBLE_API_KEY 2>/dev/null || true)
   [[ -n "$compatible_api_key" ]] || compatible_api_key=dummy
 
   base_url="${NEMOCLAW_ENDPOINT_URL:-$(workspace_read_env HERMES_LITELLM_BASE_URL 2>/dev/null || true)}"
