@@ -7079,7 +7079,6 @@ cmd_update() {
   local gateway_update=0 gateway_config=""
   local postgres_update=0 vikunja_update=0 n8n_update=0
   local postgres_image="" vikunja_image="" n8n_image=""
-  local tailscale_update=0 tailscale_version=""
   local nemohermes_update=0 nemohermes_status="" nemohermes_update_line=""
   local update_count=0
 
@@ -7149,13 +7148,7 @@ cmd_update() {
     [[ -n "$nemohermes_update_line" ]] && nemohermes_update=1
   fi
 
-  # --- Tailscale self-update ---
-  if command -v tailscale >/dev/null 2>&1; then
-    tailscale_version=$(tailscale version 2>/dev/null | awk 'NR==1 {print $1}')
-    tailscale_update=1
-  fi
-
-  update_count=$(( spark_update + ngc_update + gateway_update + postgres_update + vikunja_update + n8n_update + nemohermes_update + tailscale_update ))
+  update_count=$(( spark_update + ngc_update + gateway_update + postgres_update + vikunja_update + n8n_update + nemohermes_update ))
 
   printf "\n  Available update actions:\n"
   if [[ "$update_count" -eq 0 ]]; then
@@ -7176,7 +7169,6 @@ cmd_update() {
   [[ "$vikunja_update" -eq 1 ]] && printf "    - Vikunja image: %s\n" "$vikunja_image"
   [[ "$n8n_update" -eq 1 ]] && printf "    - n8n image: %s\n" "$n8n_image"
   [[ "$nemohermes_update" -eq 1 ]] && printf "    - NemoHermes: %s\n" "$(workspace_trim "$nemohermes_update_line")"
-  [[ "$tailscale_update" -eq 1 ]] && printf "    - Tailscale self-update check%s\n" "${tailscale_version:+ (current ${tailscale_version})}"
   printf "\n"
 
   if [[ "$spark_update" -eq 1 ]] && confirm "Update spark CLI to v${spark_remote_version}?"; then
@@ -7233,16 +7225,12 @@ cmd_update() {
   fi
 
   if [[ "$nemohermes_update" -eq 1 ]] && confirm "Update NemoHermes sandbox?"; then
-    NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes rebuild \
-      && info "NemoHermes sandbox updated" \
-      || err "Failed to update NemoHermes sandbox"
-    did_update=1
-  fi
-
-  if [[ "$tailscale_update" -eq 1 ]] && confirm "Run Tailscale self-update?"; then
-    tailscale update \
-      && info "Tailscale update completed" \
-      || err "Failed to update Tailscale"
+    if NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes rebuild; then
+      info "NemoHermes sandbox updated"
+    else
+      err "Failed to update NemoHermes sandbox"
+      warn "NemoHermes rebuild is non-destructive, but may require provider credentials in this shell, e.g. COMPATIBLE_API_KEY for the local LiteLLM/OpenAI-compatible route"
+    fi
     did_update=1
   fi
 
@@ -7474,7 +7462,7 @@ cmd_help() {
     gateway          Manage LiteLLM gateway (start|stop|status|logs)
     reinstall        Remove spark state and run setup again
     uninstall        Remove spark-managed runtime/config/data
-    update           Check and apply Spark, model, workspace, and tool updates
+    update           Check and apply Spark, model, gateway, workspace, and NemoHermes updates
     config           Configure spark settings (e.g. auto-update)
     architecture     Show developer architecture map and invariants
 

@@ -4880,28 +4880,45 @@ ENV
 printf 'VERSION="%s"\\n' "$SPARK_VERSION"
 EOF
   chmod +x "${fake_bin}/curl"
-  out=$(printf 'y\ny\ny\ny\ny\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+  out=$(printf 'y\ny\ny\ny\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:${current_tag}" \
     FAKE_COMPOSE_FILE="${tmp}/compose.log" \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_NEMOHERMES_STATUS=$'Hermes ready\nUpdate:   v2026.5.22 available\n' \
-    FAKE_TAILSCALE_UPDATE_MARKER="${tmp}/tailscale.updated" \
     "$SPARK" update 2>&1)
   compose_log=$(cat "${tmp}/compose.log" 2>/dev/null || echo "")
   nemo_log=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
-  [[ -e "${tmp}/tailscale.updated" ]] || { rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
   [[ "$out" == *"Available update actions:"* ]] &&
     [[ "$out" == *"Postgres image: postgres:17"* ]] &&
     [[ "$out" == *"Vikunja image: vikunja/vikunja:latest"* ]] &&
     [[ "$out" == *"n8n image: docker.n8n.io/n8nio/n8n:latest"* ]] &&
     [[ "$out" == *"NemoHermes:"* ]] &&
-    [[ "$out" == *"Tailscale self-update check"* ]] &&
+    [[ "$out" != *"Tailscale self-update check"* ]] &&
     [[ "$compose_log" == *"pull postgres"* ]] &&
     [[ "$compose_log" == *"pull vikunja"* ]] &&
     [[ "$compose_log" == *"pull n8n"* ]] &&
     [[ "$compose_log" == *"up -d --remove-orphans"* ]] &&
     [[ "$nemo_log" == *"hermes rebuild"* ]]
+}
+
+test_update_nemohermes_failure_explains_credentials() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  cat > "${fake_bin}/curl" <<EOF
+#!/usr/bin/env bash
+printf 'VERSION="%s"\\n' "$SPARK_VERSION"
+EOF
+  chmod +x "${fake_bin}/curl"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:$(date +%y.%m)-py3" \
+    FAKE_NEMOHERMES_STATUS=$'Hermes ready\nUpdate:   v2026.5.22 available\n' \
+    FAKE_NEMOHERMES_EXIT=9 \
+    "$SPARK" update 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Failed to update NemoHermes sandbox"* ]] &&
+    [[ "$out" == *"COMPATIBLE_API_KEY"* ]] &&
+    [[ "$out" == *"non-destructive"* ]]
 }
 
 test_update_does_not_suggest_ngc_downgrade() {
@@ -5037,6 +5054,7 @@ run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
 run_test "update prompts workspace tool updates one by one" test_update_prompts_workspace_tool_updates_one_by_one
+run_test "update NemoHermes failure explains credentials" test_update_nemohermes_failure_explains_credentials
 run_test "update does not suggest NGC downgrade" test_update_does_not_suggest_ngc_downgrade
 run_test "models recommend suggests vLLM models" test_models_recommend_vllm
 run_test "uninstall --purge-models removes spark state" test_uninstall_purge_removes_state
