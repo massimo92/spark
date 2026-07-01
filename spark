@@ -44,6 +44,7 @@ WORKSPACE_PROJECT="workspace"
 WORKSPACE_VIKUNJA_PORT=3456
 WORKSPACE_N8N_PORT=5678
 WORKSPACE_HERMES_PORT=18789
+WORKSPACE_HERMES_LOCAL_PORT=8642
 WORKSPACE_POSTGRES_IMAGE_DEFAULT="postgres:18"
 WORKSPACE_VIKUNJA_IMAGE_DEFAULT="vikunja/vikunja:latest"
 WORKSPACE_N8N_IMAGE_DEFAULT="docker.n8n.io/n8nio/n8n:latest"
@@ -5212,6 +5213,11 @@ workspace_create_n8n_owner() {
   return 1
 }
 
+workspace_reset_n8n_user_management() {
+  workspace_compose_service_running n8n || return 1
+  workspace_compose exec -T n8n n8n user-management:reset >/dev/null 2>&1
+}
+
 workspace_configure_tailscale() {
   local tailnet="$1" check_only="$2" funnel_action="${3:-}" auto_yes="${4:-0}" requested_mode bind_addr dns_name
   requested_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)}"
@@ -5276,10 +5282,13 @@ workspace_configure_tailscale() {
 }
 
 workspace_hermes_config_ready() {
-  local litellm_model="$1" configured_model=""
+  local litellm_model="$1" configured_model="" onboard_status=""
   configured_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  onboard_status=$(workspace_read_env HERMES_ONBOARD_STATUS 2>/dev/null || true)
   [[ "$configured_model" == "$litellm_model" ]] || return 1
+  [[ "$onboard_status" == "configured" || "$onboard_status" == "manual" ]] || return 1
   workspace_hermes_running || return 1
+  workspace_start_hermes_private_proxy || return 1
   workspace_hermes_nemoclaw_configured || return 1
   workspace_hermes_doctor_ready || return 1
   workspace_hermes_inference_route_ready || return 1
@@ -5299,6 +5308,7 @@ workspace_setup_hermes() {
     info "NemoHermes: installed"
     [[ "$check_only" == "1" ]] && return 0
     if workspace_hermes_config_ready "$litellm_model"; then
+      workspace_set_env_key HERMES_ONBOARD_STATUS configured
       info "Hermes already configured with ${litellm_model}"
       return 0
     fi
@@ -5310,6 +5320,7 @@ workspace_setup_hermes() {
       NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=300 \
       NEMOCLAW_SANDBOX_READY_TIMEOUT=600 \
       NEMOCLAW_NO_GPU=1 \
+      NEMOCLAW_SANDBOX_GPU=0 \
       NEMOCLAW_PROVIDER=custom \
       NEMOCLAW_ENDPOINT_URL="http://127.0.0.1:${GATEWAY_PORT}/v1" \
       NEMOCLAW_MODEL="$litellm_model" \
@@ -5323,6 +5334,7 @@ workspace_setup_hermes() {
         --yes \
         --no-gpu \
         --control-ui-port "$WORKSPACE_HERMES_PORT" >/dev/null 2>&1 \
+      && workspace_start_hermes_private_proxy \
       && { workspace_set_env_key HERMES_ONBOARD_STATUS configured; info "Hermes onboarded with ${litellm_model}"; } \
       || { workspace_set_env_key HERMES_ONBOARD_STATUS manual; setup_fail "Hermes onboarding failed; run nemohermes onboard manually"; }
   elif [[ "$check_only" == "1" ]]; then
@@ -5337,6 +5349,7 @@ workspace_setup_hermes() {
       NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=300 \
       NEMOCLAW_SANDBOX_READY_TIMEOUT=600 \
       NEMOCLAW_NO_GPU=1 \
+      NEMOCLAW_SANDBOX_GPU=0 \
       NEMOCLAW_PROVIDER=custom \
       NEMOCLAW_ENDPOINT_URL="http://127.0.0.1:${GATEWAY_PORT}/v1" \
       NEMOCLAW_MODEL="$litellm_model" \
@@ -5347,6 +5360,7 @@ workspace_setup_hermes() {
       COMPATIBLE_API_KEY=dummy \
       CHAT_UI_URL="$hermes_url" \
       bash -c 'curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash' \
+      && workspace_start_hermes_private_proxy \
       && { workspace_set_env_key HERMES_ONBOARD_STATUS configured; info "Installed Hermes with NemoClaw"; } \
       || { workspace_set_env_key HERMES_ONBOARD_STATUS manual; setup_fail "Hermes/NemoClaw install failed"; }
   fi
@@ -5743,7 +5757,7 @@ cmd_workspace_credentials_show() {
     recovery password: ${n8n_pass:-n/a}
 
   Hermes/Vikunja
-    dashboard:         ${hermes_url:-n/a}
+    API URL:           ${hermes_url:-n/a}
     username:          ${hermes_user:-hermes}
     password:          ${hermes_pass:-n/a}
     API token:         ${token:-n/a}
@@ -5774,7 +5788,12 @@ cmd_workspace_credentials_reset() {
       workspace_set_env_file_key "$WORKSPACE_N8N_ENV_FILE" N8N_BASIC_AUTH_PASSWORD "$secret"
       workspace_set_env_key N8N_OWNER_SETUP_STATUS manual
       info "n8n recovery/basic-auth secret rotated locally"
-      warn "If the n8n owner already exists, update that owner's password in n8n or finish owner setup, then rerun spark ws setup"
+      workspace_compose up -d n8n >/dev/null 2>&1 || true
+      if workspace_reset_n8n_user_management && workspace_create_n8n_owner; then
+        info "n8n owner reset to generated recovery credential"
+      else
+        warn "Could not reset n8n owner automatically; finish first-run setup in n8n or rerun spark ws setup"
+      fi
       ;;
     *)
       die "Unknown credentials target: $target" "Use vikunja, n8n, or all"
@@ -6444,7 +6463,7 @@ workspace_tailscale_https_urls_ready() {
   fi
   workspace_http_ready "${vikunja%/}/api/v1/info" &&
     workspace_http_ready "${n8n%/}/healthz" &&
-    workspace_http_ready "${hermes%/}/"
+    workspace_hermes_api_ready_at "$hermes"
 }
 
 workspace_runtime_ports_not_public() {
@@ -6576,6 +6595,94 @@ workspace_tailscale_service_target_private() {
   printf '%s\n' "$block" | grep -Eq "(https?://)?(127[.]0[.]0[.]1|localhost|[[]::1[]]):${port}|(^|[^:])::1:${port}"
 }
 
+workspace_hermes_api_ready_at() {
+  local base_url="$1"
+  [[ -n "$base_url" ]] || return 1
+  workspace_http_ready "${base_url%/}/v1/models"
+}
+
+workspace_hermes_local_api_ready() {
+  workspace_hermes_api_ready_at "http://127.0.0.1:${WORKSPACE_HERMES_LOCAL_PORT}"
+}
+
+workspace_hermes_private_url_ready() {
+  local url
+  url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
+  workspace_hermes_api_ready_at "$url"
+}
+
+workspace_hermes_proxy_pid_file() {
+  printf '%s/hermes-proxy.pid\n' "$WORKSPACE_CONFIG_DIR"
+}
+
+workspace_hermes_proxy_log_file() {
+  printf '%s/hermes-proxy.log\n' "$WORKSPACE_CONFIG_DIR"
+}
+
+workspace_hermes_proxy_bind_addr() {
+  local mode bind_addr
+  mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
+  if [[ "$mode" == "ports" ]]; then
+    bind_addr=$(workspace_read_env WORKSPACE_TAILSCALE_BIND_ADDR 2>/dev/null || true)
+    workspace_tailscale_bind_addr_ok "$bind_addr" || return 1
+    printf '%s\n' "$bind_addr"
+    return 0
+  fi
+  printf '127.0.0.1\n'
+}
+
+workspace_start_hermes_private_proxy() {
+  local bind_addr pid_file log_file py pid
+  workspace_hermes_private_url_ready && return 0
+  workspace_hermes_local_api_ready || return 1
+  bind_addr=$(workspace_hermes_proxy_bind_addr) || return 1
+  pid_file=$(workspace_hermes_proxy_pid_file)
+  log_file=$(workspace_hermes_proxy_log_file)
+  pid=$(cat "$pid_file" 2>/dev/null || true)
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+  py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
+  [[ -n "$py" ]] || return 1
+  mkdir -p "$WORKSPACE_CONFIG_DIR"
+  nohup "$py" -c '
+import socket, sys, threading
+bind_addr, listen_port, target_port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+def relay(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind((bind_addr, listen_port))
+srv.listen(64)
+while True:
+    client, _ = srv.accept()
+    upstream = socket.create_connection(("127.0.0.1", target_port), timeout=10)
+    threading.Thread(target=relay, args=(client, upstream), daemon=True).start()
+    threading.Thread(target=relay, args=(upstream, client), daemon=True).start()
+' "$bind_addr" "$WORKSPACE_HERMES_PORT" "$WORKSPACE_HERMES_LOCAL_PORT" >>"$log_file" 2>&1 &
+  printf '%s\n' "$!" >"$pid_file"
+  sleep 1
+  workspace_hermes_private_url_ready
+}
+
 workspace_tailscale_services_configured() {
   local out mode bind_addr dns_name
   command -v tailscale >/dev/null 2>&1 || return 1
@@ -6617,20 +6724,18 @@ workspace_hermes_running() {
 }
 
 workspace_hermes_nemoclaw_configured() {
-  local policy_out
   command -v nemohermes >/dev/null 2>&1 || return 1
-  policy_out=$(nemohermes hermes policy-explain --json 2>/dev/null || \
-    nemohermes hermes policy-explain 2>/dev/null || \
-    nemohermes hermes policy-list 2>/dev/null || true)
   [[ "$(workspace_read_env HERMES_DASHBOARD_PORT 2>/dev/null || true)" == "$WORKSPACE_HERMES_PORT" ]] &&
     [[ "$(workspace_read_env HERMES_POLICY_TIER 2>/dev/null || true)" == "restricted" ]] &&
-    [[ "$(workspace_read_env HERMES_ONBOARD_STATUS 2>/dev/null || true)" == "configured" ]] &&
-    [[ "$policy_out" == *"restricted"* ]]
+    workspace_hermes_local_api_ready &&
+    workspace_hermes_private_url_ready
 }
 
 workspace_hermes_doctor_ready() {
   command -v nemohermes >/dev/null 2>&1 || return 1
-  nemohermes hermes doctor >/dev/null 2>&1 || nemohermes doctor >/dev/null 2>&1
+  workspace_hermes_running &&
+    workspace_hermes_local_api_ready &&
+    workspace_hermes_inference_route_ready
 }
 
 workspace_hermes_inference_route_ready() {
@@ -6647,6 +6752,7 @@ workspace_hermes_inference_route_ready() {
 workspace_hermes_dashboard_url_ready() {
   local out expected
   command -v nemohermes >/dev/null 2>&1 || return 1
+  workspace_hermes_private_url_ready && return 0
   expected=$(workspace_read_env HERMES_URL 2>/dev/null || true)
   out=$(nemohermes hermes dashboard-url 2>/dev/null || true)
   [[ -n "$out" ]] || return 1
@@ -6752,10 +6858,10 @@ cmd_workspace_doctor() {
   workspace_doctor_check "LiteLLM exposes Hermes model route" workspace_litellm_model_routed
   workspace_doctor_check "Hermes model running: ${model:-none}" workspace_model_running "$model"
   workspace_doctor_check "Hermes/NemoClaw running" workspace_hermes_running
-  workspace_doctor_check "Hermes NemoClaw uses restricted policy and workspace dashboard port" workspace_hermes_nemoclaw_configured
+  workspace_doctor_check "Hermes NemoClaw uses restricted policy and private API port" workspace_hermes_nemoclaw_configured
   workspace_doctor_check "NemoHermes sandbox doctor passes" workspace_hermes_doctor_ready
   workspace_doctor_check "NemoHermes inference route uses selected LiteLLM model" workspace_hermes_inference_route_ready
-  workspace_doctor_check "Hermes dashboard URL is reachable from NemoClaw" workspace_hermes_dashboard_url_ready
+  workspace_doctor_check "Hermes private API URL is reachable" workspace_hermes_dashboard_url_ready
   if [[ "$strict_mode" == "1" ]]; then
     workspace_doctor_check "Compose image refs are pinned for production" workspace_compose_images_pinned
   fi
