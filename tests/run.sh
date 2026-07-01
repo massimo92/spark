@@ -50,7 +50,7 @@ ${stdin_payload}"
           [[ -n "$stdin_payload" ]] && printf '%s\n' "$stdin_payload" >> "${FAKE_COMPOSE_EXEC_FILE}"
         fi
         case "$match_payload" in
-          *"/app/vikunja/vikunja doctor"*) exit "${FAKE_VIKUNJA_DOCTOR_EXIT:-0}" ;;
+          *"/app/vikunja/vikunja doctor"*) printf '%b' "${FAKE_VIKUNJA_DOCTOR_OUTPUT:-}"; exit "${FAKE_VIKUNJA_DOCTOR_EXIT:-0}" ;;
           *"pg_roles WHERE rolname='vikunja'"*) [[ "${FAKE_PG_ROLE_VIKUNJA:-1}" == "1" ]] && printf '1\n' ;;
           *"pg_roles WHERE rolname='n8n'"*) [[ "${FAKE_PG_ROLE_N8N:-1}" == "1" ]] && printf '1\n' ;;
           *"pg_database WHERE datname='vikunja'"*) [[ "${FAKE_PG_DB_VIKUNJA:-1}" == "1" ]] && printf '1\n' ;;
@@ -3088,6 +3088,31 @@ test_workspace_doctor_flags_vikunja_doctor_failure() {
     [[ "$out" == *"[ ] Vikunja internal doctor passes"* ]]
 }
 
+test_workspace_doctor_accepts_writable_vikunja_group_mismatch() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status doctor_output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  doctor_output=$'  ✗ Ownership match: directory owned by gid 1000 but Vikunja process is not a member of that group\n  ✓ Writable: yes\n\n1 check(s) failed\n'
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_VIKUNJA_DOCTOR_EXIT=1 FAKE_VIKUNJA_DOCTOR_OUTPUT="$doctor_output" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$out" == *"[x] Vikunja internal doctor passes"* ]]
+}
+
 test_workspace_doctor_flags_stale_vikunja_token_status() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status
@@ -5062,6 +5087,7 @@ run_test "workspace doctor rejects public Compose bind" test_workspace_doctor_re
 run_test "workspace doctor rejects non-Tailscale ports bind" test_workspace_doctor_rejects_non_tailscale_ports_bind
 run_test "workspace doctor flags public Docker port" test_workspace_doctor_flags_public_docker_port
 run_test "workspace doctor flags Vikunja doctor failure" test_workspace_doctor_flags_vikunja_doctor_failure
+run_test "workspace doctor accepts writable Vikunja group mismatch" test_workspace_doctor_accepts_writable_vikunja_group_mismatch
 run_test "workspace doctor flags stale Vikunja token status" test_workspace_doctor_flags_stale_vikunja_token_status
 run_test "workspace doctor requires Vikunja user/email same row" test_workspace_doctor_requires_vikunja_user_and_email_same_row
 run_test "workspace doctor rejects Vikunja user substring match" test_workspace_doctor_rejects_vikunja_user_substring_match
