@@ -97,6 +97,10 @@ ${stdin_payload}"
       [[ -n "${FAKE_NAMES:-}" ]] && printf '%b' "${FAKE_NAMES}"
     fi
     ;;
+  pull)
+    [[ -n "${FAKE_DOCKER_PULL_FILE:-}" ]] && printf '%s\n' "${2:-}" >> "${FAKE_DOCKER_PULL_FILE}"
+    exit "${FAKE_DOCKER_PULL_EXIT:-0}"
+    ;;
   run)
     [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_DOCKER_ARGS_FILE}"
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
@@ -220,6 +224,10 @@ case "$*" in
   *:5678/healthz*) exit "${FAKE_N8N_HEALTH_EXIT:-0}" ;;
   *:5678/rest/owner/setup*) [[ -n "${FAKE_N8N_OWNER_MARKER:-}" ]] && : > "$FAKE_N8N_OWNER_MARKER"; echo '{"data":{"id":"owner"}}'; exit "${FAKE_N8N_OWNER_EXIT:-0}" ;;
   *:5678/rest/login*)
+    if [[ "${FAKE_N8N_LOGIN_FORBID_EMAIL_FIELD:-0}" == "1" && "$*" == *'"email"'* ]]; then
+      echo '{"code":"email_field_forbidden"}'
+      exit 400
+    fi
     if [[ "${FAKE_N8N_LOGIN_REQUIRE_EMAIL_OR_LDAP:-0}" == "1" && "$*" != *"emailOrLdapLoginId"* ]]; then
       echo '{"code":"invalid_type","path":["emailOrLdapLoginId"],"message":"Required"}'
       exit 400
@@ -569,7 +577,7 @@ case "$*" in
   *"policy-list"*) echo "${FAKE_NEMOHERMES_POLICY_LIST:-restricted}" ;;
   *"channels status --channel whatsapp --json"*) echo "${FAKE_WHATSAPP_STATUS_JSON:-{\"verdict\":\"healthy\"}}" ;;
   *doctor*) exit "${FAKE_NEMOHERMES_DOCTOR_EXIT:-0}" ;;
-  *status*) echo "Hermes ready" ;;
+  *status*) echo "${FAKE_NEMOHERMES_STATUS:-Hermes ready}" ;;
   *logs*) echo "Hermes logs" ;;
 esac
 exit "${FAKE_NEMOHERMES_EXIT:-0}"
@@ -4202,7 +4210,7 @@ test_workspace_setup_rerun_bootstraps_n8n_owner() {
   [[ "$env" == *"N8N_OWNER_SETUP_STATUS=created"* || "$env" == *"N8N_OWNER_SETUP_STATUS=exists"* ]]
 }
 
-test_workspace_setup_verifies_n8n_2x_login_field() {
+test_workspace_setup_uses_only_n8n_2x_login_field() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin env
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -4210,7 +4218,7 @@ test_workspace_setup_verifies_n8n_2x_login_field() {
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_N8N_LOGIN_REQUIRE_EMAIL_OR_LDAP=1 \
+    FAKE_N8N_LOGIN_REQUIRE_EMAIL_OR_LDAP=1 FAKE_N8N_LOGIN_FORBID_EMAIL_FIELD=1 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
@@ -4856,6 +4864,46 @@ test_config_set_and_show() {
   [[ "$set_out" == *"Auto-update enabled"* ]] && [[ "$show_out" == *"auto-update: true"* ]]
 }
 
+test_update_prompts_workspace_tool_updates_one_by_one() {
+  local tmp fake_bin out current_tag compose_log nemo_log
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  current_tag="$(date +%y.%m)-py3"
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  cat > "${tmp}/home/.config/spark/workspace/secrets.env" <<ENV
+WORKSPACE_POSTGRES_IMAGE=postgres:17
+WORKSPACE_VIKUNJA_IMAGE=vikunja/vikunja:latest
+WORKSPACE_N8N_IMAGE=docker.n8n.io/n8nio/n8n:latest
+ENV
+  : > "${tmp}/home/.config/spark/workspace/docker-compose.yml"
+  cat > "${fake_bin}/curl" <<EOF
+#!/usr/bin/env bash
+printf 'VERSION="%s"\\n' "$SPARK_VERSION"
+EOF
+  chmod +x "${fake_bin}/curl"
+  out=$(printf 'y\ny\ny\ny\ny\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:${current_tag}" \
+    FAKE_COMPOSE_FILE="${tmp}/compose.log" \
+    FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_NEMOHERMES_STATUS=$'Hermes ready\nUpdate:   v2026.5.22 available\n' \
+    FAKE_TAILSCALE_UPDATE_MARKER="${tmp}/tailscale.updated" \
+    "$SPARK" update 2>&1)
+  compose_log=$(cat "${tmp}/compose.log" 2>/dev/null || echo "")
+  nemo_log=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  [[ -e "${tmp}/tailscale.updated" ]] || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  [[ "$out" == *"Available update actions:"* ]] &&
+    [[ "$out" == *"Postgres image: postgres:17"* ]] &&
+    [[ "$out" == *"Vikunja image: vikunja/vikunja:latest"* ]] &&
+    [[ "$out" == *"n8n image: docker.n8n.io/n8nio/n8n:latest"* ]] &&
+    [[ "$out" == *"NemoHermes:"* ]] &&
+    [[ "$out" == *"Tailscale self-update check"* ]] &&
+    [[ "$compose_log" == *"pull postgres"* ]] &&
+    [[ "$compose_log" == *"pull vikunja"* ]] &&
+    [[ "$compose_log" == *"pull n8n"* ]] &&
+    [[ "$compose_log" == *"up -d --remove-orphans"* ]] &&
+    [[ "$nemo_log" == *"hermes rebuild"* ]]
+}
+
 test_update_does_not_suggest_ngc_downgrade() {
   local tmp fake_bin out current_tag
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -4988,6 +5036,7 @@ run_test "rm errors on a model not in cache" test_rm_not_found
 run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
+run_test "update prompts workspace tool updates one by one" test_update_prompts_workspace_tool_updates_one_by_one
 run_test "update does not suggest NGC downgrade" test_update_does_not_suggest_ngc_downgrade
 run_test "models recommend suggests vLLM models" test_models_recommend_vllm
 run_test "uninstall --purge-models removes spark state" test_uninstall_purge_removes_state
@@ -5150,7 +5199,7 @@ run_test "workspace removed commands are unknown" test_workspace_removed_command
 run_test "workspace setup accepts Vikunja token" test_workspace_setup_accepts_vikunja_token
 run_test "workspace setup rejects multiline Vikunja token" test_workspace_setup_rejects_multiline_vikunja_token
 run_test "workspace setup rerun bootstraps n8n owner" test_workspace_setup_rerun_bootstraps_n8n_owner
-run_test "workspace setup verifies n8n 2.x login field" test_workspace_setup_verifies_n8n_2x_login_field
+run_test "workspace setup uses only n8n 2.x login field" test_workspace_setup_uses_only_n8n_2x_login_field
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]
