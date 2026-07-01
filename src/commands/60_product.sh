@@ -78,6 +78,48 @@ cmd_models() {
   esac
 }
 
+nemohermes_rebuild_with_workspace_env() {
+  local compatible_api_key base_url model configured_model dashboard_port policy_tier chat_ui_url
+
+  compatible_api_key="${COMPATIBLE_API_KEY:-}"
+  [[ -n "$compatible_api_key" ]] || compatible_api_key=$(workspace_read_env COMPATIBLE_API_KEY 2>/dev/null || true)
+  [[ -n "$compatible_api_key" ]] || compatible_api_key=$(workspace_read_env HERMES_COMPATIBLE_API_KEY 2>/dev/null || true)
+  [[ -n "$compatible_api_key" ]] || compatible_api_key=dummy
+
+  base_url="${NEMOCLAW_ENDPOINT_URL:-$(workspace_read_env HERMES_LITELLM_BASE_URL 2>/dev/null || true)}"
+  [[ -n "$base_url" ]] || base_url="http://127.0.0.1:${GATEWAY_PORT}/v1"
+
+  model="${NEMOCLAW_MODEL:-$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)}"
+  if [[ -z "$model" ]]; then
+    configured_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+    [[ -n "$configured_model" ]] && model=$(workspace_litellm_model_name "$configured_model")
+  fi
+
+  dashboard_port="${NEMOCLAW_DASHBOARD_PORT:-$(workspace_read_env HERMES_DASHBOARD_PORT 2>/dev/null || true)}"
+  [[ -n "$dashboard_port" ]] || dashboard_port="$WORKSPACE_HERMES_PORT"
+  policy_tier="${NEMOCLAW_POLICY_TIER:-$(workspace_read_env HERMES_POLICY_TIER 2>/dev/null || true)}"
+  [[ -n "$policy_tier" ]] || policy_tier=restricted
+  chat_ui_url="${CHAT_UI_URL:-$(workspace_read_env HERMES_URL 2>/dev/null || true)}"
+
+  local env_args=(
+    "NEMOCLAW_AGENT=${NEMOCLAW_AGENT:-hermes}"
+    "NEMOCLAW_SANDBOX_NAME=hermes"
+    "NEMOCLAW_PROVIDER=${NEMOCLAW_PROVIDER:-custom}"
+    "NEMOCLAW_ENDPOINT_URL=${base_url}"
+    "NEMOCLAW_PREFERRED_API=${NEMOCLAW_PREFERRED_API:-openai-completions}"
+    "NEMOCLAW_DASHBOARD_PORT=${dashboard_port}"
+    "NEMOCLAW_POLICY_TIER=${policy_tier}"
+    "NEMOCLAW_POLICY_MODE=${NEMOCLAW_POLICY_MODE:-suggested}"
+    "NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=${NEMOCLAW_LOCAL_INFERENCE_TIMEOUT:-300}"
+    "NEMOCLAW_SANDBOX_READY_TIMEOUT=${NEMOCLAW_SANDBOX_READY_TIMEOUT:-600}"
+    "COMPATIBLE_API_KEY=${compatible_api_key}"
+  )
+  [[ -n "$model" ]] && env_args+=("NEMOCLAW_MODEL=${model}")
+  [[ -n "$chat_ui_url" ]] && env_args+=("CHAT_UI_URL=${chat_ui_url}")
+
+  env "${env_args[@]}" nemohermes hermes rebuild
+}
+
 cmd_update() {
   printf "\n"
   command -v curl >/dev/null 2>&1 || die "curl is required for updates"
@@ -234,11 +276,11 @@ cmd_update() {
   fi
 
   if [[ "$nemohermes_update" -eq 1 ]] && confirm "Update NemoHermes sandbox?"; then
-    if NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes rebuild; then
+    if nemohermes_rebuild_with_workspace_env; then
       info "NemoHermes sandbox updated"
     else
       err "Failed to update NemoHermes sandbox"
-      warn "NemoHermes rebuild is non-destructive, but may require provider credentials in this shell, e.g. COMPATIBLE_API_KEY for the local LiteLLM/OpenAI-compatible route"
+      warn "NemoHermes rebuild used workspace inference env; if this sandbox points to an external provider, export its provider key and rerun"
     fi
     did_update=1
   fi

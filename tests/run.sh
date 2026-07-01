@@ -563,6 +563,9 @@ EOF
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf '%s\n' "$*" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_AGENT=%s\n' "${NEMOCLAW_AGENT:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_PREFERRED_API=%s\n' "${NEMOCLAW_PREFERRED_API:-}" >> "${FAKE_NEMOHERMES_FILE}"
+[[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_ENDPOINT_URL=%s\n' "${NEMOCLAW_ENDPOINT_URL:-}" >> "${FAKE_NEMOHERMES_FILE}"
+[[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_MODEL=%s\n' "${NEMOCLAW_MODEL:-}" >> "${FAKE_NEMOHERMES_FILE}"
+[[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'COMPATIBLE_API_KEY=%s\n' "${COMPATIBLE_API_KEY:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=%s\n' "${NEMOCLAW_LOCAL_INFERENCE_TIMEOUT:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_SANDBOX_READY_TIMEOUT=%s\n' "${NEMOCLAW_SANDBOX_READY_TIMEOUT:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_NO_GPU=%s\n' "${NEMOCLAW_NO_GPU:-}" >> "${FAKE_NEMOHERMES_FILE}"
@@ -4873,6 +4876,12 @@ test_update_prompts_workspace_tool_updates_one_by_one() {
 WORKSPACE_POSTGRES_IMAGE=postgres:17
 WORKSPACE_VIKUNJA_IMAGE=vikunja/vikunja:latest
 WORKSPACE_N8N_IMAGE=docker.n8n.io/n8nio/n8n:latest
+HERMES_MODEL=Org/Alpha
+HERMES_LITELLM_MODEL=vllm/Org/Alpha
+HERMES_LITELLM_BASE_URL=http://127.0.0.1:4000/v1
+HERMES_DASHBOARD_PORT=18789
+HERMES_POLICY_TIER=restricted
+HERMES_URL=https://hermes.test-tailnet.ts.net
 ENV
   : > "${tmp}/home/.config/spark/workspace/docker-compose.yml"
   cat > "${fake_bin}/curl" <<EOF
@@ -4899,10 +4908,13 @@ EOF
     [[ "$compose_log" == *"pull vikunja"* ]] &&
     [[ "$compose_log" == *"pull n8n"* ]] &&
     [[ "$compose_log" == *"up -d --remove-orphans"* ]] &&
-    [[ "$nemo_log" == *"hermes rebuild"* ]]
+    [[ "$nemo_log" == *"hermes rebuild"* ]] &&
+    [[ "$nemo_log" == *"NEMOCLAW_ENDPOINT_URL=http://127.0.0.1:4000/v1"* ]] &&
+    [[ "$nemo_log" == *"NEMOCLAW_MODEL=vllm/Org/Alpha"* ]] &&
+    [[ "$nemo_log" == *"COMPATIBLE_API_KEY=dummy"* ]]
 }
 
-test_update_nemohermes_failure_explains_credentials() {
+test_update_nemohermes_failure_explains_rebuild_env() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   cat > "${fake_bin}/curl" <<EOF
@@ -4917,8 +4929,32 @@ EOF
     "$SPARK" update 2>&1 || true)
   rm -rf "$tmp"
   [[ "$out" == *"Failed to update NemoHermes sandbox"* ]] &&
-    [[ "$out" == *"COMPATIBLE_API_KEY"* ]] &&
-    [[ "$out" == *"non-destructive"* ]]
+    [[ "$out" == *"workspace inference env"* ]] &&
+    [[ "$out" == *"external provider"* ]]
+}
+
+test_update_nemohermes_rebuild_uses_stored_compatible_key() {
+  local tmp fake_bin nemo_log
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  cat > "${tmp}/home/.config/spark/workspace/secrets.env" <<ENV
+HERMES_LITELLM_MODEL=vllm/Org/Alpha
+HERMES_LITELLM_BASE_URL=http://127.0.0.1:4000/v1
+COMPATIBLE_API_KEY=stored-compatible-key
+ENV
+  cat > "${fake_bin}/curl" <<EOF
+#!/usr/bin/env bash
+printf 'VERSION="%s"\\n' "$SPARK_VERSION"
+EOF
+  chmod +x "${fake_bin}/curl"
+  printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:$(date +%y.%m)-py3" \
+    FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_NEMOHERMES_STATUS=$'Hermes ready\nUpdate:   v2026.5.22 available\n' \
+    "$SPARK" update >/dev/null 2>&1
+  nemo_log=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$nemo_log" == *"COMPATIBLE_API_KEY=stored-compatible-key"* ]]
 }
 
 test_update_does_not_suggest_ngc_downgrade() {
@@ -5054,7 +5090,8 @@ run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
 run_test "update prompts workspace tool updates one by one" test_update_prompts_workspace_tool_updates_one_by_one
-run_test "update NemoHermes failure explains credentials" test_update_nemohermes_failure_explains_credentials
+run_test "update NemoHermes failure explains rebuild env" test_update_nemohermes_failure_explains_rebuild_env
+run_test "update NemoHermes rebuild uses stored compatible key" test_update_nemohermes_rebuild_uses_stored_compatible_key
 run_test "update does not suggest NGC downgrade" test_update_does_not_suggest_ngc_downgrade
 run_test "models recommend suggests vLLM models" test_models_recommend_vllm
 run_test "uninstall --purge-models removes spark state" test_uninstall_purge_removes_state
