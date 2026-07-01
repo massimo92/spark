@@ -220,6 +220,10 @@ case "$*" in
   *:5678/healthz*) exit "${FAKE_N8N_HEALTH_EXIT:-0}" ;;
   *:5678/rest/owner/setup*) [[ -n "${FAKE_N8N_OWNER_MARKER:-}" ]] && : > "$FAKE_N8N_OWNER_MARKER"; echo '{"data":{"id":"owner"}}'; exit "${FAKE_N8N_OWNER_EXIT:-0}" ;;
   *:5678/rest/login*)
+    if [[ "${FAKE_N8N_LOGIN_REQUIRE_EMAIL_OR_LDAP:-0}" == "1" && "$*" != *"emailOrLdapLoginId"* ]]; then
+      echo '{"code":"invalid_type","path":["emailOrLdapLoginId"],"message":"Required"}'
+      exit 400
+    fi
     echo '{"data":{"id":"owner"}}'
     if [[ "${FAKE_N8N_LOGIN_AFTER_OWNER:-0}" == "1" && -n "${FAKE_N8N_OWNER_MARKER:-}" && -e "$FAKE_N8N_OWNER_MARKER" ]]; then
       exit 0
@@ -4198,6 +4202,22 @@ test_workspace_setup_rerun_bootstraps_n8n_owner() {
   [[ "$env" == *"N8N_OWNER_SETUP_STATUS=created"* || "$env" == *"N8N_OWNER_SETUP_STATUS=exists"* ]]
 }
 
+test_workspace_setup_verifies_n8n_2x_login_field() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_N8N_LOGIN_REQUIRE_EMAIL_OR_LDAP=1 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$env" == *"N8N_OWNER_SETUP_STATUS=exists"* ]]
+}
+
 # --- Doctor per backend ---
 test_doctor_ollama_backend() {
   local tmp fake_bin out
@@ -5130,6 +5150,7 @@ run_test "workspace removed commands are unknown" test_workspace_removed_command
 run_test "workspace setup accepts Vikunja token" test_workspace_setup_accepts_vikunja_token
 run_test "workspace setup rejects multiline Vikunja token" test_workspace_setup_rejects_multiline_vikunja_token
 run_test "workspace setup rerun bootstraps n8n owner" test_workspace_setup_rerun_bootstraps_n8n_owner
+run_test "workspace setup verifies n8n 2.x login field" test_workspace_setup_verifies_n8n_2x_login_field
 
 printf "\n%d passed, %d failed\n" "$passed" "$failed"
 [[ "$failed" -eq 0 ]]
