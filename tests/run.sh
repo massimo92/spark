@@ -57,6 +57,7 @@ ${stdin_payload}"
           *"pg_database WHERE datname='n8n'"*) [[ "${FAKE_PG_DB_N8N:-1}" == "1" ]] && printf '1\n' ;;
           *"CREATE USER vikunja"*|*"ALTER USER vikunja"*|*"CREATE DATABASE vikunja"*|*"ALTER DATABASE vikunja"*) exit 0 ;;
           *"CREATE USER n8n"*|*"ALTER USER n8n"*|*"CREATE DATABASE n8n"*|*"ALTER DATABASE n8n"*) exit 0 ;;
+          *"n8n user-management:reset"*) exit "${FAKE_N8N_USER_RESET_EXIT:-0}" ;;
           *"pg_dump -U vikunja vikunja"*) printf '%s\n' "-- vikunja dump" ;;
           *"pg_dump -U n8n n8n"*) printf '%s\n' "-- n8n dump" ;;
           *"user list -e "*) exit 2 ;;
@@ -224,6 +225,7 @@ case "$*" in
       exit 0
     fi
     exit "${FAKE_N8N_LOGIN_EXIT:-0}" ;;
+  *:8642/v1/models*) echo "${FAKE_HERMES_MODELS:-{\"data\":[{\"id\":\"hermes-agent\"}]}"; exit "${FAKE_HERMES_LOCAL_API_EXIT:-0}" ;;
   */v1/models*) [[ "${FAKE_VLLM_READY:-1}" == "1" ]] && { echo "${FAKE_LITELLM_MODELS:-{\"data\":[{\"id\":\"vllm/Org/Alpha\"}]}"; exit 0; }; exit 7 ;;
   *)            [[ "${FAKE_OLLAMA_UP:-0}" == "1" ]] && exit 0; exit 7 ;;
 esac
@@ -552,6 +554,7 @@ EOF
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=%s\n' "${NEMOCLAW_LOCAL_INFERENCE_TIMEOUT:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_SANDBOX_READY_TIMEOUT=%s\n' "${NEMOCLAW_SANDBOX_READY_TIMEOUT:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_NO_GPU=%s\n' "${NEMOCLAW_NO_GPU:-}" >> "${FAKE_NEMOHERMES_FILE}"
+[[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_SANDBOX_GPU=%s\n' "${NEMOCLAW_SANDBOX_GPU:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'CHAT_UI_URL=%s\n' "${CHAT_UI_URL:-}" >> "${FAKE_NEMOHERMES_FILE}"
 case "$*" in
   *dashboard-url*) echo "${FAKE_NEMOHERMES_DASHBOARD_URL:-http://127.0.0.1:18789}" ;;
@@ -1813,6 +1816,7 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=300"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_SANDBOX_READY_TIMEOUT=600"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_NO_GPU=1"* ]] &&
+    [[ "$nemo_calls" == *"NEMOCLAW_SANDBOX_GPU=0"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
     [[ "$curl_calls" == *'"expires_at":"2099-12-31T23:59:59Z"'* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
@@ -2523,7 +2527,7 @@ test_workspace_credentials_show_outputs_recovery_secrets() {
 
 test_workspace_credentials_reset_rotates_local_secrets() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin env n8n_env old_human old_n8n new_human new_n8n
+  local tmp fake_bin env n8n_env old_human old_n8n new_human new_n8n compose_exec
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
@@ -2535,9 +2539,12 @@ test_workspace_credentials_reset_rotates_local_secrets() {
   old_human=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
   old_n8n=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws credentials reset vikunja >/dev/null 2>&1
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws credentials reset n8n >/dev/null 2>&1
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' FAKE_COMPOSE_EXEC_FILE="${tmp}/compose-exec.log" \
+    "$SPARK" ws credentials reset n8n >/dev/null 2>&1
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
   n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env")
+  compose_exec=$(cat "${tmp}/compose-exec.log" 2>/dev/null || echo "")
   new_human=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
   new_n8n=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
   rm -rf "$tmp"
@@ -2549,7 +2556,8 @@ test_workspace_credentials_reset_rotates_local_secrets() {
     [[ "$old_n8n" != "$new_n8n" ]] &&
     [[ "$n8n_env" == *"N8N_BASIC_AUTH_PASSWORD=${new_n8n}"* ]] &&
     [[ "$env" == *"VIKUNJA_HUMAN_USER_STATUS=manual"* ]] &&
-    [[ "$env" == *"N8N_OWNER_SETUP_STATUS=manual"* ]]
+    [[ "$env" == *"N8N_OWNER_SETUP_STATUS=exists"* ]] &&
+    [[ "$compose_exec" == *"n8n user-management:reset"* ]]
 }
 
 test_workspace_setup_repairs_polluted_required_env_values() {
@@ -2734,10 +2742,10 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Shared Postgres runtime has Vikunja and n8n roles/databases"* ]] &&
     [[ "$out" == *"[x] LiteLLM exposes Hermes model route"* ]] &&
     [[ "$out" == *"[x] Vikunja internal doctor passes"* ]] &&
-    [[ "$out" == *"[x] Hermes NemoClaw uses restricted policy and workspace dashboard port"* ]] &&
+    [[ "$out" == *"[x] Hermes NemoClaw uses restricted policy and private API port"* ]] &&
     [[ "$out" == *"[x] NemoHermes sandbox doctor passes"* ]] &&
     [[ "$out" == *"[x] NemoHermes inference route uses selected LiteLLM model"* ]] &&
-    [[ "$out" == *"[x] Hermes dashboard URL is reachable from NemoClaw"* ]]
+    [[ "$out" == *"[x] Hermes private API URL is reachable"* ]]
 }
 
 test_workspace_doctor_strict_checks_pinned_images() {
@@ -3634,7 +3642,7 @@ test_workspace_doctor_flags_nemohermes_doctor_failure() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_NEMOHERMES_DOCTOR_EXIT=1 \
+    FAKE_HERMES_LOCAL_API_EXIT=7 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -3655,18 +3663,18 @@ test_workspace_doctor_flags_wrong_nemoclaw_policy() {
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  perl -0pi -e 's/^HERMES_POLICY_TIER=restricted$/HERMES_POLICY_TIER=balanced/m' "${tmp}/home/.config/spark/workspace/secrets.env"
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_NEMOHERMES_POLICY_JSON='{"tier":"balanced","appliedPresets":["web"]}' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Hermes NemoClaw uses restricted policy and workspace dashboard port"* ]]
+    [[ "$out" == *"[ ] Hermes NemoClaw uses restricted policy and private API port"* ]]
 }
 
 test_workspace_doctor_flags_wrong_hermes_dashboard_url() {
@@ -3684,6 +3692,7 @@ test_workspace_doctor_flags_wrong_hermes_dashboard_url() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_TAILSCALE_HERMES_EXIT=7 \
     FAKE_NEMOHERMES_DASHBOARD_URL='http://127.0.0.1:9999' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
@@ -3691,7 +3700,7 @@ test_workspace_doctor_flags_wrong_hermes_dashboard_url() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Hermes dashboard URL is reachable from NemoClaw"* ]]
+    [[ "$out" == *"[ ] Hermes private API URL is reachable"* ]]
 }
 
 test_workspace_doctor_flags_missing_tailscale_service_config() {
