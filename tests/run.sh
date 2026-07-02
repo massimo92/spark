@@ -2237,7 +2237,7 @@ test_workspace_setup_skips_hermes_when_services_fail() {
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_TAILSCALE_GET_CONFIG_EXIT=1 FAKE_TAILSCALE_SERVE_CONFIG='not-configured' FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
   status=$?
