@@ -1824,8 +1824,7 @@ test_workspace_setup_writes_compose_names() {
     [[ "$(grep -c 'stop_grace_period: 30s' <<< "$compose")" -ge 3 ]] &&
     [[ "$(grep -c 'max-size: "10m"' <<< "$compose")" -ge 3 ]] &&
     [[ "$(grep -c 'max-file: "5"' <<< "$compose")" -ge 3 ]] &&
-    [[ "$tailscale_calls" == *"serve --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456"* ]] &&
-    [[ "$tailscale_calls" != *"--bg"* ]] &&
+    [[ "$tailscale_calls" == *"serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456"* ]] &&
     [[ "$nemo_calls" == *"onboard --non-interactive --yes-i-accept-third-party-software --yes --no-gpu --control-ui-port 18789"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_AGENT=hermes"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_PREFERRED_API=openai-completions"* ]] &&
@@ -2193,7 +2192,7 @@ test_workspace_setup_updates_old_tailscale_for_services() {
     [[ "$out" == *"Tailscale updated"* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$tailscale_calls" == *"update"* ]] &&
-    [[ "$tailscale_calls" == *"serve --service=svc:vikunja"* ]]
+    [[ "$tailscale_calls" == *"serve --bg --service=svc:vikunja"* ]]
 }
 
 test_workspace_setup_defaults_to_services_from_ports_workspace() {
@@ -2223,9 +2222,9 @@ test_workspace_setup_defaults_to_services_from_ports_workspace() {
     [[ "$env" == *"VIKUNJA_URL=https://vikunja.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"N8N_URL=https://n8n.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"HERMES_URL=https://hermes.test-tailnet.ts.net"* ]] &&
-    [[ "$tailscale_calls" == *"serve --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456"* ]] &&
-    [[ "$tailscale_calls" == *"serve --service=svc:n8n --https=443 --yes http://127.0.0.1:5678"* ]] &&
-    [[ "$tailscale_calls" == *"serve --service=svc:hermes --https=443 --yes http://127.0.0.1:18789"* ]]
+    [[ "$tailscale_calls" == *"serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456"* ]] &&
+    [[ "$tailscale_calls" == *"serve --bg --service=svc:n8n --https=443 --yes http://127.0.0.1:5678"* ]] &&
+    [[ "$tailscale_calls" == *"serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:18789"* ]]
 }
 
 test_workspace_setup_skips_hermes_when_services_fail() {
@@ -2288,7 +2287,7 @@ test_workspace_setup_blocks_tailscale_funnel() {
   [[ "$status" -ne 0 ]] &&
     [[ "$out" == *"Tailscale Funnel is active; rerun with --funnel-action reset"* ]] &&
     [[ "$tailscale_calls" != *"funnel reset"* ]] &&
-    [[ "$tailscale_calls" != *"serve --service=svc:"* ]] &&
+    [[ "$tailscale_calls" != *"serve --bg --service=svc:"* ]] &&
     [[ "$nemo_calls" != *"onboard"* ]] &&
     [[ "$mutated" -eq 0 ]]
 }
@@ -2315,7 +2314,7 @@ test_workspace_setup_resets_tailscale_funnel_with_flag() {
   [[ "$status" -eq 0 ]] &&
     [[ "$out" == *"Tailscale Funnel reset"* ]] &&
     [[ "$tailscale_calls" == *"funnel reset"* ]] &&
-    [[ "$tailscale_calls" == *"serve --service=svc:"* ]]
+    [[ "$tailscale_calls" == *"serve --bg --service=svc:"* ]]
 }
 
 test_workspace_setup_check_reports_funnel_without_reset() {
