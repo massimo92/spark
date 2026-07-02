@@ -5309,6 +5309,10 @@ workspace_configure_tailscale() {
     fi
     sleep 1
   done
+  if [[ "$ready" != "1" && "${SPARK_WORKSPACE_TAILSCALE_MODE_EXPLICIT:-0}" != "1" ]] &&
+    workspace_tailscale_serve_disabled_error "$vikunja_log" "$n8n_log" "$hermes_log"; then
+    fallback_ports=1
+  fi
   rm -rf "$status_dir"
   if [[ "$fallback_ports" == "1" ]]; then
     workspace_tailscale_ports_fallback "$tailnet" || {
@@ -6648,7 +6652,11 @@ workspace_tailscale_serve_launch_bg() {
     target="$2"
     status_file="$3"
     log_file="$4"
-    tailscale serve --bg --service="$service" --https=443 --yes "$target" >"$log_file" 2>&1
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 5 tailscale serve --bg --service="$service" --https=443 --yes "$target" >"$log_file" 2>&1
+    else
+      tailscale serve --bg --service="$service" --https=443 --yes "$target" >"$log_file" 2>&1
+    fi
     rc=$?
     printf "%s" "$rc" >"$status_file"
   ' _ "$service" "$target" "$status_file" "$log_file" >/dev/null 2>&1 &
