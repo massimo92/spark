@@ -3980,7 +3980,7 @@ cmd_setup_help() {
     --yes                   Accept safe defaults. Does not reset Funnel by itself.
     --full                  Set up model server + agent workspace.
     --model MODEL           Workspace/Hermes model. Required for remote --full unless --check.
-    --tailscale-mode MODE   Workspace private access mode: services or ports.
+    --tailscale-mode MODE   Workspace private access mode: default services; use ports to keep port URLs.
     --funnel-action reset   If Funnel is active, run 'tailscale funnel reset' and re-check.
     --funnel-action abort   If Funnel is active, fail without changing Funnel.
 
@@ -5531,7 +5531,7 @@ workspace_setup() {
   local auto_yes=0 check_only=0 requested_model="" remote_spec="" requested_tail_mode=""
   local postgres_image="" vikunja_image="" n8n_image="" model tailnet
   local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_token="" n8n_email_arg="" n8n_password_arg="" funnel_action=""
-  local existing_model="" setup_overrides=0
+  local existing_model="" existing_tail_mode="" effective_tail_mode="" setup_overrides=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --yes) auto_yes=1; shift ;;
@@ -5610,7 +5610,9 @@ workspace_setup() {
   printf "\n  ${BOLD}spark ws setup${NC} — Vikunja + n8n + Hermes\n\n"
   workspace_preflight "$check_only" || true
   existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
-  if [[ -n "$requested_model" || -n "$requested_tail_mode" || -n "$postgres_image" || -n "$vikunja_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" ]]; then
+  existing_tail_mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
+  effective_tail_mode="${requested_tail_mode:-services}"
+  if [[ -n "$requested_model" || -n "$postgres_image" || -n "$vikunja_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
     setup_overrides=1
   fi
   if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
@@ -5629,6 +5631,7 @@ workspace_setup() {
       info "Workspace drift detected; reconciling"
     fi
   fi
+  SPARK_WORKSPACE_TAILSCALE_MODE="$effective_tail_mode"
   if [[ -n "$requested_model" ]]; then
     model=$(workspace_select_model "$requested_model")
   elif [[ -n "$existing_model" ]]; then
@@ -6975,7 +6978,7 @@ cmd_workspace_help() {
     --remote user@host          Run workspace setup on a configured remote host
     --model MODEL               Hermes model; must match spark list data
     --tailscale-mode services|ports
-                                services = friendly HTTPS names; ports = MagicDNS + ports
+                                default = services; ports = MagicDNS + ports
     --funnel-action reset|abort Handle active Tailscale Funnel explicitly
     --postgres-image IMAGE      Override Postgres image ref
     --vikunja-image IMAGE       Override Vikunja image ref
