@@ -2290,6 +2290,34 @@ test_workspace_setup_yes_does_not_fallback_when_services_disabled() {
     [[ "$nemo_calls" != *"onboard"* ]]
 }
 
+test_workspace_setup_reports_tailscale_service_pending_approval() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env nemo_calls serve_config
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  serve_config='{"version":"0.0.1","services":{"svc:vikunja":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18789"}}}}'
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:18789"]}]}}}' \
+    FAKE_TAILSCALE_SERVE_CONFIG="$serve_config" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Tailscale Services configured locally"* ]] &&
+    [[ "$out" == *"Tailscale Service host pending admin approval"* ]] &&
+    [[ "$out" == *"Open: https://login.tailscale.com/admin/services"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_LAST_ERROR=pending-approval"* ]] &&
+    [[ "$nemo_calls" != *"onboard"* ]]
+}
+
 test_workspace_setup_interactive_offers_ports_fallback_when_services_disabled() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status env nemo_calls
@@ -4071,6 +4099,28 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
+test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out serve_config
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  serve_config='{"version":"0.0.1","services":{"svc:vikunja":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18789"}}}}'
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_TAILSCALE_SERVE_CONFIG="$serve_config" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Workspace doctor passed"* ]] &&
+    [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
+}
+
 test_workspace_doctor_flags_invalid_compose_config() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status
@@ -5383,6 +5433,7 @@ run_test "workspace setup updates old Tailscale for Services" test_workspace_set
 run_test "workspace setup defaults to services from ports workspace" test_workspace_setup_defaults_to_services_from_ports_workspace
 run_test "workspace setup reports missing Tailscale Services HITL" test_workspace_setup_reports_missing_tailscale_services_hitl
 run_test "workspace setup --yes does not fallback when Services are disabled" test_workspace_setup_yes_does_not_fallback_when_services_disabled
+run_test "workspace setup reports pending Tailscale Service approval" test_workspace_setup_reports_tailscale_service_pending_approval
 run_test "workspace setup interactively offers ports fallback when Services are disabled" test_workspace_setup_interactive_offers_ports_fallback_when_services_disabled
 run_test "workspace setup explicit Services does not fall back to ports" test_workspace_setup_explicit_services_does_not_fall_back_to_ports
 run_test "workspace setup blocks Tailscale Funnel" test_workspace_setup_blocks_tailscale_funnel
@@ -5449,6 +5500,7 @@ run_test "workspace doctor flags Tailscale Funnel enabled" test_workspace_doctor
 run_test "workspace doctor rejects public Tailscale Service target" test_workspace_doctor_rejects_public_tailscale_service_target
 run_test "workspace doctor rejects swapped Tailscale Service ports" test_workspace_doctor_rejects_swapped_tailscale_service_ports
 run_test "workspace doctor accepts multiline Tailscale Service JSON" test_workspace_doctor_accepts_multiline_tailscale_service_json
+run_test "workspace doctor accepts Tailscale services endpoint JSON" test_workspace_doctor_accepts_tailscale_services_endpoint_json
 run_test "workspace doctor flags invalid compose config" test_workspace_doctor_flags_invalid_compose_config
 run_test "workspace doctor flags missing runtime hardening" test_workspace_doctor_flags_missing_runtime_hardening
 run_test "workspace backup writes manifest and verifies" test_workspace_backup_manifest_and_verify
