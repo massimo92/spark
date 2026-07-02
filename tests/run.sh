@@ -2542,7 +2542,7 @@ test_workspace_credentials_show_outputs_recovery_secrets() {
 
 test_workspace_credentials_reset_rotates_local_secrets() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin env n8n_env old_human old_n8n new_human new_n8n compose_exec
+  local tmp fake_bin env n8n_env old_human old_n8n old_token new_human new_n8n new_token compose_exec
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
@@ -2553,25 +2553,34 @@ test_workspace_credentials_reset_rotates_local_secrets() {
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
   old_human=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
   old_n8n=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
+  old_token=$(sed -n 's/^VIKUNJA_HERMES_API_TOKEN=//p' <<< "$env")
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws credentials reset vikunja >/dev/null 2>&1
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' FAKE_COMPOSE_EXEC_FILE="${tmp}/compose-exec.log" \
     "$SPARK" ws credentials reset n8n >/dev/null 2>&1
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_VIKUNJA_CREATED_TOKEN=vk_rotated_hermes \
+    "$SPARK" ws credentials reset hermes >/dev/null 2>&1
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
   n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env")
   compose_exec=$(cat "${tmp}/compose-exec.log" 2>/dev/null || echo "")
   new_human=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
   new_n8n=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
+  new_token=$(sed -n 's/^VIKUNJA_HERMES_API_TOKEN=//p' <<< "$env")
   rm -rf "$tmp"
   [[ -n "$old_human" ]] &&
     [[ -n "$old_n8n" ]] &&
+    [[ -n "$old_token" ]] &&
     [[ -n "$new_human" ]] &&
     [[ -n "$new_n8n" ]] &&
+    [[ -n "$new_token" ]] &&
     [[ "$old_human" != "$new_human" ]] &&
     [[ "$old_n8n" != "$new_n8n" ]] &&
+    [[ "$old_token" != "$new_token" ]] &&
+    [[ "$new_token" == "vk_rotated_hermes" ]] &&
     [[ "$n8n_env" == *"N8N_BASIC_AUTH_PASSWORD=${new_n8n}"* ]] &&
     [[ "$env" == *"VIKUNJA_HUMAN_USER_STATUS=manual"* ]] &&
     [[ "$env" == *"N8N_OWNER_SETUP_STATUS=exists"* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_API_STATUS=verified"* ]] &&
     [[ "$compose_exec" == *"n8n user-management:reset"* ]]
 }
 
