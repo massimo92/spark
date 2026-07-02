@@ -1085,7 +1085,7 @@ cmd_setup_help() {
     --yes                   Accept safe defaults. Does not reset Funnel by itself.
     --full                  Set up model server + agent workspace.
     --model MODEL           Workspace/Hermes model. Required for remote --full unless --check.
-    --tailscale-mode MODE   Workspace private access mode: services or ports.
+    --tailscale-mode MODE   Workspace private access mode: default services; use ports to keep port URLs.
     --funnel-action reset   If Funnel is active, run 'tailscale funnel reset' and re-check.
     --funnel-action abort   If Funnel is active, fail without changing Funnel.
 

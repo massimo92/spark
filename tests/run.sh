@@ -1707,6 +1707,7 @@ test_workspace_check_existing_config_no_mutation() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_TAILSCALE_MODE=services \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
@@ -1917,6 +1918,7 @@ test_workspace_setup_repairs_compose_drift_without_hermes_onboard() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_TAILSCALE_MODE=services \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
@@ -2192,6 +2194,38 @@ test_workspace_setup_updates_old_tailscale_for_services() {
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$tailscale_calls" == *"update"* ]] &&
     [[ "$tailscale_calls" == *"serve --service=svc:vikunja"* ]]
+}
+
+test_workspace_setup_defaults_to_services_from_ports_workspace() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out env tailscale_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10","fd7a:115c:a1e0::10"]}}' \
+    FAKE_TAILSCALE_IP=100.64.0.10 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha --tailscale-mode ports >/dev/null 2>&1 || true
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10","fd7a:115c:a1e0::10"]}}' \
+    FAKE_TAILSCALE_IP=100.64.0.10 FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1 || true)
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  tailscale_calls=$(cat "${tmp}/tailscale.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$out" == *"Tailscale Services configured"* || "$out" == *"Workspace drift detected; reconciling"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
+    [[ "$env" == *"VIKUNJA_URL=https://vikunja.test-tailnet.ts.net"* ]] &&
+    [[ "$env" == *"N8N_URL=https://n8n.test-tailnet.ts.net"* ]] &&
+    [[ "$env" == *"HERMES_URL=https://hermes.test-tailnet.ts.net"* ]] &&
+    [[ "$tailscale_calls" == *"serve --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456"* ]] &&
+    [[ "$tailscale_calls" == *"serve --service=svc:n8n --https=443 --yes http://127.0.0.1:5678"* ]] &&
+    [[ "$tailscale_calls" == *"serve --service=svc:hermes --https=443 --yes http://127.0.0.1:18789"* ]]
 }
 
 test_workspace_setup_skips_hermes_when_services_fail() {
@@ -5188,6 +5222,7 @@ run_test "workspace setup requires tailnet URLs" test_workspace_setup_requires_t
 run_test "workspace ports mode requires MagicDNS URLs" test_workspace_ports_requires_magicdns_urls
 run_test "workspace supports Tailscale MagicDNS ports fallback" test_workspace_tailscale_ports_fallback
 run_test "workspace setup updates old Tailscale for Services" test_workspace_setup_updates_old_tailscale_for_services
+run_test "workspace setup defaults to services from ports workspace" test_workspace_setup_defaults_to_services_from_ports_workspace
 run_test "workspace setup skips Hermes when Services fail" test_workspace_setup_skips_hermes_when_services_fail
 run_test "workspace setup blocks Tailscale Funnel" test_workspace_setup_blocks_tailscale_funnel
 run_test "workspace setup resets Tailscale Funnel with flag" test_workspace_setup_resets_tailscale_funnel_with_flag
