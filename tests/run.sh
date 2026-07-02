@@ -537,6 +537,7 @@ case "${1:-}" in
       exit "${FAKE_TAILSCALE_GET_CONFIG_EXIT:-0}"
     fi
     [[ "${2:-}" == "status" ]] && exit 0
+    [[ -n "${FAKE_TAILSCALE_SERVE_STDERR:-}" ]] && printf '%s\n' "${FAKE_TAILSCALE_SERVE_STDERR}" >&2
     exit "${FAKE_TAILSCALE_SERVE_EXIT:-0}" ;;
   funnel)
     if [[ "${2:-}" == "reset" ]]; then
@@ -2227,7 +2228,7 @@ test_workspace_setup_defaults_to_services_from_ports_workspace() {
     [[ "$tailscale_calls" == *"serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:18789"* ]]
 }
 
-test_workspace_setup_skips_hermes_when_services_fail() {
+test_workspace_setup_falls_back_to_ports_when_services_disabled() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status env nemo_calls vikunja_env n8n_env
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -2237,7 +2238,8 @@ test_workspace_setup_skips_hermes_when_services_fail() {
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_TAILSCALE_GET_CONFIG_EXIT=1 FAKE_TAILSCALE_SERVE_CONFIG='not-configured' FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10","fd7a:115c:a1e0::10"]}}' \
+    FAKE_TAILSCALE_IP=100.64.0.10 FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_TAILSCALE_SERVE_STDERR='Serve is not enabled on your tailnet.' FAKE_TAILSCALE_GET_CONFIG_EXIT=1 FAKE_TAILSCALE_SERVE_CONFIG='not-configured' FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
   status=$?
@@ -2247,21 +2249,21 @@ test_workspace_setup_skips_hermes_when_services_fail() {
   n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env" 2>/dev/null || echo "")
   nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"Could not configure Tailscale Services automatically"* ]] &&
-    [[ "$out" == *"Hermes onboarding skipped until Tailscale private access is configured"* ]] &&
-    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=manual"* ]] &&
-    grep -qx 'VIKUNJA_URL=' <<< "$env" &&
-    grep -qx 'N8N_URL=' <<< "$env" &&
-    grep -qx 'HERMES_URL=' <<< "$env" &&
-    grep -qx 'VIKUNJA_SERVICE_PUBLICURL=' <<< "$vikunja_env" &&
-    grep -qx 'N8N_HOST=' <<< "$n8n_env" &&
+  [[ "$status" -eq 0 ]] &&
+    [[ "$out" == *"Tailscale Serve is not enabled on this tailnet; using ports fallback"* ]] &&
+    [[ "$out" == *"Hermes onboarded with"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=ports"* ]] &&
+    [[ "$env" == *"VIKUNJA_URL=http://sparkbox.test-tailnet.ts.net:3456"* ]] &&
+    [[ "$env" == *"N8N_URL=http://sparkbox.test-tailnet.ts.net:5678"* ]] &&
+    [[ "$env" == *"HERMES_URL=http://sparkbox.test-tailnet.ts.net:18789"* ]] &&
+    grep -qx 'VIKUNJA_SERVICE_PUBLICURL=http://sparkbox.test-tailnet.ts.net:3456' <<< "$vikunja_env" &&
+    grep -qx 'N8N_HOST=sparkbox.test-tailnet.ts.net' <<< "$n8n_env" &&
     grep -qx 'N8N_PROTOCOL=http' <<< "$n8n_env" &&
     grep -qx 'N8N_SECURE_COOKIE=false' <<< "$n8n_env" &&
-    grep -qx 'N8N_EDITOR_BASE_URL=' <<< "$n8n_env" &&
-    grep -qx 'WEBHOOK_URL=' <<< "$n8n_env" &&
-    [[ "$env" == *"HERMES_ONBOARD_STATUS=manual"* ]] &&
-    [[ "$nemo_calls" != *"onboard"* ]]
+    grep -qx 'N8N_EDITOR_BASE_URL=http://sparkbox.test-tailnet.ts.net:5678' <<< "$n8n_env" &&
+    grep -qx 'WEBHOOK_URL=http://sparkbox.test-tailnet.ts.net:5678' <<< "$n8n_env" &&
+    [[ "$env" == *"HERMES_ONBOARD_STATUS=configured"* ]] &&
+    [[ "$nemo_calls" == *"onboard"* ]]
 }
 
 test_workspace_setup_blocks_tailscale_funnel() {
@@ -5222,7 +5224,7 @@ run_test "workspace ports mode requires MagicDNS URLs" test_workspace_ports_requ
 run_test "workspace supports Tailscale MagicDNS ports fallback" test_workspace_tailscale_ports_fallback
 run_test "workspace setup updates old Tailscale for Services" test_workspace_setup_updates_old_tailscale_for_services
 run_test "workspace setup defaults to services from ports workspace" test_workspace_setup_defaults_to_services_from_ports_workspace
-run_test "workspace setup skips Hermes when Services fail" test_workspace_setup_skips_hermes_when_services_fail
+run_test "workspace setup falls back to ports when Services are disabled" test_workspace_setup_falls_back_to_ports_when_services_disabled
 run_test "workspace setup blocks Tailscale Funnel" test_workspace_setup_blocks_tailscale_funnel
 run_test "workspace setup resets Tailscale Funnel with flag" test_workspace_setup_resets_tailscale_funnel_with_flag
 run_test "workspace setup --check reports Funnel without reset" test_workspace_setup_check_reports_funnel_without_reset
