@@ -1161,7 +1161,7 @@ workspace_configure_tailscale() {
     fi
   fi
   [[ "$check_only" == "1" ]] && return 0
-  local status_dir="" vikunja_status="" n8n_status="" hermes_status="" vikunja_rc="" n8n_rc="" hermes_rc=""
+  local status_dir="" vikunja_status="" n8n_status="" hermes_status="" vikunja_rc="" n8n_rc="" hermes_rc="" out="" ready=0
   status_dir=$(mktemp -d)
   vikunja_status="${status_dir}/vikunja.rc"
   n8n_status="${status_dir}/n8n.rc"
@@ -1169,20 +1169,38 @@ workspace_configure_tailscale() {
   workspace_tailscale_serve_launch_bg "svc:vikunja" "http://127.0.0.1:${WORKSPACE_VIKUNJA_PORT}" "$vikunja_status"
   workspace_tailscale_serve_launch_bg "svc:n8n" "http://127.0.0.1:${WORKSPACE_N8N_PORT}" "$n8n_status"
   workspace_tailscale_serve_launch_bg "svc:hermes" "http://127.0.0.1:${WORKSPACE_HERMES_PORT}" "$hermes_status"
-  for _ in 1 2 3; do
-    [[ -s "$vikunja_status" && -s "$n8n_status" && -s "$hermes_status" ]] && break
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if [[ -s "$vikunja_status" && -s "$n8n_status" && -s "$hermes_status" ]]; then
+      vikunja_rc=$(cat "$vikunja_status" 2>/dev/null || echo 1)
+      n8n_rc=$(cat "$n8n_status" 2>/dev/null || echo 1)
+      hermes_rc=$(cat "$hermes_status" 2>/dev/null || echo 1)
+      if [[ "$vikunja_rc" != "0" || "$n8n_rc" != "0" || "$hermes_rc" != "0" ]]; then
+        rm -rf "$status_dir"
+        workspace_clear_public_urls
+        setup_fail "Could not configure Tailscale Services automatically"
+        printf "    Configure manually:\n"
+        printf "    tailscale serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_VIKUNJA_PORT"
+        printf "    tailscale serve --bg --service=svc:n8n --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_N8N_PORT"
+        printf "    tailscale serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_HERMES_PORT"
+        printf "    The host may need tag-based identity and admin approval in Tailscale Services.\n"
+        return 0
+      fi
+    fi
+    out=$(tailscale serve get-config --all 2>/dev/null || tailscale serve status --json 2>/dev/null || tailscale serve status 2>/dev/null || true)
+    if [[ "$out" == *"svc:vikunja"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]] &&
+      workspace_tailscale_service_target_private "$out" vikunja "$WORKSPACE_VIKUNJA_PORT" &&
+      workspace_tailscale_service_target_private "$out" n8n "$WORKSPACE_N8N_PORT" &&
+      workspace_tailscale_service_target_private "$out" hermes "$WORKSPACE_HERMES_PORT"; then
+      ready=1
+      break
+    fi
     sleep 1
   done
-  if [[ -s "$vikunja_status" && -s "$n8n_status" && -s "$hermes_status" ]]; then
-    vikunja_rc=$(cat "$vikunja_status" 2>/dev/null || echo 1)
-    n8n_rc=$(cat "$n8n_status" 2>/dev/null || echo 1)
-    hermes_rc=$(cat "$hermes_status" 2>/dev/null || echo 1)
-    rm -rf "$status_dir"
-    if [[ "$vikunja_rc" == "0" && "$n8n_rc" == "0" && "$hermes_rc" == "0" ]]; then
-      workspace_set_env_key WORKSPACE_TAILSCALE_MODE services
-      info "Tailscale Services configured"
-      return 0
-    fi
+  rm -rf "$status_dir"
+  if [[ "$ready" == "1" ]]; then
+    workspace_set_env_key WORKSPACE_TAILSCALE_MODE services
+    info "Tailscale Services configured"
+  else
     workspace_clear_public_urls
     setup_fail "Could not configure Tailscale Services automatically"
     printf "    Configure manually:\n"
@@ -1190,11 +1208,7 @@ workspace_configure_tailscale() {
     printf "    tailscale serve --bg --service=svc:n8n --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_N8N_PORT"
     printf "    tailscale serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_HERMES_PORT"
     printf "    The host may need tag-based identity and admin approval in Tailscale Services.\n"
-    return 0
   fi
-  rm -rf "$status_dir"
-  workspace_set_env_key WORKSPACE_TAILSCALE_MODE services
-  info "Tailscale Services configured (detached)"
 }
 
 workspace_hermes_config_ready() {
