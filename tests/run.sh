@@ -527,7 +527,11 @@ case "${1:-}" in
     exit "${FAKE_TAILSCALE_UPDATE_EXIT:-0}" ;;
   status)
     if [[ "${2:-}" == "--json" ]]; then
-      echo "${FAKE_TAILSCALE_STATUS_JSON:-{\"MagicDNSSuffix\":\"test-tailnet.ts.net.\"}}"
+      if [[ -n "${FAKE_TAILSCALE_STATUS_JSON:-}" ]]; then
+        printf '%s\n' "$FAKE_TAILSCALE_STATUS_JSON"
+      else
+        printf '%s\n' '{"MagicDNSSuffix":"test-tailnet.ts.net."}'
+      fi
       exit 0
     fi
     exit "${FAKE_TAILSCALE_STATUS_EXIT:-1}" ;;
@@ -2228,9 +2232,38 @@ test_workspace_setup_defaults_to_services_from_ports_workspace() {
     [[ "$tailscale_calls" == *"serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:18789"* ]]
 }
 
-test_workspace_setup_falls_back_to_ports_when_services_disabled() {
+test_workspace_setup_reports_missing_tailscale_services_hitl() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out status env nemo_calls vikunja_env n8n_env
+  local tmp fake_bin out status env tailscale_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}]}}}' \
+    FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  tailscale_calls=$(cat "${tmp}/tailscale.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Tailscale Services must be created/approved in the Tailscale admin console"* ]] &&
+    [[ "$out" == *"Open: https://login.tailscale.com/admin/services"* ]] &&
+    [[ "$out" == *"hermes (tcp:18789)"* ]] &&
+    [[ "$out" == *"Approve/authorize host: sparkbox.test-tailnet.ts.net"* ]] &&
+    [[ "$out" == *"Tailscale Services not registered/authorized: hermes:18789"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=manual"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_LAST_ERROR=missing-service"* ]] &&
+    [[ "$tailscale_calls" != *"serve --bg --service=svc:"* ]]
+}
+
+test_workspace_setup_yes_does_not_fallback_when_services_disabled() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env nemo_calls
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   set +e
@@ -2239,31 +2272,49 @@ test_workspace_setup_falls_back_to_ports_when_services_disabled() {
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10","fd7a:115c:a1e0::10"]}}' \
-    FAKE_TAILSCALE_IP=100.64.0.10 FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_TAILSCALE_SERVE_STDERR='Serve is not enabled on your tailnet.' FAKE_TAILSCALE_GET_CONFIG_EXIT=1 FAKE_TAILSCALE_SERVE_CONFIG='not-configured' FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_TAILSCALE_IP=100.64.0.10 FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_TAILSCALE_SERVE_STDERR='Serve is not enabled on your tailnet.\nTo enable, visit:\n\n         https://login.tailscale.com/f/serve?node=test' FAKE_TAILSCALE_GET_CONFIG_EXIT=1 FAKE_TAILSCALE_SERVE_CONFIG='not-configured' FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
   status=$?
   set -e
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
-  vikunja_env=$(cat "${tmp}/home/.config/spark/workspace/vikunja.env" 2>/dev/null || echo "")
-  n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env" 2>/dev/null || echo "")
   nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$status" -eq 0 ]] &&
-    [[ "$out" == *"Tailscale Serve is not enabled on this tailnet; using ports fallback"* ]] &&
-    [[ "$out" == *"Hermes onboarded with"* ]] &&
-    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=ports"* ]] &&
-    [[ "$env" == *"VIKUNJA_URL=http://sparkbox.test-tailnet.ts.net:3456"* ]] &&
-    [[ "$env" == *"N8N_URL=http://sparkbox.test-tailnet.ts.net:5678"* ]] &&
-    [[ "$env" == *"HERMES_URL=http://sparkbox.test-tailnet.ts.net:18789"* ]] &&
-    grep -qx 'VIKUNJA_SERVICE_PUBLICURL=http://sparkbox.test-tailnet.ts.net:3456' <<< "$vikunja_env" &&
-    grep -qx 'N8N_HOST=sparkbox.test-tailnet.ts.net' <<< "$n8n_env" &&
-    grep -qx 'N8N_PROTOCOL=http' <<< "$n8n_env" &&
-    grep -qx 'N8N_SECURE_COOKIE=false' <<< "$n8n_env" &&
-    grep -qx 'N8N_EDITOR_BASE_URL=http://sparkbox.test-tailnet.ts.net:5678' <<< "$n8n_env" &&
-    grep -qx 'WEBHOOK_URL=http://sparkbox.test-tailnet.ts.net:5678' <<< "$n8n_env" &&
-    [[ "$env" == *"HERMES_ONBOARD_STATUS=configured"* ]] &&
-    [[ "$nemo_calls" == *"onboard"* ]]
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Tailscale Serve is not enabled for this tailnet"* ]] &&
+    [[ "$out" == *"https://login.tailscale.com/f/serve?node=test"* ]] &&
+    [[ "$out" == *"Workspace incomplete"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=manual"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_LAST_ERROR=serve-disabled"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_ENABLE_URL=https://login.tailscale.com/f/serve?node=test"* ]] &&
+    [[ "$nemo_calls" != *"onboard"* ]]
+}
+
+test_workspace_setup_interactive_offers_ports_fallback_when_services_disabled() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env nemo_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
+  out=$(printf '\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ASSUME_INTERACTIVE=1 \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10","fd7a:115c:a1e0::10"]}}' \
+    FAKE_TAILSCALE_IP=100.64.0.10 FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_TAILSCALE_SERVE_STDERR='Serve is not enabled on your tailnet.' FAKE_TAILSCALE_GET_CONFIG_EXIT=1 FAKE_TAILSCALE_SERVE_CONFIG='not-configured' FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_NAMES='spark-litellm\n' FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Use temporary Tailscale port URLs instead of Services for now?"* ]] &&
+    [[ "$out" != *"using ports fallback"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=manual"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_LAST_ERROR=serve-disabled"* ]] &&
+    [[ "$nemo_calls" != *"onboard"* ]]
 }
 
 test_workspace_setup_explicit_services_does_not_fall_back_to_ports() {
@@ -2285,7 +2336,7 @@ test_workspace_setup_explicit_services_does_not_fall_back_to_ports() {
   nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"Could not configure Tailscale Services automatically"* ]] &&
+    [[ "$out" == *"Tailscale Serve is not enabled for this tailnet"* ]] &&
     [[ "$out" == *"Hermes onboarding skipped until Tailscale private access is configured"* ]] &&
     [[ "$out" != *"using ports fallback"* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=manual"* ]] &&
@@ -2819,7 +2870,10 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] n8n hardened for private agent workflows"* ]] &&
     [[ "$out" == *"[x] n8n owner/admin login ready"* ]] &&
     [[ "$out" == *"[x] Tailscale supports selected private access mode"* ]] &&
-    [[ "$out" == *"[x] Tailscale private access configured for vikunja, n8n, hermes"* ]] &&
+    [[ "$out" == *"[x] Tailscale Services registered/authorized"* ]] &&
+    [[ "$out" == *"[x] Tailscale Serve enabled"* ]] &&
+    [[ "$out" == *"[x] Tailscale Service host advertised"* ]] &&
+    [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]] &&
     [[ "$out" == *"[x] Tailscale mode is Services or ports"* ]] &&
     [[ "$out" == *"[x] Tailscale workspace URLs respond"* ]] &&
     [[ "$out" == *"[x] No workspace/gateway port is published on 0.0.0.0"* ]] &&
@@ -3120,7 +3174,7 @@ test_workspace_doctor_rejects_non_tailscale_ports_bind() {
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
     [[ "$out" == *"[ ] Compose uses private host bindings only"* ]] &&
-    [[ "$out" == *"[ ] Tailscale private access configured for vikunja, n8n, hermes"* ]]
+    [[ "$out" == *"[ ] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
 test_workspace_doctor_flags_public_docker_port() {
@@ -3459,7 +3513,7 @@ test_workspace_doctor_rejects_stale_ports_dns_name() {
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
     [[ "$out" == *"[ ] Workspace URLs configured"* ]] &&
-    [[ "$out" == *"[ ] Tailscale private access configured for vikunja, n8n, hermes"* ]] &&
+    [[ "$out" == *"[ ] Tailscale local config maps vikunja, n8n, hermes"* ]] &&
     [[ "$out" == *"[ ] Tailscale workspace URLs respond"* ]]
 }
 
@@ -3762,6 +3816,83 @@ test_workspace_doctor_flags_nemohermes_doctor_failure() {
     [[ "$out" == *"[ ] NemoHermes sandbox doctor passes"* ]]
 }
 
+test_workspace_doctor_flags_missing_tailscale_service_registration() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}]}}}' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] Tailscale Services registered/authorized"* ]]
+}
+
+test_workspace_doctor_flags_tailscale_serve_disabled() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  awk '
+    /^WORKSPACE_TAILSCALE_LAST_ERROR=/ { print "WORKSPACE_TAILSCALE_LAST_ERROR=serve-disabled"; next }
+    { print }
+  ' "${tmp}/home/.config/spark/workspace/secrets.env" > "${tmp}/home/.config/spark/workspace/secrets.env.tmp"
+  mv "${tmp}/home/.config/spark/workspace/secrets.env.tmp" "${tmp}/home/.config/spark/workspace/secrets.env"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] Tailscale Serve enabled"* ]]
+}
+
+test_workspace_doctor_flags_tailscale_service_host_not_advertised() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_TAILSCALE_GET_CONFIG_EXIT=0 FAKE_TAILSCALE_SERVE_CONFIG='{"version":"0.0.1"}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:18789"]}]}}}' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] Tailscale Service host advertised"* ]]
+}
+
 test_workspace_doctor_flags_wrong_nemoclaw_policy() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status
@@ -3835,7 +3966,7 @@ test_workspace_doctor_flags_missing_tailscale_service_config() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Tailscale private access configured for vikunja, n8n, hermes"* ]]
+    [[ "$out" == *"[ ] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
 test_workspace_doctor_flags_tailscale_funnel_enabled() {
@@ -3885,7 +4016,7 @@ test_workspace_doctor_rejects_public_tailscale_service_target() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Tailscale private access configured for vikunja, n8n, hermes"* ]]
+    [[ "$out" == *"[ ] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
 test_workspace_doctor_rejects_swapped_tailscale_service_ports() {
@@ -3910,7 +4041,7 @@ test_workspace_doctor_rejects_swapped_tailscale_service_ports() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Tailscale private access configured for vikunja, n8n, hermes"* ]]
+    [[ "$out" == *"[ ] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
 test_workspace_doctor_accepts_multiline_tailscale_service_json() {
@@ -3937,7 +4068,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   rm -rf "$tmp"
   [[ "$out" == *"Workspace doctor passed"* ]] &&
-    [[ "$out" == *"[x] Tailscale private access configured for vikunja, n8n, hermes"* ]]
+    [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
 test_workspace_doctor_flags_invalid_compose_config() {
@@ -5250,7 +5381,9 @@ run_test "workspace ports mode requires MagicDNS URLs" test_workspace_ports_requ
 run_test "workspace supports Tailscale MagicDNS ports fallback" test_workspace_tailscale_ports_fallback
 run_test "workspace setup updates old Tailscale for Services" test_workspace_setup_updates_old_tailscale_for_services
 run_test "workspace setup defaults to services from ports workspace" test_workspace_setup_defaults_to_services_from_ports_workspace
-run_test "workspace setup falls back to ports when Services are disabled" test_workspace_setup_falls_back_to_ports_when_services_disabled
+run_test "workspace setup reports missing Tailscale Services HITL" test_workspace_setup_reports_missing_tailscale_services_hitl
+run_test "workspace setup --yes does not fallback when Services are disabled" test_workspace_setup_yes_does_not_fallback_when_services_disabled
+run_test "workspace setup interactively offers ports fallback when Services are disabled" test_workspace_setup_interactive_offers_ports_fallback_when_services_disabled
 run_test "workspace setup explicit Services does not fall back to ports" test_workspace_setup_explicit_services_does_not_fall_back_to_ports
 run_test "workspace setup blocks Tailscale Funnel" test_workspace_setup_blocks_tailscale_funnel
 run_test "workspace setup resets Tailscale Funnel with flag" test_workspace_setup_resets_tailscale_funnel_with_flag
@@ -5306,6 +5439,9 @@ run_test "workspace doctor flags missing Postgres runtime DB" test_workspace_doc
 run_test "workspace doctor flags missing LiteLLM route" test_workspace_doctor_flags_missing_litellm_route
 run_test "workspace doctor flags wrong NemoHermes route" test_workspace_doctor_flags_wrong_nemohermes_route
 run_test "workspace doctor flags NemoHermes doctor failure" test_workspace_doctor_flags_nemohermes_doctor_failure
+run_test "workspace doctor flags missing Tailscale Service registration" test_workspace_doctor_flags_missing_tailscale_service_registration
+run_test "workspace doctor flags Tailscale Serve disabled" test_workspace_doctor_flags_tailscale_serve_disabled
+run_test "workspace doctor flags Tailscale Service host not advertised" test_workspace_doctor_flags_tailscale_service_host_not_advertised
 run_test "workspace doctor flags wrong NemoClaw policy" test_workspace_doctor_flags_wrong_nemoclaw_policy
 run_test "workspace doctor flags wrong Hermes dashboard URL" test_workspace_doctor_flags_wrong_hermes_dashboard_url
 run_test "workspace doctor flags missing Tailscale Service config" test_workspace_doctor_flags_missing_tailscale_service_config
