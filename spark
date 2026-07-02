@@ -5268,9 +5268,9 @@ workspace_configure_tailscale() {
   fi
   [[ "$check_only" == "1" ]] && return 0
   local ok=1
-  tailscale serve --service="svc:vikunja" --https=443 --yes "http://127.0.0.1:${WORKSPACE_VIKUNJA_PORT}" >/dev/null 2>&1 || ok=0
-  tailscale serve --service="svc:n8n" --https=443 --yes "http://127.0.0.1:${WORKSPACE_N8N_PORT}" >/dev/null 2>&1 || ok=0
-  tailscale serve --service="svc:hermes" --https=443 --yes "http://127.0.0.1:${WORKSPACE_HERMES_PORT}" >/dev/null 2>&1 || ok=0
+  tailscale serve --bg --service="svc:vikunja" --https=443 --yes "http://127.0.0.1:${WORKSPACE_VIKUNJA_PORT}" >/dev/null 2>&1 || ok=0
+  tailscale serve --bg --service="svc:n8n" --https=443 --yes "http://127.0.0.1:${WORKSPACE_N8N_PORT}" >/dev/null 2>&1 || ok=0
+  tailscale serve --bg --service="svc:hermes" --https=443 --yes "http://127.0.0.1:${WORKSPACE_HERMES_PORT}" >/dev/null 2>&1 || ok=0
   if [[ "$ok" == "1" ]]; then
     workspace_set_env_key WORKSPACE_TAILSCALE_MODE services
     info "Tailscale Services configured"
@@ -5278,9 +5278,9 @@ workspace_configure_tailscale() {
     workspace_clear_public_urls
     warn "Could not configure Tailscale Services automatically"
     printf "    Configure manually:\n"
-    printf "    tailscale serve --service=svc:vikunja --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_VIKUNJA_PORT"
-    printf "    tailscale serve --service=svc:n8n --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_N8N_PORT"
-    printf "    tailscale serve --service=svc:hermes --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_HERMES_PORT"
+    printf "    tailscale serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_VIKUNJA_PORT"
+    printf "    tailscale serve --bg --service=svc:n8n --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_N8N_PORT"
+    printf "    tailscale serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_HERMES_PORT"
     printf "    The host may need tag-based identity and admin approval in Tailscale Services.\n"
   fi
 }
