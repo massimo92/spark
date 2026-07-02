@@ -2300,7 +2300,7 @@ test_workspace_setup_reports_tailscale_service_pending_approval() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:18789"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:18789"]}]}}}' \
     FAKE_TAILSCALE_SERVE_CONFIG="$serve_config" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
@@ -2315,6 +2315,61 @@ test_workspace_setup_reports_tailscale_service_pending_approval() {
     [[ "$out" == *"Open: https://login.tailscale.com/admin/services"* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_LAST_ERROR=pending-approval"* ]] &&
+    [[ "$nemo_calls" != *"onboard"* ]]
+}
+
+test_workspace_setup_reports_missing_tailscale_tag() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env nemo_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:18789"]}]}}}' \
+    FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Tailscale Services require this machine to use a tag identity"* ]] &&
+    [[ "$out" == *"Create tag: tag:spark"* ]] &&
+    [[ "$out" == *"Assign tag:spark to machine: sparkbox.test-tailnet.ts.net"* ]] &&
+    [[ "$out" == *"Tailscale machine is not tagged for Services"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=manual"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_LAST_ERROR=missing-tag"* ]] &&
+    [[ "$nemo_calls" != *"onboard"* ]]
+}
+
+test_workspace_setup_reports_missing_tailscale_operator() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env nemo_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_TAILSCALE_SERVE_STDERR="Access denied: serve config denied\nUse 'sudo tailscale serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456'.\nTo not require root, use 'sudo tailscale set --operator=\$USER' once." \
+    FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Tailscale Serve needs local operator permission"* ]] &&
+    [[ "$out" == *"sudo tailscale set --operator=\$USER"* ]] &&
+    [[ "$out" == *"Tailscale operator permission is not configured"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=manual"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_LAST_ERROR=operator-missing"* ]] &&
     [[ "$nemo_calls" != *"onboard"* ]]
 }
 
@@ -5434,6 +5489,8 @@ run_test "workspace setup defaults to services from ports workspace" test_worksp
 run_test "workspace setup reports missing Tailscale Services HITL" test_workspace_setup_reports_missing_tailscale_services_hitl
 run_test "workspace setup --yes does not fallback when Services are disabled" test_workspace_setup_yes_does_not_fallback_when_services_disabled
 run_test "workspace setup reports pending Tailscale Service approval" test_workspace_setup_reports_tailscale_service_pending_approval
+run_test "workspace setup reports missing Tailscale tag" test_workspace_setup_reports_missing_tailscale_tag
+run_test "workspace setup reports missing Tailscale operator" test_workspace_setup_reports_missing_tailscale_operator
 run_test "workspace setup interactively offers ports fallback when Services are disabled" test_workspace_setup_interactive_offers_ports_fallback_when_services_disabled
 run_test "workspace setup explicit Services does not fall back to ports" test_workspace_setup_explicit_services_does_not_fall_back_to_ports
 run_test "workspace setup blocks Tailscale Funnel" test_workspace_setup_blocks_tailscale_funnel
