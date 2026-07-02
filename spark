@@ -182,10 +182,22 @@ SWAPPINESS="${SPARK_SWAPPINESS:-10}"
 PROFILE_SCHEMA_VERSION=2
 
 # Detect the latest pulled NGC vLLM image
+ngc_vllm_image_blocked() {
+  local image="$1" blocked
+  [[ "${SPARK_NGC_VLLM_ALLOW_BLOCKED:-0}" == "1" ]] && return 1
+  for blocked in ${SPARK_NGC_VLLM_DENYLIST:-nvcr.io/nvidia/vllm:26.06-py3}; do
+    [[ "$image" == "$blocked" ]] && return 0
+  done
+  return 1
+}
+
 detect_ngc_image() {
   local images
   images=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-    | awk '/^nvcr\.io\/nvidia\/vllm:/ {print}' || true)
+    | awk '/^nvcr\.io\/nvidia\/vllm:/ {print}' \
+    | while IFS= read -r image; do
+        ngc_vllm_image_blocked "$image" || printf '%s\n' "$image"
+      done || true)
 
   [[ -z "$images" ]] && return 0
 
@@ -5315,7 +5327,7 @@ workspace_configure_tailscale() {
         info "Tailscale Services configured locally"
         workspace_tailscale_print_pending_approval_hitl
         if workspace_tailscale_confirm_step "I approved this host for the Services; verify now?" "$auto_yes"; then
-          if workspace_tailscale_service_host_advertised; then
+          if workspace_tailscale_wait_for_service_host_advertised; then
             workspace_tailscale_clear_error
             info "Tailscale Service host approval verified"
           else
@@ -5435,7 +5447,7 @@ workspace_configure_tailscale() {
       info "Tailscale Services configured locally"
       workspace_tailscale_print_pending_approval_hitl
       if workspace_tailscale_confirm_step "I approved this host for the Services; verify now?" "$auto_yes"; then
-        if workspace_tailscale_service_host_advertised; then
+        if workspace_tailscale_wait_for_service_host_advertised; then
           workspace_tailscale_clear_error
           info "Tailscale Service host approval verified"
         else
@@ -6626,7 +6638,8 @@ workspace_urls_configured() {
 workspace_http_ready() {
   local url="$1"
   command -v curl >/dev/null 2>&1 || return 1
-  curl -fsS --max-time 3 "$url" >/dev/null 2>&1
+  curl -fsS --max-time 3 "$url" >/dev/null 2>&1 ||
+    curl -4 -fsS --max-time 3 "$url" >/dev/null 2>&1
 }
 
 workspace_vikunja_http_ready() {
@@ -6660,6 +6673,20 @@ workspace_litellm_model_routed() {
   command -v curl >/dev/null 2>&1 || return 1
   out=$(curl -fsS --max-time 5 "http://127.0.0.1:${GATEWAY_PORT}/v1/models" 2>/dev/null) || return 1
   printf '%s\n' "$out" | grep -Fq "\"${litellm_model}\""
+}
+
+workspace_litellm_model_smoke() {
+  local litellm_model escaped_model payload out
+  litellm_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  [[ -n "$litellm_model" ]] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  escaped_model=$(printf '%s' "$litellm_model" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply with ok."}],"max_tokens":1,"temperature":0}' "$escaped_model")
+  out=$(curl -fsS --max-time "${SPARK_WORKSPACE_LITELLM_SMOKE_TIMEOUT:-60}" \
+    -H 'Content-Type: application/json' \
+    -d "$payload" \
+    "http://127.0.0.1:${GATEWAY_PORT}/v1/chat/completions" 2>/dev/null) || return 1
+  printf '%s\n' "$out" | grep -Fq '"choices"'
 }
 
 workspace_tailscale_https_urls_ready() {
@@ -6786,9 +6813,9 @@ workspace_update_tailscale() {
 }
 
 workspace_tailscale_service_specs() {
-  printf 'vikunja %s\n' "$WORKSPACE_VIKUNJA_PORT"
-  printf 'n8n %s\n' "$WORKSPACE_N8N_PORT"
-  printf 'hermes %s\n' "$WORKSPACE_HERMES_PORT"
+  printf 'vikunja 443\n'
+  printf 'n8n 443\n'
+  printf 'hermes 443\n'
 }
 
 workspace_tailscale_status_json() {
@@ -7118,6 +7145,19 @@ workspace_tailscale_service_host_advertised() {
   [[ "$out" == *"svc:vikunja"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]]
 }
 
+workspace_tailscale_wait_for_service_host_advertised() {
+  local attempts="${SPARK_WORKSPACE_TAILSCALE_APPROVAL_WAIT_ATTEMPTS:-45}" delay="${SPARK_WORKSPACE_TAILSCALE_APPROVAL_WAIT_DELAY:-2}" i=0
+  [[ "$attempts" =~ ^[0-9]+$ && "$attempts" -gt 0 ]] || attempts=45
+  [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]] || delay=2
+  while [[ "$i" -lt "$attempts" ]]; do
+    workspace_tailscale_service_host_advertised && return 0
+    i=$((i + 1))
+    [[ "$i" -lt "$attempts" ]] || break
+    sleep "$delay"
+  done
+  return 1
+}
+
 workspace_tailscale_service_target_private() {
   local out="$1" service="$2" port="$3" block
   if command -v jq >/dev/null 2>&1 && printf '%s\n' "$out" | jq -e . >/dev/null 2>&1; then
@@ -7409,6 +7449,7 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Tailscale workspace URLs respond" workspace_tailscale_https_urls_ready
   workspace_doctor_check "LiteLLM gateway running" workspace_gateway_running
   workspace_doctor_check "LiteLLM exposes Hermes model route" workspace_litellm_model_routed
+  workspace_doctor_check "LiteLLM Hermes route completes smoke request" workspace_litellm_model_smoke
   workspace_doctor_check "Hermes model running: ${model:-none}" workspace_model_running "$model"
   workspace_doctor_check "Hermes/NemoClaw running" workspace_hermes_running
   workspace_doctor_check "Hermes NemoClaw uses restricted policy and private API port" workspace_hermes_nemoclaw_configured

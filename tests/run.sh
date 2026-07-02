@@ -238,6 +238,7 @@ case "$*" in
     fi
     exit "${FAKE_N8N_LOGIN_EXIT:-0}" ;;
   *:8642/v1/models*) echo "${FAKE_HERMES_MODELS:-{\"data\":[{\"id\":\"hermes-agent\"}]}"; exit "${FAKE_HERMES_LOCAL_API_EXIT:-0}" ;;
+  */v1/chat/completions*) [[ "${FAKE_LITELLM_SMOKE_EXIT:-0}" == "0" ]] && { echo "${FAKE_LITELLM_SMOKE_JSON:-{\"choices\":[{\"message\":{\"content\":\"ok\"}}],\"usage\":{\"completion_tokens\":1}}}"; exit 0; }; exit "${FAKE_LITELLM_SMOKE_EXIT:-1}" ;;
   */v1/models*) [[ "${FAKE_VLLM_READY:-1}" == "1" ]] && { echo "${FAKE_LITELLM_MODELS:-{\"data\":[{\"id\":\"vllm/Org/Alpha\"}]}"; exit 0; }; exit 7 ;;
   *)            [[ "${FAKE_OLLAMA_UP:-0}" == "1" ]] && exit 0; exit 7 ;;
 esac
@@ -527,7 +528,9 @@ case "${1:-}" in
     exit "${FAKE_TAILSCALE_UPDATE_EXIT:-0}" ;;
   status)
     if [[ "${2:-}" == "--json" ]]; then
-      if [[ -n "${FAKE_TAILSCALE_STATUS_JSON:-}" ]]; then
+      if [[ -n "${FAKE_TAILSCALE_STATUS_JSON_FILE:-}" && -f "$FAKE_TAILSCALE_STATUS_JSON_FILE" ]]; then
+        cat "$FAKE_TAILSCALE_STATUS_JSON_FILE"
+      elif [[ -n "${FAKE_TAILSCALE_STATUS_JSON:-}" ]]; then
         printf '%s\n' "$FAKE_TAILSCALE_STATUS_JSON"
       else
         printf '%s\n' '{"MagicDNSSuffix":"test-tailnet.ts.net."}'
@@ -720,6 +723,21 @@ test_doctor_reports_no_ngc_image() {
 
   [[ "$output" == *"NGC container: vLLM image not pulled"* ]] &&
     [[ "$output" == *"checks passed"* ]]
+}
+
+test_doctor_skips_blocked_ngc_vllm_image() {
+  local tmp fake_bin output
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_DOCKER_IMAGE=$'nvcr.io/nvidia/vllm:26.06-py3\nnvcr.io/nvidia/vllm:26.05-py3' \
+    "$SPARK" doctor 2>&1)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"NGC container: nvcr.io/nvidia/vllm:26.05-py3"* ]] &&
+    [[ "$output" != *"NGC container: nvcr.io/nvidia/vllm:26.06-py3"* ]]
 }
 
 test_doctor_reports_bad_hf_cache_permissions() {
@@ -2241,7 +2259,7 @@ test_workspace_setup_reports_missing_tailscale_services_hitl() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}]}}}' \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
@@ -2253,9 +2271,9 @@ test_workspace_setup_reports_missing_tailscale_services_hitl() {
   [[ "$status" -ne 0 ]] &&
     [[ "$out" == *"Tailscale Services must be created/approved in the Tailscale admin console"* ]] &&
     [[ "$out" == *"Open: https://login.tailscale.com/admin/services"* ]] &&
-    [[ "$out" == *"hermes (tcp:18789)"* ]] &&
+    [[ "$out" == *"hermes (tcp:443)"* ]] &&
     [[ "$out" == *"Approve/authorize host: sparkbox.test-tailnet.ts.net"* ]] &&
-    [[ "$out" == *"Tailscale Services not registered/authorized: hermes:18789"* ]] &&
+    [[ "$out" == *"Tailscale Services not registered/authorized: hermes:443"* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=manual"* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_LAST_ERROR=missing-service"* ]] &&
     [[ "$tailscale_calls" != *"serve --bg --service=svc:"* ]]
@@ -2300,7 +2318,7 @@ test_workspace_setup_reports_tailscale_service_pending_approval() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:18789"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
     FAKE_TAILSCALE_SERVE_CONFIG="$serve_config" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
@@ -2318,6 +2336,30 @@ test_workspace_setup_reports_tailscale_service_pending_approval() {
     [[ "$nemo_calls" != *"onboard"* ]]
 }
 
+test_workspace_waits_for_delayed_tailscale_service_approval() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin status status_file updater initial_json approved_json
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf 'WORKSPACE_TAILSCALE_MODE=services\n' > "${tmp}/home/.config/spark/workspace/secrets.env"
+  status_file="${tmp}/tailscale-status.json"
+  initial_json='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}'
+  approved_json='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}],"service-host":[{"Name":"svc:vikunja"},{"Name":"svc:n8n"},{"Name":"svc:hermes"}]}}}'
+  printf '%s\n' "$initial_json" > "$status_file"
+  ( sleep 0.2; printf '%s\n' "$approved_json" > "$status_file" ) &
+  updater=$!
+  set +e
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_TAILSCALE_APPROVAL_WAIT_ATTEMPTS=20 SPARK_WORKSPACE_TAILSCALE_APPROVAL_WAIT_DELAY=0.1 \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_STATUS_JSON_FILE="$status_file" \
+    bash -c 'source "$1"; workspace_tailscale_wait_for_service_host_advertised' bash "$SPARK"
+  status=$?
+  set -e
+  wait "$updater" 2>/dev/null || true
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]]
+}
+
 test_workspace_setup_reports_missing_tailscale_tag() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status env nemo_calls
@@ -2327,7 +2369,7 @@ test_workspace_setup_reports_missing_tailscale_tag() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:18789"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
@@ -2963,6 +3005,7 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Host listeners for workspace/gateway are loopback-only"* ]] &&
     [[ "$out" == *"[x] Shared Postgres runtime has Vikunja and n8n roles/databases"* ]] &&
     [[ "$out" == *"[x] LiteLLM exposes Hermes model route"* ]] &&
+    [[ "$out" == *"[x] LiteLLM Hermes route completes smoke request"* ]] &&
     [[ "$out" == *"[x] Vikunja internal doctor passes"* ]] &&
     [[ "$out" == *"[x] Hermes NemoClaw uses restricted policy and private API port"* ]] &&
     [[ "$out" == *"[x] NemoHermes sandbox doctor passes"* ]] &&
@@ -3044,6 +3087,7 @@ test_workspace_doctor_json() {
     .failed == 0 and
     .model == "Org/Alpha" and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "LiteLLM Hermes route completes smoke request" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "NemoHermes inference route uses selected LiteLLM model" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Tailscale workspace URLs respond" and .ok == true)] | length == 1)
   ' >/dev/null
@@ -3849,6 +3893,31 @@ test_workspace_doctor_flags_missing_litellm_route() {
     [[ "$out" == *"[ ] LiteLLM exposes Hermes model route"* ]]
 }
 
+test_workspace_doctor_flags_litellm_smoke_failure() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_LITELLM_SMOKE_EXIT=22 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] LiteLLM Hermes route completes smoke request"* ]]
+}
+
 test_workspace_doctor_flags_wrong_nemohermes_route() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status
@@ -3913,7 +3982,7 @@ test_workspace_doctor_flags_missing_tailscale_service_registration() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}]}}}' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -3966,7 +4035,7 @@ test_workspace_doctor_flags_tailscale_service_host_not_advertised() {
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_TAILSCALE_GET_CONFIG_EXIT=0 FAKE_TAILSCALE_SERVE_CONFIG='{"version":"0.0.1"}' \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:3456"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:5678"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:18789"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -5358,6 +5427,7 @@ run_test "architecture command maps core boundaries" test_architecture_command_m
 run_test "single-file build matches modules" test_single_file_build_matches_modules
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
+run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vllm_image
 run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "setup --check reports Tailscale Funnel" test_setup_check_reports_tailscale_funnel
@@ -5489,6 +5559,7 @@ run_test "workspace setup defaults to services from ports workspace" test_worksp
 run_test "workspace setup reports missing Tailscale Services HITL" test_workspace_setup_reports_missing_tailscale_services_hitl
 run_test "workspace setup --yes does not fallback when Services are disabled" test_workspace_setup_yes_does_not_fallback_when_services_disabled
 run_test "workspace setup reports pending Tailscale Service approval" test_workspace_setup_reports_tailscale_service_pending_approval
+run_test "workspace waits for delayed Tailscale Service approval" test_workspace_waits_for_delayed_tailscale_service_approval
 run_test "workspace setup reports missing Tailscale tag" test_workspace_setup_reports_missing_tailscale_tag
 run_test "workspace setup reports missing Tailscale operator" test_workspace_setup_reports_missing_tailscale_operator
 run_test "workspace setup interactively offers ports fallback when Services are disabled" test_workspace_setup_interactive_offers_ports_fallback_when_services_disabled
@@ -5545,6 +5616,7 @@ run_test "workspace doctor flags wrong n8n cookie mode" test_workspace_doctor_fl
 run_test "workspace doctor flags non-idempotent Postgres init" test_workspace_doctor_flags_non_idempotent_postgres_init
 run_test "workspace doctor flags missing Postgres runtime DB" test_workspace_doctor_flags_missing_postgres_runtime_db
 run_test "workspace doctor flags missing LiteLLM route" test_workspace_doctor_flags_missing_litellm_route
+run_test "workspace doctor flags LiteLLM smoke failure" test_workspace_doctor_flags_litellm_smoke_failure
 run_test "workspace doctor flags wrong NemoHermes route" test_workspace_doctor_flags_wrong_nemohermes_route
 run_test "workspace doctor flags NemoHermes doctor failure" test_workspace_doctor_flags_nemohermes_doctor_failure
 run_test "workspace doctor flags missing Tailscale Service registration" test_workspace_doctor_flags_missing_tailscale_service_registration
