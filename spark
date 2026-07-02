@@ -5284,7 +5284,7 @@ workspace_configure_tailscale() {
       n8n_rc=$(cat "$n8n_status" 2>/dev/null || echo 1)
       hermes_rc=$(cat "$hermes_status" 2>/dev/null || echo 1)
       if [[ "$vikunja_rc" != "0" || "$n8n_rc" != "0" || "$hermes_rc" != "0" ]]; then
-        if workspace_tailscale_serve_disabled_error "$vikunja_log" "$n8n_log" "$hermes_log"; then
+        if [[ "${SPARK_WORKSPACE_TAILSCALE_MODE_EXPLICIT:-0}" != "1" ]] && workspace_tailscale_serve_disabled_error "$vikunja_log" "$n8n_log" "$hermes_log"; then
           fallback_ports=1
           break
         fi
@@ -5577,7 +5577,8 @@ workspace_setup() {
   local auto_yes=0 check_only=0 requested_model="" remote_spec="" requested_tail_mode=""
   local postgres_image="" vikunja_image="" n8n_image="" model tailnet
   local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_token="" n8n_email_arg="" n8n_password_arg="" funnel_action=""
-  local existing_model="" existing_tail_mode="" effective_tail_mode="" setup_overrides=0
+  local existing_model="" existing_tail_mode="" effective_tail_mode="" env_tail_mode="" requested_tail_mode_explicit=0 setup_overrides=0
+  env_tail_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --yes) auto_yes=1; shift ;;
@@ -5591,6 +5592,7 @@ workspace_setup() {
           services|ports) ;;
           *) die "--tailscale-mode must be 'services' or 'ports'" ;;
         esac
+        requested_tail_mode_explicit=1
         shift 2
         ;;
       --postgres-image) postgres_image="${2:-}"; [[ -n "$postgres_image" ]] || die "--postgres-image requires a value"; shift 2 ;;
@@ -5647,6 +5649,15 @@ workspace_setup() {
       "$requested_tail_mode" "$postgres_image" "$vikunja_image" "$n8n_image" "$funnel_action"
     return $?
   }
+  if [[ -z "$requested_tail_mode" && -n "$env_tail_mode" ]]; then
+    case "$env_tail_mode" in
+      services|ports)
+        requested_tail_mode="$env_tail_mode"
+        requested_tail_mode_explicit=1
+        ;;
+      *) die "SPARK_WORKSPACE_TAILSCALE_MODE must be 'services' or 'ports'" ;;
+    esac
+  fi
   [[ -n "$requested_tail_mode" ]] && SPARK_WORKSPACE_TAILSCALE_MODE="$requested_tail_mode"
   [[ -n "$postgres_image" ]] && SPARK_WORKSPACE_POSTGRES_IMAGE="$postgres_image"
   [[ -n "$vikunja_image" ]] && SPARK_WORKSPACE_VIKUNJA_IMAGE="$vikunja_image"
@@ -5678,6 +5689,7 @@ workspace_setup() {
     fi
   fi
   SPARK_WORKSPACE_TAILSCALE_MODE="$effective_tail_mode"
+  SPARK_WORKSPACE_TAILSCALE_MODE_EXPLICIT="$requested_tail_mode_explicit"
   if [[ -n "$requested_model" ]]; then
     model=$(workspace_select_model "$requested_model")
   elif [[ -n "$existing_model" ]]; then

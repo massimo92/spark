@@ -2266,6 +2266,32 @@ test_workspace_setup_falls_back_to_ports_when_services_disabled() {
     [[ "$nemo_calls" == *"onboard"* ]]
 }
 
+test_workspace_setup_explicit_services_does_not_fall_back_to_ports() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status env nemo_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10","fd7a:115c:a1e0::10"]}}' \
+    FAKE_TAILSCALE_IP=100.64.0.10 FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_TAILSCALE_SERVE_STDERR='Serve is not enabled on your tailnet.' FAKE_TAILSCALE_GET_CONFIG_EXIT=1 FAKE_TAILSCALE_SERVE_CONFIG='not-configured' FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha --tailscale-mode services 2>&1)
+  status=$?
+  set -e
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Could not configure Tailscale Services automatically"* ]] &&
+    [[ "$out" == *"Hermes onboarding skipped until Tailscale private access is configured"* ]] &&
+    [[ "$out" != *"using ports fallback"* ]] &&
+    [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=manual"* ]] &&
+    [[ "$nemo_calls" != *"onboard"* ]]
+}
+
 test_workspace_setup_blocks_tailscale_funnel() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status tailscale_calls nemo_calls mutated=0
@@ -5225,6 +5251,7 @@ run_test "workspace supports Tailscale MagicDNS ports fallback" test_workspace_t
 run_test "workspace setup updates old Tailscale for Services" test_workspace_setup_updates_old_tailscale_for_services
 run_test "workspace setup defaults to services from ports workspace" test_workspace_setup_defaults_to_services_from_ports_workspace
 run_test "workspace setup falls back to ports when Services are disabled" test_workspace_setup_falls_back_to_ports_when_services_disabled
+run_test "workspace setup explicit Services does not fall back to ports" test_workspace_setup_explicit_services_does_not_fall_back_to_ports
 run_test "workspace setup blocks Tailscale Funnel" test_workspace_setup_blocks_tailscale_funnel
 run_test "workspace setup resets Tailscale Funnel with flag" test_workspace_setup_resets_tailscale_funnel_with_flag
 run_test "workspace setup --check reports Funnel without reset" test_workspace_setup_check_reports_funnel_without_reset
