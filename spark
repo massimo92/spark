@@ -5270,15 +5270,34 @@ workspace_configure_tailscale() {
   if [[ -n "$json" ]] && workspace_tailscale_capmap_available "$json"; then
     missing=$(workspace_tailscale_missing_services "$json" || true)
     if [[ -n "$missing" ]]; then
-      missing_summary=$(workspace_tailscale_missing_services_summary "$missing")
       [[ "$check_only" == "1" ]] || workspace_tailscale_mark_error missing-service
-      workspace_tailscale_print_services_hitl "$missing" "$tailnet"
-      if [[ "$check_only" != "1" ]] && workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
+      if [[ "$check_only" != "1" ]] && workspace_tailscale_verify_services_after_hitl "$tailnet" "$missing" "$auto_yes"; then
+        workspace_tailscale_clear_error
+        json=$(workspace_tailscale_status_json 2>/dev/null || true)
+      else
+        missing_summary=$(workspace_tailscale_missing_services_summary "$missing")
+        [[ "$check_only" == "1" ]] && workspace_tailscale_print_services_hitl "$missing" "$tailnet"
+        if [[ "$check_only" != "1" ]] && workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
+          return 0
+        fi
+        [[ "$check_only" == "1" ]] || workspace_clear_public_urls
+        setup_fail "Tailscale Services not registered/authorized: ${missing_summary}"
         return 0
       fi
-      [[ "$check_only" == "1" ]] || workspace_clear_public_urls
-      setup_fail "Tailscale Services not registered/authorized: ${missing_summary}"
-      return 0
+    fi
+    if [[ -n "$json" ]] && workspace_tailscale_tag_required_but_missing "$json"; then
+      [[ "$check_only" == "1" ]] || workspace_tailscale_mark_error missing-tag
+      if [[ "$check_only" != "1" ]] && workspace_tailscale_verify_tag_after_hitl "$auto_yes"; then
+        workspace_tailscale_clear_error
+      else
+        [[ "$check_only" == "1" ]] && workspace_tailscale_print_tag_hitl
+        if [[ "$check_only" != "1" ]] && workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
+          return 0
+        fi
+        [[ "$check_only" == "1" ]] || workspace_clear_public_urls
+        setup_fail "Tailscale machine is not tagged for Services"
+        return 0
+      fi
     fi
   fi
   [[ "$check_only" == "1" ]] && return 0
@@ -5295,7 +5314,16 @@ workspace_configure_tailscale() {
         workspace_tailscale_mark_error pending-approval
         info "Tailscale Services configured locally"
         workspace_tailscale_print_pending_approval_hitl
-        setup_fail "Tailscale Service host pending admin approval"
+        if workspace_tailscale_confirm_step "I approved this host for the Services; verify now?" "$auto_yes"; then
+          if workspace_tailscale_service_host_advertised; then
+            workspace_tailscale_clear_error
+            info "Tailscale Service host approval verified"
+          else
+            setup_fail "Tailscale Service host pending admin approval"
+          fi
+        else
+          setup_fail "Tailscale Service host pending admin approval"
+        fi
       fi
       return 0
     fi
@@ -5321,11 +5349,42 @@ workspace_configure_tailscale() {
           rm -rf "$status_dir"
           workspace_tailscale_mark_error serve-disabled "$enable_url"
           workspace_tailscale_print_serve_disabled_hitl "$enable_url"
+          if workspace_tailscale_retry_after_hitl "$tailnet" "$check_only" "$funnel_action" "$auto_yes" "I enabled Tailscale Serve; retry now?"; then
+            return 0
+          fi
           if workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
             return 0
           fi
           workspace_clear_public_urls
           setup_fail "Tailscale Serve is not enabled"
+          return 0
+        fi
+        if workspace_tailscale_operator_error "$vikunja_log" "$n8n_log" "$hermes_log"; then
+          rm -rf "$status_dir"
+          workspace_tailscale_mark_error operator-missing
+          workspace_tailscale_print_operator_hitl
+          if workspace_tailscale_retry_after_hitl "$tailnet" "$check_only" "$funnel_action" "$auto_yes" "I ran sudo tailscale set --operator=\$USER; retry now?"; then
+            return 0
+          fi
+          if workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
+            return 0
+          fi
+          workspace_clear_public_urls
+          setup_fail "Tailscale operator permission is not configured"
+          return 0
+        fi
+        if workspace_tailscale_tagged_node_error "$vikunja_log" "$n8n_log" "$hermes_log"; then
+          rm -rf "$status_dir"
+          workspace_tailscale_mark_error missing-tag
+          workspace_tailscale_print_tag_hitl
+          if workspace_tailscale_retry_after_hitl "$tailnet" "$check_only" "$funnel_action" "$auto_yes" "I assigned tag:spark to this machine; retry now?"; then
+            return 0
+          fi
+          if workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
+            return 0
+          fi
+          workspace_clear_public_urls
+          setup_fail "Tailscale machine is not tagged for Services"
           return 0
         fi
         rm -rf "$status_dir"
@@ -5355,6 +5414,9 @@ workspace_configure_tailscale() {
     rm -rf "$status_dir"
     workspace_tailscale_mark_error serve-disabled "$enable_url"
     workspace_tailscale_print_serve_disabled_hitl "$enable_url"
+    if workspace_tailscale_retry_after_hitl "$tailnet" "$check_only" "$funnel_action" "$auto_yes" "I enabled Tailscale Serve; retry now?"; then
+      return 0
+    fi
     if workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
       return 0
     fi
@@ -5372,7 +5434,16 @@ workspace_configure_tailscale() {
       workspace_tailscale_mark_error pending-approval
       info "Tailscale Services configured locally"
       workspace_tailscale_print_pending_approval_hitl
-      setup_fail "Tailscale Service host pending admin approval"
+      if workspace_tailscale_confirm_step "I approved this host for the Services; verify now?" "$auto_yes"; then
+        if workspace_tailscale_service_host_advertised; then
+          workspace_tailscale_clear_error
+          info "Tailscale Service host approval verified"
+        else
+          setup_fail "Tailscale Service host pending admin approval"
+        fi
+      else
+        setup_fail "Tailscale Service host pending admin approval"
+      fi
     fi
   else
     workspace_tailscale_mark_error not-advertised
@@ -6774,6 +6845,80 @@ EOF
   printf '%s\n' "$out"
 }
 
+workspace_tailscale_tag_required_but_missing() {
+  local json="$1"
+  workspace_tailscale_capmap_available "$json" || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  ! printf '%s\n' "$json" | jq -e '((.Self.Tags // []) | length) > 0' >/dev/null 2>&1
+}
+
+workspace_tailscale_print_tag_hitl() {
+  local dns_name
+  dns_name=$(workspace_tailscale_dns_name 2>/dev/null || true)
+  printf "    Tailscale Services require this machine to use a tag identity.\n"
+  printf "    In the Tailscale admin console:\n"
+  printf "      1. Create tag: tag:spark (owner: autogroup:admin).\n"
+  if [[ -n "$dns_name" ]]; then
+    printf "      2. Assign tag:spark to machine: %s\n" "$dns_name"
+  else
+    printf "      2. Assign tag:spark to this machine.\n"
+  fi
+  printf "      3. Re-auth the node if Tailscale asks for it.\n"
+  printf "    Then return here; spark will verify the tag before continuing.\n"
+}
+
+workspace_tailscale_print_operator_hitl() {
+  printf "    Tailscale Serve needs local operator permission for this Unix user.\n"
+  printf "    Run on this machine:\n"
+  printf "      sudo tailscale set --operator=\$USER\n"
+  printf "    Then return here; spark will retry and verify the Serve config write.\n"
+}
+
+workspace_tailscale_confirm_step() {
+  local prompt="$1" auto_yes="${2:-0}"
+  [[ "$auto_yes" == "1" ]] && return 1
+  [[ "${SPARK_WORKSPACE_TAILSCALE_HITL_RETRY:-0}" == "1" ]] && return 1
+  is_interactive || return 1
+  confirm "$prompt"
+}
+
+workspace_tailscale_verify_services_after_hitl() {
+  local tailnet="$1" missing="$2" auto_yes="$3" json missing_after summary_after
+  workspace_tailscale_print_services_hitl "$missing" "$tailnet"
+  workspace_tailscale_confirm_step "I created/approved the Tailscale Services; verify now?" "$auto_yes" || return 1
+  json=$(workspace_tailscale_status_json 2>/dev/null || true)
+  [[ -n "$json" ]] || return 1
+  workspace_tailscale_capmap_available "$json" || return 1
+  missing_after=$(workspace_tailscale_missing_services "$json" || true)
+  if [[ -z "$missing_after" ]]; then
+    info "Tailscale Services verified"
+    return 0
+  fi
+  summary_after=$(workspace_tailscale_missing_services_summary "$missing_after")
+  warn "Tailscale Services still missing/not authorized: ${summary_after}"
+  return 1
+}
+
+workspace_tailscale_verify_tag_after_hitl() {
+  local auto_yes="$1" json
+  workspace_tailscale_print_tag_hitl
+  workspace_tailscale_confirm_step "I assigned tag:spark to this machine; verify now?" "$auto_yes" || return 1
+  json=$(workspace_tailscale_status_json 2>/dev/null || true)
+  [[ -n "$json" ]] || return 1
+  if workspace_tailscale_tag_required_but_missing "$json"; then
+    warn "Tailscale still reports this machine without a tag"
+    return 1
+  fi
+  info "Tailscale tag verified"
+  return 0
+}
+
+workspace_tailscale_retry_after_hitl() {
+  local tailnet="$1" check_only="$2" funnel_action="$3" auto_yes="$4" prompt="$5"
+  workspace_tailscale_confirm_step "$prompt" "$auto_yes" || return 1
+  SPARK_WORKSPACE_TAILSCALE_HITL_RETRY=1 workspace_configure_tailscale "$tailnet" "$check_only" "$funnel_action" "$auto_yes"
+}
+
 workspace_tailscale_mark_error() {
   local code="$1" url="${2:-}"
   workspace_set_env_key WORKSPACE_TAILSCALE_LAST_ERROR "$code"
@@ -6849,6 +6994,24 @@ workspace_tailscale_serve_disabled_error() {
   for log in "$@"; do
     [[ -f "$log" ]] || continue
     grep -q "Serve is not enabled on your tailnet" "$log" && return 0
+  done
+  return 1
+}
+
+workspace_tailscale_operator_error() {
+  local log
+  for log in "$@"; do
+    [[ -f "$log" ]] || continue
+    grep -Eq "serve config denied|sudo tailscale set --operator|Use 'sudo tailscale serve" "$log" && return 0
+  done
+  return 1
+}
+
+workspace_tailscale_tagged_node_error() {
+  local log
+  for log in "$@"; do
+    [[ -f "$log" ]] || continue
+    grep -qi "service hosts must be tagged nodes" "$log" && return 0
   done
   return 1
 }
