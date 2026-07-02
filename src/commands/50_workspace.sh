@@ -1161,20 +1161,27 @@ workspace_configure_tailscale() {
     fi
   fi
   [[ "$check_only" == "1" ]] && return 0
-  local status_dir="" vikunja_status="" n8n_status="" hermes_status="" vikunja_rc="" n8n_rc="" hermes_rc="" out="" ready=0
+  local status_dir="" vikunja_status="" n8n_status="" hermes_status="" vikunja_log="" n8n_log="" hermes_log="" vikunja_rc="" n8n_rc="" hermes_rc="" out="" ready=0 fallback_ports=0
   status_dir=$(mktemp -d)
   vikunja_status="${status_dir}/vikunja.rc"
   n8n_status="${status_dir}/n8n.rc"
   hermes_status="${status_dir}/hermes.rc"
-  workspace_tailscale_serve_launch_bg "svc:vikunja" "http://127.0.0.1:${WORKSPACE_VIKUNJA_PORT}" "$vikunja_status"
-  workspace_tailscale_serve_launch_bg "svc:n8n" "http://127.0.0.1:${WORKSPACE_N8N_PORT}" "$n8n_status"
-  workspace_tailscale_serve_launch_bg "svc:hermes" "http://127.0.0.1:${WORKSPACE_HERMES_PORT}" "$hermes_status"
+  vikunja_log="${status_dir}/vikunja.log"
+  n8n_log="${status_dir}/n8n.log"
+  hermes_log="${status_dir}/hermes.log"
+  workspace_tailscale_serve_launch_bg "svc:vikunja" "http://127.0.0.1:${WORKSPACE_VIKUNJA_PORT}" "$vikunja_status" "$vikunja_log"
+  workspace_tailscale_serve_launch_bg "svc:n8n" "http://127.0.0.1:${WORKSPACE_N8N_PORT}" "$n8n_status" "$n8n_log"
+  workspace_tailscale_serve_launch_bg "svc:hermes" "http://127.0.0.1:${WORKSPACE_HERMES_PORT}" "$hermes_status" "$hermes_log"
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     if [[ -s "$vikunja_status" && -s "$n8n_status" && -s "$hermes_status" ]]; then
       vikunja_rc=$(cat "$vikunja_status" 2>/dev/null || echo 1)
       n8n_rc=$(cat "$n8n_status" 2>/dev/null || echo 1)
       hermes_rc=$(cat "$hermes_status" 2>/dev/null || echo 1)
       if [[ "$vikunja_rc" != "0" || "$n8n_rc" != "0" || "$hermes_rc" != "0" ]]; then
+        if workspace_tailscale_serve_disabled_error "$vikunja_log" "$n8n_log" "$hermes_log"; then
+          fallback_ports=1
+          break
+        fi
         rm -rf "$status_dir"
         workspace_clear_public_urls
         setup_fail "Could not configure Tailscale Services automatically"
@@ -1197,6 +1204,13 @@ workspace_configure_tailscale() {
     sleep 1
   done
   rm -rf "$status_dir"
+  if [[ "$fallback_ports" == "1" ]]; then
+    workspace_tailscale_ports_fallback "$tailnet" || {
+      workspace_clear_public_urls
+      setup_fail "Could not configure Tailscale ports fallback"
+    }
+    return 0
+  fi
   if [[ "$ready" == "1" ]]; then
     workspace_set_env_key WORKSPACE_TAILSCALE_MODE services
     info "Tailscale Services configured"
@@ -2510,15 +2524,45 @@ workspace_update_tailscale() {
 }
 
 workspace_tailscale_serve_launch_bg() {
-  local service="$1" target="$2" status_file="$3"
+  local service="$1" target="$2" status_file="$3" log_file="$4"
   nohup bash -c '
     service="$1"
     target="$2"
     status_file="$3"
-    tailscale serve --bg --service="$service" --https=443 --yes "$target" >/dev/null 2>&1
+    log_file="$4"
+    tailscale serve --bg --service="$service" --https=443 --yes "$target" >"$log_file" 2>&1
     rc=$?
     printf "%s" "$rc" >"$status_file"
-  ' _ "$service" "$target" "$status_file" >/dev/null 2>&1 &
+  ' _ "$service" "$target" "$status_file" "$log_file" >/dev/null 2>&1 &
+}
+
+workspace_tailscale_serve_disabled_error() {
+  local log
+  for log in "$@"; do
+    [[ -f "$log" ]] || continue
+    grep -q "Serve is not enabled on your tailnet" "$log" && return 0
+  done
+  return 1
+}
+
+workspace_tailscale_ports_fallback() {
+  local tailnet="$1" human_user="" human_email="" human_pass="" n8n_email="" n8n_pass="" hermes_pass="" model="" bind_addr="" dns_name=""
+  human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
+  human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
+  human_pass=$(workspace_read_env VIKUNJA_HUMAN_RECOVERY_PASSWORD 2>/dev/null || true)
+  n8n_email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
+  n8n_pass=$(workspace_read_env N8N_BASIC_AUTH_PASSWORD 2>/dev/null || true)
+  hermes_pass=$(workspace_read_env VIKUNJA_HERMES_PASSWORD 2>/dev/null || true)
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  bind_addr=$(workspace_tailscale_ipv4 2>/dev/null || true)
+  dns_name=$(workspace_tailscale_dns_name 2>/dev/null || true)
+  [[ -n "$human_user" && -n "$human_email" && -n "$human_pass" && -n "$n8n_email" && -n "$n8n_pass" && -n "$hermes_pass" && -n "$model" ]] || return 1
+  [[ -n "$bind_addr" && -n "$dns_name" ]] || return 1
+  SPARK_WORKSPACE_TAILSCALE_MODE=ports \
+    workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$hermes_pass" "$model" || return 1
+  workspace_compose up -d --remove-orphans >/dev/null 2>&1 || return 1
+  info "Tailscale Serve is not enabled on this tailnet; using ports fallback"
+  return 0
 }
 
 workspace_tailscale_requested_version_ok() {
