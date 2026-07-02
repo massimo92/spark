@@ -5223,7 +5223,7 @@ workspace_reset_n8n_user_management() {
 }
 
 workspace_configure_tailscale() {
-  local tailnet="$1" check_only="$2" funnel_action="${3:-}" auto_yes="${4:-0}" requested_mode bind_addr dns_name
+  local tailnet="$1" check_only="$2" funnel_action="${3:-}" auto_yes="${4:-0}" requested_mode bind_addr dns_name json missing missing_summary
   requested_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)}"
   if [[ -z "$tailnet" ]]; then
     [[ "$check_only" == "1" ]] || workspace_clear_public_urls
@@ -5266,8 +5266,23 @@ workspace_configure_tailscale() {
       return 0
     fi
   fi
+  json=$(workspace_tailscale_status_json 2>/dev/null || true)
+  if [[ -n "$json" ]] && workspace_tailscale_capmap_available "$json"; then
+    missing=$(workspace_tailscale_missing_services "$json" || true)
+    if [[ -n "$missing" ]]; then
+      missing_summary=$(workspace_tailscale_missing_services_summary "$missing")
+      [[ "$check_only" == "1" ]] || workspace_tailscale_mark_error missing-service
+      workspace_tailscale_print_services_hitl "$missing" "$tailnet"
+      if [[ "$check_only" != "1" ]] && workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
+        return 0
+      fi
+      [[ "$check_only" == "1" ]] || workspace_clear_public_urls
+      setup_fail "Tailscale Services not registered/authorized: ${missing_summary}"
+      return 0
+    fi
+  fi
   [[ "$check_only" == "1" ]] && return 0
-  local status_dir="" vikunja_status="" n8n_status="" hermes_status="" vikunja_log="" n8n_log="" hermes_log="" vikunja_rc="" n8n_rc="" hermes_rc="" out="" ready=0 fallback_ports=0
+  local status_dir="" vikunja_status="" n8n_status="" hermes_status="" vikunja_log="" n8n_log="" hermes_log="" vikunja_rc="" n8n_rc="" hermes_rc="" out="" ready=0 enable_url=""
   status_dir=$(mktemp -d)
   vikunja_status="${status_dir}/vikunja.rc"
   n8n_status="${status_dir}/n8n.rc"
@@ -5284,11 +5299,23 @@ workspace_configure_tailscale() {
       n8n_rc=$(cat "$n8n_status" 2>/dev/null || echo 1)
       hermes_rc=$(cat "$hermes_status" 2>/dev/null || echo 1)
       if [[ "$vikunja_rc" != "0" || "$n8n_rc" != "0" || "$hermes_rc" != "0" ]]; then
-        if [[ "${SPARK_WORKSPACE_TAILSCALE_MODE_EXPLICIT:-0}" != "1" ]] && workspace_tailscale_serve_disabled_error "$vikunja_log" "$n8n_log" "$hermes_log"; then
-          fallback_ports=1
-          break
+        if workspace_tailscale_serve_disabled_error "$vikunja_log" "$n8n_log" "$hermes_log"; then
+          enable_url=$(workspace_tailscale_serve_enable_url "$vikunja_log" "$n8n_log" "$hermes_log" || true)
+          rm -rf "$status_dir"
+          workspace_tailscale_mark_error serve-disabled "$enable_url"
+          workspace_tailscale_print_serve_disabled_hitl "$enable_url"
+          if workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
+            return 0
+          fi
+          workspace_clear_public_urls
+          setup_fail "Tailscale Serve is not enabled"
+          return 0
         fi
         rm -rf "$status_dir"
+        workspace_tailscale_mark_error service-host-failed
+        if workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
+          return 0
+        fi
         workspace_clear_public_urls
         setup_fail "Could not configure Tailscale Services automatically"
         printf "    Configure manually:\n"
@@ -5309,22 +5336,28 @@ workspace_configure_tailscale() {
     fi
     sleep 1
   done
-  if [[ "$ready" != "1" && "${SPARK_WORKSPACE_TAILSCALE_MODE_EXPLICIT:-0}" != "1" ]] &&
-    workspace_tailscale_serve_disabled_error "$vikunja_log" "$n8n_log" "$hermes_log"; then
-    fallback_ports=1
-  fi
-  rm -rf "$status_dir"
-  if [[ "$fallback_ports" == "1" ]]; then
-    workspace_tailscale_ports_fallback "$tailnet" || {
-      workspace_clear_public_urls
-      setup_fail "Could not configure Tailscale ports fallback"
-    }
+  if [[ "$ready" != "1" ]] && workspace_tailscale_serve_disabled_error "$vikunja_log" "$n8n_log" "$hermes_log"; then
+    enable_url=$(workspace_tailscale_serve_enable_url "$vikunja_log" "$n8n_log" "$hermes_log" || true)
+    rm -rf "$status_dir"
+    workspace_tailscale_mark_error serve-disabled "$enable_url"
+    workspace_tailscale_print_serve_disabled_hitl "$enable_url"
+    if workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
+      return 0
+    fi
+    workspace_clear_public_urls
+    setup_fail "Tailscale Serve is not enabled"
     return 0
   fi
+  rm -rf "$status_dir"
   if [[ "$ready" == "1" ]]; then
+    workspace_tailscale_clear_error
     workspace_set_env_key WORKSPACE_TAILSCALE_MODE services
     info "Tailscale Services configured"
   else
+    workspace_tailscale_mark_error not-advertised
+    if workspace_tailscale_offer_ports_fallback "$tailnet" "$auto_yes"; then
+      return 0
+    fi
     workspace_clear_public_urls
     setup_fail "Could not configure Tailscale Services automatically"
     printf "    Configure manually:\n"
@@ -5581,7 +5614,7 @@ workspace_setup() {
   local auto_yes=0 check_only=0 requested_model="" remote_spec="" requested_tail_mode=""
   local postgres_image="" vikunja_image="" n8n_image="" model tailnet
   local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_token="" n8n_email_arg="" n8n_password_arg="" funnel_action=""
-  local existing_model="" existing_tail_mode="" effective_tail_mode="" env_tail_mode="" requested_tail_mode_explicit=0 setup_overrides=0
+  local existing_model="" existing_tail_mode="" effective_tail_mode="" env_tail_mode="" setup_overrides=0
   env_tail_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -5596,7 +5629,6 @@ workspace_setup() {
           services|ports) ;;
           *) die "--tailscale-mode must be 'services' or 'ports'" ;;
         esac
-        requested_tail_mode_explicit=1
         shift 2
         ;;
       --postgres-image) postgres_image="${2:-}"; [[ -n "$postgres_image" ]] || die "--postgres-image requires a value"; shift 2 ;;
@@ -5657,7 +5689,6 @@ workspace_setup() {
     case "$env_tail_mode" in
       services|ports)
         requested_tail_mode="$env_tail_mode"
-        requested_tail_mode_explicit=1
         ;;
       *) die "SPARK_WORKSPACE_TAILSCALE_MODE must be 'services' or 'ports'" ;;
     esac
@@ -5693,7 +5724,6 @@ workspace_setup() {
     fi
   fi
   SPARK_WORKSPACE_TAILSCALE_MODE="$effective_tail_mode"
-  SPARK_WORKSPACE_TAILSCALE_MODE_EXPLICIT="$requested_tail_mode_explicit"
   if [[ -n "$requested_model" ]]; then
     model=$(workspace_select_model "$requested_model")
   elif [[ -n "$existing_model" ]]; then
@@ -5768,6 +5798,15 @@ workspace_setup() {
   fi
   workspace_create_vikunja_users "$human_pass"
   workspace_create_n8n_owner || true
+  if workspace_tailscale_services_mode; then
+    if workspace_tailscale_urls_ready_after_setup; then
+      workspace_tailscale_clear_error
+      info "Tailscale workspace URLs reachable"
+    else
+      workspace_tailscale_mark_error url-unreachable
+      setup_fail "Tailscale workspace URLs are not reachable yet"
+    fi
+  fi
   workspace_summary
 }
 
@@ -6552,6 +6591,15 @@ workspace_tailscale_https_urls_ready() {
     workspace_hermes_api_ready_at "$hermes"
 }
 
+workspace_tailscale_urls_ready_after_setup() {
+  local _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    workspace_tailscale_https_urls_ready && return 0
+    sleep 1
+  done
+  return 1
+}
+
 workspace_runtime_ports_not_public() {
   local ports out
   ports="${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${GATEWAY_PORT}"
@@ -6645,6 +6693,117 @@ workspace_update_tailscale() {
   return 1
 }
 
+workspace_tailscale_service_specs() {
+  printf 'vikunja %s\n' "$WORKSPACE_VIKUNJA_PORT"
+  printf 'n8n %s\n' "$WORKSPACE_N8N_PORT"
+  printf 'hermes %s\n' "$WORKSPACE_HERMES_PORT"
+}
+
+workspace_tailscale_status_json() {
+  command -v tailscale >/dev/null 2>&1 || return 1
+  tailscale status --json 2>/dev/null
+}
+
+workspace_tailscale_capmap_available() {
+  local json="$1"
+  command -v jq >/dev/null 2>&1 || return 1
+  printf '%s\n' "$json" | jq -e '.Self.CapMap? != null' >/dev/null 2>&1
+}
+
+workspace_tailscale_service_registered_in_json() {
+  local json="$1" service="$2" port="$3" cap svc tcp_port
+  cap="services/${service}"
+  svc="svc:${service}"
+  tcp_port="tcp:${port}"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s\n' "$json" | jq -e --arg cap "$cap" --arg svc "$svc" --arg port "$tcp_port" '
+      (.Self.CapMap[$cap] // [])
+      | map(select(.Name == $svc and ((.Ports // []) | index($port))))
+      | length > 0
+    ' >/dev/null 2>&1
+    return $?
+  fi
+  printf '%s\n' "$json" | grep -Fq "\"${cap}\"" &&
+    printf '%s\n' "$json" | grep -Fq "\"${svc}\"" &&
+    printf '%s\n' "$json" | grep -Fq "\"${tcp_port}\""
+}
+
+workspace_tailscale_missing_services() {
+  local json="$1" service port missing=0
+  while read -r service port; do
+    [[ -n "$service" ]] || continue
+    if ! workspace_tailscale_service_registered_in_json "$json" "$service" "$port"; then
+      printf '%s:%s\n' "$service" "$port"
+      missing=1
+    fi
+  done <<EOF
+$(workspace_tailscale_service_specs)
+EOF
+  return "$missing"
+}
+
+workspace_tailscale_missing_services_summary() {
+  local missing="$1" line out=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    out="${out}${out:+,}${line}"
+  done <<EOF
+${missing}
+EOF
+  printf '%s\n' "$out"
+}
+
+workspace_tailscale_mark_error() {
+  local code="$1" url="${2:-}"
+  workspace_set_env_key WORKSPACE_TAILSCALE_LAST_ERROR "$code"
+  workspace_set_env_key WORKSPACE_TAILSCALE_ENABLE_URL "$url"
+}
+
+workspace_tailscale_clear_error() {
+  workspace_set_env_key WORKSPACE_TAILSCALE_LAST_ERROR ""
+  workspace_set_env_key WORKSPACE_TAILSCALE_ENABLE_URL ""
+}
+
+workspace_tailscale_services_registered() {
+  local mode json missing last_error
+  mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
+  [[ "$mode" == "ports" ]] && return 0
+  last_error=$(workspace_read_env WORKSPACE_TAILSCALE_LAST_ERROR 2>/dev/null || true)
+  [[ "$last_error" == "missing-service" ]] && return 1
+  json=$(workspace_tailscale_status_json) || return 1
+  # Older/fake status JSON may not expose CapMap. When CapMap exists, it is the source of truth.
+  workspace_tailscale_capmap_available "$json" || return 0
+  missing=$(workspace_tailscale_missing_services "$json" || true)
+  [[ -z "$missing" ]]
+}
+
+workspace_tailscale_print_services_hitl() {
+  local missing="$1" tailnet="$2" dns_name="" service port
+  dns_name=$(workspace_tailscale_dns_name 2>/dev/null || true)
+  printf "    Tailscale Services must be created/approved in the Tailscale admin console.\n"
+  printf "    Open: https://login.tailscale.com/admin/services\n"
+  printf "    Required Services:\n"
+  while read -r service port; do
+    [[ -n "$service" ]] || continue
+    printf "      - %s: address https://%s.%s, endpoint tcp:%s\n" "$service" "$service" "$tailnet" "$port"
+  done <<EOF
+$(workspace_tailscale_service_specs)
+EOF
+  if [[ -n "$missing" ]]; then
+    printf "    Missing or not authorized for this node:\n"
+    while IFS=: read -r service port; do
+      [[ -n "$service" ]] || continue
+      printf "      - %s (tcp:%s)\n" "$service" "$port"
+    done <<EOF
+${missing}
+EOF
+  fi
+  if [[ -n "$dns_name" ]]; then
+    printf "    Approve/authorize host: %s\n" "$dns_name"
+  fi
+  printf "    Then rerun: spark ws setup --tailscale-mode services\n"
+}
+
 workspace_tailscale_serve_launch_bg() {
   local service="$1" target="$2" status_file="$3" log_file="$4"
   nohup bash -c '
@@ -6659,7 +6818,7 @@ workspace_tailscale_serve_launch_bg() {
     fi
     rc=$?
     printf "%s" "$rc" >"$status_file"
-  ' _ "$service" "$target" "$status_file" "$log_file" >/dev/null 2>&1 &
+  ' _ "$service" "$target" "$status_file" "$log_file" </dev/null >/dev/null 2>&1 &
 }
 
 workspace_tailscale_serve_disabled_error() {
@@ -6669,6 +6828,40 @@ workspace_tailscale_serve_disabled_error() {
     grep -q "Serve is not enabled on your tailnet" "$log" && return 0
   done
   return 1
+}
+
+workspace_tailscale_serve_enable_url() {
+  local log url
+  for log in "$@"; do
+    [[ -f "$log" ]] || continue
+    url=$(grep -Eo 'https://login[.]tailscale[.]com/f/serve[^[:space:]]*' "$log" | head -1 || true)
+    if [[ -n "$url" ]]; then
+      printf '%s\n' "$url"
+      return 0
+    fi
+  done
+  return 1
+}
+
+workspace_tailscale_print_serve_disabled_hitl() {
+  local url="${1:-}"
+  printf "    Tailscale Serve is not enabled for this tailnet.\n"
+  if [[ -n "$url" ]]; then
+    printf "    Enable it here: %s\n" "$url"
+  else
+    printf "    Run tailscale serve once and follow the login.tailscale.com consent link.\n"
+  fi
+  printf "    Then rerun: spark ws setup --tailscale-mode services\n"
+}
+
+workspace_tailscale_offer_ports_fallback() {
+  local tailnet="$1" auto_yes="$2"
+  [[ "$auto_yes" == "1" ]] && return 1
+  is_interactive || return 1
+  confirm "Use temporary Tailscale port URLs instead of Services for now?" || return 1
+  workspace_tailscale_ports_fallback "$tailnet" || return 1
+  workspace_tailscale_clear_error
+  return 0
 }
 
 workspace_tailscale_ports_fallback() {
@@ -6702,7 +6895,29 @@ workspace_tailscale_funnel_disabled() {
 
 workspace_tailscale_serve_present() {
   [[ "$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)" == "ports" ]] && return 0
+  [[ "$(workspace_read_env WORKSPACE_TAILSCALE_LAST_ERROR 2>/dev/null || true)" == "serve-disabled" ]] && return 1
   command -v tailscale >/dev/null 2>&1 && tailscale serve status >/dev/null 2>&1
+}
+
+workspace_tailscale_service_host_advertised() {
+  local mode last_error out json
+  mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
+  [[ "$mode" == "ports" ]] && return 0
+  last_error=$(workspace_read_env WORKSPACE_TAILSCALE_LAST_ERROR 2>/dev/null || true)
+  case "$last_error" in
+    service-host-failed|not-advertised) return 1 ;;
+  esac
+  out=$(tailscale serve get-config --all 2>/dev/null || tailscale serve status --json 2>/dev/null || tailscale serve status 2>/dev/null || true)
+  if [[ "$out" == *"svc:vikunja"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]]; then
+    return 0
+  fi
+  json=$(workspace_tailscale_status_json 2>/dev/null || true)
+  [[ -n "$json" ]] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s\n' "$json" | jq -e '.Self.CapMap["service-host"]? != null' >/dev/null 2>&1
+    return $?
+  fi
+  printf '%s\n' "$json" | grep -Fq '"service-host"'
 }
 
 workspace_tailscale_service_target_private() {
@@ -6825,6 +7040,8 @@ workspace_tailscale_services_configured() {
     workspace_tailscale_dns_name_ok "$dns_name" && workspace_tailscale_bind_addr_ok "$bind_addr"
     return $?
   fi
+  workspace_tailscale_services_registered || return 1
+  workspace_tailscale_service_host_advertised || return 1
   out=$(tailscale serve get-config --all 2>/dev/null || tailscale serve status --json 2>/dev/null || tailscale serve status 2>/dev/null || true)
   [[ "$out" == *"svc:vikunja"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]] &&
     workspace_tailscale_service_target_private "$out" vikunja "$WORKSPACE_VIKUNJA_PORT" &&
@@ -6982,8 +7199,10 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Tailscale connected" workspace_tailscale_connected
   workspace_doctor_check "Tailscale supports selected private access mode" workspace_tailscale_requested_version_ok
   workspace_doctor_check "Tailscale Funnel disabled" workspace_tailscale_funnel_disabled
-  workspace_doctor_check "Tailscale Serve/ports access reachable" workspace_tailscale_serve_present
-  workspace_doctor_check "Tailscale private access configured for vikunja, n8n, hermes" workspace_tailscale_services_configured
+  workspace_doctor_check "Tailscale Services registered/authorized" workspace_tailscale_services_registered
+  workspace_doctor_check "Tailscale Serve enabled" workspace_tailscale_serve_present
+  workspace_doctor_check "Tailscale Service host advertised" workspace_tailscale_service_host_advertised
+  workspace_doctor_check "Tailscale local config maps vikunja, n8n, hermes" workspace_tailscale_services_configured
   workspace_doctor_check "Tailscale mode is Services or ports" workspace_tailscale_services_mode
   workspace_doctor_check "Tailscale workspace URLs respond" workspace_tailscale_https_urls_ready
   workspace_doctor_check "LiteLLM gateway running" workspace_gateway_running
