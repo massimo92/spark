@@ -720,16 +720,25 @@ MODEL_LIST_MODELS=()
 MODEL_LIST_SIZES=()
 MODEL_LIST_AGES=()
 MODEL_LIST_BYTES=()
+MODEL_LIST_STATUS=()
+
+model_cache_complete() {
+  local model_dir="$1"
+  [[ -d "${model_dir}/snapshots" ]] || return 1
+  find "${model_dir}/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -q . || return 1
+  ! find "$model_dir" \( -name '*.incomplete' -o -name '*.lock' \) -print -quit 2>/dev/null | grep -q .
+}
 
 collect_downloaded_models() {
   MODEL_LIST_MODELS=()
   MODEL_LIST_SIZES=()
   MODEL_LIST_AGES=()
   MODEL_LIST_BYTES=()
+  MODEL_LIST_STATUS=()
   local cache_dir="${HF_CACHE_DIR}/hub"
   [[ -d "$cache_dir" ]] || return 0
 
-  local model_dir dirname model_name size_bytes size_gb mod_time age now diff
+  local model_dir dirname model_name size_bytes size_gb mod_time age now diff status
   for model_dir in "$cache_dir"/models--*; do
     [[ -d "$model_dir" ]] || continue
     dirname=$(basename "$model_dir")
@@ -753,10 +762,12 @@ collect_downloaded_models() {
         age="$(( diff / 604800 )) weeks ago"
       fi
     fi
+    if model_cache_complete "$model_dir"; then status="complete"; else status="partial"; fi
     MODEL_LIST_MODELS+=("$model_name")
     MODEL_LIST_SIZES+=("$size_gb")
     MODEL_LIST_AGES+=("$age")
     MODEL_LIST_BYTES+=("${size_bytes:-0}")
+    MODEL_LIST_STATUS+=("$status")
   done
 }
 
@@ -769,10 +780,10 @@ cmd_list() {
     return 0
   fi
 
-  printf "  ${BOLD}%-45s %-10s %s${NC}\n" "MODEL" "SIZE" "DOWNLOADED"
+  printf "  ${BOLD}%-45s %-10s %-10s %s${NC}\n" "MODEL" "SIZE" "STATUS" "UPDATED"
   local total_size=0 i
   for i in "${!MODEL_LIST_MODELS[@]}"; do
-    printf "  %-45s %-10s %s\n" "${MODEL_LIST_MODELS[$i]}" "${MODEL_LIST_SIZES[$i]}" "${MODEL_LIST_AGES[$i]}"
+    printf "  %-45s %-10s %-10s %s\n" "${MODEL_LIST_MODELS[$i]}" "${MODEL_LIST_SIZES[$i]}" "${MODEL_LIST_STATUS[$i]}" "${MODEL_LIST_AGES[$i]}"
     total_size=$(( total_size + ${MODEL_LIST_BYTES[$i]:-0} ))
   done
   local total_gb
@@ -989,4 +1000,3 @@ print_workspace_overview() {
   dashboard_row ok "Hermes" "${hermes_url:-unset}"
   return 0
 }
-

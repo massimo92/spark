@@ -219,10 +219,10 @@ workspace_litellm_model_name() {
 }
 
 workspace_model_in_list() {
-  local model="$1" m
+  local model="$1" i
   collect_downloaded_models
-  for m in "${MODEL_LIST_MODELS[@]}"; do
-    [[ "$m" == "$model" ]] && return 0
+  for i in "${!MODEL_LIST_MODELS[@]}"; do
+    [[ "${MODEL_LIST_MODELS[$i]}" == "$model" && "${MODEL_LIST_STATUS[$i]:-complete}" == "complete" ]] && return 0
   done
   return 1
 }
@@ -230,16 +230,21 @@ workspace_model_in_list() {
 workspace_select_model() {
   local requested="$1" choice i state
   collect_downloaded_models
-  [[ ${#MODEL_LIST_MODELS[@]} -gt 0 ]] || die "No downloaded models found" "Run: spark pull <model>"
   if [[ -n "$requested" ]]; then
-    workspace_model_in_list "$requested" || die "Model not found in spark list: $requested"
+    workspace_model_in_list "$requested" || die "Model not found or not fully downloaded in spark list: $requested"
     printf '%s\n' "$requested"
     return 0
   fi
+  local complete_count=0
+  for i in "${!MODEL_LIST_MODELS[@]}"; do
+    [[ "${MODEL_LIST_STATUS[$i]:-complete}" == "complete" ]] && complete_count=$((complete_count + 1))
+  done
+  [[ "$complete_count" -gt 0 ]] || die "No fully downloaded models found" "Wait for 'spark pull <model>' to finish."
   is_interactive || die "Choose a model with --model in non-interactive mode"
   printf "\n  ${BOLD}Choose the model Hermes will use:${NC}\n\n" >&2
   for i in "${!MODEL_LIST_MODELS[@]}"; do
     state=$(workspace_model_state "${MODEL_LIST_MODELS[$i]}")
+    [[ "${MODEL_LIST_STATUS[$i]:-complete}" == "partial" ]] && state="partial"
     printf "    [%d] %-45s %-10s %s\n" "$((i + 1))" "${MODEL_LIST_MODELS[$i]}" "${MODEL_LIST_SIZES[$i]}" "$state" >&2
   done
   while true; do
@@ -247,6 +252,7 @@ workspace_select_model() {
     read -r choice || true
     [[ "$choice" =~ ^[0-9]+$ ]] || { printf "  Enter a number.\n" >&2; continue; }
     [[ "$choice" -ge 1 && "$choice" -le ${#MODEL_LIST_MODELS[@]} ]] || { printf "  Enter 1-%d.\n" "${#MODEL_LIST_MODELS[@]}" >&2; continue; }
+    [[ "${MODEL_LIST_STATUS[$((choice - 1))]:-complete}" == "complete" ]] || { printf "  That model is still downloading.\n" >&2; continue; }
     printf '%s\n' "${MODEL_LIST_MODELS[$((choice - 1))]}"
     return 0
   done
@@ -1209,7 +1215,7 @@ workspace_configure_tailscale() {
         info "Tailscale Services configured locally"
         workspace_tailscale_print_pending_approval_hitl
         if workspace_tailscale_confirm_step "I approved this host for the Services; verify now?" "$auto_yes"; then
-          if workspace_tailscale_service_host_advertised; then
+          if workspace_tailscale_wait_for_service_host_advertised; then
             workspace_tailscale_clear_error
             info "Tailscale Service host approval verified"
           else
@@ -1329,7 +1335,7 @@ workspace_configure_tailscale() {
       info "Tailscale Services configured locally"
       workspace_tailscale_print_pending_approval_hitl
       if workspace_tailscale_confirm_step "I approved this host for the Services; verify now?" "$auto_yes"; then
-        if workspace_tailscale_service_host_advertised; then
+        if workspace_tailscale_wait_for_service_host_advertised; then
           workspace_tailscale_clear_error
           info "Tailscale Service host approval verified"
         else
@@ -2520,7 +2526,8 @@ workspace_urls_configured() {
 workspace_http_ready() {
   local url="$1"
   command -v curl >/dev/null 2>&1 || return 1
-  curl -fsS --max-time 3 "$url" >/dev/null 2>&1
+  curl -fsS --max-time 3 "$url" >/dev/null 2>&1 ||
+    curl -4 -fsS --max-time 3 "$url" >/dev/null 2>&1
 }
 
 workspace_vikunja_http_ready() {
@@ -2554,6 +2561,20 @@ workspace_litellm_model_routed() {
   command -v curl >/dev/null 2>&1 || return 1
   out=$(curl -fsS --max-time 5 "http://127.0.0.1:${GATEWAY_PORT}/v1/models" 2>/dev/null) || return 1
   printf '%s\n' "$out" | grep -Fq "\"${litellm_model}\""
+}
+
+workspace_litellm_model_smoke() {
+  local litellm_model escaped_model payload out
+  litellm_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  [[ -n "$litellm_model" ]] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  escaped_model=$(printf '%s' "$litellm_model" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply with ok."}],"max_tokens":1,"temperature":0}' "$escaped_model")
+  out=$(curl -fsS --max-time "${SPARK_WORKSPACE_LITELLM_SMOKE_TIMEOUT:-60}" \
+    -H 'Content-Type: application/json' \
+    -d "$payload" \
+    "http://127.0.0.1:${GATEWAY_PORT}/v1/chat/completions" 2>/dev/null) || return 1
+  printf '%s\n' "$out" | grep -Fq '"choices"'
 }
 
 workspace_tailscale_https_urls_ready() {
@@ -2680,9 +2701,9 @@ workspace_update_tailscale() {
 }
 
 workspace_tailscale_service_specs() {
-  printf 'vikunja %s\n' "$WORKSPACE_VIKUNJA_PORT"
-  printf 'n8n %s\n' "$WORKSPACE_N8N_PORT"
-  printf 'hermes %s\n' "$WORKSPACE_HERMES_PORT"
+  printf 'vikunja 443\n'
+  printf 'n8n 443\n'
+  printf 'hermes 443\n'
 }
 
 workspace_tailscale_status_json() {
@@ -3012,6 +3033,19 @@ workspace_tailscale_service_host_advertised() {
   [[ "$out" == *"svc:vikunja"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]]
 }
 
+workspace_tailscale_wait_for_service_host_advertised() {
+  local attempts="${SPARK_WORKSPACE_TAILSCALE_APPROVAL_WAIT_ATTEMPTS:-45}" delay="${SPARK_WORKSPACE_TAILSCALE_APPROVAL_WAIT_DELAY:-2}" i=0
+  [[ "$attempts" =~ ^[0-9]+$ && "$attempts" -gt 0 ]] || attempts=45
+  [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]] || delay=2
+  while [[ "$i" -lt "$attempts" ]]; do
+    workspace_tailscale_service_host_advertised && return 0
+    i=$((i + 1))
+    [[ "$i" -lt "$attempts" ]] || break
+    sleep "$delay"
+  done
+  return 1
+}
+
 workspace_tailscale_service_target_private() {
   local out="$1" service="$2" port="$3" block
   if command -v jq >/dev/null 2>&1 && printf '%s\n' "$out" | jq -e . >/dev/null 2>&1; then
@@ -3303,6 +3337,7 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Tailscale workspace URLs respond" workspace_tailscale_https_urls_ready
   workspace_doctor_check "LiteLLM gateway running" workspace_gateway_running
   workspace_doctor_check "LiteLLM exposes Hermes model route" workspace_litellm_model_routed
+  workspace_doctor_check "LiteLLM Hermes route completes smoke request" workspace_litellm_model_smoke
   workspace_doctor_check "Hermes model running: ${model:-none}" workspace_model_running "$model"
   workspace_doctor_check "Hermes/NemoClaw running" workspace_hermes_running
   workspace_doctor_check "Hermes NemoClaw uses restricted policy and private API port" workspace_hermes_nemoclaw_configured

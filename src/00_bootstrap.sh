@@ -182,10 +182,22 @@ SWAPPINESS="${SPARK_SWAPPINESS:-10}"
 PROFILE_SCHEMA_VERSION=2
 
 # Detect the latest pulled NGC vLLM image
+ngc_vllm_image_blocked() {
+  local image="$1" blocked
+  [[ "${SPARK_NGC_VLLM_ALLOW_BLOCKED:-0}" == "1" ]] && return 1
+  for blocked in ${SPARK_NGC_VLLM_DENYLIST:-nvcr.io/nvidia/vllm:26.06-py3}; do
+    [[ "$image" == "$blocked" ]] && return 0
+  done
+  return 1
+}
+
 detect_ngc_image() {
   local images
   images=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-    | awk '/^nvcr\.io\/nvidia\/vllm:/ {print}' || true)
+    | awk '/^nvcr\.io\/nvidia\/vllm:/ {print}' \
+    | while IFS= read -r image; do
+        ngc_vllm_image_blocked "$image" || printf '%s\n' "$image"
+      done || true)
 
   [[ -z "$images" ]] && return 0
 
