@@ -1786,6 +1786,24 @@ test_workspace_model_tui_uses_list() {
   [[ "$out" == *"Choose the model Hermes will use"* ]] && [[ "$out" == *"Org/Alpha"* ]] && [[ "$out" == *"Org/Beta"* ]]
 }
 
+test_workspace_rejects_partial_model() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status dir
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  dir="${tmp}/home/.cache/huggingface/hub/models--Org--Partial"
+  mkdir -p "${dir}/snapshots/1" "${dir}/blobs"
+  : > "${dir}/snapshots/1/config.json"
+  : > "${dir}/blobs/weights.incomplete"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 "$SPARK" ws setup --check --model Org/Partial 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Model not found or not fully downloaded in spark list: Org/Partial"* ]]
+}
+
 test_workspace_setup_starts_model_detached() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out
@@ -5153,7 +5171,21 @@ test_list_shows_models() {
   mkdir -p "${tmp}/home/.cache/huggingface/hub/models--Org--Beta/snapshots/1"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" list 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"MODEL"* ]] && [[ "$out" == *"Org/Alpha"* ]] && [[ "$out" == *"Org/Beta"* ]]
+  [[ "$out" == *"MODEL"* ]] && [[ "$out" == *"STATUS"* ]] &&
+    [[ "$out" == *"Org/Alpha"* ]] && [[ "$out" == *"Org/Beta"* ]] &&
+    [[ "$out" == *"complete"* ]]
+}
+
+test_list_marks_partial_models() {
+  local tmp fake_bin out dir
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  dir="${tmp}/home/.cache/huggingface/hub/models--Org--Partial"
+  mkdir -p "${dir}/snapshots/1" "${dir}/blobs"
+  : > "${dir}/snapshots/1/config.json"
+  : > "${dir}/blobs/weights.incomplete"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" list 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Org/Partial"* ]] && [[ "$out" == *"partial"* ]]
 }
 
 test_list_empty() {
@@ -5458,6 +5490,7 @@ run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provide
 run_test "pull (vllm) reports ready" test_pull_vllm_ready
 run_test "pull routes to Ollama on the ollama backend" test_pull_ollama_routes
 run_test "list shows downloaded models" test_list_shows_models
+run_test "list marks partial models" test_list_marks_partial_models
 run_test "list reports empty cache" test_list_empty
 run_test "rm removes the right model dir" test_rm_removes_the_right_dir
 run_test "rm removes multiple models" test_rm_removes_multiple_models
@@ -5540,6 +5573,7 @@ run_test "workspace setup --check does not write files" test_workspace_check_no_
 run_test "workspace setup --check preserves existing config" test_workspace_check_existing_config_no_mutation
 run_test "workspace setup --check reports missing Compose plugin" test_workspace_check_reports_missing_compose_plugin
 run_test "workspace setup model picker uses spark list data" test_workspace_model_tui_uses_list
+run_test "workspace setup rejects partial model" test_workspace_rejects_partial_model
 run_test "workspace setup starts Hermes model detached" test_workspace_setup_starts_model_detached
 run_test "workspace setup rejects invalid Tailscale mode" test_workspace_setup_rejects_bad_tailscale_mode
 run_test "workspace setup rejects invalid Docker image refs" test_workspace_setup_rejects_bad_image_ref
