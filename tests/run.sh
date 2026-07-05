@@ -5064,7 +5064,7 @@ test_hf_card_context_wins() {
     SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     "$SPARK" run Org/Long --dry-run </dev/null 2>&1 || true)
   rm -rf "$tmp"
-  [[ "$out" == *"--max-model-len 262144"* ]]
+  [[ "$out" == *"--max-model-len 262144"* ]] && [[ "$out" == *"--max-num-batched-tokens 32768"* ]]
 }
 
 test_hf_mtp_explain_asks_only_when_supported() {
@@ -5083,6 +5083,21 @@ test_hf_mtp_explain_asks_only_when_supported() {
     "$SPARK" run Org/MTP --dry-run --explain </dev/null 2>&1 || true)
   rm -rf "$tmp"
   [[ "$with_mtp" == *"MTP: ask"* ]] && [[ "$without_mtp" != *"MTP: ask"* ]]
+}
+
+test_hf_mtp_launch_sets_batched_tokens() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin dargs meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/MTP" "$KV_CONFIG"
+  meta=$(hf_inspect_json true true null false dense nvfp4)
+  printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_ASSUME_INTERACTIVE=1 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.05-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    "$SPARK" run Org/MTP --no-wait >/dev/null 2>&1 || true
+  dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$dargs" == *"--speculative-config"* ]] && [[ "$dargs" == *"--max-num-batched-tokens 32768"* ]]
 }
 
 test_hf_kv_fp8_question_and_recommendation() {
@@ -5671,6 +5686,7 @@ run_test "HF MoE NVFP4 emits Marlin + atomic add" test_hf_moe_nvfp4_emits_marlin
 run_test "HF inspector maps compressed-tensors NVFP4" test_hf_inspector_compressed_tensors_nvfp4_tag
 run_test "HF card recommended context wins" test_hf_card_context_wins
 run_test "HF MTP question only when supported" test_hf_mtp_explain_asks_only_when_supported
+run_test "HF MTP launch sets batched tokens" test_hf_mtp_launch_sets_batched_tokens
 run_test "HF KV FP8 question/recommendation" test_hf_kv_fp8_question_and_recommendation
 run_test "dry-run explain shows HF source and flags" test_dry_run_explain_shows_hf_and_flags
 run_test "CLI overrides win over HF metadata" test_hf_metadata_cli_overrides_win
