@@ -5039,6 +5039,21 @@ test_hf_moe_nvfp4_emits_marlin_atomic() {
   [[ "$out" == *"--moe-backend marlin"* ]] && [[ "$out" == *"VLLM_MARLIN_USE_ATOMIC_ADD=1"* ]]
 }
 
+test_hf_inspector_compressed_tensors_nvfp4_tag() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  command -v python3 >/dev/null 2>&1 || { printf "skip - python3 not installed\n"; return 0; }
+  local tmp q
+  tmp=$(mktemp -d)
+  make_model "${tmp}/home" "Org/Model-NVFP4" '{ "model_type":"qwen3", "architectures":["Qwen3MoeForCausalLM"],
+    "max_position_embeddings":262144, "num_experts":128,
+    "quantization_config":{"quant_method":"compressed-tensors"} }'
+  q=$(python3 "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-NVFP4 \
+    --local-path "${tmp}/home/.cache/huggingface/hub/models--Org--Model-NVFP4/snapshots/1" \
+    | jq -r '.features.quantization')
+  rm -rf "$tmp"
+  [[ "$q" == "nvfp4" ]]
+}
+
 test_hf_card_context_wins() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out meta
@@ -5653,6 +5668,7 @@ run_test "unrecoverable startup aborts without retry" test_startup_unrecoverable
 run_test "--no-wait launches without supervising" test_startup_no_wait
 run_test "enforce-eager auto for MoE, not for dense" test_enforce_eager_auto_for_moe
 run_test "HF MoE NVFP4 emits Marlin + atomic add" test_hf_moe_nvfp4_emits_marlin_atomic
+run_test "HF inspector maps compressed-tensors NVFP4" test_hf_inspector_compressed_tensors_nvfp4_tag
 run_test "HF card recommended context wins" test_hf_card_context_wins
 run_test "HF MTP question only when supported" test_hf_mtp_explain_asks_only_when_supported
 run_test "HF KV FP8 question/recommendation" test_hf_kv_fp8_question_and_recommendation
