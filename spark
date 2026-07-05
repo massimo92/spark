@@ -132,6 +132,19 @@ detect_platform() {
 detect_platform
 
 TOTAL_MEM_GB=$(detect_total_mem_gb)
+detect_gpu_field() {
+  local field="$1"
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  nvidia-smi --query-gpu="$field" --format=csv,noheader 2>/dev/null | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
+}
+GPU_NAME=""
+GPU_COMPUTE_CAPABILITY=""
+GPU_DRIVER_VERSION=""
+if [[ "$ACCEL" == cuda-* ]]; then
+  GPU_NAME="$(detect_gpu_field name)"
+  GPU_COMPUTE_CAPABILITY="$(detect_gpu_field compute_cap)"
+  GPU_DRIVER_VERSION="$(detect_gpu_field driver_version)"
+fi
 if [[ "$ACCEL" == "cuda-discrete" ]]; then
   OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-2}"         # small VRAM headroom (OS runs in system RAM)
 else
@@ -179,7 +192,7 @@ SWAPPINESS="${SPARK_SWAPPINESS:-10}"
 # Profile cache schema. Bumped when new fields are added (e.g. is_moe). A cached profile older than
 # this is auto-refreshed on the next `spark run` so new fields (and the decisions that depend on them,
 # like auto enforce-eager) are populated — no user action needed.
-PROFILE_SCHEMA_VERSION=2
+PROFILE_SCHEMA_VERSION=3
 
 # Detect the latest pulled NGC vLLM image
 ngc_vllm_image_blocked() {
@@ -508,6 +521,53 @@ resolve_model_path() {
   return 1
 }
 
+spark_root_dir() {
+  local self dir
+  self="${BASH_SOURCE[0]}"
+  [[ "$self" != */* ]] && self="$(command -v "$self" 2>/dev/null || printf '%s\n' "$self")"
+  dir="$(cd "$(dirname "$self")" >/dev/null 2>&1 && pwd || pwd)"
+  printf '%s\n' "$dir"
+}
+
+hf_model_inspect_path() {
+  local root
+  [[ -n "${SPARK_HF_MODEL_INSPECT:-}" && -x "${SPARK_HF_MODEL_INSPECT}" ]] && { printf '%s\n' "$SPARK_HF_MODEL_INSPECT"; return 0; }
+  root="$(spark_root_dir)"
+  if [[ -x "${root}/scripts/hf_model_inspect.py" ]]; then
+    printf '%s\n' "${root}/scripts/hf_model_inspect.py"; return 0
+  fi
+  if [[ -x "${HOME}/.local/share/spark/scripts/hf_model_inspect.py" ]]; then
+    printf '%s\n' "${HOME}/.local/share/spark/scripts/hf_model_inspect.py"; return 0
+  fi
+  return 1
+}
+
+inspect_hf_model() {
+  local model="$1" model_path="$2" helper err_file status py
+  helper="$(hf_model_inspect_path)" || die "Hugging Face inspector not found" "Run: spark setup, or set SPARK_HF_MODEL_INSPECT"
+  py="${HOME}/.local/share/spark/hf-inspect-venv/bin/python"
+  [[ -x "$py" ]] || py="python3"
+  command -v "$py" >/dev/null 2>&1 || die "python3 is required for Hugging Face model inspection" "Run: spark setup"
+  err_file="$(mktemp)"
+  set +e
+  HF_MODEL_INFO_JSON=$("$py" "$helper" --model-id "$model" --local-path "$model_path" 2>"$err_file")
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    local msg
+    msg="$(cat "$err_file" 2>/dev/null || true)"
+    rm -f "$err_file"
+    die "Could not inspect Hugging Face metadata for ${model}" "${msg:-Check the model id and Hugging Face access}"
+  fi
+  rm -f "$err_file"
+  printf '%s' "$HF_MODEL_INFO_JSON" | jq -e . >/dev/null 2>&1 || die "Hugging Face inspector returned invalid JSON"
+}
+
+hf_profile_value() {
+  local expr="$1"
+  printf '%s' "${HF_MODEL_INFO_JSON:-{}}" | jq -r "$expr" 2>/dev/null || true
+}
+
 # --- Auto-Profiler ---
 validate_profile_values() {
   [[ -z "$REASONING_PARSER" || "$REASONING_PARSER" =~ ^[a-z0-9_]+$ ]] || die "Invalid profile value: reasoning_parser"
@@ -515,6 +575,15 @@ validate_profile_values() {
   is_mem_util "$GPU_MEM_UTIL" || die "Invalid profile value: gpu_memory_utilization"
   is_positive_int "$MAX_MODEL_LEN" || die "Invalid profile value: max_model_len"
   [[ "$IS_MULTIMODAL" =~ ^(true|false)$ ]] || die "Invalid profile value: is_multimodal"
+  [[ "$IS_MOE" =~ ^(0|1)$ ]] || die "Invalid profile value: is_moe"
+  [[ -z "${MODEL_FAMILY:-}" || "$MODEL_FAMILY" =~ ^[a-z0-9_.-]+$ ]] || die "Invalid profile value: model_family"
+  [[ -z "${MODEL_ARCHITECTURE:-}" || "$MODEL_ARCHITECTURE" =~ ^[a-z0-9_.-]+$ ]] || die "Invalid profile value: model_architecture"
+  [[ -z "${MODEL_QUANTIZATION:-}" || "$MODEL_QUANTIZATION" =~ ^[a-z0-9_.+-]+$ ]] || die "Invalid profile value: model_quantization"
+  [[ -z "${HF_RECOMMENDED_CONTEXT:-}" || "$HF_RECOMMENDED_CONTEXT" =~ ^[0-9]+$ ]] || die "Invalid profile value: hf_recommended_context"
+  [[ "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" =~ ^(true|false)$ ]] || die "Invalid profile value: hf_kv_cache_fp8_recommended"
+  [[ "${HAS_MTP:-false}" =~ ^(true|false)$ ]] || die "Invalid profile value: has_mtp"
+  [[ "${HAS_REASONING:-false}" =~ ^(true|false)$ ]] || die "Invalid profile value: has_reasoning"
+  [[ "${SUPPORTS_TOOLS:-false}" =~ ^(true|false)$ ]] || die "Invalid profile value: supports_tools"
   [[ "$MODEL_SIZE_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: model_size_gb"
   [[ "$WEIGHTS_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: weights_gb"
   [[ "$KV_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: kv_gb"
@@ -534,6 +603,19 @@ load_profile() {
   MODEL_MAX_LEN="$MAX_MODEL_LEN"   # cached proxy for the model's max context (fit suggestions)
   IS_MULTIMODAL=$(jq -r '.is_multimodal // "false"' "$profile_file") || die "Could not read profile: $profile_file"
   IS_MOE=$(jq -r '.is_moe // "0"' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_MODEL_INFO_JSON=$(jq -c '.hf // {}' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_REVISION=$(jq -r '.hf.revision // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_TAGS=$(jq -r '(.hf.tags // []) | join(",")' "$profile_file") || die "Could not read profile: $profile_file"
+  MODEL_FAMILY=$(jq -r '.hf.features.family // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  MODEL_ARCHITECTURE=$(jq -r '.hf.features.architecture // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  MODEL_QUANTIZATION=$(jq -r '.hf.features.quantization // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_RECOMMENDED_RUNTIME=$(jq -r '.hf.card.recommended_runtime // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_RECOMMENDED_COMMAND=$(jq -r '.hf.card.recommended_command // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_RECOMMENDED_CONTEXT=$(jq -r '.hf.card.recommended_context // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_KV_CACHE_FP8_RECOMMENDED=$(jq -r '.hf.card.kv_cache_fp8_recommended // false' "$profile_file") || die "Could not read profile: $profile_file"
+  HAS_MTP=$(jq -r '.hf.features.has_mtp // false' "$profile_file") || die "Could not read profile: $profile_file"
+  HAS_REASONING=$(jq -r '.hf.features.has_reasoning // false' "$profile_file") || die "Could not read profile: $profile_file"
+  SUPPORTS_TOOLS=$(jq -r '.hf.features.supports_tools // false' "$profile_file") || die "Could not read profile: $profile_file"
   MODEL_SIZE_GB=$(jq -r '.model_size_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
   WEIGHTS_GB=$(jq -r '.weights_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
   KV_GB=$(jq -r '.kv_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
@@ -650,60 +732,63 @@ profile_model() {
     return 1
   fi
 
-  # Read model config
-  local model_type arch_list
-  model_type=$(jq -r '.model_type // ""' "$config_json" 2>/dev/null || echo "")
-  arch_list=$(jq -r '.architectures // [] | join(",")' "$config_json" 2>/dev/null || echo "")
+  inspect_hf_model "$model" "$model_path"
 
-  # Reasoning parser
+  local model_type arch_list model_max
+  model_type=$(hf_profile_value '.raw.model_type // ""')
+  arch_list=$(hf_profile_value '(.raw.architectures // []) | join(",")')
+  HF_REVISION=$(hf_profile_value '.revision // ""')
+  HF_TAGS=$(hf_profile_value '(.tags // []) | join(",")')
+  MODEL_FAMILY=$(hf_profile_value '.features.family // ""')
+  MODEL_ARCHITECTURE=$(hf_profile_value '.features.architecture // ""')
+  MODEL_QUANTIZATION=$(hf_profile_value '.features.quantization // ""')
+  HF_RECOMMENDED_RUNTIME=$(hf_profile_value '.card.recommended_runtime // ""')
+  HF_RECOMMENDED_COMMAND=$(hf_profile_value '.card.recommended_command // ""')
+  HF_RECOMMENDED_CONTEXT=$(hf_profile_value '.card.recommended_context // ""')
+  HF_KV_CACHE_FP8_RECOMMENDED=$(hf_profile_value '.card.kv_cache_fp8_recommended // false')
+  HAS_MTP=$(hf_profile_value '.features.has_mtp // false')
+  HAS_REASONING=$(hf_profile_value '.features.has_reasoning // false')
+  SUPPORTS_TOOLS=$(hf_profile_value '.features.supports_tools // false')
+
   REASONING_PARSER=""
-  case "$model_type" in
-    qwen3*) REASONING_PARSER="qwen3" ;;
-    deepseek_v3) REASONING_PARSER="deepseek_r1" ;;
+  case "$MODEL_FAMILY:$model_type" in
+    qwen:*|*:qwen3*) REASONING_PARSER="qwen3" ;;
+    deepseek:*|*:deepseek_v3) REASONING_PARSER="deepseek_r1" ;;
   esac
 
-  # Tool-call parser
   TOOL_CALL_PARSER=""
-  case "$model_type" in
-    qwen3*) TOOL_CALL_PARSER="qwen3_coder" ;;
+  case "$MODEL_FAMILY:$model_type" in
+    qwen:*|*:qwen3*) TOOL_CALL_PARSER="qwen3_xml" ;;
   esac
 
-  # Warn if model_type is unrecognized
   if [[ -n "$model_type" && -z "$REASONING_PARSER" && -z "$TOOL_CALL_PARSER" ]]; then
     warn "Unknown model_type '${model_type}' — reasoning and tool-call parsers not configured"
   fi
 
-  # Max context length — default to 128K, capped to what the model supports.
-  local model_max
-  model_max=$(jq -r '
-    (.text_config // .) |
-    .max_position_embeddings //
-    .max_sequence_length //
-    .seq_length //
-    32768' "$config_json" 2>/dev/null || echo "32768")
+  model_max=$(hf_profile_value '.card.config_context // 32768')
   is_positive_int "$model_max" || model_max=32768
-  MODEL_MAX_LEN="$model_max"   # the model's own max context (used to cap fit suggestions)
-  if [[ "$model_max" -lt 131072 ]]; then
+  MODEL_MAX_LEN="$model_max"
+  if [[ -n "$HF_RECOMMENDED_CONTEXT" && "$HF_RECOMMENDED_CONTEXT" =~ ^[0-9]+$ && "$HF_RECOMMENDED_CONTEXT" -gt 0 ]]; then
+    MAX_MODEL_LEN="$HF_RECOMMENDED_CONTEXT"
+    [[ "$HF_RECOMMENDED_CONTEXT" -gt "$MODEL_MAX_LEN" ]] && MODEL_MAX_LEN="$HF_RECOMMENDED_CONTEXT"
+  elif [[ "$model_max" -lt 131072 ]]; then
     MAX_MODEL_LEN="$model_max"
   else
     MAX_MODEL_LEN=131072
   fi
 
-  # Multimodal detection
-  IS_MULTIMODAL="false"
-  local has_vision
-  has_vision=$(jq -r 'has("vision_config") or has("visual")' "$config_json" 2>/dev/null || echo "false")
-  if [[ "$has_vision" == "true" ]] || echo "$arch_list" | grep -qi "VL\|Vision"; then
-    IS_MULTIMODAL="true"
-  fi
+  IS_MULTIMODAL=$(hf_profile_value '.features.is_multimodal // false')
+  [[ "$IS_MULTIMODAL" =~ ^(true|false)$ ]] || IS_MULTIMODAL="false"
 
-  # MoE detection: vLLM under-profiles MoE startup memory (imbalanced experts) → big warmup peak.
-  # Used to bias --enforce-eager on the first launch when there's no measured peak yet.
   IS_MOE="0"
-  local has_experts
-  has_experts=$(jq -r '(.text_config // .) | (has("num_experts") or has("n_routed_experts") or has("num_local_experts") or has("num_experts_per_tok"))' "$config_json" 2>/dev/null || echo "false")
-  if [[ "$has_experts" == "true" ]] || echo "$arch_list" | grep -qiE "moe|mixture"; then
-    IS_MOE="1"
+  [[ "$(hf_profile_value '.features.is_moe // false')" == "true" ]] && IS_MOE="1"
+
+  if [[ -z "${KV_CACHE_DTYPE:-}" ]]; then
+    if [[ "$HF_KV_CACHE_FP8_RECOMMENDED" == "true" ]]; then
+      KV_CACHE_DTYPE="fp8"
+    else
+      KV_CACHE_DTYPE="auto"
+    fi
   fi
 
   # Model size (sum of safetensors)
@@ -745,11 +830,13 @@ profile_model() {
     --arg need_gb "$NEED_GB" \
     --arg kv_cache_dtype "$KV_CACHE_DTYPE" \
     --arg is_moe "$IS_MOE" \
+    --argjson hf "$HF_MODEL_INFO_JSON" \
     --argjson schema_version "$PROFILE_SCHEMA_VERSION" \
     '{
       schema_version: $schema_version,
       model: $model,
       generated: $generated,
+      hf: $hf,
       reasoning_parser: $reasoning_parser,
       tool_call_parser: $tool_call_parser,
       gpu_memory_utilization: $gpu_memory_utilization,
@@ -1248,6 +1335,7 @@ cmd_run_help() {
     --no-reasoning         Disable reasoning parser.
     --no-pull              Fail if model is missing; do not offer download.
     --dry-run              Print memory plan and Docker command; do not run.
+    --explain              With --dry-run, show HF metadata, chosen flags and questions.
     --no-wait              Start container and return without health supervision.
     --tail                 Follow logs after launch.
     --force                Replace an already running instance of the model.
@@ -1258,7 +1346,7 @@ EOF
 
 cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
-  local no_reasoning=0 dry_run=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
+  local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto"
 
   while [[ $# -gt 0 ]]; do
@@ -1277,6 +1365,7 @@ cmd_run() {
       --no-reasoning) no_reasoning=1; shift ;;
       --no-pull)   no_pull=1; shift ;;
       --dry-run)   dry_run=1; shift ;;
+      --explain)   explain=1; shift ;;
       --tail)      tail_logs=1; shift ;;
       --force)     force=1; shift ;;
       --regen-profile) regen=1; shift ;;
@@ -1326,6 +1415,96 @@ resolve_enforce_eager() {
   ENFORCE_EAGER=0
 }
 
+vllm_arg_has_flag() {
+  local flag="$1" arg
+  for arg in "${vllm_args[@]}"; do
+    [[ "$arg" == "$flag" ]] && return 0
+  done
+  return 1
+}
+
+add_vllm_flag_once() {
+  local flag="$1"
+  vllm_arg_has_flag "$flag" || vllm_args+=("$@")
+}
+
+hf_command_value() {
+  local flag="$1" re
+  re="(^|[[:space:]])${flag}[[:space:]]+([^[:space:]]+)"
+  if [[ "${HF_RECOMMENDED_COMMAND:-}" =~ $re ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+  fi
+}
+
+add_recommended_command_flags() {
+  local value
+  value="$(hf_command_value --load-format)"
+  [[ "$value" =~ ^[A-Za-z0-9_.-]+$ ]] && add_vllm_flag_once --load-format "$value"
+
+  value="$(hf_command_value --max-num-batched-tokens)"
+  [[ "$value" =~ ^[0-9]+$ ]] && add_vllm_flag_once --max-num-batched-tokens "$value"
+
+  [[ "${HF_RECOMMENDED_COMMAND:-}" == *"--async-scheduling"* ]] && add_vllm_flag_once --async-scheduling
+  return 0
+}
+
+ask_runtime_tradeoffs() {
+  MTP_ENABLED="${MTP_ENABLED:-0}"
+  [[ "$dry_run" == "1" ]] && return 0
+  is_interactive || return 0
+
+  local ans
+  if [[ -z "${mem:-}" && -z "${kv_dtype:-}" && "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" != "true" ]]; then
+    printf "  Use FP8 KV cache? Lower memory/faster; may affect quality without model card calibration. [y/N] "
+    read -r ans || ans=""
+    if [[ "$ans" =~ ^[Yy] ]]; then
+      KV_CACHE_DTYPE="fp8"
+      recompute_memory "${model_path}/config.json"
+    fi
+  fi
+
+  if [[ "${HAS_MTP:-false}" == "true" ]]; then
+    printf "  Enable MTP speculative decoding? More tok/s; runtime-dependent/less stable. [y/N] "
+    read -r ans || ans=""
+    [[ "$ans" =~ ^[Yy] ]] && MTP_ENABLED=1
+  fi
+
+  if [[ "${SUPPORTS_TOOLS:-false}" == "true" && "$tools" != "1" ]]; then
+    printf "  Enable tool calling? Adds parser/tool protocol; only needed for agents. [y/N] "
+    read -r ans || ans=""
+    [[ "$ans" =~ ^[Yy] ]] && tools=1
+  fi
+}
+
+print_launch_explain() {
+  [[ "${explain:-0}" == "1" ]] || return 0
+  printf "\n  ${BOLD}Explain${NC}\n"
+  printf "    HF:        %s%s\n" "$model" "${HF_REVISION:+ @ ${HF_REVISION}}"
+  printf "    Tags:      %s\n" "${HF_TAGS:-none}"
+  printf "    Features:  family=%s arch=%s quant=%s moe=%s mtp=%s tools=%s\n" \
+    "${MODEL_FAMILY:-unknown}" "${MODEL_ARCHITECTURE:-unknown}" "${MODEL_QUANTIZATION:-unknown}" \
+    "${IS_MOE:-0}" "${HAS_MTP:-false}" "${SUPPORTS_TOOLS:-false}"
+  printf "    Card:      runtime=%s context=%s kv_fp8=%s\n" \
+    "${HF_RECOMMENDED_RUNTIME:-unknown}" "${HF_RECOMMENDED_CONTEXT:-none}" "${HF_KV_CACHE_FP8_RECOMMENDED:-false}"
+  printf "    Hardware:  accel=%s gpu=%s cc=%s driver=%s image=%s\n" \
+    "$ACCEL" "${GPU_NAME:-unknown}" "${GPU_COMPUTE_CAPABILITY:-unknown}" "${GPU_DRIVER_VERSION:-unknown}" "$ngc_image"
+  [[ -n "${HF_RECOMMENDED_COMMAND:-}" ]] && printf "    Card cmd:  %s\n" "$HF_RECOMMENDED_COMMAND"
+  printf "    vLLM:      "
+  shell_join "${vllm_args[@]}"
+  printf "    Questions:\n"
+  local any=0
+  if [[ -z "${mem:-}" && -z "${kv_dtype:-}" && "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" != "true" ]]; then
+    printf "      - KV cache FP8: ask, default no\n"; any=1
+  fi
+  if [[ "${HAS_MTP:-false}" == "true" ]]; then
+    printf "      - MTP: ask, default no\n"; any=1
+  fi
+  if [[ "${SUPPORTS_TOOLS:-false}" == "true" && "$tools" != "1" ]]; then
+    printf "      - Tool calling: ask, default no\n"; any=1
+  fi
+  [[ "$any" == "0" ]] && printf "      - none\n"
+}
+
 # (Re)build vllm_args + docker_cmd from the current $seqs (concurrency), $headroom_gb (cgroup cap
 # above NEED) and $enforce_eager. Called once and again on each adaptive-startup retry. Reads/writes
 # run_backend_vllm locals via dynamic scope (same pattern as the backend reading cmd_run's flags).
@@ -1337,10 +1516,23 @@ build_launch() {
     --max-model-len "$MAX_MODEL_LEN"
     --max-num-seqs "$seqs"
     --port "$port")
+  local quant_lc use_marlin_atomic=0
+  quant_lc=$(printf '%s' "${MODEL_QUANTIZATION:-}" | tr '[:upper:]' '[:lower:]')
+  if [[ "$ACCEL" == cuda-* ]]; then
+    add_vllm_flag_once --attention-backend flashinfer
+    add_vllm_flag_once --enable-chunked-prefill
+    add_vllm_flag_once --enable-prefix-caching
+  fi
+  if [[ "$ACCEL" == cuda-* && "${IS_MOE:-0}" == "1" && "$quant_lc" =~ (nvfp4|fp8|fp4|modelopt) ]]; then
+    add_vllm_flag_once --moe-backend marlin
+    use_marlin_atomic=1
+  fi
+  add_recommended_command_flags
   [[ "$KV_CACHE_DTYPE" == "fp8" ]] && vllm_args+=(--kv-cache-dtype fp8)
   [[ "$enforce_eager" == "1" ]] && vllm_args+=(--enforce-eager)
   [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]] && vllm_args+=(--reasoning-parser "$REASONING_PARSER")
   [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] && vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
+  [[ "${MTP_ENABLED:-0}" == "1" ]] && vllm_args+=(--speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}')
   [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt image=0)
 
   # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
@@ -1375,6 +1567,7 @@ build_launch() {
     --label "spark.weights_gb=${WEIGHTS_GB}"
     --label "spark.kv_gb=${KV_GB}"
     --label "spark.max_model_len=${MAX_MODEL_LEN}")
+  [[ "$use_marlin_atomic" == "1" ]] && docker_cmd+=(-e VLLM_MARLIN_USE_ATOMIC_ADD=1)
   [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_swap_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
   docker_cmd+=("$ngc_image")
 }
@@ -1464,13 +1657,14 @@ run_backend_vllm() {
 
   # Profile (sizes memory by the model's NEED: weights + KV + cushion)
   REGEN_PROFILE="${REGEN_PROFILE:-$regen}"
-  KV_CACHE_DTYPE="${kv_dtype:-auto}"
+  KV_CACHE_DTYPE="${kv_dtype:-}"
   profile_model "$model" "$model_path"
 
   # Apply effective settings (these override whatever a cached profile baked in),
   # then always recompute memory so the reservation reflects this run's flags.
   [[ -n "$max_len" ]] && MAX_MODEL_LEN="$max_len"
-  KV_CACHE_DTYPE="${kv_dtype:-auto}"
+  [[ -n "$kv_dtype" ]] && KV_CACHE_DTYPE="$kv_dtype"
+  [[ -z "$KV_CACHE_DTYPE" ]] && KV_CACHE_DTYPE="auto"
   recompute_memory "${model_path}/config.json"
   if [[ -n "$mem" ]]; then
     # Manual fraction: derive need from it so budget accounting stays coherent.
@@ -1530,13 +1724,16 @@ run_backend_vllm() {
     REGEN_PROFILE=1
     profile_model "$model" "$model_path"
     [[ -n "$max_len" ]] && MAX_MODEL_LEN="$max_len"
-    KV_CACHE_DTYPE="${kv_dtype:-auto}"
+    [[ -n "$kv_dtype" ]] && KV_CACHE_DTYPE="$kv_dtype"
+    [[ -z "$KV_CACHE_DTYPE" ]] && KV_CACHE_DTYPE="auto"
     recompute_memory "${model_path}/config.json"
     if [[ -n "$mem" ]]; then GPU_MEM_UTIL="$mem"; NEED_GB=$(awk -v m="$mem" -v T="$TOTAL_MEM_GB" 'BEGIN{ printf "%.1f", m*T }'); fi
     [[ "$no_reasoning" == "1" ]] && REASONING_PARSER=""
     validate_profile_values
   fi
   verify_capacity "$NEED_GB" "$cname" "$dry_run" "$mem" "$model" "${model_path}/config.json"
+  ask_runtime_tradeoffs
+  validate_profile_values
 
   # Assign a port (auto unless --port given). Reject collisions with live models.
   if [[ -z "$port" ]]; then
@@ -1577,6 +1774,7 @@ run_backend_vllm() {
   print_memory_plan "$model" "$cname" "$port" "$reserved" "$free"
 
   if [[ "$dry_run" == "1" ]]; then
+    print_launch_explain
     printf "${DIM}# Docker command that would be executed:${NC}\n"
     shell_join "${docker_cmd[@]}" "${vllm_args[@]}"
     printf "\n"
@@ -3060,6 +3258,20 @@ step_hf_cli() {
   else
     setup_skip "HuggingFace CLI (needs uv)"
   fi
+
+  if ctx_run '~/.local/share/spark/hf-inspect-venv/bin/python -c "import huggingface_hub"'; then
+    info "HF library: installed"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "HuggingFace library not installed"
+  elif ctx_run "${TGT_PATH} command -v uv" >/dev/null 2>&1; then
+    if ctx_run 'mkdir -p ~/.local/share/spark && uv venv ~/.local/share/spark/hf-inspect-venv >/dev/null && ~/.local/share/spark/hf-inspect-venv/bin/python -m pip install -q huggingface-hub'; then
+      info "Installed HF library"
+    else
+      setup_fail "HF library install failed"
+    fi
+  else
+    setup_skip "HuggingFace library (needs uv)"
+  fi
 }
 
 step_nvitop() {
@@ -3745,12 +3957,19 @@ ensure_local_tailscale() {
 
 # Copy this CLI to the remote so `spark` is available there too.
 deploy_spark_binary() {
-  local self rv
+  local self helper rv
   self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
+  helper="$(hf_model_inspect_path 2>/dev/null || true)"
   # Always overwrite the remote binary with this controller's copy, so the server runs the exact
   # same spark version every setup run (no stale CLI lingering on the server).
   remote 'mkdir -p ~/.local/bin'
   remote_in 'cat > ~/.local/bin/spark && chmod +x ~/.local/bin/spark' < "$self"
+  if [[ -n "$helper" ]]; then
+    remote 'mkdir -p ~/.local/share/spark/scripts'
+    remote_in 'cat > ~/.local/share/spark/scripts/hf_model_inspect.py && chmod +x ~/.local/share/spark/scripts/hf_model_inspect.py' < "$helper"
+  else
+    setup_fail "Hugging Face inspector not found locally; cannot deploy spark runtime helper"
+  fi
   remote 'grep -q "local/bin" ~/.bashrc 2>/dev/null' || remote 'echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.bashrc'
   # Verify the deployed version matches this controller's — surfaces a botched copy immediately.
   rv="$(remote 'grep -m1 "^VERSION=" ~/.local/bin/spark 2>/dev/null | cut -d\" -f2')"

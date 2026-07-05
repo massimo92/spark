@@ -143,6 +143,20 @@ step_hf_cli() {
   else
     setup_skip "HuggingFace CLI (needs uv)"
   fi
+
+  if ctx_run '~/.local/share/spark/hf-inspect-venv/bin/python -c "import huggingface_hub"'; then
+    info "HF library: installed"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "HuggingFace library not installed"
+  elif ctx_run "${TGT_PATH} command -v uv" >/dev/null 2>&1; then
+    if ctx_run 'mkdir -p ~/.local/share/spark && uv venv ~/.local/share/spark/hf-inspect-venv >/dev/null && ~/.local/share/spark/hf-inspect-venv/bin/python -m pip install -q huggingface-hub'; then
+      info "Installed HF library"
+    else
+      setup_fail "HF library install failed"
+    fi
+  else
+    setup_skip "HuggingFace library (needs uv)"
+  fi
 }
 
 step_nvitop() {
@@ -828,12 +842,19 @@ ensure_local_tailscale() {
 
 # Copy this CLI to the remote so `spark` is available there too.
 deploy_spark_binary() {
-  local self rv
+  local self helper rv
   self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
+  helper="$(hf_model_inspect_path 2>/dev/null || true)"
   # Always overwrite the remote binary with this controller's copy, so the server runs the exact
   # same spark version every setup run (no stale CLI lingering on the server).
   remote 'mkdir -p ~/.local/bin'
   remote_in 'cat > ~/.local/bin/spark && chmod +x ~/.local/bin/spark' < "$self"
+  if [[ -n "$helper" ]]; then
+    remote 'mkdir -p ~/.local/share/spark/scripts'
+    remote_in 'cat > ~/.local/share/spark/scripts/hf_model_inspect.py && chmod +x ~/.local/share/spark/scripts/hf_model_inspect.py' < "$helper"
+  else
+    setup_fail "Hugging Face inspector not found locally; cannot deploy spark runtime helper"
+  fi
   remote 'grep -q "local/bin" ~/.bashrc 2>/dev/null' || remote 'echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.bashrc'
   # Verify the deployed version matches this controller's — surfaces a botched copy immediately.
   rv="$(remote 'grep -m1 "^VERSION=" ~/.local/bin/spark 2>/dev/null | cut -d\" -f2')"

@@ -19,6 +19,7 @@ cmd_run_help() {
     --no-reasoning         Disable reasoning parser.
     --no-pull              Fail if model is missing; do not offer download.
     --dry-run              Print memory plan and Docker command; do not run.
+    --explain              With --dry-run, show HF metadata, chosen flags and questions.
     --no-wait              Start container and return without health supervision.
     --tail                 Follow logs after launch.
     --force                Replace an already running instance of the model.
@@ -29,7 +30,7 @@ EOF
 
 cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
-  local no_reasoning=0 dry_run=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
+  local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto"
 
   while [[ $# -gt 0 ]]; do
@@ -48,6 +49,7 @@ cmd_run() {
       --no-reasoning) no_reasoning=1; shift ;;
       --no-pull)   no_pull=1; shift ;;
       --dry-run)   dry_run=1; shift ;;
+      --explain)   explain=1; shift ;;
       --tail)      tail_logs=1; shift ;;
       --force)     force=1; shift ;;
       --regen-profile) regen=1; shift ;;
@@ -97,6 +99,96 @@ resolve_enforce_eager() {
   ENFORCE_EAGER=0
 }
 
+vllm_arg_has_flag() {
+  local flag="$1" arg
+  for arg in "${vllm_args[@]}"; do
+    [[ "$arg" == "$flag" ]] && return 0
+  done
+  return 1
+}
+
+add_vllm_flag_once() {
+  local flag="$1"
+  vllm_arg_has_flag "$flag" || vllm_args+=("$@")
+}
+
+hf_command_value() {
+  local flag="$1" re
+  re="(^|[[:space:]])${flag}[[:space:]]+([^[:space:]]+)"
+  if [[ "${HF_RECOMMENDED_COMMAND:-}" =~ $re ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+  fi
+}
+
+add_recommended_command_flags() {
+  local value
+  value="$(hf_command_value --load-format)"
+  [[ "$value" =~ ^[A-Za-z0-9_.-]+$ ]] && add_vllm_flag_once --load-format "$value"
+
+  value="$(hf_command_value --max-num-batched-tokens)"
+  [[ "$value" =~ ^[0-9]+$ ]] && add_vllm_flag_once --max-num-batched-tokens "$value"
+
+  [[ "${HF_RECOMMENDED_COMMAND:-}" == *"--async-scheduling"* ]] && add_vllm_flag_once --async-scheduling
+  return 0
+}
+
+ask_runtime_tradeoffs() {
+  MTP_ENABLED="${MTP_ENABLED:-0}"
+  [[ "$dry_run" == "1" ]] && return 0
+  is_interactive || return 0
+
+  local ans
+  if [[ -z "${mem:-}" && -z "${kv_dtype:-}" && "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" != "true" ]]; then
+    printf "  Use FP8 KV cache? Lower memory/faster; may affect quality without model card calibration. [y/N] "
+    read -r ans || ans=""
+    if [[ "$ans" =~ ^[Yy] ]]; then
+      KV_CACHE_DTYPE="fp8"
+      recompute_memory "${model_path}/config.json"
+    fi
+  fi
+
+  if [[ "${HAS_MTP:-false}" == "true" ]]; then
+    printf "  Enable MTP speculative decoding? More tok/s; runtime-dependent/less stable. [y/N] "
+    read -r ans || ans=""
+    [[ "$ans" =~ ^[Yy] ]] && MTP_ENABLED=1
+  fi
+
+  if [[ "${SUPPORTS_TOOLS:-false}" == "true" && "$tools" != "1" ]]; then
+    printf "  Enable tool calling? Adds parser/tool protocol; only needed for agents. [y/N] "
+    read -r ans || ans=""
+    [[ "$ans" =~ ^[Yy] ]] && tools=1
+  fi
+}
+
+print_launch_explain() {
+  [[ "${explain:-0}" == "1" ]] || return 0
+  printf "\n  ${BOLD}Explain${NC}\n"
+  printf "    HF:        %s%s\n" "$model" "${HF_REVISION:+ @ ${HF_REVISION}}"
+  printf "    Tags:      %s\n" "${HF_TAGS:-none}"
+  printf "    Features:  family=%s arch=%s quant=%s moe=%s mtp=%s tools=%s\n" \
+    "${MODEL_FAMILY:-unknown}" "${MODEL_ARCHITECTURE:-unknown}" "${MODEL_QUANTIZATION:-unknown}" \
+    "${IS_MOE:-0}" "${HAS_MTP:-false}" "${SUPPORTS_TOOLS:-false}"
+  printf "    Card:      runtime=%s context=%s kv_fp8=%s\n" \
+    "${HF_RECOMMENDED_RUNTIME:-unknown}" "${HF_RECOMMENDED_CONTEXT:-none}" "${HF_KV_CACHE_FP8_RECOMMENDED:-false}"
+  printf "    Hardware:  accel=%s gpu=%s cc=%s driver=%s image=%s\n" \
+    "$ACCEL" "${GPU_NAME:-unknown}" "${GPU_COMPUTE_CAPABILITY:-unknown}" "${GPU_DRIVER_VERSION:-unknown}" "$ngc_image"
+  [[ -n "${HF_RECOMMENDED_COMMAND:-}" ]] && printf "    Card cmd:  %s\n" "$HF_RECOMMENDED_COMMAND"
+  printf "    vLLM:      "
+  shell_join "${vllm_args[@]}"
+  printf "    Questions:\n"
+  local any=0
+  if [[ -z "${mem:-}" && -z "${kv_dtype:-}" && "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" != "true" ]]; then
+    printf "      - KV cache FP8: ask, default no\n"; any=1
+  fi
+  if [[ "${HAS_MTP:-false}" == "true" ]]; then
+    printf "      - MTP: ask, default no\n"; any=1
+  fi
+  if [[ "${SUPPORTS_TOOLS:-false}" == "true" && "$tools" != "1" ]]; then
+    printf "      - Tool calling: ask, default no\n"; any=1
+  fi
+  [[ "$any" == "0" ]] && printf "      - none\n"
+}
+
 # (Re)build vllm_args + docker_cmd from the current $seqs (concurrency), $headroom_gb (cgroup cap
 # above NEED) and $enforce_eager. Called once and again on each adaptive-startup retry. Reads/writes
 # run_backend_vllm locals via dynamic scope (same pattern as the backend reading cmd_run's flags).
@@ -108,10 +200,23 @@ build_launch() {
     --max-model-len "$MAX_MODEL_LEN"
     --max-num-seqs "$seqs"
     --port "$port")
+  local quant_lc use_marlin_atomic=0
+  quant_lc=$(printf '%s' "${MODEL_QUANTIZATION:-}" | tr '[:upper:]' '[:lower:]')
+  if [[ "$ACCEL" == cuda-* ]]; then
+    add_vllm_flag_once --attention-backend flashinfer
+    add_vllm_flag_once --enable-chunked-prefill
+    add_vllm_flag_once --enable-prefix-caching
+  fi
+  if [[ "$ACCEL" == cuda-* && "${IS_MOE:-0}" == "1" && "$quant_lc" =~ (nvfp4|fp8|fp4|modelopt) ]]; then
+    add_vllm_flag_once --moe-backend marlin
+    use_marlin_atomic=1
+  fi
+  add_recommended_command_flags
   [[ "$KV_CACHE_DTYPE" == "fp8" ]] && vllm_args+=(--kv-cache-dtype fp8)
   [[ "$enforce_eager" == "1" ]] && vllm_args+=(--enforce-eager)
   [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]] && vllm_args+=(--reasoning-parser "$REASONING_PARSER")
   [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] && vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
+  [[ "${MTP_ENABLED:-0}" == "1" ]] && vllm_args+=(--speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}')
   [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt image=0)
 
   # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
@@ -146,6 +251,7 @@ build_launch() {
     --label "spark.weights_gb=${WEIGHTS_GB}"
     --label "spark.kv_gb=${KV_GB}"
     --label "spark.max_model_len=${MAX_MODEL_LEN}")
+  [[ "$use_marlin_atomic" == "1" ]] && docker_cmd+=(-e VLLM_MARLIN_USE_ATOMIC_ADD=1)
   [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_swap_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
   docker_cmd+=("$ngc_image")
 }
@@ -235,13 +341,14 @@ run_backend_vllm() {
 
   # Profile (sizes memory by the model's NEED: weights + KV + cushion)
   REGEN_PROFILE="${REGEN_PROFILE:-$regen}"
-  KV_CACHE_DTYPE="${kv_dtype:-auto}"
+  KV_CACHE_DTYPE="${kv_dtype:-}"
   profile_model "$model" "$model_path"
 
   # Apply effective settings (these override whatever a cached profile baked in),
   # then always recompute memory so the reservation reflects this run's flags.
   [[ -n "$max_len" ]] && MAX_MODEL_LEN="$max_len"
-  KV_CACHE_DTYPE="${kv_dtype:-auto}"
+  [[ -n "$kv_dtype" ]] && KV_CACHE_DTYPE="$kv_dtype"
+  [[ -z "$KV_CACHE_DTYPE" ]] && KV_CACHE_DTYPE="auto"
   recompute_memory "${model_path}/config.json"
   if [[ -n "$mem" ]]; then
     # Manual fraction: derive need from it so budget accounting stays coherent.
@@ -301,13 +408,16 @@ run_backend_vllm() {
     REGEN_PROFILE=1
     profile_model "$model" "$model_path"
     [[ -n "$max_len" ]] && MAX_MODEL_LEN="$max_len"
-    KV_CACHE_DTYPE="${kv_dtype:-auto}"
+    [[ -n "$kv_dtype" ]] && KV_CACHE_DTYPE="$kv_dtype"
+    [[ -z "$KV_CACHE_DTYPE" ]] && KV_CACHE_DTYPE="auto"
     recompute_memory "${model_path}/config.json"
     if [[ -n "$mem" ]]; then GPU_MEM_UTIL="$mem"; NEED_GB=$(awk -v m="$mem" -v T="$TOTAL_MEM_GB" 'BEGIN{ printf "%.1f", m*T }'); fi
     [[ "$no_reasoning" == "1" ]] && REASONING_PARSER=""
     validate_profile_values
   fi
   verify_capacity "$NEED_GB" "$cname" "$dry_run" "$mem" "$model" "${model_path}/config.json"
+  ask_runtime_tradeoffs
+  validate_profile_values
 
   # Assign a port (auto unless --port given). Reject collisions with live models.
   if [[ -z "$port" ]]; then
@@ -348,6 +458,7 @@ run_backend_vllm() {
   print_memory_plan "$model" "$cname" "$port" "$reserved" "$free"
 
   if [[ "$dry_run" == "1" ]]; then
+    print_launch_explain
     printf "${DIM}# Docker command that would be executed:${NC}\n"
     shell_join "${docker_cmd[@]}" "${vllm_args[@]}"
     printf "\n"
