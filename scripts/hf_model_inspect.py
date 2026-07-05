@@ -119,11 +119,18 @@ def extract_card_context(card_text: str, command: str) -> int | None:
 
 
 def quantization(config: dict[str, Any], hf_quant: dict[str, Any], tags: list[str], model_id: str) -> str:
+    side_raw = text_lower(json.dumps({"hf_quant": hf_quant, "tags": tags, "model_id": model_id}, sort_keys=True))
     qconf = config.get("quantization_config")
     if isinstance(qconf, dict):
         q = first_value(qconf, "quant_method", "quant_algo", "quantization", "bits")
         if q is not None:
             raw = text_lower(q)
+            # Some NVIDIA HF repos expose the container format as "compressed-tensors" in
+            # config.json while the concrete hardware quantization (nvfp4/fp8) is in tags/card.
+            if "compressed" in raw:
+                for key in ("nvfp4", "fp8", "fp4", "int4", "int8"):
+                    if key in side_raw:
+                        return key
             if "nvfp4" in raw:
                 return "nvfp4"
             if "fp8" in raw:
@@ -135,11 +142,9 @@ def quantization(config: dict[str, Any], hf_quant: dict[str, Any], tags: list[st
             if "int8" in raw or raw == "8":
                 return "int8"
             return raw
-    for source in (hf_quant, {"tags": tags, "model_id": model_id}):
-        raw = text_lower(json.dumps(source, sort_keys=True))
-        for key in ("nvfp4", "fp8", "fp4", "int4", "int8", "gguf"):
-            if key in raw:
-                return key
+    for key in ("nvfp4", "fp8", "fp4", "int4", "int8", "gguf"):
+        if key in side_raw:
+            return key
     dtype = text_lower(config.get("torch_dtype"))
     return dtype
 
