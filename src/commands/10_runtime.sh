@@ -206,6 +206,9 @@ build_launch() {
     add_vllm_flag_once --attention-backend flashinfer
     add_vllm_flag_once --enable-chunked-prefill
     add_vllm_flag_once --enable-prefix-caching
+    if [[ "${MAX_MODEL_LEN:-0}" -ge 65536 ]]; then
+      add_vllm_flag_once --max-num-batched-tokens "${SPARK_MAX_NUM_BATCHED_TOKENS:-32768}"
+    fi
   fi
   if [[ "$ACCEL" == cuda-* && "${IS_MOE:-0}" == "1" && "$quant_lc" =~ (nvfp4|fp8|fp4|modelopt) ]]; then
     add_vllm_flag_once --moe-backend marlin
@@ -216,7 +219,10 @@ build_launch() {
   [[ "$enforce_eager" == "1" ]] && vllm_args+=(--enforce-eager)
   [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]] && vllm_args+=(--reasoning-parser "$REASONING_PARSER")
   [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] && vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
-  [[ "${MTP_ENABLED:-0}" == "1" ]] && vllm_args+=(--speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}')
+  if [[ "${MTP_ENABLED:-0}" == "1" ]]; then
+    vllm_args+=(--speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}')
+    add_vllm_flag_once --max-num-batched-tokens "${SPARK_MTP_MAX_NUM_BATCHED_TOKENS:-32768}"
+  fi
   [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt image=0)
 
   # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
