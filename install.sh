@@ -5,6 +5,7 @@ set -euo pipefail
 
 REPO="massimo92/spark"
 INSTALL_DIR="${HOME}/.local/bin"
+DATA_DIR="${HOME}/.local/share/spark"
 BINARY="spark"
 
 printf "Installing spark...\n"
@@ -26,6 +27,10 @@ chmod +x "$tmp_file"
 mkdir -p "$INSTALL_DIR"
 mv "$tmp_file" "${INSTALL_DIR}/${BINARY}"
 trap - EXIT
+
+mkdir -p "${DATA_DIR}/scripts"
+curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/scripts/hf_model_inspect.py" -o "${DATA_DIR}/scripts/hf_model_inspect.py"
+chmod +x "${DATA_DIR}/scripts/hf_model_inspect.py"
 
 # Ensure ~/.local/bin is in PATH
 if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
@@ -54,4 +59,5 @@ if [[ -f "/usr/local/bin/${BINARY}" ]]; then
 fi
 
 printf "✓ spark installed to %s/%s\n" "$INSTALL_DIR" "$BINARY"
+printf "✓ Hugging Face inspector installed to %s/scripts/hf_model_inspect.py\n" "$DATA_DIR"
 printf "  Run: spark setup\n"

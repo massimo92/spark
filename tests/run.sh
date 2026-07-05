@@ -159,6 +159,12 @@ case "$args" in
   *--query-gpu=name*)
     [[ -n "${FAKE_GPU_NAME:-}" ]] && echo "${FAKE_GPU_NAME}"
     exit "${FAKE_NVIDIA_SMI_EXIT:-1}" ;;
+  *--query-gpu=compute_cap*)
+    [[ -n "${FAKE_COMPUTE_CAP:-}" ]] && echo "${FAKE_COMPUTE_CAP}"
+    exit "${FAKE_NVIDIA_SMI_EXIT:-1}" ;;
+  *--query-gpu=driver_version*)
+    [[ -n "${FAKE_DRIVER_VERSION:-}" ]] && echo "${FAKE_DRIVER_VERSION}"
+    exit "${FAKE_NVIDIA_SMI_EXIT:-1}" ;;
   *)
     exit "${FAKE_NVIDIA_SMI_EXIT:-1}" ;;
 esac
@@ -615,6 +621,9 @@ case "$cmd" in
   *"query-gpu"*)           echo "Remote GPU" ;;
   *"mkdir -p ~/.local/bin"*) exit 0 ;;
   *"cat > ~/.local/bin/spark"*) exit 0 ;;
+  *"mkdir -p ~/.local/share/spark/scripts"*) exit 0 ;;
+  *"cat > ~/.local/share/spark/scripts/hf_model_inspect.py"*) exit 0 ;;
+  *"hf-inspect-venv/bin/python -c"*) exit 0 ;;
   *'grep -q "local/bin"'*) exit 0 ;;
   *"command -v ollama"*)   exit 1 ;;
   *"command -v systemctl"*) exit 0 ;;
@@ -930,6 +939,17 @@ KV_CONFIG='{ "model_type":"qwen3", "architectures":["Qwen3ForCausalLM"],
   "num_hidden_layers":48, "num_key_value_heads":4, "num_attention_heads":32,
   "head_dim":128, "hidden_size":2048, "max_position_embeddings":262144,
   "quantization_config":{"quant_method":"nvfp4"}, "num_parameters":30000000000 }'
+
+hf_inspect_json() {
+  local mtp="${1:-false}" kv_fp8="${2:-false}" ctx="${3:-null}" tools="${4:-false}" arch="${5:-dense}" quant="${6:-nvfp4}"
+  jq -nc --argjson mtp "$mtp" --argjson kv "$kv_fp8" --argjson ctx "$ctx" --argjson tools "$tools" \
+    --arg arch "$arch" --arg quant "$quant" '{
+      model_id:"Org/Test", revision:"rev-test", tags:["vllm","blackwell"],
+      card:{license:"test", recommended_runtime:"vllm", recommended_command:"vllm serve Org/Test --load-format fastsafetensors", long_context:($ctx != null), recommended_context:$ctx, config_context:262144, kv_cache_fp8_recommended:$kv},
+      features:{family:"qwen", architecture:$arch, quantization:$quant, has_mtp:$mtp, has_reasoning:true, supports_tools:$tools, is_multimodal:false, is_moe:($arch == "moe"), is_nvfp4:($quant == "nvfp4"), is_fp8:($quant == "fp8"), is_gguf:false},
+      raw:{model_type:"qwen3", architectures:["Qwen3ForCausalLM"], quantization_config:{quant_method:$quant}}
+    }'
+}
 
 test_total_mem_detection_positive() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
@@ -5006,6 +5026,98 @@ test_enforce_eager_auto_for_moe() {
   [[ "$moe" == *"--enforce-eager"* ]] && [[ "$dense" != *"--enforce-eager"* ]]
 }
 
+test_hf_moe_nvfp4_emits_marlin_atomic() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Moe" "$MOE_CONFIG"
+  meta=$(hf_inspect_json false false null false moe nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/Moe --dry-run </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--moe-backend marlin"* ]] && [[ "$out" == *"VLLM_MARLIN_USE_ATOMIC_ADD=1"* ]]
+}
+
+test_hf_card_context_wins() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Long" "$KV_CONFIG"
+  meta=$(hf_inspect_json false false 262144 false dense nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/Long --dry-run </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--max-model-len 262144"* ]]
+}
+
+test_hf_mtp_explain_asks_only_when_supported() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin with_mtp without_mtp meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/MTP" "$KV_CONFIG"
+  meta=$(hf_inspect_json true false null false dense nvfp4)
+  with_mtp=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/MTP --dry-run --explain </dev/null 2>&1 || true)
+  rm -f "${tmp}/home/.config/spark/profiles/Org--MTP.json"
+  meta=$(hf_inspect_json false false null false dense nvfp4)
+  without_mtp=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/MTP --dry-run --explain </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$with_mtp" == *"MTP: ask"* ]] && [[ "$without_mtp" != *"MTP: ask"* ]]
+}
+
+test_hf_kv_fp8_question_and_recommendation() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin ask auto meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/KV" "$KV_CONFIG"
+  meta=$(hf_inspect_json false false null false dense nvfp4)
+  ask=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/KV --dry-run --explain </dev/null 2>&1 || true)
+  rm -f "${tmp}/home/.config/spark/profiles/Org--KV.json"
+  meta=$(hf_inspect_json false true null false dense nvfp4)
+  auto=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/KV --dry-run --explain </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$ask" == *"KV cache FP8: ask"* ]] &&
+    [[ "$auto" != *"KV cache FP8: ask"* ]] &&
+    [[ "$auto" == *"--kv-cache-dtype fp8"* ]]
+}
+
+test_dry_run_explain_shows_hf_and_flags() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Explain" "$KV_CONFIG"
+  meta=$(hf_inspect_json false false null true dense nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/Explain --dry-run --explain </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Explain"* ]] && [[ "$out" == *"HF:"* ]] && [[ "$out" == *"Features:"* ]] &&
+    [[ "$out" == *"vLLM:"* ]] && [[ "$out" == *"--load-format fastsafetensors"* ]] &&
+    [[ "$out" == *"Tool calling: ask"* ]]
+}
+
+test_hf_metadata_cli_overrides_win() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Override" "$KV_CONFIG"
+  meta=$(hf_inspect_json false true 262144 false dense nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/Override --dry-run --max-len 4096 --kv-cache-dtype auto </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--max-model-len 4096"* ]] && [[ "$out" != *"--kv-cache-dtype fp8"* ]]
+}
+
 # A cached profile from an older spark (no schema_version, missing fields like is_moe) is refreshed
 # automatically on the next run — so decisions that depend on the new fields work without user action.
 test_profile_schema_autoregen() {
@@ -5021,7 +5133,7 @@ test_profile_schema_autoregen() {
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1 || true)
   sv=$(jq -r '.schema_version // "none"' "$pf" 2>/dev/null || echo none)
   rm -rf "$tmp"
-  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "2" ]]
+  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "3" ]]
 }
 
 # CUDA-graph calibration over the two-column peak table: eager peak on record + no graph peak →
@@ -5033,7 +5145,7 @@ _write_cal_profile() {
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
   jq -n --arg m "$2" --arg ep "$3" --arg cp "$4" '{
-    schema_version:2, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    schema_version:3, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
     warmup: {"8192/auto": ({date:"2026-01-01"}
@@ -5048,7 +5160,7 @@ _write_legacy_cal_profile() {
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
   jq -n --arg m "$2" --arg p "$3" --arg e "$4" --arg c "$5" '{
-    schema_version:2, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    schema_version:3, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
     warmup: {"8192/auto": {peak_gb:$p, enforce_eager:$e, cudagraph_oom:$c, date:"2026-01-01"}}
@@ -5540,6 +5652,12 @@ run_test "startup retries warmup OOM with more headroom" test_startup_retry_oom
 run_test "unrecoverable startup aborts without retry" test_startup_unrecoverable_aborts
 run_test "--no-wait launches without supervising" test_startup_no_wait
 run_test "enforce-eager auto for MoE, not for dense" test_enforce_eager_auto_for_moe
+run_test "HF MoE NVFP4 emits Marlin + atomic add" test_hf_moe_nvfp4_emits_marlin_atomic
+run_test "HF card recommended context wins" test_hf_card_context_wins
+run_test "HF MTP question only when supported" test_hf_mtp_explain_asks_only_when_supported
+run_test "HF KV FP8 question/recommendation" test_hf_kv_fp8_question_and_recommendation
+run_test "dry-run explain shows HF source and flags" test_dry_run_explain_shows_hf_and_flags
+run_test "CLI overrides win over HF metadata" test_hf_metadata_cli_overrides_win
 run_test "stale profile schema auto-refreshes on run" test_profile_schema_autoregen
 run_test "CUDA-graph calibration: try / stay-eager / use-graphs" test_cudagraph_calibration
 run_test "warmup cache migrates legacy single-peak entries" test_warmup_legacy_migration

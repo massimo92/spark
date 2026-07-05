@@ -132,6 +132,19 @@ detect_platform() {
 detect_platform
 
 TOTAL_MEM_GB=$(detect_total_mem_gb)
+detect_gpu_field() {
+  local field="$1"
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  nvidia-smi --query-gpu="$field" --format=csv,noheader 2>/dev/null | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' || true
+}
+GPU_NAME=""
+GPU_COMPUTE_CAPABILITY=""
+GPU_DRIVER_VERSION=""
+if [[ "$ACCEL" == cuda-* ]]; then
+  GPU_NAME="$(detect_gpu_field name)"
+  GPU_COMPUTE_CAPABILITY="$(detect_gpu_field compute_cap)"
+  GPU_DRIVER_VERSION="$(detect_gpu_field driver_version)"
+fi
 if [[ "$ACCEL" == "cuda-discrete" ]]; then
   OS_RESERVE_GB="${SPARK_OS_RESERVE_GB:-2}"         # small VRAM headroom (OS runs in system RAM)
 else
@@ -179,7 +192,7 @@ SWAPPINESS="${SPARK_SWAPPINESS:-10}"
 # Profile cache schema. Bumped when new fields are added (e.g. is_moe). A cached profile older than
 # this is auto-refreshed on the next `spark run` so new fields (and the decisions that depend on them,
 # like auto enforce-eager) are populated — no user action needed.
-PROFILE_SCHEMA_VERSION=2
+PROFILE_SCHEMA_VERSION=3
 
 # Detect the latest pulled NGC vLLM image
 ngc_vllm_image_blocked() {
@@ -508,6 +521,53 @@ resolve_model_path() {
   return 1
 }
 
+spark_root_dir() {
+  local self dir
+  self="${BASH_SOURCE[0]}"
+  [[ "$self" != */* ]] && self="$(command -v "$self" 2>/dev/null || printf '%s\n' "$self")"
+  dir="$(cd "$(dirname "$self")" >/dev/null 2>&1 && pwd || pwd)"
+  printf '%s\n' "$dir"
+}
+
+hf_model_inspect_path() {
+  local root
+  [[ -n "${SPARK_HF_MODEL_INSPECT:-}" && -x "${SPARK_HF_MODEL_INSPECT}" ]] && { printf '%s\n' "$SPARK_HF_MODEL_INSPECT"; return 0; }
+  root="$(spark_root_dir)"
+  if [[ -x "${root}/scripts/hf_model_inspect.py" ]]; then
+    printf '%s\n' "${root}/scripts/hf_model_inspect.py"; return 0
+  fi
+  if [[ -x "${HOME}/.local/share/spark/scripts/hf_model_inspect.py" ]]; then
+    printf '%s\n' "${HOME}/.local/share/spark/scripts/hf_model_inspect.py"; return 0
+  fi
+  return 1
+}
+
+inspect_hf_model() {
+  local model="$1" model_path="$2" helper err_file status py
+  helper="$(hf_model_inspect_path)" || die "Hugging Face inspector not found" "Run: spark setup, or set SPARK_HF_MODEL_INSPECT"
+  py="${HOME}/.local/share/spark/hf-inspect-venv/bin/python"
+  [[ -x "$py" ]] || py="python3"
+  command -v "$py" >/dev/null 2>&1 || die "python3 is required for Hugging Face model inspection" "Run: spark setup"
+  err_file="$(mktemp)"
+  set +e
+  HF_MODEL_INFO_JSON=$("$py" "$helper" --model-id "$model" --local-path "$model_path" 2>"$err_file")
+  status=$?
+  set -e
+  if [[ "$status" -ne 0 ]]; then
+    local msg
+    msg="$(cat "$err_file" 2>/dev/null || true)"
+    rm -f "$err_file"
+    die "Could not inspect Hugging Face metadata for ${model}" "${msg:-Check the model id and Hugging Face access}"
+  fi
+  rm -f "$err_file"
+  printf '%s' "$HF_MODEL_INFO_JSON" | jq -e . >/dev/null 2>&1 || die "Hugging Face inspector returned invalid JSON"
+}
+
+hf_profile_value() {
+  local expr="$1"
+  printf '%s' "${HF_MODEL_INFO_JSON:-{}}" | jq -r "$expr" 2>/dev/null || true
+}
+
 # --- Auto-Profiler ---
 validate_profile_values() {
   [[ -z "$REASONING_PARSER" || "$REASONING_PARSER" =~ ^[a-z0-9_]+$ ]] || die "Invalid profile value: reasoning_parser"
@@ -515,6 +575,15 @@ validate_profile_values() {
   is_mem_util "$GPU_MEM_UTIL" || die "Invalid profile value: gpu_memory_utilization"
   is_positive_int "$MAX_MODEL_LEN" || die "Invalid profile value: max_model_len"
   [[ "$IS_MULTIMODAL" =~ ^(true|false)$ ]] || die "Invalid profile value: is_multimodal"
+  [[ "$IS_MOE" =~ ^(0|1)$ ]] || die "Invalid profile value: is_moe"
+  [[ -z "${MODEL_FAMILY:-}" || "$MODEL_FAMILY" =~ ^[a-z0-9_.-]+$ ]] || die "Invalid profile value: model_family"
+  [[ -z "${MODEL_ARCHITECTURE:-}" || "$MODEL_ARCHITECTURE" =~ ^[a-z0-9_.-]+$ ]] || die "Invalid profile value: model_architecture"
+  [[ -z "${MODEL_QUANTIZATION:-}" || "$MODEL_QUANTIZATION" =~ ^[a-z0-9_.+-]+$ ]] || die "Invalid profile value: model_quantization"
+  [[ -z "${HF_RECOMMENDED_CONTEXT:-}" || "$HF_RECOMMENDED_CONTEXT" =~ ^[0-9]+$ ]] || die "Invalid profile value: hf_recommended_context"
+  [[ "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" =~ ^(true|false)$ ]] || die "Invalid profile value: hf_kv_cache_fp8_recommended"
+  [[ "${HAS_MTP:-false}" =~ ^(true|false)$ ]] || die "Invalid profile value: has_mtp"
+  [[ "${HAS_REASONING:-false}" =~ ^(true|false)$ ]] || die "Invalid profile value: has_reasoning"
+  [[ "${SUPPORTS_TOOLS:-false}" =~ ^(true|false)$ ]] || die "Invalid profile value: supports_tools"
   [[ "$MODEL_SIZE_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: model_size_gb"
   [[ "$WEIGHTS_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: weights_gb"
   [[ "$KV_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: kv_gb"
@@ -534,6 +603,19 @@ load_profile() {
   MODEL_MAX_LEN="$MAX_MODEL_LEN"   # cached proxy for the model's max context (fit suggestions)
   IS_MULTIMODAL=$(jq -r '.is_multimodal // "false"' "$profile_file") || die "Could not read profile: $profile_file"
   IS_MOE=$(jq -r '.is_moe // "0"' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_MODEL_INFO_JSON=$(jq -c '.hf // {}' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_REVISION=$(jq -r '.hf.revision // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_TAGS=$(jq -r '(.hf.tags // []) | join(",")' "$profile_file") || die "Could not read profile: $profile_file"
+  MODEL_FAMILY=$(jq -r '.hf.features.family // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  MODEL_ARCHITECTURE=$(jq -r '.hf.features.architecture // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  MODEL_QUANTIZATION=$(jq -r '.hf.features.quantization // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_RECOMMENDED_RUNTIME=$(jq -r '.hf.card.recommended_runtime // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_RECOMMENDED_COMMAND=$(jq -r '.hf.card.recommended_command // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_RECOMMENDED_CONTEXT=$(jq -r '.hf.card.recommended_context // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_KV_CACHE_FP8_RECOMMENDED=$(jq -r '.hf.card.kv_cache_fp8_recommended // false' "$profile_file") || die "Could not read profile: $profile_file"
+  HAS_MTP=$(jq -r '.hf.features.has_mtp // false' "$profile_file") || die "Could not read profile: $profile_file"
+  HAS_REASONING=$(jq -r '.hf.features.has_reasoning // false' "$profile_file") || die "Could not read profile: $profile_file"
+  SUPPORTS_TOOLS=$(jq -r '.hf.features.supports_tools // false' "$profile_file") || die "Could not read profile: $profile_file"
   MODEL_SIZE_GB=$(jq -r '.model_size_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
   WEIGHTS_GB=$(jq -r '.weights_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
   KV_GB=$(jq -r '.kv_gb // "0"' "$profile_file") || die "Could not read profile: $profile_file"
@@ -650,60 +732,63 @@ profile_model() {
     return 1
   fi
 
-  # Read model config
-  local model_type arch_list
-  model_type=$(jq -r '.model_type // ""' "$config_json" 2>/dev/null || echo "")
-  arch_list=$(jq -r '.architectures // [] | join(",")' "$config_json" 2>/dev/null || echo "")
+  inspect_hf_model "$model" "$model_path"
 
-  # Reasoning parser
+  local model_type arch_list model_max
+  model_type=$(hf_profile_value '.raw.model_type // ""')
+  arch_list=$(hf_profile_value '(.raw.architectures // []) | join(",")')
+  HF_REVISION=$(hf_profile_value '.revision // ""')
+  HF_TAGS=$(hf_profile_value '(.tags // []) | join(",")')
+  MODEL_FAMILY=$(hf_profile_value '.features.family // ""')
+  MODEL_ARCHITECTURE=$(hf_profile_value '.features.architecture // ""')
+  MODEL_QUANTIZATION=$(hf_profile_value '.features.quantization // ""')
+  HF_RECOMMENDED_RUNTIME=$(hf_profile_value '.card.recommended_runtime // ""')
+  HF_RECOMMENDED_COMMAND=$(hf_profile_value '.card.recommended_command // ""')
+  HF_RECOMMENDED_CONTEXT=$(hf_profile_value '.card.recommended_context // ""')
+  HF_KV_CACHE_FP8_RECOMMENDED=$(hf_profile_value '.card.kv_cache_fp8_recommended // false')
+  HAS_MTP=$(hf_profile_value '.features.has_mtp // false')
+  HAS_REASONING=$(hf_profile_value '.features.has_reasoning // false')
+  SUPPORTS_TOOLS=$(hf_profile_value '.features.supports_tools // false')
+
   REASONING_PARSER=""
-  case "$model_type" in
-    qwen3*) REASONING_PARSER="qwen3" ;;
-    deepseek_v3) REASONING_PARSER="deepseek_r1" ;;
+  case "$MODEL_FAMILY:$model_type" in
+    qwen:*|*:qwen3*) REASONING_PARSER="qwen3" ;;
+    deepseek:*|*:deepseek_v3) REASONING_PARSER="deepseek_r1" ;;
   esac
 
-  # Tool-call parser
   TOOL_CALL_PARSER=""
-  case "$model_type" in
-    qwen3*) TOOL_CALL_PARSER="qwen3_coder" ;;
+  case "$MODEL_FAMILY:$model_type" in
+    qwen:*|*:qwen3*) TOOL_CALL_PARSER="qwen3_xml" ;;
   esac
 
-  # Warn if model_type is unrecognized
   if [[ -n "$model_type" && -z "$REASONING_PARSER" && -z "$TOOL_CALL_PARSER" ]]; then
     warn "Unknown model_type '${model_type}' — reasoning and tool-call parsers not configured"
   fi
 
-  # Max context length — default to 128K, capped to what the model supports.
-  local model_max
-  model_max=$(jq -r '
-    (.text_config // .) |
-    .max_position_embeddings //
-    .max_sequence_length //
-    .seq_length //
-    32768' "$config_json" 2>/dev/null || echo "32768")
+  model_max=$(hf_profile_value '.card.config_context // 32768')
   is_positive_int "$model_max" || model_max=32768
-  MODEL_MAX_LEN="$model_max"   # the model's own max context (used to cap fit suggestions)
-  if [[ "$model_max" -lt 131072 ]]; then
+  MODEL_MAX_LEN="$model_max"
+  if [[ -n "$HF_RECOMMENDED_CONTEXT" && "$HF_RECOMMENDED_CONTEXT" =~ ^[0-9]+$ && "$HF_RECOMMENDED_CONTEXT" -gt 0 ]]; then
+    MAX_MODEL_LEN="$HF_RECOMMENDED_CONTEXT"
+    [[ "$HF_RECOMMENDED_CONTEXT" -gt "$MODEL_MAX_LEN" ]] && MODEL_MAX_LEN="$HF_RECOMMENDED_CONTEXT"
+  elif [[ "$model_max" -lt 131072 ]]; then
     MAX_MODEL_LEN="$model_max"
   else
     MAX_MODEL_LEN=131072
   fi
 
-  # Multimodal detection
-  IS_MULTIMODAL="false"
-  local has_vision
-  has_vision=$(jq -r 'has("vision_config") or has("visual")' "$config_json" 2>/dev/null || echo "false")
-  if [[ "$has_vision" == "true" ]] || echo "$arch_list" | grep -qi "VL\|Vision"; then
-    IS_MULTIMODAL="true"
-  fi
+  IS_MULTIMODAL=$(hf_profile_value '.features.is_multimodal // false')
+  [[ "$IS_MULTIMODAL" =~ ^(true|false)$ ]] || IS_MULTIMODAL="false"
 
-  # MoE detection: vLLM under-profiles MoE startup memory (imbalanced experts) → big warmup peak.
-  # Used to bias --enforce-eager on the first launch when there's no measured peak yet.
   IS_MOE="0"
-  local has_experts
-  has_experts=$(jq -r '(.text_config // .) | (has("num_experts") or has("n_routed_experts") or has("num_local_experts") or has("num_experts_per_tok"))' "$config_json" 2>/dev/null || echo "false")
-  if [[ "$has_experts" == "true" ]] || echo "$arch_list" | grep -qiE "moe|mixture"; then
-    IS_MOE="1"
+  [[ "$(hf_profile_value '.features.is_moe // false')" == "true" ]] && IS_MOE="1"
+
+  if [[ -z "${KV_CACHE_DTYPE:-}" ]]; then
+    if [[ "$HF_KV_CACHE_FP8_RECOMMENDED" == "true" ]]; then
+      KV_CACHE_DTYPE="fp8"
+    else
+      KV_CACHE_DTYPE="auto"
+    fi
   fi
 
   # Model size (sum of safetensors)
@@ -745,11 +830,13 @@ profile_model() {
     --arg need_gb "$NEED_GB" \
     --arg kv_cache_dtype "$KV_CACHE_DTYPE" \
     --arg is_moe "$IS_MOE" \
+    --argjson hf "$HF_MODEL_INFO_JSON" \
     --argjson schema_version "$PROFILE_SCHEMA_VERSION" \
     '{
       schema_version: $schema_version,
       model: $model,
       generated: $generated,
+      hf: $hf,
       reasoning_parser: $reasoning_parser,
       tool_call_parser: $tool_call_parser,
       gpu_memory_utilization: $gpu_memory_utilization,
