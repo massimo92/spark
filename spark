@@ -206,6 +206,10 @@ ngc_vllm_image_blocked() {
 
 detect_ngc_image() {
   local images
+  if [[ -n "${SPARK_VLLM_IMAGE:-}" ]]; then
+    printf '%s\n' "$SPARK_VLLM_IMAGE"
+    return 0
+  fi
   images=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
     | awk '/^nvcr\.io\/nvidia\/vllm:/ {print}' \
     | while IFS= read -r image; do
@@ -1428,11 +1432,31 @@ add_vllm_flag_once() {
   vllm_arg_has_flag "$flag" || vllm_args+=("$@")
 }
 
+set_vllm_flag_value() {
+  local flag="$1" value="$2" arg i skip=0 next=()
+  for ((i = 0; i < ${#vllm_args[@]}; i++)); do
+    if [[ "$skip" == "1" ]]; then
+      skip=0
+      continue
+    fi
+    arg="${vllm_args[$i]}"
+    if [[ "$arg" == "$flag" ]]; then
+      skip=1
+      continue
+    fi
+    next+=("$arg")
+  done
+  vllm_args=("${next[@]}" "$flag" "$value")
+}
+
 hf_command_value() {
   local flag="$1" re
   re="(^|[[:space:]])${flag}[[:space:]]+([^[:space:]]+)"
   if [[ "${HF_RECOMMENDED_COMMAND:-}" =~ $re ]]; then
-    printf '%s\n' "${BASH_REMATCH[2]}"
+    local value="${BASH_REMATCH[2]}"
+    value="${value#\'}"
+    value="${value%\'}"
+    printf '%s\n' "$value"
   fi
 }
 
@@ -1444,8 +1468,57 @@ add_recommended_command_flags() {
   value="$(hf_command_value --max-num-batched-tokens)"
   [[ "$value" =~ ^[0-9]+$ ]] && add_vllm_flag_once --max-num-batched-tokens "$value"
 
+  value="$(hf_command_value --stream-interval)"
+  [[ "$value" =~ ^[0-9]+$ ]] && add_vllm_flag_once --stream-interval "$value"
+
   [[ "${HF_RECOMMENDED_COMMAND:-}" == *"--async-scheduling"* ]] && add_vllm_flag_once --async-scheduling
   return 0
+}
+
+preferred_mtp_moe_backend() {
+  if [[ -n "${SPARK_MTP_MOE_BACKEND:-}" ]]; then
+    printf '%s\n' "$SPARK_MTP_MOE_BACKEND"
+    return 0
+  fi
+  if [[ "$ACCEL" == cuda-* && "${IS_MOE:-0}" == "1" && "${GPU_COMPUTE_CAPABILITY:-}" =~ ^12([.][0-9]+)?$ ]]; then
+    printf 'flashinfer_cutlass\n'
+    return 0
+  fi
+  printf 'triton\n'
+}
+
+resolve_mtp_speculative_config() {
+  local spec backend escaped
+  spec="${SPARK_MTP_SPECULATIVE_CONFIG:-$(hf_command_value --speculative-config)}"
+  [[ -n "$spec" ]] || spec='{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'
+  backend="$(preferred_mtp_moe_backend)"
+  [[ -n "$backend" ]] || { printf '%s\n' "$spec"; return 0; }
+  escaped=$(printf '%s' "$backend" | sed 's/[\/&]/\\&/g')
+  if [[ "$spec" == *'"moe_backend":"'* ]]; then
+    spec="$(printf '%s' "$spec" | sed -E "s/\"moe_backend\":\"[^\"]+\"/\"moe_backend\":\"${escaped}\"/")"
+  else
+    spec="$(printf '%s' "$spec" | sed -E "s/}[[:space:]]*$/,\"moe_backend\":\"${escaped}\"}/")"
+  fi
+  printf '%s\n' "$spec"
+}
+
+resolve_stream_interval() {
+  local value
+  if [[ "${SPARK_STREAM_INTERVAL:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$SPARK_STREAM_INTERVAL"
+    return 0
+  fi
+  value="$(hf_command_value --stream-interval)"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+  if [[ "$ACCEL" == cuda-* && "${IS_MOE:-0}" == "1" && "${MTP_ENABLED:-0}" == "1" && "$seqs" == "1" \
+        && "${GPU_COMPUTE_CAPABILITY:-}" =~ ^12([.][0-9]+)?$ ]]; then
+    printf '%s\n' "${SPARK_SINGLE_STREAM_INTERVAL:-64}"
+    return 0
+  fi
+  return 1
 }
 
 ask_runtime_tradeoffs() {
@@ -1516,7 +1589,7 @@ build_launch() {
     --max-model-len "$MAX_MODEL_LEN"
     --max-num-seqs "$seqs"
     --port "$port")
-  local quant_lc use_marlin_atomic=0
+  local quant_lc use_marlin_atomic=0 mtp_spec="" stream_interval=""
   quant_lc=$(printf '%s' "${MODEL_QUANTIZATION:-}" | tr '[:upper:]' '[:lower:]')
   if [[ "$ACCEL" == cuda-* ]]; then
     add_vllm_flag_once --attention-backend flashinfer
@@ -1536,8 +1609,12 @@ build_launch() {
   [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]] && vllm_args+=(--reasoning-parser "$REASONING_PARSER")
   [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] && vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
   if [[ "${MTP_ENABLED:-0}" == "1" ]]; then
-    vllm_args+=(--speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}')
-    add_vllm_flag_once --max-num-batched-tokens "${SPARK_MTP_MAX_NUM_BATCHED_TOKENS:-32768}"
+    mtp_spec="$(resolve_mtp_speculative_config)"
+    vllm_args+=(--speculative-config "$mtp_spec")
+    set_vllm_flag_value --max-num-batched-tokens "${SPARK_MTP_MAX_NUM_BATCHED_TOKENS:-32768}"
+    if stream_interval="$(resolve_stream_interval 2>/dev/null)"; then
+      add_vllm_flag_once --stream-interval "$stream_interval"
+    fi
   fi
   [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt image=0)
 
