@@ -18,6 +18,7 @@ FILES = [
     "tokenizer_config.json",
     "chat_template.jinja",
     "hf_quant_config.json",
+    "README.md",
 ]
 
 
@@ -81,10 +82,37 @@ def config_context(config: dict[str, Any]) -> int | None:
     return None
 
 
+def score_command(command: str, context: str) -> int:
+    score = 0
+    raw = command.lower()
+    ctx = context.lower()
+    if "recommend" in ctx:
+        score += 20
+    if "dgx spark" in ctx:
+        score += 40
+    for token in (
+        "--kv-cache-dtype",
+        "--attention-backend",
+        "--moe-backend",
+        "--enable-chunked-prefill",
+        "--enable-prefix-caching",
+        "--async-scheduling",
+        "--speculative-config",
+        "--load-format",
+        "--tool-call-parser",
+    ):
+        if token in raw:
+            score += 5
+    score += raw.count("--")
+    return score
+
+
 def extract_command(card_text: str) -> str:
     lines = card_text.splitlines()
+    candidates: list[tuple[int, str]] = []
     for idx, line in enumerate(lines):
-        if "vllm serve" not in line and "python -m vllm" not in line:
+        raw = line.lower()
+        if "vllm serve" not in raw and "python -m vllm" not in raw:
             continue
         chunk = [line.strip().rstrip("\\").strip()]
         for cont in lines[idx + 1 : idx + 20]:
@@ -95,8 +123,13 @@ def extract_command(card_text: str) -> str:
                 chunk.append(stripped)
                 continue
             break
-        return " ".join(chunk)
-    return ""
+        command = " ".join(part for part in chunk if part)
+        context = "\n".join(lines[max(0, idx - 4) : idx + 1])
+        candidates.append((score_command(command, context), command))
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def extract_card_context(card_text: str, command: str) -> int | None:
@@ -127,7 +160,7 @@ def quantization(config: dict[str, Any], hf_quant: dict[str, Any], tags: list[st
             raw = text_lower(q)
             # Some NVIDIA HF repos expose the container format as "compressed-tensors" in
             # config.json while the concrete hardware quantization (nvfp4/fp8) is in tags/card.
-            if "compressed" in raw:
+            if raw in ("modelopt", "mixed_precision", "modelopt_mixed") or "compressed" in raw:
                 for key in ("nvfp4", "fp8", "fp4", "int4", "int8"):
                     if key in side_raw:
                         return key
@@ -184,6 +217,48 @@ def recommended_runtime(card_text: str, tags: list[str], command: str) -> str:
     if "llama.cpp" in raw or "gguf" in raw:
         return "llama.cpp"
     return ""
+
+
+def load_card(
+    model_id: str,
+    revision: str | None,
+    local_path: Path | None,
+    local_files_only: bool,
+    model_card_cls: Any,
+    hf_hub_download_fn: Any,
+) -> tuple[str, str]:
+    card_path: Path | None = None
+    if local_path:
+        local_readme = local_path / "README.md"
+        if local_readme.exists():
+            card_path = local_readme
+    if card_path is None and hf_hub_download_fn is not None:
+        try:
+            downloaded = hf_hub_download_fn(
+                repo_id=model_id,
+                filename="README.md",
+                revision=revision,
+                local_files_only=local_files_only,
+            )
+            card_path = Path(downloaded)
+        except Exception:
+            card_path = None
+    if card_path is not None:
+        try:
+            card = model_card_cls.load(card_path)
+            return str(card), str(getattr(getattr(card, "data", None), "license", "") or "")
+        except Exception:
+            try:
+                return card_path.read_text(encoding="utf-8"), ""
+            except Exception:
+                return "", ""
+    if revision is None and not local_files_only:
+        try:
+            card = model_card_cls.load(model_id)
+            return str(card), str(getattr(getattr(card, "data", None), "license", "") or "")
+        except Exception:
+            return "", ""
+    return "", ""
 
 
 def main() -> int:
@@ -249,12 +324,14 @@ def main() -> int:
     card_text = ""
     card_license = ""
     if ModelCard is not None:
-        try:
-            card = ModelCard.load(args.model_id, revision=args.revision)
-            card_text = str(card)
-            card_license = str(getattr(getattr(card, "data", None), "license", "") or "")
-        except Exception:
-            card_text = ""
+        card_text, card_license = load_card(
+            args.model_id,
+            args.revision,
+            local_path,
+            args.local_files_only,
+            ModelCard,
+            hf_hub_download,
+        )
 
     config = load_json(paths.get("config.json"))
     generation_config = load_json(paths.get("generation_config.json"))

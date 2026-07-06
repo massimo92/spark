@@ -206,6 +206,10 @@ ngc_vllm_image_blocked() {
 
 detect_ngc_image() {
   local images
+  if [[ -n "${SPARK_VLLM_IMAGE:-}" ]]; then
+    printf '%s\n' "$SPARK_VLLM_IMAGE"
+    return 0
+  fi
   images=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
     | awk '/^nvcr\.io\/nvidia\/vllm:/ {print}' \
     | while IFS= read -r image; do

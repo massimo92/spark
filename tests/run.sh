@@ -749,6 +749,20 @@ test_doctor_skips_blocked_ngc_vllm_image() {
     [[ "$output" != *"NGC container: nvcr.io/nvidia/vllm:26.06-py3"* ]]
 }
 
+test_vllm_image_override_wins() {
+  local tmp fake_bin output
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_VLLM_IMAGE="eugr/spark-vllm:latest" \
+    "$SPARK" doctor 2>&1)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"NGC container: eugr/spark-vllm:latest"* ]]
+}
+
 test_doctor_reports_bad_hf_cache_permissions() {
   local tmp fake_bin output bad
   tmp=$(mktemp -d)
@@ -942,10 +956,11 @@ KV_CONFIG='{ "model_type":"qwen3", "architectures":["Qwen3ForCausalLM"],
 
 hf_inspect_json() {
   local mtp="${1:-false}" kv_fp8="${2:-false}" ctx="${3:-null}" tools="${4:-false}" arch="${5:-dense}" quant="${6:-nvfp4}"
+  local cmd="${7:-vllm serve Org/Test --load-format fastsafetensors}"
   jq -nc --argjson mtp "$mtp" --argjson kv "$kv_fp8" --argjson ctx "$ctx" --argjson tools "$tools" \
-    --arg arch "$arch" --arg quant "$quant" '{
+    --arg arch "$arch" --arg quant "$quant" --arg cmd "$cmd" '{
       model_id:"Org/Test", revision:"rev-test", tags:["vllm","blackwell"],
-      card:{license:"test", recommended_runtime:"vllm", recommended_command:"vllm serve Org/Test --load-format fastsafetensors", long_context:($ctx != null), recommended_context:$ctx, config_context:262144, kv_cache_fp8_recommended:$kv},
+      card:{license:"test", recommended_runtime:"vllm", recommended_command:$cmd, long_context:($ctx != null), recommended_context:$ctx, config_context:262144, kv_cache_fp8_recommended:$kv},
       features:{family:"qwen", architecture:$arch, quantization:$quant, has_mtp:$mtp, has_reasoning:true, supports_tools:$tools, is_multimodal:false, is_moe:($arch == "moe"), is_nvfp4:($quant == "nvfp4"), is_fp8:($quant == "fp8"), is_gguf:false},
       raw:{model_type:"qwen3", architectures:["Qwen3ForCausalLM"], quantization_config:{quant_method:$quant}}
     }'
@@ -5054,6 +5069,63 @@ test_hf_inspector_compressed_tensors_nvfp4_tag() {
   [[ "$q" == "nvfp4" ]]
 }
 
+test_hf_inspector_modelopt_hf_quant_nvfp4_tag() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  command -v python3 >/dev/null 2>&1 || { printf "skip - python3 not installed\n"; return 0; }
+  local tmp dir q
+  tmp=$(mktemp -d)
+  make_model "${tmp}/home" "Org/Model-ModelOpt" '{ "model_type":"qwen3", "architectures":["Qwen3MoeForCausalLM"],
+    "max_position_embeddings":262144, "num_experts":128,
+    "quantization_config":{"quant_method":"modelopt"} }'
+  dir="${tmp}/home/.cache/huggingface/hub/models--Org--Model-ModelOpt/snapshots/1"
+  printf '%s\n' '{ "quantization": { "quantized_layers": { "layer0": { "quant_algo":"W4A16_NVFP4" } } } }' > "${dir}/hf_quant_config.json"
+  q=$(python3 "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-ModelOpt \
+    --local-path "$dir" | jq -r '.features.quantization')
+  rm -rf "$tmp"
+  [[ "$q" == "nvfp4" ]]
+}
+
+test_hf_inspector_prefers_recommended_multiline_command_from_readme() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  command -v python3 >/dev/null 2>&1 || { printf "skip - python3 not installed\n"; return 0; }
+  local tmp dir cmd
+  tmp=$(mktemp -d)
+  make_model "${tmp}/home" "Org/Model-Readme" '{ "model_type":"qwen3", "architectures":["Qwen3MoeForCausalLM"],
+    "max_position_embeddings":262144, "num_experts":128,
+    "quantization_config":{"quant_method":"modelopt"} }'
+  dir="${tmp}/home/.cache/huggingface/hub/models--Org--Model-Readme/snapshots/1"
+  cat > "${dir}/README.md" <<'EOF'
+# Test
+
+vllm serve Org/Model-Readme --port 8000 --quantization modelopt --max-model-len 262144
+
+For NVIDIA DGX Spark, we recommend using this `vllm serve` command:
+
+```sh
+vllm serve Org/Model-Readme \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --attention-backend flashinfer \
+  --moe-backend marlin \
+  --max-model-len 262144 \
+  --max-num-seqs 4 \
+  --max-num-batched-tokens 8192 \
+  --enable-chunked-prefill \
+  --async-scheduling \
+  --enable-prefix-caching \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}' \
+  --load-format fastsafetensors
+```
+EOF
+  cmd=$(python3 "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Readme \
+    --local-path "$dir" --local-files-only | jq -r '.card.recommended_command')
+  rm -rf "$tmp"
+  [[ "$cmd" == *"--attention-backend flashinfer"* ]] &&
+    [[ "$cmd" == *"--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"moe_backend\":\"triton\"}'"* ]]
+}
+
 test_hf_card_context_wins() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out meta
@@ -5083,6 +5155,50 @@ test_hf_mtp_explain_asks_only_when_supported() {
     "$SPARK" run Org/MTP --dry-run --explain </dev/null 2>&1 || true)
   rm -rf "$tmp"
   [[ "$with_mtp" == *"MTP: ask"* ]] && [[ "$without_mtp" != *"MTP: ask"* ]]
+}
+
+test_hf_stream_interval_from_recommended_command() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Stream" "$KV_CONFIG"
+  meta=$(hf_inspect_json true false 262144 false moe nvfp4 \
+    "vllm serve Org/Stream --load-format fastsafetensors --stream-interval 32 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"moe_backend\":\"triton\"}'")
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    MTP_ENABLED=1 "$SPARK" run Org/Stream --dry-run </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--stream-interval 32"* ]]
+}
+
+test_mtp_batched_tokens_overrides_recommended_command() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/MTPBatch" "$KV_CONFIG"
+  meta=$(hf_inspect_json true false 262144 false moe nvfp4 \
+    "vllm serve Org/MTPBatch --load-format fastsafetensors --max-num-batched-tokens 8192 --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"moe_backend\":\"triton\"}'")
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    MTP_ENABLED=1 "$SPARK" run Org/MTPBatch --dry-run </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--max-num-batched-tokens 32768"* ]] &&
+    [[ "$out" != *"--max-num-batched-tokens 8192"* ]]
+}
+
+test_blackwell_single_stream_mtp_uses_flashinfer_cutlass_and_stream64() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Blackwell" "$MOE_CONFIG"
+  meta=$(hf_inspect_json true false 262144 false moe nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_ACCEL=cuda-unified FAKE_NVIDIA_SMI_EXIT=0 FAKE_COMPUTE_CAP=12.1 FAKE_GPU_NAME="NVIDIA GB10" \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    MTP_ENABLED=1 "$SPARK" run Org/Blackwell --dry-run --max-num-seqs 1 </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--stream-interval 64"* ]] &&
+    [[ "$out" == *"flashinfer_cutlass"* ]]
 }
 
 test_hf_mtp_launch_sets_batched_tokens() {
@@ -5602,6 +5718,7 @@ run_test "single-file build matches modules" test_single_file_build_matches_modu
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vllm_image
+run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wins
 run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "setup --check reports Tailscale Funnel" test_setup_check_reports_tailscale_funnel
@@ -5684,8 +5801,13 @@ run_test "--no-wait launches without supervising" test_startup_no_wait
 run_test "enforce-eager auto for MoE, not for dense" test_enforce_eager_auto_for_moe
 run_test "HF MoE NVFP4 emits Marlin + atomic add" test_hf_moe_nvfp4_emits_marlin_atomic
 run_test "HF inspector maps compressed-tensors NVFP4" test_hf_inspector_compressed_tensors_nvfp4_tag
+run_test "HF inspector maps ModelOpt HF quant NVFP4" test_hf_inspector_modelopt_hf_quant_nvfp4_tag
+run_test "HF inspector prefers recommended multiline command" test_hf_inspector_prefers_recommended_multiline_command_from_readme
 run_test "HF card recommended context wins" test_hf_card_context_wins
 run_test "HF MTP question only when supported" test_hf_mtp_explain_asks_only_when_supported
+run_test "HF recommended command maps stream interval" test_hf_stream_interval_from_recommended_command
+run_test "MTP batched tokens override HF command" test_mtp_batched_tokens_overrides_recommended_command
+run_test "Blackwell single-stream MTP uses flashinfer_cutlass + stream64" test_blackwell_single_stream_mtp_uses_flashinfer_cutlass_and_stream64
 run_test "HF MTP launch sets batched tokens" test_hf_mtp_launch_sets_batched_tokens
 run_test "HF KV FP8 question/recommendation" test_hf_kv_fp8_question_and_recommendation
 run_test "dry-run explain shows HF source and flags" test_dry_run_explain_shows_hf_and_flags
