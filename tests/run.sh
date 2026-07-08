@@ -5155,7 +5155,7 @@ test_hf_card_context_wins() {
   [[ "$out" == *"--max-model-len 262144"* ]] && [[ "$out" == *"--max-num-batched-tokens 32768"* ]]
 }
 
-test_hf_mtp_explain_asks_only_when_supported() {
+test_hf_mtp_auto_enables_when_supported() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin with_mtp without_mtp meta
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -5170,7 +5170,10 @@ test_hf_mtp_explain_asks_only_when_supported() {
     SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     "$SPARK" run Org/MTP --dry-run --explain </dev/null 2>&1 || true)
   rm -rf "$tmp"
-  [[ "$with_mtp" == *"MTP: ask"* ]] && [[ "$without_mtp" != *"MTP: ask"* ]]
+  [[ "$with_mtp" == *"--speculative-config"* ]] &&
+    [[ "$with_mtp" == *"MTP: auto-enable"* ]] &&
+    [[ "$without_mtp" != *"--speculative-config"* ]] &&
+    [[ "$without_mtp" != *"MTP: auto-enable"* ]]
 }
 
 test_hf_stream_interval_from_recommended_command() {
@@ -5223,7 +5226,7 @@ test_hf_mtp_launch_sets_batched_tokens() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Org/MTP" "$KV_CONFIG"
   meta=$(hf_inspect_json true true null false dense nvfp4)
-  printf 'n\ny\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+  printf 'n\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     SPARK_ASSUME_INTERACTIVE=1 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.05-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
     "$SPARK" run Org/MTP --no-wait >/dev/null 2>&1 || true
@@ -5250,6 +5253,19 @@ test_hf_kv_fp8_question_and_recommendation() {
   [[ "$ask" == *"KV cache FP8: ask"* ]] &&
     [[ "$auto" == *"KV cache FP8: ask, default no (card recommends)"* ]] &&
     [[ "$auto" != *"--kv-cache-dtype fp8"* ]]
+}
+
+test_kv_fp8_override_does_not_persist_to_profile() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out saved
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/KVOverride" "$KV_CONFIG"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/KVOverride --dry-run --kv-cache-dtype fp8 </dev/null 2>&1 || true)
+  saved=$(jq -r '.kv_cache_dtype // ""' "${tmp}/home/.config/spark/profiles/Org--KVOverride.json" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--kv-cache-dtype fp8"* ]] && [[ "$saved" == "auto" ]]
 }
 
 test_dry_run_explain_shows_hf_and_flags() {
@@ -5333,7 +5349,7 @@ test_profile_schema_autoregen() {
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1 || true)
   sv=$(jq -r '.schema_version // "none"' "$pf" 2>/dev/null || echo none)
   rm -rf "$tmp"
-  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "4" ]]
+  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "5" ]]
 }
 
 # CUDA-graph calibration over the two-column peak table: eager peak on record + no graph peak →
@@ -5345,7 +5361,7 @@ _write_cal_profile() {
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
   jq -n --arg m "$2" --arg ep "$3" --arg cp "$4" '{
-    schema_version:4, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    schema_version:5, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
     warmup: {"8192/auto": ({date:"2026-01-01"}
@@ -5360,7 +5376,7 @@ _write_legacy_cal_profile() {
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
   jq -n --arg m "$2" --arg p "$3" --arg e "$4" --arg c "$5" '{
-    schema_version:4, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    schema_version:5, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
     warmup: {"8192/auto": {peak_gb:$p, enforce_eager:$e, cudagraph_oom:$c, date:"2026-01-01"}}
@@ -5859,12 +5875,13 @@ run_test "HF inspector maps ModelOpt HF quant NVFP4" test_hf_inspector_modelopt_
 run_test "HF inspector prefers recommended multiline command" test_hf_inspector_prefers_recommended_multiline_command_from_readme
 run_test "HF inspector tools needs explicit tool-calling signal" test_hf_inspector_tools_requires_tool_calling_signal
 run_test "HF card recommended context wins" test_hf_card_context_wins
-run_test "HF MTP question only when supported" test_hf_mtp_explain_asks_only_when_supported
+run_test "HF MTP auto-enables when supported" test_hf_mtp_auto_enables_when_supported
 run_test "HF recommended command maps stream interval" test_hf_stream_interval_from_recommended_command
 run_test "MTP batched tokens override HF command" test_mtp_batched_tokens_overrides_recommended_command
 run_test "Blackwell single-stream MTP uses flashinfer_cutlass + stream64" test_blackwell_single_stream_mtp_uses_flashinfer_cutlass_and_stream64
 run_test "HF MTP launch sets batched tokens" test_hf_mtp_launch_sets_batched_tokens
 run_test "HF KV FP8 question/recommendation" test_hf_kv_fp8_question_and_recommendation
+run_test "KV FP8 override does not persist to profile" test_kv_fp8_override_does_not_persist_to_profile
 run_test "dry-run explain shows HF source and flags" test_dry_run_explain_shows_hf_and_flags
 run_test "CLI overrides win over HF metadata" test_hf_metadata_cli_overrides_win
 run_test "calibrate dry-run lists candidate configs" test_calibrate_dry_run_lists_candidates
