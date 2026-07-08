@@ -252,6 +252,14 @@ apply_launch_calibration() {
   fi
 }
 
+auto_enable_mtp_if_supported() {
+  [[ "${MTP_DECIDED:-0}" == "1" ]] && return 0
+  if [[ "${HAS_MTP:-false}" == "true" ]]; then
+    MTP_ENABLED=1
+    MTP_DECIDED=1
+  fi
+}
+
 auto_fit_context_to_budget() {
   local cname="$1" config_json="$2" reserved free target=""
   [[ -n "${mem:-}" || -n "${max_len:-}" ]] && return 0
@@ -291,12 +299,6 @@ ask_runtime_tradeoffs() {
     fi
   fi
 
-  if [[ "${HAS_MTP:-false}" == "true" && "${MTP_DECIDED:-0}" != "1" ]]; then
-    printf "  Enable MTP speculative decoding? More tok/s; runtime-dependent/less stable. [y/N] "
-    read -r ans || ans=""
-    [[ "$ans" =~ ^[Yy] ]] && MTP_ENABLED=1
-  fi
-
   if [[ "${SUPPORTS_TOOLS:-false}" == "true" && "$tools" != "1" ]]; then
     printf "  Enable tool calling? Adds parser/tool protocol; only needed for agents. [y/N] "
     read -r ans || ans=""
@@ -331,8 +333,9 @@ print_launch_explain() {
     printf "      - KV cache FP8: ask, default no%s\n" \
       "$([[ "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" == "true" ]] && printf ' (card recommends)')"; any=1
   fi
-  if [[ "${HAS_MTP:-false}" == "true" && "${MTP_DECIDED:-0}" != "1" ]]; then
-    printf "      - MTP: ask, default no\n"; any=1
+  if [[ "${HAS_MTP:-false}" == "true" ]]; then
+    printf "      - MTP: auto-enable%s\n" \
+      "$([[ "${MTP_DECIDED:-0}" == "1" && "${MTP_ENABLED:-0}" == "0" ]] && printf ' disabled by override')"; any=1
   fi
   if [[ "${SUPPORTS_TOOLS:-false}" == "true" && "$tools" != "1" ]]; then
     printf "      - Tool calling: ask, default no\n"; any=1
@@ -513,6 +516,7 @@ run_backend_vllm() {
   REGEN_PROFILE="${REGEN_PROFILE:-$regen}"
   KV_CACHE_DTYPE="${kv_dtype:-}"
   profile_model "$model" "$model_path"
+  auto_enable_mtp_if_supported
 
   # Apply effective settings (these override whatever a cached profile baked in),
   # then always recompute memory so the reservation reflects this run's flags.
@@ -579,6 +583,7 @@ run_backend_vllm() {
     model_path=$(resolve_model_path "$model") || die "Download did not produce a usable snapshot"
     REGEN_PROFILE=1
     profile_model "$model" "$model_path"
+    auto_enable_mtp_if_supported
     [[ -n "$max_len" ]] && MAX_MODEL_LEN="$max_len"
     [[ -n "$kv_dtype" ]] && KV_CACHE_DTYPE="$kv_dtype"
     [[ -z "$KV_CACHE_DTYPE" ]] && KV_CACHE_DTYPE="auto"

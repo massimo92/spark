@@ -9,7 +9,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.1.45"
+VERSION="0.1.46"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -192,7 +192,7 @@ SWAPPINESS="${SPARK_SWAPPINESS:-10}"
 # Profile cache schema. Bumped when new fields are added (e.g. is_moe). A cached profile older than
 # this is auto-refreshed on the next `spark run` so new fields (and the decisions that depend on them,
 # like auto enforce-eager) are populated — no user action needed.
-PROFILE_SCHEMA_VERSION=4
+PROFILE_SCHEMA_VERSION=5
 
 # Detect the latest pulled NGC vLLM image
 ngc_vllm_image_blocked() {
@@ -786,7 +786,9 @@ profile_model() {
   IS_MOE="0"
   [[ "$(hf_profile_value '.features.is_moe // false')" == "true" ]] && IS_MOE="1"
 
-  [[ -z "${KV_CACHE_DTYPE:-}" ]] && KV_CACHE_DTYPE="auto"
+  # Profiles describe the model baseline. Per-run KV overrides are applied by cmd_run
+  # after profiling and must not become the future automatic default.
+  KV_CACHE_DTYPE="auto"
 
   # Model size (sum of safetensors)
   # -L follows symlinks (HF cache uses symlinks in snapshots/)
