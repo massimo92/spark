@@ -1238,9 +1238,18 @@ MODEL_LIST_BYTES=()
 MODEL_LIST_STATUS=()
 
 model_cache_complete() {
-  local model_dir="$1"
+  local model_dir="$1" snapshot has_snapshot=0
   [[ -d "${model_dir}/snapshots" ]] || return 1
-  find "${model_dir}/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -q . || return 1
+  for snapshot in "${model_dir}/snapshots"/*; do
+    [[ -d "$snapshot" ]] || continue
+    has_snapshot=1
+    find "$snapshot" \( -name '*.incomplete' -o -name '*.lock' \) -print -quit 2>/dev/null | grep -q . && continue
+    find -L "$snapshot" -type l -print -quit 2>/dev/null | grep -q . && continue
+    find -L "$snapshot" -maxdepth 1 -type f \
+      \( -name '*.safetensors' -o -name '*.bin' -o -name '*.gguf' -o -name '*.pt' -o -name '*.pth' \) \
+      -print -quit 2>/dev/null | grep -q . && return 0
+  done
+  [[ "$has_snapshot" == "1" ]] || return 1
   ! find "$model_dir" \( -name '*.incomplete' -o -name '*.lock' \) -print -quit 2>/dev/null | grep -q .
 }
 
