@@ -9,7 +9,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.1.47"
+VERSION="0.1.48"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -160,6 +160,10 @@ BUDGET_GB=$(( TOTAL_MEM_GB - OS_RESERVE_GB ))
 # thrashing the host. The peak is torch.compile + CUDA-graph capture (pinned, non-swappable), not
 # the weights — measured per model and cached in the profile; else this conservative default.
 WARMUP_HEADROOM_GB="${SPARK_WARMUP_HEADROOM_GB:-20}"
+# MTP/speculative decoding loads an extra drafter path and vLLM profiles it before
+# allocating KV blocks. Keep the launch fraction high enough for that runtime shape.
+MTP_GPU_MEM_UTIL_FLOOR="${SPARK_MTP_GPU_MEM_UTIL_FLOOR:-0.65}"
+MTP_RUNTIME_HEADROOM_GB="${SPARK_MTP_RUNTIME_HEADROOM_GB:-30}"
 # Calibration: a model that first loaded with --enforce-eager (a safe default for MoE) has only ever
 # revealed its EAGER peak — not whether CUDA graphs would fit. When 1, spark tries CUDA graphs ONCE on
 # a later run to measure the real peak; if it fits it "graduates" the model to CUDA graphs (faster),
