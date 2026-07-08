@@ -5511,6 +5511,8 @@ test_list_shows_models() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   mkdir -p "${tmp}/home/.cache/huggingface/hub/models--Org--Alpha/snapshots/1"
   mkdir -p "${tmp}/home/.cache/huggingface/hub/models--Org--Beta/snapshots/1"
+  : > "${tmp}/home/.cache/huggingface/hub/models--Org--Alpha/snapshots/1/model.safetensors"
+  : > "${tmp}/home/.cache/huggingface/hub/models--Org--Beta/snapshots/1/model.safetensors"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" list 2>&1)
   rm -rf "$tmp"
   [[ "$out" == *"MODEL"* ]] && [[ "$out" == *"STATUS"* ]] &&
@@ -5528,6 +5530,19 @@ test_list_marks_partial_models() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" list 2>&1)
   rm -rf "$tmp"
   [[ "$out" == *"Org/Partial"* ]] && [[ "$out" == *"partial"* ]]
+}
+
+test_list_ignores_stale_incomplete_blobs() {
+  local tmp fake_bin out dir
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  dir="${tmp}/home/.cache/huggingface/hub/models--Org--Complete"
+  mkdir -p "${dir}/snapshots/1" "${dir}/blobs"
+  : > "${dir}/snapshots/1/config.json"
+  : > "${dir}/snapshots/1/model.safetensors"
+  : > "${dir}/blobs/old-download.incomplete"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" list 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Org/Complete"* ]] && [[ "$out" == *"complete"* ]] && [[ "$out" != *"partial"* ]]
 }
 
 test_list_empty() {
@@ -5834,6 +5849,7 @@ run_test "pull (vllm) reports ready" test_pull_vllm_ready
 run_test "pull routes to Ollama on the ollama backend" test_pull_ollama_routes
 run_test "list shows downloaded models" test_list_shows_models
 run_test "list marks partial models" test_list_marks_partial_models
+run_test "list ignores stale incomplete blobs" test_list_ignores_stale_incomplete_blobs
 run_test "list reports empty cache" test_list_empty
 run_test "rm removes the right model dir" test_rm_removes_the_right_dir
 run_test "rm removes multiple models" test_rm_removes_multiple_models
