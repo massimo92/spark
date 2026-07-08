@@ -205,7 +205,19 @@ def is_multimodal(config: dict[str, Any], archs: list[str], tags: list[str]) -> 
 
 def supports_tools(card_text: str, tokenizer_config: dict[str, Any], tags: list[str]) -> bool:
     raw = f"{card_text}\n{json.dumps(tokenizer_config, sort_keys=True)}\n{' '.join(tags)}".lower()
-    return any(token in raw for token in ("tool calling", "tool-call", "function calling", "tools", "<tool_call>"))
+    return any(
+        token in raw
+        for token in (
+            "tool calling",
+            "tool-call",
+            "tool_call",
+            "function calling",
+            "function-calling",
+            "function_calling",
+            "<tool_call>",
+            "tools_in_user_message",
+        )
+    )
 
 
 def recommended_runtime(card_text: str, tags: list[str], command: str) -> str:

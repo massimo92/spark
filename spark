@@ -192,7 +192,7 @@ SWAPPINESS="${SPARK_SWAPPINESS:-10}"
 # Profile cache schema. Bumped when new fields are added (e.g. is_moe). A cached profile older than
 # this is auto-refreshed on the next `spark run` so new fields (and the decisions that depend on them,
 # like auto enforce-eager) are populated — no user action needed.
-PROFILE_SCHEMA_VERSION=3
+PROFILE_SCHEMA_VERSION=4
 
 # Detect the latest pulled NGC vLLM image
 ngc_vllm_image_blocked() {
@@ -604,7 +604,13 @@ load_profile() {
   TOOL_CALL_PARSER=$(jq -r '.tool_call_parser // ""' "$profile_file") || die "Could not read profile: $profile_file"
   GPU_MEM_UTIL=$(jq -r '.gpu_memory_utilization // ""' "$profile_file") || die "Could not read profile: $profile_file"
   MAX_MODEL_LEN=$(jq -r '.max_model_len // ""' "$profile_file") || die "Could not read profile: $profile_file"
-  MODEL_MAX_LEN="$MAX_MODEL_LEN"   # cached proxy for the model's max context (fit suggestions)
+  MODEL_MAX_LEN=$(jq -r '
+    [
+      (.hf.card.config_context // empty),
+      (.hf.card.recommended_context // empty),
+      (.max_model_len // empty)
+    ] | map(select(type == "number" and . > 0)) | max // (.max_model_len // "")
+  ' "$profile_file") || die "Could not read profile: $profile_file"
   IS_MULTIMODAL=$(jq -r '.is_multimodal // "false"' "$profile_file") || die "Could not read profile: $profile_file"
   IS_MOE=$(jq -r '.is_moe // "0"' "$profile_file") || die "Could not read profile: $profile_file"
   HF_MODEL_INFO_JSON=$(jq -c '.hf // {}' "$profile_file") || die "Could not read profile: $profile_file"
@@ -769,17 +775,10 @@ profile_model() {
     warn "Unknown model_type '${model_type}' — reasoning and tool-call parsers not configured"
   fi
 
-  model_max=$(hf_profile_value '.card.config_context // 32768')
+  model_max=$(hf_profile_value '[.card.config_context, .card.recommended_context] | map(select(type == "number" and . > 0)) | max // 32768')
   is_positive_int "$model_max" || model_max=32768
   MODEL_MAX_LEN="$model_max"
-  if [[ -n "$HF_RECOMMENDED_CONTEXT" && "$HF_RECOMMENDED_CONTEXT" =~ ^[0-9]+$ && "$HF_RECOMMENDED_CONTEXT" -gt 0 ]]; then
-    MAX_MODEL_LEN="$HF_RECOMMENDED_CONTEXT"
-    [[ "$HF_RECOMMENDED_CONTEXT" -gt "$MODEL_MAX_LEN" ]] && MODEL_MAX_LEN="$HF_RECOMMENDED_CONTEXT"
-  elif [[ "$model_max" -lt 131072 ]]; then
-    MAX_MODEL_LEN="$model_max"
-  else
-    MAX_MODEL_LEN=131072
-  fi
+  MAX_MODEL_LEN="$MODEL_MAX_LEN"
 
   IS_MULTIMODAL=$(hf_profile_value '.features.is_multimodal // false')
   [[ "$IS_MULTIMODAL" =~ ^(true|false)$ ]] || IS_MULTIMODAL="false"
@@ -787,13 +786,7 @@ profile_model() {
   IS_MOE="0"
   [[ "$(hf_profile_value '.features.is_moe // false')" == "true" ]] && IS_MOE="1"
 
-  if [[ -z "${KV_CACHE_DTYPE:-}" ]]; then
-    if [[ "$HF_KV_CACHE_FP8_RECOMMENDED" == "true" ]]; then
-      KV_CACHE_DTYPE="fp8"
-    else
-      KV_CACHE_DTYPE="auto"
-    fi
-  fi
+  [[ -z "${KV_CACHE_DTYPE:-}" ]] && KV_CACHE_DTYPE="auto"
 
   # Model size (sum of safetensors)
   # -L follows symlinks (HF cache uses symlinks in snapshots/)
@@ -935,6 +928,53 @@ save_warmup_peak() {
     mv "$tmp" "$pf"
   else
     rm -f "$tmp"
+  fi
+}
+
+load_launch_calibration() {
+  local model="$1" pf
+  CALIBRATION_AVAILABLE=0
+  CALIBRATED_MAX_NUM_SEQS=""
+  CALIBRATED_MTP_ENABLED=""
+  CALIBRATED_STREAM_INTERVAL=""
+  CALIBRATED_MAX_NUM_BATCHED_TOKENS=""
+  CALIBRATED_KV_CACHE_DTYPE=""
+  CALIBRATED_TOKENS_PER_SECOND=""
+  pf=$(profile_file_for "$model")
+  [[ -f "$pf" ]] || return 0
+  jq -e '.calibration.best' "$pf" >/dev/null 2>&1 || return 0
+  CALIBRATION_AVAILABLE=1
+  CALIBRATED_MAX_NUM_SEQS=$(jq -r '.calibration.best.max_num_seqs // ""' "$pf" 2>/dev/null || echo "")
+  CALIBRATED_MTP_ENABLED=$(jq -r '.calibration.best.mtp_enabled // ""' "$pf" 2>/dev/null || echo "")
+  CALIBRATED_STREAM_INTERVAL=$(jq -r '.calibration.best.stream_interval // ""' "$pf" 2>/dev/null || echo "")
+  CALIBRATED_MAX_NUM_BATCHED_TOKENS=$(jq -r '.calibration.best.max_num_batched_tokens // ""' "$pf" 2>/dev/null || echo "")
+  CALIBRATED_KV_CACHE_DTYPE=$(jq -r '.calibration.best.kv_cache_dtype // ""' "$pf" 2>/dev/null || echo "")
+  CALIBRATED_TOKENS_PER_SECOND=$(jq -r '.calibration.best.tokens_per_second // ""' "$pf" 2>/dev/null || echo "")
+  [[ "$CALIBRATED_MAX_NUM_SEQS" =~ ^[0-9]+$ ]] || CALIBRATED_MAX_NUM_SEQS=""
+  [[ "$CALIBRATED_MTP_ENABLED" =~ ^(0|1)$ ]] || CALIBRATED_MTP_ENABLED=""
+  [[ "$CALIBRATED_STREAM_INTERVAL" =~ ^[0-9]+$ ]] || CALIBRATED_STREAM_INTERVAL=""
+  [[ "$CALIBRATED_MAX_NUM_BATCHED_TOKENS" =~ ^[0-9]+$ ]] || CALIBRATED_MAX_NUM_BATCHED_TOKENS=""
+  [[ "$CALIBRATED_KV_CACHE_DTYPE" =~ ^(auto|fp8)$ ]] || CALIBRATED_KV_CACHE_DTYPE=""
+  [[ "$CALIBRATED_TOKENS_PER_SECOND" =~ ^[0-9]+([.][0-9]+)?$ ]] || CALIBRATED_TOKENS_PER_SECOND=""
+}
+
+save_launch_calibration() {
+  local model="$1" best_json="$2" results_json="$3" pf tmp
+  pf=$(profile_file_for "$model")
+  [[ -f "$pf" ]] || return 0
+  printf '%s\n' "$best_json" | jq -e . >/dev/null 2>&1 || return 1
+  printf '%s\n' "$results_json" | jq -e . >/dev/null 2>&1 || return 1
+  tmp=$(mktemp)
+  if jq --arg d "$(date +%Y-%m-%d)" --argjson best "$best_json" --argjson results "$results_json" \
+      '.calibration = {
+        date: $d,
+        best: $best,
+        results: $results
+      }' "$pf" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$pf"
+  else
+    rm -f "$tmp"
+    return 1
   fi
 }
 
@@ -1163,9 +1203,9 @@ print_next_steps() {
   return 0
 }
 
-# Given free GB, compute the two largest "clean" context windows that would fit:
+# Given free GB, compute the two largest context windows that would fit:
 #   FIT_CTX_AUTO (KV in auto, 2 bytes) and FIT_CTX_FP8 (KV in fp8, 1 byte -> double the tokens).
-# Capped at the model's max and 131072, rounded down. FIT_POSSIBLE=1 if any option exists.
+# Capped at the model's HF max and rounded down to a 1024-token boundary.
 fit_options() {
   local free="$1"
   FIT_POSSIBLE=0; FIT_CTX_AUTO=0; FIT_CTX_FP8=0
@@ -1175,7 +1215,6 @@ fit_options() {
 
   local cap="${MODEL_MAX_LEN:-131072}"
   [[ "$cap" =~ ^[0-9]+$ ]] || cap=131072
-  [[ "$cap" -gt 131072 ]] && cap=131072
 
   read -r FIT_POSSIBLE FIT_CTX_AUTO FIT_CTX_FP8 < <(awk \
     -v free="$free" -v w="${WEIGHTS_GB:-0}" -v h="${MEM_HEADROOM_PCT:-8}" \
@@ -1188,9 +1227,10 @@ fit_options() {
       per_tok_fp8  = per_tok_auto/2;
       max_auto = kv_budget/per_tok_auto;
       max_fp8  = kv_budget/per_tok_fp8;
-      n=split("2048 4096 8192 16384 32768 65536 131072", S, " ");
-      ca=0; cf=0;
-      for(i=1;i<=n;i++){ if(S[i]<=max_auto && S[i]<=cap) ca=S[i]; if(S[i]<=max_fp8 && S[i]<=cap) cf=S[i]; }
+      ca = int((max_auto < cap ? max_auto : cap) / 1024) * 1024;
+      cf = int((max_fp8  < cap ? max_fp8  : cap) / 1024) * 1024;
+      if (ca < 1024) ca=0;
+      if (cf < 1024) cf=0;
       print ((ca>0||cf>0)?1:0), ca, cf;
     }')
   return 0
@@ -1331,6 +1371,8 @@ cmd_run_help() {
     --max-len <int>        Force context length; affects KV cache memory.
     --kv-cache-dtype fp8   Use fp8 KV cache to reduce memory.
     --max-num-seqs <int>   Max concurrent requests; higher uses more memory.
+    --mtp                  Enable MTP speculative decoding when supported.
+    --no-mtp               Disable MTP speculative decoding.
     --enforce-eager        Disable CUDA graphs; lower startup peak, slower inference.
     --no-enforce-eager     Force CUDA graphs on.
     --port <int>           Direct model API port; default auto-selects from 8000.
@@ -1351,7 +1393,7 @@ EOF
 cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
-  local no_wait=0 max_num_seqs="" enforce_eager_flag="auto"
+  local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1364,6 +1406,8 @@ cmd_run() {
       --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; shift 2 ;;
       --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; shift 2 ;;
       --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; shift 2 ;;
+      --mtp)       mtp_flag=1; shift ;;
+      --no-mtp)    mtp_flag=0; shift ;;
       --tools)     tools=1; shift ;;
       --text-only) text_only=1; shift ;;
       --no-reasoning) no_reasoning=1; shift ;;
@@ -1508,6 +1552,10 @@ resolve_stream_interval() {
     printf '%s\n' "$SPARK_STREAM_INTERVAL"
     return 0
   fi
+  if [[ "${CALIBRATED_STREAM_INTERVAL:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$CALIBRATED_STREAM_INTERVAL"
+    return 0
+  fi
   value="$(hf_command_value --stream-interval)"
   if [[ "$value" =~ ^[0-9]+$ ]]; then
     printf '%s\n' "$value"
@@ -1521,14 +1569,81 @@ resolve_stream_interval() {
   return 1
 }
 
+resolve_batched_tokens() {
+  local env_name="$1" default="$2" value
+  value="${!env_name:-}"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+  elif [[ "${CALIBRATED_MAX_NUM_BATCHED_TOKENS:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$CALIBRATED_MAX_NUM_BATCHED_TOKENS"
+  else
+    printf '%s\n' "$default"
+  fi
+}
+
+resolve_default_max_num_seqs() {
+  local value quant_lc
+  if [[ "${CALIBRATED_MAX_NUM_SEQS:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$CALIBRATED_MAX_NUM_SEQS"
+    return 0
+  fi
+  value="$(hf_command_value --max-num-seqs)"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+  quant_lc=$(printf '%s' "${MODEL_QUANTIZATION:-}" | tr '[:upper:]' '[:lower:]')
+  if [[ "$ACCEL" == cuda-* && "${IS_MOE:-0}" == "1" && "$quant_lc" =~ (nvfp4|fp8|fp4|modelopt) \
+        && "${GPU_COMPUTE_CAPABILITY:-}" =~ ^12([.][0-9]+)?$ ]]; then
+    printf '4\n'
+    return 0
+  fi
+  printf '%s\n' "$MAX_NUM_SEQS_DEFAULT"
+}
+
+apply_launch_calibration() {
+  [[ "${SPARK_IGNORE_CALIBRATION:-0}" == "1" ]] && return 0
+  load_launch_calibration "$model"
+  [[ "${CALIBRATION_AVAILABLE:-0}" == "1" ]] || return 0
+  [[ -z "${max_num_seqs:-}" && "${CALIBRATED_MAX_NUM_SEQS:-}" =~ ^[0-9]+$ ]] && max_num_seqs="$CALIBRATED_MAX_NUM_SEQS"
+  if [[ "${MTP_DECIDED:-0}" != "1" && "${CALIBRATED_MTP_ENABLED:-}" =~ ^(0|1)$ ]]; then
+    MTP_ENABLED="$CALIBRATED_MTP_ENABLED"
+    MTP_DECIDED=1
+  fi
+}
+
+auto_fit_context_to_budget() {
+  local cname="$1" config_json="$2" reserved free target=""
+  [[ -n "${mem:-}" || -n "${max_len:-}" ]] && return 0
+  reserved=$(reserved_budget_gb "$cname")
+  free=$(awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+  awk -v n="${NEED_GB:-0}" -v f="$free" 'BEGIN{ exit !(n > f) }' || return 0
+  fit_options "$free"
+  if [[ "${KV_CACHE_DTYPE:-auto}" == "fp8" && "${FIT_CTX_FP8:-0}" -gt 0 ]]; then
+    target="$FIT_CTX_FP8"
+  elif [[ "${KV_CACHE_DTYPE:-auto}" != "fp8" && "${FIT_CTX_AUTO:-0}" -gt 0 ]]; then
+    target="$FIT_CTX_AUTO"
+    KV_CACHE_DTYPE="auto"
+  fi
+  [[ -n "$target" ]] || return 0
+  MAX_MODEL_LEN="$target"
+  recompute_memory "$config_json"
+  info "Using max context that fits now: ${MAX_MODEL_LEN}/${MODEL_MAX_LEN} tokens (KV ${KV_CACHE_DTYPE}) — needs ${NEED_GB} GB"
+  return 0
+}
+
 ask_runtime_tradeoffs() {
   MTP_ENABLED="${MTP_ENABLED:-0}"
   [[ "$dry_run" == "1" ]] && return 0
   is_interactive || return 0
 
   local ans
-  if [[ -z "${mem:-}" && -z "${kv_dtype:-}" && "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" != "true" ]]; then
-    printf "  Use FP8 KV cache? Lower memory/faster; may affect quality without model card calibration. [y/N] "
+  if [[ -z "${mem:-}" && -z "${kv_dtype:-}" ]]; then
+    if [[ "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" == "true" ]]; then
+      printf "  Use FP8 KV cache? Model card recommends it; lower memory/faster, but still affects precision. [y/N] "
+    else
+      printf "  Use FP8 KV cache? Lower memory/faster; may affect quality without model card calibration. [y/N] "
+    fi
     read -r ans || ans=""
     if [[ "$ans" =~ ^[Yy] ]]; then
       KV_CACHE_DTYPE="fp8"
@@ -1536,7 +1651,7 @@ ask_runtime_tradeoffs() {
     fi
   fi
 
-  if [[ "${HAS_MTP:-false}" == "true" ]]; then
+  if [[ "${HAS_MTP:-false}" == "true" && "${MTP_DECIDED:-0}" != "1" ]]; then
     printf "  Enable MTP speculative decoding? More tok/s; runtime-dependent/less stable. [y/N] "
     read -r ans || ans=""
     [[ "$ans" =~ ^[Yy] ]] && MTP_ENABLED=1
@@ -1562,14 +1677,21 @@ print_launch_explain() {
   printf "    Hardware:  accel=%s gpu=%s cc=%s driver=%s image=%s\n" \
     "$ACCEL" "${GPU_NAME:-unknown}" "${GPU_COMPUTE_CAPABILITY:-unknown}" "${GPU_DRIVER_VERSION:-unknown}" "$ngc_image"
   [[ -n "${HF_RECOMMENDED_COMMAND:-}" ]] && printf "    Card cmd:  %s\n" "$HF_RECOMMENDED_COMMAND"
+  if [[ "${CALIBRATION_AVAILABLE:-0}" == "1" ]]; then
+    printf "    Calib:     %.2f tok/s, seqs=%s mtp=%s stream=%s batched=%s\n" \
+      "${CALIBRATED_TOKENS_PER_SECOND:-0}" "${CALIBRATED_MAX_NUM_SEQS:-auto}" \
+      "${CALIBRATED_MTP_ENABLED:-auto}" "${CALIBRATED_STREAM_INTERVAL:-auto}" \
+      "${CALIBRATED_MAX_NUM_BATCHED_TOKENS:-auto}"
+  fi
   printf "    vLLM:      "
   shell_join "${vllm_args[@]}"
   printf "    Questions:\n"
   local any=0
-  if [[ -z "${mem:-}" && -z "${kv_dtype:-}" && "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" != "true" ]]; then
-    printf "      - KV cache FP8: ask, default no\n"; any=1
+  if [[ -z "${mem:-}" && -z "${kv_dtype:-}" ]]; then
+    printf "      - KV cache FP8: ask, default no%s\n" \
+      "$([[ "${HF_KV_CACHE_FP8_RECOMMENDED:-false}" == "true" ]] && printf ' (card recommends)')"; any=1
   fi
-  if [[ "${HAS_MTP:-false}" == "true" ]]; then
+  if [[ "${HAS_MTP:-false}" == "true" && "${MTP_DECIDED:-0}" != "1" ]]; then
     printf "      - MTP: ask, default no\n"; any=1
   fi
   if [[ "${SUPPORTS_TOOLS:-false}" == "true" && "$tools" != "1" ]]; then
@@ -1596,7 +1718,7 @@ build_launch() {
     add_vllm_flag_once --enable-chunked-prefill
     add_vllm_flag_once --enable-prefix-caching
     if [[ "${MAX_MODEL_LEN:-0}" -ge 65536 ]]; then
-      add_vllm_flag_once --max-num-batched-tokens "${SPARK_MAX_NUM_BATCHED_TOKENS:-32768}"
+      add_vllm_flag_once --max-num-batched-tokens "$(resolve_batched_tokens SPARK_MAX_NUM_BATCHED_TOKENS 32768)"
     fi
   fi
   if [[ "$ACCEL" == cuda-* && "${IS_MOE:-0}" == "1" && "$quant_lc" =~ (nvfp4|fp8|fp4|modelopt) ]]; then
@@ -1611,7 +1733,7 @@ build_launch() {
   if [[ "${MTP_ENABLED:-0}" == "1" ]]; then
     mtp_spec="$(resolve_mtp_speculative_config)"
     vllm_args+=(--speculative-config "$mtp_spec")
-    set_vllm_flag_value --max-num-batched-tokens "${SPARK_MTP_MAX_NUM_BATCHED_TOKENS:-32768}"
+    set_vllm_flag_value --max-num-batched-tokens "$(resolve_batched_tokens SPARK_MTP_MAX_NUM_BATCHED_TOKENS 32768)"
     if stream_interval="$(resolve_stream_interval 2>/dev/null)"; then
       add_vllm_flag_once --stream-interval "$stream_interval"
     fi
@@ -1697,6 +1819,15 @@ run_backend_vllm() {
   [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto or fp8"
   [[ -z "$max_num_seqs" ]] || is_positive_int "$max_num_seqs" || die "Invalid --max-num-seqs value: $max_num_seqs" "Expected a positive integer"
 
+  local mtp_env_was_set=0 MTP_DECIDED=0
+  [[ -n "${MTP_ENABLED+x}" ]] && mtp_env_was_set=1
+  MTP_ENABLED="${MTP_ENABLED:-0}"
+  [[ "$mtp_env_was_set" == "1" ]] && MTP_DECIDED=1
+  case "${mtp_flag:-auto}" in
+    1) MTP_ENABLED=1; MTP_DECIDED=1 ;;
+    0) MTP_ENABLED=0; MTP_DECIDED=1 ;;
+  esac
+
   local cname
   cname=$(container_name_for_model "$model")
 
@@ -1749,6 +1880,8 @@ run_backend_vllm() {
   [[ -n "$kv_dtype" ]] && KV_CACHE_DTYPE="$kv_dtype"
   [[ -z "$KV_CACHE_DTYPE" ]] && KV_CACHE_DTYPE="auto"
   recompute_memory "${model_path}/config.json"
+  auto_fit_context_to_budget "$cname" "${model_path}/config.json"
+  apply_launch_calibration
   if [[ -n "$mem" ]]; then
     # Manual fraction: derive need from it so budget accounting stays coherent.
     GPU_MEM_UTIL="$mem"
@@ -1810,6 +1943,8 @@ run_backend_vllm() {
     [[ -n "$kv_dtype" ]] && KV_CACHE_DTYPE="$kv_dtype"
     [[ -z "$KV_CACHE_DTYPE" ]] && KV_CACHE_DTYPE="auto"
     recompute_memory "${model_path}/config.json"
+    auto_fit_context_to_budget "$cname" "${model_path}/config.json"
+    apply_launch_calibration
     if [[ -n "$mem" ]]; then GPU_MEM_UTIL="$mem"; NEED_GB=$(awk -v m="$mem" -v T="$TOTAL_MEM_GB" 'BEGIN{ printf "%.1f", m*T }'); fi
     [[ "$no_reasoning" == "1" ]] && REASONING_PARSER=""
     validate_profile_values
@@ -1833,7 +1968,8 @@ run_backend_vllm() {
   # Concurrency cap (raise with --max-num-seqs); cgroup headroom for the startup peak (cached per
   # model, else default); and enforce-eager (kills the torch.compile/CUDA-graph peak). The adaptive
   # loop below lowers $seqs for cache-block errors and flips $enforce_eager on a warmup OOM.
-  local seqs="${max_num_seqs:-$MAX_NUM_SEQS_DEFAULT}"
+  apply_launch_calibration
+  local seqs="${max_num_seqs:-$(resolve_default_max_num_seqs)}"
   load_warmup_cache "$model"   # sets WARMUP_PEAK_EAGER_GB / WARMUP_PEAK_CUDAGRAPH_GB
   local enforce_eager
   resolve_enforce_eager   # sets ENFORCE_EAGER + EAGER_CALIBRATING (globals, propagate to here)
@@ -1959,6 +2095,199 @@ run_backend_vllm() {
   if [[ "$tail_logs" == "1" ]]; then
     docker logs -f "$cname"
   fi
+}
+
+cmd_calibrate_help() {
+  cat <<EOF
+
+  ${BOLD}Usage:${NC} spark calibrate <model> [flags]
+
+  ${BOLD}Flags:${NC}
+    --passes <int>         Passes per configuration; default 5.
+    --max-tokens <int>     Generated tokens per request; default 256.
+    --max-num-seqs <int>   Candidate baseline concurrency; default inferred.
+    --kv-cache-dtype fp8   Include FP8 KV cache explicitly. Default: auto only.
+    --port <int>           Benchmark API port; default auto-selects from 8000.
+    --prompt <text>        Prompt used for calibration.
+    --dry-run              Print candidate configs only.
+    --force                Replace an already running instance during calibration.
+
+EOF
+}
+
+CALIBRATION_CANDIDATE_SEEN=""
+CALIBRATION_CANDIDATE_COUNT=0
+calibration_add_candidate() {
+  local label="$1" seqs="$2" mtp="$3" stream="$4" batched="$5" max_configs="${6:-5}" key
+  [[ "$seqs" =~ ^[0-9]+$ && "$seqs" -gt 0 ]] || return 0
+  [[ "$mtp" =~ ^(0|1)$ ]] || mtp=0
+  key="${seqs}|${mtp}|${stream}|${batched}"
+  [[ "$CALIBRATION_CANDIDATE_SEEN" == *"|${key}|"* ]] && return 0
+  [[ "$CALIBRATION_CANDIDATE_COUNT" -ge "$max_configs" ]] && return 0
+  CALIBRATION_CANDIDATE_SEEN="${CALIBRATION_CANDIDATE_SEEN}${key}|"
+  CALIBRATION_CANDIDATE_COUNT=$((CALIBRATION_CANDIDATE_COUNT + 1))
+  printf '%s\t%s\t%s\t%s\t%s\n' "$label" "$seqs" "$mtp" "$stream" "$batched"
+}
+
+calibration_candidate_rows() {
+  local base_seqs="$1" max_configs="${SPARK_CALIBRATE_MAX_CONFIGS:-5}"
+  [[ "$max_configs" =~ ^[0-9]+$ && "$max_configs" -gt 0 ]] || max_configs=5
+  CALIBRATION_CANDIDATE_SEEN="|"; CALIBRATION_CANDIDATE_COUNT=0
+  calibration_add_candidate "baseline" "$base_seqs" 0 "" "" "$max_configs"
+  calibration_add_candidate "single-stream" 1 0 "" "" "$max_configs"
+  calibration_add_candidate "c4" 4 0 "" "" "$max_configs"
+  if [[ "${HAS_MTP:-false}" == "true" ]]; then
+    calibration_add_candidate "mtp-c${base_seqs}" "$base_seqs" 1 "" 32768 "$max_configs"
+    calibration_add_candidate "mtp-c1-stream64" 1 1 64 32768 "$max_configs"
+  fi
+}
+
+calibrate_one_request() {
+  local port="$1" model="$2" prompt="$3" max_tokens="$4" payload timeout
+  timeout="${SPARK_CALIBRATE_REQUEST_TIMEOUT:-120}"
+  [[ "$timeout" =~ ^[0-9]+$ && "$timeout" -gt 0 ]] || timeout=120
+  payload=$(jq -nc --arg model "$model" --arg prompt "$prompt" --argjson max_tokens "$max_tokens" \
+    '{model:$model,messages:[{role:"user",content:$prompt}],max_tokens:$max_tokens,temperature:0}')
+  curl -sS --max-time "$timeout" -H 'Content-Type: application/json' -d "$payload" \
+    "http://127.0.0.1:${port}/v1/chat/completions"
+}
+
+calibrate_measure_config() {
+  local port="$1" model="$2" prompt="$3" max_tokens="$4" concurrency="$5" passes="$6"
+  CALIBRATE_TPS=""
+  if [[ -n "${SPARK_CALIBRATE_FAKE_TPS:-}" ]]; then
+    local values idx
+    read -r -a values <<< "$SPARK_CALIBRATE_FAKE_TPS"
+    idx="${CALIBRATE_FAKE_INDEX:-0}"
+    local last=$(( ${#values[@]} - 1 ))
+    [[ "$last" -lt 0 ]] && last=0
+    CALIBRATE_TPS="${values[$idx]:-${values[$last]:-0}}"
+    CALIBRATE_FAKE_INDEX=$((idx + 1))
+    return 0
+  fi
+
+  local pass i tmp start end seconds tokens total_tps=0 ok=0
+  for ((pass = 1; pass <= passes; pass++)); do
+    tmp=$(mktemp -d)
+    start=$(python3 -c 'import time; print(time.perf_counter())')
+    for ((i = 1; i <= concurrency; i++)); do
+      calibrate_one_request "$port" "$model" "$prompt" "$max_tokens" > "${tmp}/${i}.json" 2>/dev/null &
+    done
+    wait
+    end=$(python3 -c 'import time; print(time.perf_counter())')
+    tokens=$(jq -s '[.[] | .usage.completion_tokens? // .usage.output_tokens? // 0] | add // 0' "${tmp}"/*.json 2>/dev/null || echo 0)
+    seconds=$(awk -v s="$start" -v e="$end" 'BEGIN{ d=e-s; if(d<=0)d=0.001; printf "%.6f", d }')
+    rm -rf "$tmp"
+    if [[ "$tokens" =~ ^[0-9]+$ && "$tokens" -gt 0 ]]; then
+      total_tps=$(awk -v t="$total_tps" -v tok="$tokens" -v sec="$seconds" 'BEGIN{ printf "%.4f", t + tok/sec }')
+      ok=$((ok + 1))
+    fi
+  done
+  [[ "$ok" -gt 0 ]] || return 1
+  CALIBRATE_TPS=$(awk -v t="$total_tps" -v n="$ok" 'BEGIN{ printf "%.2f", t/n }')
+}
+
+cmd_calibrate() {
+  local model="" passes=5 max_tokens=256 port="" prompt="Write a concise technical explanation of GPU inference scheduling." kv_dtype=""
+  local dry_run=0 force=0 max_num_seqs=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --passes) [[ $# -ge 2 ]] || die "Missing value for --passes"; passes="$2"; shift 2 ;;
+      --max-tokens) [[ $# -ge 2 ]] || die "Missing value for --max-tokens"; max_tokens="$2"; shift 2 ;;
+      --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; shift 2 ;;
+      --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; shift 2 ;;
+      --port) [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; shift 2 ;;
+      --prompt) [[ $# -ge 2 ]] || die "Missing value for --prompt"; prompt="$2"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      --force) force=1; shift ;;
+      -h|--help) cmd_calibrate_help; return 0 ;;
+      -*) die "Unknown flag: $1" "Run 'spark calibrate --help' for usage" ;;
+      *) [[ -z "$model" ]] || die "Only one model can be specified"; model="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$model" ]] && die "No model specified" "Usage: spark calibrate <model> [flags]"
+  validate_model_ref_for_backend "$model"
+  [[ "$BACKEND" == "vllm" ]] || die "Calibration is only available for vLLM models"
+  is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
+  is_positive_int "$passes" || die "Invalid --passes value: $passes"
+  is_positive_int "$max_tokens" || die "Invalid --max-tokens value: $max_tokens"
+  [[ -z "$max_num_seqs" ]] || is_positive_int "$max_num_seqs" || die "Invalid --max-num-seqs value: $max_num_seqs"
+  [[ -z "$port" ]] || is_port "$port" || die "Invalid --port value: $port"
+  [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto or fp8"
+
+  local cname existing model_path base_seqs candidates
+  cname=$(container_name_for_model "$model")
+  existing=$(container_for_ref "$model" 2>/dev/null || true)
+  if [[ -n "$existing" && "$force" != "1" ]]; then
+    die "Model '${model}' is already running" "Stop it first, or rerun calibration with --force"
+  fi
+  model_path=$(resolve_model_path "$model") || die "Model '${model}' not found in HF cache" "Download it first: spark pull ${model}"
+
+  KV_CACHE_DTYPE="${kv_dtype:-auto}"
+  REGEN_PROFILE="${REGEN_PROFILE:-0}"
+  profile_model "$model" "$model_path"
+  [[ -n "$kv_dtype" ]] && KV_CACHE_DTYPE="$kv_dtype"
+  recompute_memory "${model_path}/config.json"
+  auto_fit_context_to_budget "$cname" "${model_path}/config.json"
+  load_launch_calibration "$model"
+  base_seqs="${max_num_seqs:-$(resolve_default_max_num_seqs)}"
+  candidates="$(calibration_candidate_rows "$base_seqs")"
+  [[ -n "$candidates" ]] || die "No calibration candidates generated"
+
+  printf "\n  Calibration candidates for %s (ctx %s, KV %s):\n" "$model" "$MAX_MODEL_LEN" "$KV_CACHE_DTYPE"
+  printf '%s\n' "$candidates" | awk -F'\t' '{printf "    - %s: seqs=%s mtp=%s stream=%s batched=%s\n",$1,$2,$3,($4==""?"auto":$4),($5==""?"auto":$5)}'
+  if [[ "$dry_run" == "1" ]]; then
+    printf "\n"
+    return 0
+  fi
+
+  port="${port:-$(next_free_port "$DEFAULT_PORT")}"
+  local results_file best_json="" best_tps=0 label seqs mtp stream batched tps stream_json batched_json kv_arg=()
+  results_file=$(mktemp)
+  [[ -n "$kv_dtype" ]] && kv_arg=(--kv-cache-dtype "$kv_dtype")
+  while IFS=$'\t' read -r label seqs mtp stream batched; do
+    printf "\n  Calibrating %s...\n" "$label"
+    if ! (
+      export SPARK_IGNORE_CALIBRATION=1
+      export MTP_ENABLED="$mtp"
+      [[ -n "$stream" ]] && export SPARK_STREAM_INTERVAL="$stream"
+      [[ -n "$batched" ]] && export SPARK_MAX_NUM_BATCHED_TOKENS="$batched" SPARK_MTP_MAX_NUM_BATCHED_TOKENS="$batched"
+      cmd_run "$model" --force --port "$port" --max-num-seqs "$seqs" "${kv_arg[@]}"
+    ); then
+      docker rm -f "$cname" >/dev/null 2>&1 || true
+      warn "Launch failed for ${label}; skipping"
+      continue
+    fi
+    calibrate_measure_config "$port" "$model" "$prompt" "$max_tokens" "$seqs" "$passes" || {
+      docker rm -f "$cname" >/dev/null 2>&1 || true
+      warn "Calibration failed for ${label}; skipping"
+      continue
+    }
+    tps="$CALIBRATE_TPS"
+    docker rm -f "$cname" >/dev/null 2>&1 || true
+    stream_json="null"; [[ "$stream" =~ ^[0-9]+$ ]] && stream_json="$stream"
+    batched_json="null"; [[ "$batched" =~ ^[0-9]+$ ]] && batched_json="$batched"
+    local row
+    row=$(jq -nc --arg label "$label" --arg kv "$KV_CACHE_DTYPE" \
+      --argjson tps "$tps" --argjson seqs "$seqs" --argjson mtp "$mtp" \
+      --argjson stream "$stream_json" --argjson batched "$batched_json" \
+      '{label:$label,tokens_per_second:$tps,max_num_seqs:$seqs,mtp_enabled:$mtp,
+        stream_interval:$stream,max_num_batched_tokens:$batched,kv_cache_dtype:$kv}')
+    printf '%s\n' "$row" >> "$results_file"
+    printf "    %.2f tok/s\n" "$tps"
+    if awk -v n="$tps" -v b="$best_tps" 'BEGIN{ exit !(n > b) }'; then
+      best_tps="$tps"
+      best_json="$row"
+    fi
+  done <<< "$candidates"
+
+  [[ -n "$best_json" ]] || { rm -f "$results_file"; die "Calibration produced no valid measurements"; }
+  local results_json
+  results_json=$(jq -s '.' "$results_file")
+  rm -f "$results_file"
+  save_launch_calibration "$model" "$best_json" "$results_json" || die "Could not save calibration"
+  info "Calibration saved: ${best_tps} tok/s. Future spark run uses this config unless overridden."
 }
 
 # Is the local Ollama service answering on :11434?
@@ -2221,6 +2550,14 @@ cmd_pull() {
   is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
   printf "\n  Downloading %s...\n\n" "$model"
   hf download "$model"
+  local model_path
+  if model_path=$(resolve_model_path "$model" 2>/dev/null); then
+    REGEN_PROFILE=1
+    KV_CACHE_DTYPE="auto"
+    profile_model "$model" "$model_path" || warn "Downloaded, but profile refresh failed; run with --regen-profile if needed"
+  else
+    warn "Downloaded, but no complete local snapshot was found for profiling"
+  fi
   printf "\n"
   info "Ready. Run: spark run ${model}"
   printf "\n"
@@ -3342,12 +3679,12 @@ step_hf_cli() {
     setup_skip "HuggingFace CLI (needs uv)"
   fi
 
-  if ctx_run '~/.local/share/spark/hf-inspect-venv/bin/python -c "import huggingface_hub"'; then
+  if ctx_run '$HOME/.local/share/spark/hf-inspect-venv/bin/python -c "import huggingface_hub"'; then
     info "HF library: installed"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "HuggingFace library not installed"
   elif ctx_run "${TGT_PATH} command -v uv" >/dev/null 2>&1; then
-    if ctx_run 'mkdir -p ~/.local/share/spark && uv venv ~/.local/share/spark/hf-inspect-venv >/dev/null && ~/.local/share/spark/hf-inspect-venv/bin/python -m pip install -q huggingface-hub'; then
+    if ctx_run 'mkdir -p $HOME/.local/share/spark && uv venv $HOME/.local/share/spark/hf-inspect-venv >/dev/null && $HOME/.local/share/spark/hf-inspect-venv/bin/python -m pip install -q huggingface-hub'; then
       info "Installed HF library"
     else
       setup_fail "HF library install failed"
@@ -3886,9 +4223,9 @@ swap_file_state() {
 }
 
 swap_fail_reconcile() {
-  local total_mib="$1" target_mib="$2" cur_sw="$3" sf="$4" next="$5" source="$6" diag="${7:-}" state
+  local total_mib="$1" target_mib="$2" cur_sw="$3" sf="$4" next_action_msg="$5" total_source="$6" diag="${7:-}" state
   state="$(swap_file_state "$sf")"
-  setup_fail "Could not reconcile swap: total=${total_mib}MiB $(swap_total_context "$source" "$diag"), target≥${target_mib}MiB, swappiness=${cur_sw:-?}/${SWAPPINESS}, ${sf}=(${state}); next: ${next}"
+  setup_fail "Could not reconcile swap: total=${total_mib}MiB $(swap_total_context "$total_source" "$diag"), target≥${target_mib}MiB, swappiness=${cur_sw:-?}/${SWAPPINESS}, ${sf} state=${state}; next: ${next_action_msg}"
 }
 
 swap_ensure_fstab_entry() {
@@ -8406,6 +8743,7 @@ cmd_help() {
     doctor           Check all prerequisites (read-only)
     models           Recommend models for this hardware
     run <model>      Start serving a model (can run several at once)
+    calibrate <model> Measure launch configs and save the fastest one
     stop [<model>]   Stop a model (no arg: the only one; --all: every one)
     pull <model>     Download a model from HuggingFace
     list             List downloaded models
@@ -8990,6 +9328,7 @@ main() {
 
   case "${1:-}" in
     run)          shift; cmd_run "$@" ;;
+    calibrate)    shift; cmd_calibrate "$@" ;;
     dashboard)    shift; cmd_dashboard "$@" ;;
     stop)         shift; cmd_stop "$@" ;;
     pull)         shift; cmd_pull "$@" ;;

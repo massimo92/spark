@@ -144,12 +144,12 @@ step_hf_cli() {
     setup_skip "HuggingFace CLI (needs uv)"
   fi
 
-  if ctx_run '~/.local/share/spark/hf-inspect-venv/bin/python -c "import huggingface_hub"'; then
+  if ctx_run '$HOME/.local/share/spark/hf-inspect-venv/bin/python -c "import huggingface_hub"'; then
     info "HF library: installed"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "HuggingFace library not installed"
   elif ctx_run "${TGT_PATH} command -v uv" >/dev/null 2>&1; then
-    if ctx_run 'mkdir -p ~/.local/share/spark && uv venv ~/.local/share/spark/hf-inspect-venv >/dev/null && ~/.local/share/spark/hf-inspect-venv/bin/python -m pip install -q huggingface-hub'; then
+    if ctx_run 'mkdir -p $HOME/.local/share/spark && uv venv $HOME/.local/share/spark/hf-inspect-venv >/dev/null && $HOME/.local/share/spark/hf-inspect-venv/bin/python -m pip install -q huggingface-hub'; then
       info "Installed HF library"
     else
       setup_fail "HF library install failed"
@@ -688,9 +688,9 @@ swap_file_state() {
 }
 
 swap_fail_reconcile() {
-  local total_mib="$1" target_mib="$2" cur_sw="$3" sf="$4" next="$5" source="$6" diag="${7:-}" state
+  local total_mib="$1" target_mib="$2" cur_sw="$3" sf="$4" next_action_msg="$5" total_source="$6" diag="${7:-}" state
   state="$(swap_file_state "$sf")"
-  setup_fail "Could not reconcile swap: total=${total_mib}MiB $(swap_total_context "$source" "$diag"), target≥${target_mib}MiB, swappiness=${cur_sw:-?}/${SWAPPINESS}, ${sf}=(${state}); next: ${next}"
+  setup_fail "Could not reconcile swap: total=${total_mib}MiB $(swap_total_context "$total_source" "$diag"), target≥${target_mib}MiB, swappiness=${cur_sw:-?}/${SWAPPINESS}, ${sf} state=${state}; next: ${next_action_msg}"
 }
 
 swap_ensure_fstab_entry() {
