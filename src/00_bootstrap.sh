@@ -192,7 +192,7 @@ SWAPPINESS="${SPARK_SWAPPINESS:-10}"
 # Profile cache schema. Bumped when new fields are added (e.g. is_moe). A cached profile older than
 # this is auto-refreshed on the next `spark run` so new fields (and the decisions that depend on them,
 # like auto enforce-eager) are populated — no user action needed.
-PROFILE_SCHEMA_VERSION=3
+PROFILE_SCHEMA_VERSION=4
 
 # Detect the latest pulled NGC vLLM image
 ngc_vllm_image_blocked() {
@@ -604,7 +604,13 @@ load_profile() {
   TOOL_CALL_PARSER=$(jq -r '.tool_call_parser // ""' "$profile_file") || die "Could not read profile: $profile_file"
   GPU_MEM_UTIL=$(jq -r '.gpu_memory_utilization // ""' "$profile_file") || die "Could not read profile: $profile_file"
   MAX_MODEL_LEN=$(jq -r '.max_model_len // ""' "$profile_file") || die "Could not read profile: $profile_file"
-  MODEL_MAX_LEN="$MAX_MODEL_LEN"   # cached proxy for the model's max context (fit suggestions)
+  MODEL_MAX_LEN=$(jq -r '
+    [
+      (.hf.card.config_context // empty),
+      (.hf.card.recommended_context // empty),
+      (.max_model_len // empty)
+    ] | map(select(type == "number" and . > 0)) | max // (.max_model_len // "")
+  ' "$profile_file") || die "Could not read profile: $profile_file"
   IS_MULTIMODAL=$(jq -r '.is_multimodal // "false"' "$profile_file") || die "Could not read profile: $profile_file"
   IS_MOE=$(jq -r '.is_moe // "0"' "$profile_file") || die "Could not read profile: $profile_file"
   HF_MODEL_INFO_JSON=$(jq -c '.hf // {}' "$profile_file") || die "Could not read profile: $profile_file"
@@ -769,17 +775,10 @@ profile_model() {
     warn "Unknown model_type '${model_type}' — reasoning and tool-call parsers not configured"
   fi
 
-  model_max=$(hf_profile_value '.card.config_context // 32768')
+  model_max=$(hf_profile_value '[.card.config_context, .card.recommended_context] | map(select(type == "number" and . > 0)) | max // 32768')
   is_positive_int "$model_max" || model_max=32768
   MODEL_MAX_LEN="$model_max"
-  if [[ -n "$HF_RECOMMENDED_CONTEXT" && "$HF_RECOMMENDED_CONTEXT" =~ ^[0-9]+$ && "$HF_RECOMMENDED_CONTEXT" -gt 0 ]]; then
-    MAX_MODEL_LEN="$HF_RECOMMENDED_CONTEXT"
-    [[ "$HF_RECOMMENDED_CONTEXT" -gt "$MODEL_MAX_LEN" ]] && MODEL_MAX_LEN="$HF_RECOMMENDED_CONTEXT"
-  elif [[ "$model_max" -lt 131072 ]]; then
-    MAX_MODEL_LEN="$model_max"
-  else
-    MAX_MODEL_LEN=131072
-  fi
+  MAX_MODEL_LEN="$MODEL_MAX_LEN"
 
   IS_MULTIMODAL=$(hf_profile_value '.features.is_multimodal // false')
   [[ "$IS_MULTIMODAL" =~ ^(true|false)$ ]] || IS_MULTIMODAL="false"
@@ -787,13 +786,7 @@ profile_model() {
   IS_MOE="0"
   [[ "$(hf_profile_value '.features.is_moe // false')" == "true" ]] && IS_MOE="1"
 
-  if [[ -z "${KV_CACHE_DTYPE:-}" ]]; then
-    if [[ "$HF_KV_CACHE_FP8_RECOMMENDED" == "true" ]]; then
-      KV_CACHE_DTYPE="fp8"
-    else
-      KV_CACHE_DTYPE="auto"
-    fi
-  fi
+  [[ -z "${KV_CACHE_DTYPE:-}" ]] && KV_CACHE_DTYPE="auto"
 
   # Model size (sum of safetensors)
   # -L follows symlinks (HF cache uses symlinks in snapshots/)
@@ -935,6 +928,53 @@ save_warmup_peak() {
     mv "$tmp" "$pf"
   else
     rm -f "$tmp"
+  fi
+}
+
+load_launch_calibration() {
+  local model="$1" pf
+  CALIBRATION_AVAILABLE=0
+  CALIBRATED_MAX_NUM_SEQS=""
+  CALIBRATED_MTP_ENABLED=""
+  CALIBRATED_STREAM_INTERVAL=""
+  CALIBRATED_MAX_NUM_BATCHED_TOKENS=""
+  CALIBRATED_KV_CACHE_DTYPE=""
+  CALIBRATED_TOKENS_PER_SECOND=""
+  pf=$(profile_file_for "$model")
+  [[ -f "$pf" ]] || return 0
+  jq -e '.calibration.best' "$pf" >/dev/null 2>&1 || return 0
+  CALIBRATION_AVAILABLE=1
+  CALIBRATED_MAX_NUM_SEQS=$(jq -r '.calibration.best.max_num_seqs // ""' "$pf" 2>/dev/null || echo "")
+  CALIBRATED_MTP_ENABLED=$(jq -r '.calibration.best.mtp_enabled // ""' "$pf" 2>/dev/null || echo "")
+  CALIBRATED_STREAM_INTERVAL=$(jq -r '.calibration.best.stream_interval // ""' "$pf" 2>/dev/null || echo "")
+  CALIBRATED_MAX_NUM_BATCHED_TOKENS=$(jq -r '.calibration.best.max_num_batched_tokens // ""' "$pf" 2>/dev/null || echo "")
+  CALIBRATED_KV_CACHE_DTYPE=$(jq -r '.calibration.best.kv_cache_dtype // ""' "$pf" 2>/dev/null || echo "")
+  CALIBRATED_TOKENS_PER_SECOND=$(jq -r '.calibration.best.tokens_per_second // ""' "$pf" 2>/dev/null || echo "")
+  [[ "$CALIBRATED_MAX_NUM_SEQS" =~ ^[0-9]+$ ]] || CALIBRATED_MAX_NUM_SEQS=""
+  [[ "$CALIBRATED_MTP_ENABLED" =~ ^(0|1)$ ]] || CALIBRATED_MTP_ENABLED=""
+  [[ "$CALIBRATED_STREAM_INTERVAL" =~ ^[0-9]+$ ]] || CALIBRATED_STREAM_INTERVAL=""
+  [[ "$CALIBRATED_MAX_NUM_BATCHED_TOKENS" =~ ^[0-9]+$ ]] || CALIBRATED_MAX_NUM_BATCHED_TOKENS=""
+  [[ "$CALIBRATED_KV_CACHE_DTYPE" =~ ^(auto|fp8)$ ]] || CALIBRATED_KV_CACHE_DTYPE=""
+  [[ "$CALIBRATED_TOKENS_PER_SECOND" =~ ^[0-9]+([.][0-9]+)?$ ]] || CALIBRATED_TOKENS_PER_SECOND=""
+}
+
+save_launch_calibration() {
+  local model="$1" best_json="$2" results_json="$3" pf tmp
+  pf=$(profile_file_for "$model")
+  [[ -f "$pf" ]] || return 0
+  printf '%s\n' "$best_json" | jq -e . >/dev/null 2>&1 || return 1
+  printf '%s\n' "$results_json" | jq -e . >/dev/null 2>&1 || return 1
+  tmp=$(mktemp)
+  if jq --arg d "$(date +%Y-%m-%d)" --argjson best "$best_json" --argjson results "$results_json" \
+      '.calibration = {
+        date: $d,
+        best: $best,
+        results: $results
+      }' "$pf" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$pf"
+  else
+    rm -f "$tmp"
+    return 1
   fi
 }
 
@@ -1163,9 +1203,9 @@ print_next_steps() {
   return 0
 }
 
-# Given free GB, compute the two largest "clean" context windows that would fit:
+# Given free GB, compute the two largest context windows that would fit:
 #   FIT_CTX_AUTO (KV in auto, 2 bytes) and FIT_CTX_FP8 (KV in fp8, 1 byte -> double the tokens).
-# Capped at the model's max and 131072, rounded down. FIT_POSSIBLE=1 if any option exists.
+# Capped at the model's HF max and rounded down to a 1024-token boundary.
 fit_options() {
   local free="$1"
   FIT_POSSIBLE=0; FIT_CTX_AUTO=0; FIT_CTX_FP8=0
@@ -1175,7 +1215,6 @@ fit_options() {
 
   local cap="${MODEL_MAX_LEN:-131072}"
   [[ "$cap" =~ ^[0-9]+$ ]] || cap=131072
-  [[ "$cap" -gt 131072 ]] && cap=131072
 
   read -r FIT_POSSIBLE FIT_CTX_AUTO FIT_CTX_FP8 < <(awk \
     -v free="$free" -v w="${WEIGHTS_GB:-0}" -v h="${MEM_HEADROOM_PCT:-8}" \
@@ -1188,9 +1227,10 @@ fit_options() {
       per_tok_fp8  = per_tok_auto/2;
       max_auto = kv_budget/per_tok_auto;
       max_fp8  = kv_budget/per_tok_fp8;
-      n=split("2048 4096 8192 16384 32768 65536 131072", S, " ");
-      ca=0; cf=0;
-      for(i=1;i<=n;i++){ if(S[i]<=max_auto && S[i]<=cap) ca=S[i]; if(S[i]<=max_fp8 && S[i]<=cap) cf=S[i]; }
+      ca = int((max_auto < cap ? max_auto : cap) / 1024) * 1024;
+      cf = int((max_fp8  < cap ? max_fp8  : cap) / 1024) * 1024;
+      if (ca < 1024) ca=0;
+      if (cf < 1024) cf=0;
       print ((ca>0||cf>0)?1:0), ca, cf;
     }')
   return 0

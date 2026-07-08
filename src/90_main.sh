@@ -4,6 +4,7 @@ main() {
 
   case "${1:-}" in
     run)          shift; cmd_run "$@" ;;
+    calibrate)    shift; cmd_calibrate "$@" ;;
     dashboard)    shift; cmd_dashboard "$@" ;;
     stop)         shift; cmd_stop "$@" ;;
     pull)         shift; cmd_pull "$@" ;;

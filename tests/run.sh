@@ -996,10 +996,10 @@ test_need_based_fraction() {
     "$SPARK" run Qwen/Qwen3-30B --dry-run 2>&1)
   rm -rf "$tmp"
 
-  [[ "$output" == *"KV cache:  12.0 GB"* ]] &&
+  [[ "$output" == *"KV cache:  24.0 GB"* ]] &&
     [[ "$output" == *"Weights:   14.0 GB"* ]] &&
-    [[ "$output" == *"--gpu-memory-utilization 0.23"* ]] &&
-    [[ "$output" == *"--max-model-len 131072"* ]]
+    [[ "$output" == *"--gpu-memory-utilization 0.34"* ]] &&
+    [[ "$output" == *"--max-model-len 262144"* ]]
 }
 
 test_fp8_halves_kv() {
@@ -1014,7 +1014,7 @@ test_fp8_halves_kv() {
     "$SPARK" run Qwen/Qwen3-30B --dry-run --kv-cache-dtype fp8 2>&1)
   rm -rf "$tmp"
 
-  [[ "$output" == *"KV cache:  6.0 GB"* ]] &&
+  [[ "$output" == *"KV cache:  12.0 GB"* ]] &&
     [[ "$output" == *"--kv-cache-dtype fp8"* ]]
 }
 
@@ -1077,7 +1077,7 @@ test_capacity_verification_aborts() {
 
   [[ "$status" -ne 0 ]] &&
     [[ "$output" == *"Not enough memory"* ]] &&
-    [[ "$output" == *"Needs:      28.1 GB"* ]] &&
+    [[ "$output" == *"Needs:      41.0 GB"* ]] &&
     [[ "$output" == *"org/big"* ]] &&
     [[ "$output" == *"won't help"* ]]
 }
@@ -4753,12 +4753,11 @@ test_vllm_blocks_ollama_tag() {
   [[ "${rc:-0}" -ne 0 ]] && [[ "$out" == *"Ollama model tag"* ]]
 }
 
-# --- Capacity: context menu (auto vs fp8) when a model doesn't fit ---
-# 30B: weights 14, KV@128K 12, need 28.1. Reserve 85 -> free 26: doesn't fit at 128K,
-# but fits at 64K auto (need 21.6) or 128K fp8 (need 21.6).
-# Reserved so the 30B doesn't fit at full context (budget 114 − 88 = 26 GB free), to exercise the
-# fit menu — same free as before (when budget was 111 − 85).
+# --- Capacity: auto-fit max context before offering fp8 ---
+# 30B: weights 14, KV@262K 24, need 41.0. Reserve 88 -> free 26: full context does
+# not fit, so run auto-reduces to the largest 1024-aligned KV-auto context that fits.
 RESERVE_85='spark-vllm-big\torg/big\t8000\t88.0\t73.0\t15.0\n'
+RESERVE_FP8_ONLY='spark-vllm-big\torg/big\t8000\t98.8\t83.8\t15.0\n'
 
 test_dryrun_shows_fit_options() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
@@ -4773,9 +4772,8 @@ test_dryrun_shows_fit_options() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -eq 0 ]] &&
-    [[ "$out" == *"Not enough memory"* ]] &&
-    [[ "$out" == *"Fits at up to 64K"* ]] &&
-    [[ "$out" == *"up to 128K with fp8"* ]] &&
+    [[ "$out" == *"Using max context that fits now: 109568/262144 tokens"* ]] &&
+    [[ "$out" == *"--max-model-len 109568"* ]] &&
     [[ "$out" == *"docker run"* ]]
 }
 
@@ -4784,13 +4782,13 @@ test_menu_choose_fp8_relaunches() {
   local tmp fake_bin dargs
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
-  printf '2\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+  printf '1\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     SPARK_ASSUME_INTERACTIVE=1 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
-    FAKE_MANAGED="$RESERVE_85" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    FAKE_MANAGED="$RESERVE_FP8_ONLY" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
     "$SPARK" run Qwen/Qwen3-30B >/dev/null 2>&1 || true
   dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$dargs" == *"--max-model-len 131072"* ]] && [[ "$dargs" == *"--kv-cache-dtype fp8"* ]]
+  [[ "$dargs" == *"--max-model-len 1024"* ]] && [[ "$dargs" == *"--kv-cache-dtype fp8"* ]]
 }
 
 test_menu_choose_auto_relaunches() {
@@ -4798,13 +4796,13 @@ test_menu_choose_auto_relaunches() {
   local tmp fake_bin dargs
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
-  printf '1\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
-    SPARK_ASSUME_INTERACTIVE=1 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     FAKE_MANAGED="$RESERVE_85" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
     "$SPARK" run Qwen/Qwen3-30B >/dev/null 2>&1 || true
   dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$dargs" == *"--max-model-len 65536"* ]] && [[ "$dargs" != *"--kv-cache-dtype fp8"* ]]
+  [[ "$dargs" == *"--max-model-len 109568"* ]] && [[ "$dargs" != *"--kv-cache-dtype fp8"* ]]
 }
 
 test_menu_cancel_aborts() {
@@ -4812,9 +4810,9 @@ test_menu_cancel_aborts() {
   local tmp fake_bin dargs out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
-  out=$(printf '3\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+  out=$(printf '2\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     SPARK_ASSUME_INTERACTIVE=1 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
-    FAKE_MANAGED="$RESERVE_85" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    FAKE_MANAGED="$RESERVE_FP8_ONLY" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
     "$SPARK" run Qwen/Qwen3-30B 2>&1 || true)
   dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
@@ -4825,16 +4823,16 @@ test_autopull_menu_downloads_at_choice() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin dargs weights downloaded
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
-  # Not downloaded; sized from metadata. Reserve 85 -> doesn't fit at 128K. Pick option 2 (fp8 128K).
-  printf '2\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+  # Not downloaded; sized from metadata. Only a tiny fp8 context fits, so choose fp8 explicitly.
+  printf '1\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
     SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
-    FAKE_MANAGED="$RESERVE_85" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
+    FAKE_MANAGED="$RESERVE_FP8_ONLY" FAKE_DOCKER_ARGS_FILE="${tmp}/dargs.txt" \
     "$SPARK" run Qwen/Qwen3-30B >/dev/null 2>&1 || true
   dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
   weights="${tmp}/home/.cache/huggingface/hub/models--Qwen--Qwen3-30B/snapshots/1/model-00001-of-00001.safetensors"
   downloaded=0; [[ -f "$weights" ]] && downloaded=1
   rm -rf "$tmp"
-  [[ "$downloaded" -eq 1 ]] && [[ "$dargs" == *"--max-model-len 131072"* ]] && [[ "$dargs" == *"--kv-cache-dtype fp8"* ]]
+  [[ "$downloaded" -eq 1 ]] && [[ "$dargs" == *"--max-model-len 1024"* ]] && [[ "$dargs" == *"--kv-cache-dtype fp8"* ]]
 }
 
 test_mem_override_suggests_mem() {
@@ -4853,7 +4851,7 @@ test_mem_override_suggests_mem() {
 }
 
 # --- Per-container hard memory limit (--memory) ---
-# 30B NEED 28.1 → 28.1×1.25×1024 = ceil(35968) = 35968 MiB.
+# 30B NEED 41.0 at 262K context.
 test_mem_limit_present_unified() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin dargs
@@ -4865,10 +4863,10 @@ test_mem_limit_present_unified() {
     "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
   dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  # --memory cap = NEED + WARMUP_HEADROOM (default 20): (28.1+20)×1024 = ceil(49254.4) = 49255 MiB.
-  # --memory-swap = cap + provisioned swap (64G): 49255 + 65536 = 114791 MiB (lets the load peak
+  # --memory cap = NEED + WARMUP_HEADROOM (default 20): (41.0+20)×1024 = 62464 MiB.
+  # --memory-swap = cap + provisioned swap (64G): 62464 + 65536 = 128000 MiB (lets the load peak
   # spill to swap instead of cgroup-OOMing mid-load).
-  [[ "$dargs" == *"--memory 49255m"* ]] && [[ "$dargs" == *"--memory-swap 114791m"* ]]
+  [[ "$dargs" == *"--memory 62464m"* ]] && [[ "$dargs" == *"--memory-swap 128000m"* ]]
 }
 
 test_mem_limit_absent_discrete() {
@@ -4921,13 +4919,13 @@ test_mem_limit_headroom_env() {
   local tmp fake_bin dargs
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
-  # SPARK_WARMUP_HEADROOM_GB=30: (28.1+30)×1024 = ceil(59494.4) = 59495 MiB.
+  # SPARK_WARMUP_HEADROOM_GB=30: (41.0+30)×1024 = 72704 MiB.
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
     SPARK_WARMUP_HEADROOM_GB=30 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" "$SPARK" run Qwen/Qwen3-30B </dev/null >/dev/null 2>&1 || true
   dargs=$(cat "${tmp}/d.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$dargs" == *"--memory 59495m"* ]] && [[ "$dargs" != *"49255m"* ]]
+  [[ "$dargs" == *"--memory 72704m"* ]] && [[ "$dargs" != *"62464m"* ]]
 }
 
 # --- Adaptive supervised startup ---
@@ -5126,6 +5124,24 @@ EOF
     [[ "$cmd" == *"--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"moe_backend\":\"triton\"}'"* ]]
 }
 
+test_hf_inspector_tools_requires_tool_calling_signal() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  command -v python3 >/dev/null 2>&1 || { printf "skip - python3 not installed\n"; return 0; }
+  local tmp dir generic explicit
+  tmp=$(mktemp -d)
+  make_model "${tmp}/home" "Org/Model-Tools" '{ "model_type":"qwen3", "architectures":["Qwen3ForCausalLM"],
+    "max_position_embeddings":32768 }'
+  dir="${tmp}/home/.cache/huggingface/hub/models--Org--Model-Tools/snapshots/1"
+  printf '# Test\n\nUseful developer tools and examples.\n' > "${dir}/README.md"
+  generic=$(python3 "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Tools \
+    --local-path "$dir" --local-files-only | jq -r '.features.supports_tools')
+  printf '# Test\n\nSupports tool calling with <tool_call> blocks.\n' > "${dir}/README.md"
+  explicit=$(python3 "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Tools \
+    --local-path "$dir" --local-files-only | jq -r '.features.supports_tools')
+  rm -rf "$tmp"
+  [[ "$generic" == "false" ]] && [[ "$explicit" == "true" ]]
+}
+
 test_hf_card_context_wins() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out meta
@@ -5207,7 +5223,7 @@ test_hf_mtp_launch_sets_batched_tokens() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Org/MTP" "$KV_CONFIG"
   meta=$(hf_inspect_json true true null false dense nvfp4)
-  printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+  printf 'n\ny\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     SPARK_ASSUME_INTERACTIVE=1 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.05-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
     "$SPARK" run Org/MTP --no-wait >/dev/null 2>&1 || true
@@ -5232,8 +5248,8 @@ test_hf_kv_fp8_question_and_recommendation() {
     "$SPARK" run Org/KV --dry-run --explain </dev/null 2>&1 || true)
   rm -rf "$tmp"
   [[ "$ask" == *"KV cache FP8: ask"* ]] &&
-    [[ "$auto" != *"KV cache FP8: ask"* ]] &&
-    [[ "$auto" == *"--kv-cache-dtype fp8"* ]]
+    [[ "$auto" == *"KV cache FP8: ask, default no (card recommends)"* ]] &&
+    [[ "$auto" != *"--kv-cache-dtype fp8"* ]]
 }
 
 test_dry_run_explain_shows_hf_and_flags() {
@@ -5264,6 +5280,44 @@ test_hf_metadata_cli_overrides_win() {
   [[ "$out" == *"--max-model-len 4096"* ]] && [[ "$out" != *"--kv-cache-dtype fp8"* ]]
 }
 
+test_calibrate_dry_run_lists_candidates() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Calibrate" "$MOE_CONFIG"
+  meta=$(hf_inspect_json true false 262144 false moe nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.05-py3" \
+    "$SPARK" calibrate Org/Calibrate --dry-run </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Calibration candidates"* ]] &&
+    [[ "$out" == *"baseline"* ]] &&
+    [[ "$out" == *"mtp-"* ]] &&
+    [[ "$out" == *"KV auto"* ]]
+}
+
+test_calibrate_saves_best_and_run_uses_it() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out run meta pf saved
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Calibrate" "$MOE_CONFIG"
+  meta=$(hf_inspect_json true false 262144 false moe nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" SPARK_CALIBRATE_FAKE_TPS="10 20 30 40 50" \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.05-py3" "$SPARK" calibrate Org/Calibrate --passes 1 --force </dev/null 2>&1 || true)
+  pf="${tmp}/home/.config/spark/profiles/Org--Calibrate.json"
+  saved=$(jq -r '.calibration.best.tokens_per_second // empty' "$pf" 2>/dev/null || true)
+  run=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.05-py3" "$SPARK" run Org/Calibrate --dry-run --explain </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Calibration saved: 50"* ]] &&
+    [[ "$saved" == "50" ]] &&
+    [[ "$run" == *"Calib:"* ]] &&
+    [[ "$run" == *"--max-num-seqs 1"* ]] &&
+    [[ "$run" == *"--speculative-config"* ]] &&
+    [[ "$run" == *"--stream-interval 64"* ]]
+}
+
 # A cached profile from an older spark (no schema_version, missing fields like is_moe) is refreshed
 # automatically on the next run — so decisions that depend on the new fields work without user action.
 test_profile_schema_autoregen() {
@@ -5279,7 +5333,7 @@ test_profile_schema_autoregen() {
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1 || true)
   sv=$(jq -r '.schema_version // "none"' "$pf" 2>/dev/null || echo none)
   rm -rf "$tmp"
-  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "3" ]]
+  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "4" ]]
 }
 
 # CUDA-graph calibration over the two-column peak table: eager peak on record + no graph peak →
@@ -5291,7 +5345,7 @@ _write_cal_profile() {
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
   jq -n --arg m "$2" --arg ep "$3" --arg cp "$4" '{
-    schema_version:3, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    schema_version:4, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
     warmup: {"8192/auto": ({date:"2026-01-01"}
@@ -5306,7 +5360,7 @@ _write_legacy_cal_profile() {
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
   jq -n --arg m "$2" --arg p "$3" --arg e "$4" --arg c "$5" '{
-    schema_version:3, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    schema_version:4, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
     warmup: {"8192/auto": {peak_gb:$p, enforce_eager:$e, cudagraph_oom:$c, date:"2026-01-01"}}
@@ -5367,7 +5421,7 @@ test_budget_blocks_when_stacking() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
     FAKE_MANAGED='spark-vllm-big\torg/big\t8000\t90.0\t75.0\t15.0\n' \
-    "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1)
+    "$SPARK" run Qwen/Qwen3-30B --dry-run --max-len 262144 </dev/null 2>&1)
   status=$?
   set -e
   rm -rf "$tmp"
@@ -5391,7 +5445,7 @@ test_budget_blocks_single_model() {
   [[ "$status" -eq 0 ]] && [[ "$out" == *"Not enough memory"* ]] && [[ "$out" == *"Fits with --mem"* ]]
 }
 
-# Discrete GPUs get a smaller OS reserve (2 → budget 119): the stacking case (108) fits.
+# Discrete GPUs get a smaller OS reserve (2 → budget 119): the full-context stacking case fits.
 test_budget_larger_on_discrete() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out
@@ -5399,8 +5453,8 @@ test_budget_larger_on_discrete() {
   make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-discrete \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
-    FAKE_MANAGED='spark-vllm-big\torg/big\t8000\t80.0\t65.0\t15.0\n' \
-    "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1)
+    FAKE_MANAGED='spark-vllm-big\torg/big\t8000\t75.0\t60.0\t15.0\n' \
+    "$SPARK" run Qwen/Qwen3-30B --dry-run --max-len 262144 </dev/null 2>&1)
   rm -rf "$tmp"
   [[ "$out" == *"vllm serve"* ]] && [[ "$out" != *"Not enough memory"* ]]
 }
@@ -5803,6 +5857,7 @@ run_test "HF MoE NVFP4 emits Marlin + atomic add" test_hf_moe_nvfp4_emits_marlin
 run_test "HF inspector maps compressed-tensors NVFP4" test_hf_inspector_compressed_tensors_nvfp4_tag
 run_test "HF inspector maps ModelOpt HF quant NVFP4" test_hf_inspector_modelopt_hf_quant_nvfp4_tag
 run_test "HF inspector prefers recommended multiline command" test_hf_inspector_prefers_recommended_multiline_command_from_readme
+run_test "HF inspector tools needs explicit tool-calling signal" test_hf_inspector_tools_requires_tool_calling_signal
 run_test "HF card recommended context wins" test_hf_card_context_wins
 run_test "HF MTP question only when supported" test_hf_mtp_explain_asks_only_when_supported
 run_test "HF recommended command maps stream interval" test_hf_stream_interval_from_recommended_command
@@ -5812,6 +5867,8 @@ run_test "HF MTP launch sets batched tokens" test_hf_mtp_launch_sets_batched_tok
 run_test "HF KV FP8 question/recommendation" test_hf_kv_fp8_question_and_recommendation
 run_test "dry-run explain shows HF source and flags" test_dry_run_explain_shows_hf_and_flags
 run_test "CLI overrides win over HF metadata" test_hf_metadata_cli_overrides_win
+run_test "calibrate dry-run lists candidate configs" test_calibrate_dry_run_lists_candidates
+run_test "calibrate saves best config and run uses it" test_calibrate_saves_best_and_run_uses_it
 run_test "stale profile schema auto-refreshes on run" test_profile_schema_autoregen
 run_test "CUDA-graph calibration: try / stay-eager / use-graphs" test_cudagraph_calibration
 run_test "warmup cache migrates legacy single-peak entries" test_warmup_legacy_migration
