@@ -260,6 +260,20 @@ auto_enable_mtp_if_supported() {
   fi
 }
 
+adjust_memory_for_launch_features() {
+  [[ "${MTP_ENABLED:-0}" == "1" ]] || return 0
+  [[ "$ACCEL" == cuda-* ]] || return 0
+  local floor="${MTP_GPU_MEM_UTIL_FLOOR:-0.65}" extra="${MTP_RUNTIME_HEADROOM_GB:-30}" feature_need
+  is_mem_util "$floor" || floor="0.65"
+  awk -v x="$extra" 'BEGIN{exit !(x+0>=0)}' || extra="30"
+  feature_need=$(awk -v w="$WEIGHTS_GB" -v k="$KV_GB" -v x="$extra" -v h="$MEM_HEADROOM_PCT" \
+    'BEGIN{ printf "%.1f", (w+k+x)*(1+h/100) }')
+  GPU_MEM_UTIL=$(awk -v n="$feature_need" -v T="$TOTAL_MEM_GB" -v f="$floor" \
+    'BEGIN{ if(T<=0)T=128; u=n/T; if(u<f)u=f; if(u>0.95)u=0.95; if(u<0.05)u=0.05; printf "%.2f", u }')
+  NEED_GB=$(awk -v n="$feature_need" -v u="$GPU_MEM_UTIL" -v T="$TOTAL_MEM_GB" \
+    'BEGIN{ floor=u*T; if(n<floor)n=floor; printf "%.1f", n }')
+}
+
 auto_fit_context_to_budget() {
   local cname="$1" config_json="$2" reserved free target=""
   [[ -n "${mem:-}" || -n "${max_len:-}" ]] && return 0
@@ -526,6 +540,7 @@ run_backend_vllm() {
   recompute_memory "${model_path}/config.json"
   auto_fit_context_to_budget "$cname" "${model_path}/config.json"
   apply_launch_calibration
+  adjust_memory_for_launch_features
   if [[ -n "$mem" ]]; then
     # Manual fraction: derive need from it so budget accounting stays coherent.
     GPU_MEM_UTIL="$mem"
@@ -590,12 +605,20 @@ run_backend_vllm() {
     recompute_memory "${model_path}/config.json"
     auto_fit_context_to_budget "$cname" "${model_path}/config.json"
     apply_launch_calibration
+    adjust_memory_for_launch_features
     if [[ -n "$mem" ]]; then GPU_MEM_UTIL="$mem"; NEED_GB=$(awk -v m="$mem" -v T="$TOTAL_MEM_GB" 'BEGIN{ printf "%.1f", m*T }'); fi
     [[ "$no_reasoning" == "1" ]] && REASONING_PARSER=""
     validate_profile_values
   fi
   verify_capacity "$NEED_GB" "$cname" "$dry_run" "$mem" "$model" "${model_path}/config.json"
   ask_runtime_tradeoffs
+  recompute_memory "${model_path}/config.json"
+  auto_fit_context_to_budget "$cname" "${model_path}/config.json"
+  apply_launch_calibration
+  adjust_memory_for_launch_features
+  if [[ -n "$mem" ]]; then GPU_MEM_UTIL="$mem"; NEED_GB=$(awk -v m="$mem" -v T="$TOTAL_MEM_GB" 'BEGIN{ printf "%.1f", m*T }'); fi
+  [[ "$no_reasoning" == "1" ]] && REASONING_PARSER=""
+  verify_capacity "$NEED_GB" "$cname" "$dry_run" "$mem" "$model" "${model_path}/config.json"
   validate_profile_values
 
   # Assign a port (auto unless --port given). Reject collisions with live models.

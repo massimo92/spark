@@ -5176,6 +5176,20 @@ test_hf_mtp_auto_enables_when_supported() {
     [[ "$without_mtp" != *"MTP: auto-enable"* ]]
 }
 
+test_hf_mtp_raises_memory_floor() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/MTPMem" "$KV_CONFIG"
+  meta=$(hf_inspect_json true false 262144 false moe nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/MTPMem --dry-run </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--speculative-config"* ]] &&
+    [[ "$out" == *"--gpu-memory-utilization 0.65"* ]]
+}
+
 test_hf_stream_interval_from_recommended_command() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out meta
@@ -5876,6 +5890,7 @@ run_test "HF inspector prefers recommended multiline command" test_hf_inspector_
 run_test "HF inspector tools needs explicit tool-calling signal" test_hf_inspector_tools_requires_tool_calling_signal
 run_test "HF card recommended context wins" test_hf_card_context_wins
 run_test "HF MTP auto-enables when supported" test_hf_mtp_auto_enables_when_supported
+run_test "HF MTP raises memory floor" test_hf_mtp_raises_memory_floor
 run_test "HF recommended command maps stream interval" test_hf_stream_interval_from_recommended_command
 run_test "MTP batched tokens override HF command" test_mtp_batched_tokens_overrides_recommended_command
 run_test "Blackwell single-stream MTP uses flashinfer_cutlass + stream64" test_blackwell_single_stream_mtp_uses_flashinfer_cutlass_and_stream64
