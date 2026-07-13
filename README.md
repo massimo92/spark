@@ -55,6 +55,8 @@ spark setup --full           # install backend + gateway + private workspace
 spark models recommend       # pick a model for this hardware
 spark run qwen3:14b          # Apple Silicon / CPU example
 spark run Qwen/Qwen3-30B-A3B # NVIDIA/vLLM example
+spark alias create coding    # save a guided launch configuration
+spark run coding             # launch it later
 spark dashboard              # web UI at http://127.0.0.1:8787
 ```
 
@@ -73,6 +75,8 @@ spark status                 # one-shot operational summary
 spark doctor                 # read-only checks
 spark models recommend       # model suggestions for current hardware
 spark list                   # downloaded HuggingFace models
+spark alias list             # saved local launch aliases
+spark alias capture <alias>  # capture a live vLLM launch exactly
 spark logs [model]           # model logs
 spark stop [model|--all]     # stop running models
 ```

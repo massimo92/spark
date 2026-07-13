@@ -22,6 +22,8 @@ fi
 # --- Constants ---
 SPARK_CONFIG_DIR="${HOME}/.config/spark"
 PROFILES_DIR="${SPARK_CONFIG_DIR}/profiles"
+ALIASES_FILE="${SPARK_CONFIG_DIR}/aliases.json"
+ALIASES_BACKUP_FILE="${SPARK_CONFIG_DIR}/aliases.backup.json"
 UPDATE_FILE="${SPARK_CONFIG_DIR}/update.json"
 GITHUB_REPO="massimo92/spark"
 DEFAULT_PORT=8000

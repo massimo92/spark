@@ -33,30 +33,30 @@ EOF
 cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
-  local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto"
+  local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" run_flags=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; shift 2 ;;
-      --no-mem-limit) no_mem_limit=1; shift ;;
-      --enforce-eager)    enforce_eager_flag=1; shift ;;
-      --no-enforce-eager) enforce_eager_flag=0; shift ;;
-      --no-wait)   no_wait=1; shift ;;
-      --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; shift 2 ;;
-      --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; shift 2 ;;
-      --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; shift 2 ;;
-      --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; shift 2 ;;
-      --mtp)       mtp_flag=1; shift ;;
-      --no-mtp)    mtp_flag=0; shift ;;
-      --tools)     tools=1; shift ;;
-      --text-only) text_only=1; shift ;;
-      --no-reasoning) no_reasoning=1; shift ;;
-      --no-pull)   no_pull=1; shift ;;
-      --dry-run)   dry_run=1; shift ;;
-      --explain)   explain=1; shift ;;
-      --tail)      tail_logs=1; shift ;;
-      --force)     force=1; shift ;;
-      --regen-profile) regen=1; shift ;;
+      --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; run_flags=1; shift 2 ;;
+      --no-mem-limit) no_mem_limit=1; run_flags=1; shift ;;
+      --enforce-eager)    enforce_eager_flag=1; run_flags=1; shift ;;
+      --no-enforce-eager) enforce_eager_flag=0; run_flags=1; shift ;;
+      --no-wait)   no_wait=1; run_flags=1; shift ;;
+      --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; run_flags=1; shift 2 ;;
+      --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; run_flags=1; shift 2 ;;
+      --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; run_flags=1; shift 2 ;;
+      --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; run_flags=1; shift 2 ;;
+      --mtp)       mtp_flag=1; run_flags=1; shift ;;
+      --no-mtp)    mtp_flag=0; run_flags=1; shift ;;
+      --tools)     tools=1; run_flags=1; shift ;;
+      --text-only) text_only=1; run_flags=1; shift ;;
+      --no-reasoning) no_reasoning=1; run_flags=1; shift ;;
+      --no-pull)   no_pull=1; run_flags=1; shift ;;
+      --dry-run)   dry_run=1; run_flags=1; shift ;;
+      --explain)   explain=1; run_flags=1; shift ;;
+      --tail)      tail_logs=1; run_flags=1; shift ;;
+      --force)     force=1; run_flags=1; shift ;;
+      --regen-profile) regen=1; run_flags=1; shift ;;
       -h|--help)   cmd_run_help; return 0 ;;
       -*)          die "Unknown flag: $1" "Run 'spark run --help' for usage" ;;
       *)           [[ -z "$model" ]] || die "Only one model can be specified"; model="$1"; shift ;;
@@ -64,6 +64,11 @@ cmd_run() {
   done
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
+  if [[ "${SPARK_ALIAS_BYPASS:-0}" != "1" ]] && alias_exists "$model"; then
+    [[ "$run_flags" == "0" ]] || die "Aliases do not accept run flags" "Edit it first: spark alias edit ${model}"
+    cmd_alias_run "$model"
+    return 0
+  fi
   validate_model_ref_for_backend "$model"
 
   # Pick the engine from the detected hardware (vLLM on NVIDIA, Ollama elsewhere).
@@ -72,6 +77,283 @@ cmd_run() {
     vllm)   run_backend_vllm ;;
     ollama) run_backend_ollama ;;
     *)      die "Unknown backend: $BACKEND" "Set SPARK_BACKEND to 'vllm' or 'ollama'" ;;
+  esac
+}
+
+# --- Launch aliases ---
+
+is_safe_alias_name() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+}
+
+alias_init_store() {
+  mkdir -p "$SPARK_CONFIG_DIR" || die "Cannot create ${SPARK_CONFIG_DIR}"
+  chmod 700 "$SPARK_CONFIG_DIR" 2>/dev/null || true
+  if [[ ! -f "$ALIASES_FILE" ]]; then
+    printf '{}\n' > "$ALIASES_FILE" || die "Cannot write ${ALIASES_FILE}"
+    chmod 600 "$ALIASES_FILE" || die "Cannot secure ${ALIASES_FILE}"
+  fi
+  jq -e 'type == "object"' "$ALIASES_FILE" >/dev/null 2>&1 \
+    || die "Invalid alias store: ${ALIASES_FILE}" "Restore it from ${ALIASES_BACKUP_FILE} or fix its JSON."
+}
+
+alias_write_file() {
+  local file="$1" contents="$2" tmp
+  tmp=$(mktemp "${file}.tmp.XXXXXX") || die "Cannot create temporary alias file"
+  printf '%s\n' "$contents" > "$tmp" || { rm -f "$tmp"; die "Cannot write alias file"; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; die "Cannot secure alias file"; }
+  mv "$tmp" "$file" || { rm -f "$tmp"; die "Cannot replace alias file"; }
+}
+
+alias_exists() {
+  is_safe_alias_name "$1" || return 1
+  [[ -f "$ALIASES_FILE" ]] || return 1
+  jq -e --arg name "$1" '.[$name] != null' "$ALIASES_FILE" >/dev/null 2>&1
+}
+
+alias_definition() {
+  alias_init_store
+  jq -ce --arg name "$1" '.[$name] // empty' "$ALIASES_FILE"
+}
+
+alias_save_definition() {
+  local name="$1" definition="$2" force="${3:-0}" current updated backup
+  is_safe_alias_name "$name" || die "Invalid alias: ${name}" "Use 1-64 letters, numbers, dots, underscores, or hyphens."
+  jq -e 'type == "object" and (.backend | strings) and (.model | strings) and (.kind | strings)' \
+    >/dev/null <<<"$definition" || die "Invalid alias definition"
+  alias_init_store
+  current=$(jq -ce --arg name "$name" '.[$name] // empty' "$ALIASES_FILE" 2>/dev/null || true)
+  if [[ -n "$current" && "$force" != "1" ]]; then
+    die "Alias '${name}' already exists" "Use --force to replace it, or spark alias edit ${name}."
+  fi
+  if [[ -n "$current" ]]; then
+    if [[ -f "$ALIASES_BACKUP_FILE" ]]; then
+      backup=$(jq -c --arg name "$name" --argjson value "$current" '.[$name] = $value' "$ALIASES_BACKUP_FILE") \
+        || die "Invalid alias backup: ${ALIASES_BACKUP_FILE}"
+    else
+      backup=$(jq -nc --arg name "$name" --argjson value "$current" '{($name): $value}')
+    fi
+    alias_write_file "$ALIASES_BACKUP_FILE" "$backup"
+  fi
+  updated=$(jq -c --arg name "$name" --argjson value "$definition" '.[$name] = $value' "$ALIASES_FILE") \
+    || die "Cannot update aliases"
+  alias_write_file "$ALIASES_FILE" "$updated"
+}
+
+alias_vllm_value() {
+  local args="$1" flag="$2"
+  jq -r --arg flag "$flag" '
+    . as $args | range(0; length - 1) as $i | select($args[$i] == $flag) | $args[$i + 1]
+  ' <<<"$args" | tail -1
+}
+
+alias_vllm_has() {
+  jq -e --arg flag "$2" 'index($flag) != null' <<<"$1" >/dev/null
+}
+
+alias_prompt_value() {
+  local prompt="$1" value=""
+  printf '  %s: ' "$prompt" >&2
+  read -r value || value=""
+  printf '%s\n' "$value"
+}
+
+alias_prompt_yes() {
+  local answer
+  answer=$(alias_prompt_value "$1 [y/N]")
+  [[ "$answer" =~ ^[Yy] ]]
+}
+
+alias_choose_model() {
+  local choice="" i
+  if [[ "$BACKEND" == "vllm" ]]; then
+    collect_downloaded_models
+    if [[ ${#MODEL_LIST_MODELS[@]} -gt 0 ]]; then
+      printf '  Local models:\n' >&2
+      for i in "${!MODEL_LIST_MODELS[@]}"; do printf '    %d) %s\n' "$((i + 1))" "${MODEL_LIST_MODELS[$i]}" >&2; done
+    fi
+  elif command -v ollama >/dev/null 2>&1; then
+    printf '  Local models:\n' >&2
+    ollama list 2>/dev/null | awk 'NR>1 {printf "    %s\n", $1}' >&2 || true
+  fi
+  choice=$(alias_prompt_value "Model (number or reference)")
+  if [[ "$choice" =~ ^[0-9]+$ && "$BACKEND" == "vllm" ]] \
+      && [[ "$choice" -ge 1 && "$choice" -le ${#MODEL_LIST_MODELS[@]} ]]; then
+    printf '%s\n' "${MODEL_LIST_MODELS[$((choice - 1))]}"
+  else
+    printf '%s\n' "$choice"
+  fi
+}
+
+alias_guided_definition() {
+  local model mem max_len kv seqs mtp eager port args_json definition
+  local -a args=()
+  is_interactive || die "Alias creation is interactive" "Run it in a terminal."
+  model=$(alias_choose_model)
+  [[ -n "$model" ]] || die "A model is required"
+  validate_model_ref_for_backend "$model"
+
+  mem=$(alias_prompt_value "GPU memory fraction (blank = auto)")
+  [[ -z "$mem" ]] || args+=(--mem "$mem")
+  alias_prompt_yes "Disable cgroup memory limit" && args+=(--no-mem-limit)
+  max_len=$(alias_prompt_value "Max context length (blank = auto)")
+  [[ -z "$max_len" ]] || args+=(--max-len "$max_len")
+  kv=$(alias_prompt_value "KV cache dtype: auto/fp8 (blank = auto)")
+  [[ -z "$kv" || "$kv" == "auto" ]] || args+=(--kv-cache-dtype "$kv")
+  seqs=$(alias_prompt_value "Max concurrent sequences (blank = auto)")
+  [[ -z "$seqs" ]] || args+=(--max-num-seqs "$seqs")
+  mtp=$(alias_prompt_value "MTP: auto/on/off (blank = auto)")
+  [[ "$mtp" != "on" ]] || args+=(--mtp)
+  [[ "$mtp" != "off" ]] || args+=(--no-mtp)
+  eager=$(alias_prompt_value "CUDA graphs: auto/on/off (blank = auto)")
+  [[ "$eager" != "on" ]] || args+=(--enforce-eager)
+  [[ "$eager" != "off" ]] || args+=(--no-enforce-eager)
+  port=$(alias_prompt_value "Model API port (blank = auto)")
+  [[ -z "$port" ]] || args+=(--port "$port")
+  alias_prompt_yes "Enable tool calling" && args+=(--tools)
+  alias_prompt_yes "Disable vision input" && args+=(--text-only)
+  alias_prompt_yes "Disable reasoning parser" && args+=(--no-reasoning)
+  alias_prompt_yes "Do not download a missing model" && args+=(--no-pull)
+  alias_prompt_yes "Start without waiting for readiness" && args+=(--no-wait)
+  alias_prompt_yes "Replace an already running model" && args+=(--force)
+  alias_prompt_yes "Recompute model profile before launch" && args+=(--regen-profile)
+  :
+
+  args_json=$(jq -nc '$ARGS.positional' --args "${args[@]}")
+  definition=$(jq -nc --arg backend "$BACKEND" --arg model "$model" --argjson args "$args_json" \
+    '{kind:"guided", backend:$backend, model:$model, run_args:$args}')
+  printf '%s\n' "$definition"
+}
+
+cmd_alias_capture() {
+  local name="$1" force="${2:-0}" line cname model port rest choice args definition
+  local -a names=() models=()
+  while IFS=$'\t' read -r cname model port rest; do
+    [[ -n "$cname" && -n "$model" ]] || continue
+    names+=("$cname"); models+=("$model")
+  done < <(list_managed_containers)
+  [[ ${#names[@]} -gt 0 ]] || die "No live Spark vLLM runs to capture"
+  printf '  Live runs:\n'
+  local i
+  for i in "${!names[@]}"; do printf '    %d) %s  (%s)\n' "$((i + 1))" "${models[$i]}" "${names[$i]}"; done
+  choice=$(alias_prompt_value "Run to capture")
+  [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#names[@]} ]] \
+    || die "Choose a run number from the list"
+  i=$((choice - 1)); cname="${names[$i]}"; model="${models[$i]}"
+  args=$(docker inspect -f '{{json .Config.Cmd}}' "$cname" 2>/dev/null || true)
+  jq -e 'type == "array" and length >= 3 and .[0] == "vllm" and .[1] == "serve"' >/dev/null <<<"$args" \
+    || die "Cannot read effective vLLM arguments from ${cname}"
+  definition=$(jq -nc --arg model "$model" --argjson args "$args" \
+    '{kind:"captured-vllm", backend:"vllm", model:$model, vllm_args:$args}')
+  alias_save_definition "$name" "$definition" "$force"
+  info "Captured '${name}' from ${cname}"
+}
+
+cmd_alias_run() {
+  local name="$1" definition backend kind
+  definition=$(alias_definition "$name") || die "Alias '${name}' does not exist"
+  backend=$(jq -r '.backend' <<<"$definition")
+  kind=$(jq -r '.kind' <<<"$definition")
+  case "$kind" in
+    guided)
+      [[ "$backend" == "$BACKEND" ]] || warn "Alias '${name}' was created for ${backend}; checking it on ${BACKEND}."
+      local model SPARK_ALIAS_BYPASS=1
+      local -a run_args=()
+      model=$(jq -r '.model' <<<"$definition")
+      while IFS= read -r arg; do run_args+=("$arg"); done < <(jq -r '.run_args[]' <<<"$definition")
+      cmd_run "$model" "${run_args[@]}"
+      ;;
+    captured-vllm)
+      [[ "$BACKEND" == "vllm" ]] || die "Alias '${name}' captures a vLLM launch; this machine uses ${BACKEND}" \
+        "Create or edit an alias for this backend: spark alias edit ${name}"
+      local model port mem max_len kv_dtype tools=0 text_only=0 no_reasoning=0 dry_run=0 explain=0 tail_logs=0
+      local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto"
+      local ALIAS_VLLM_ARGS_JSON
+      ALIAS_VLLM_ARGS_JSON=$(jq -c '.vllm_args' <<<"$definition")
+      model=$(jq -r '.model' <<<"$definition")
+      mem=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --gpu-memory-utilization)
+      max_len=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-model-len)
+      max_num_seqs=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-num-seqs)
+      port=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --port)
+      kv_dtype=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --kv-cache-dtype)
+      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enforce-eager && enforce_eager_flag=1
+      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --speculative-config && mtp_flag=1
+      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enable-auto-tool-choice && tools=1
+      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --limit-mm-per-prompt && text_only=1
+      validate_model_ref_for_backend "$model"
+      run_backend_vllm
+      ;;
+    *) die "Alias '${name}' has an unsupported kind: ${kind}" ;;
+  esac
+}
+
+cmd_alias() {
+  local action="${1:-help}" name="" force=0 definition
+  shift || true
+  case "$action" in
+    create)
+      name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark alias create <alias>"
+      definition=$(alias_guided_definition)
+      alias_save_definition "$name" "$definition"
+      info "Saved alias '${name}'"
+      ;;
+    edit)
+      name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark alias edit <alias>"
+      alias_exists "$name" || die "Alias '${name}' does not exist"
+      definition=$(alias_guided_definition)
+      alias_save_definition "$name" "$definition" 1
+      info "Updated alias '${name}'"
+      ;;
+    capture)
+      name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark alias capture <alias> [--force]"
+      [[ "${2:-}" == "--force" || -z "${2:-}" ]] || die "Unknown capture flag: ${2:-}"
+      [[ "${2:-}" == "--force" ]] && force=1
+      cmd_alias_capture "$name" "$force"
+      ;;
+    list)
+      alias_init_store
+      jq -r 'to_entries[] | "  \(.key)\t\(.value.backend)\t\(.value.model)\t\(.value.kind)"' "$ALIASES_FILE" \
+        | { read -r first || true; [[ -n "${first:-}" ]] || { printf '  No aliases saved.\n'; return 0; }; printf '  NAME\tBACKEND\tMODEL\tSOURCE\n%s\n' "$first"; cat; }
+      ;;
+    show)
+      name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark alias show <alias>"
+      alias_definition "$name" | jq .
+      ;;
+    remove)
+      name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark alias remove <alias>"
+      definition=$(alias_definition "$name") || die "Alias '${name}' does not exist"
+      confirm "Remove alias '${name}'?" || { printf '    Aborted.\n'; return 0; }
+      alias_save_definition "$name" "$definition" 1
+      alias_write_file "$ALIASES_FILE" "$(jq -c --arg name "$name" 'del(.[$name])' "$ALIASES_FILE")"
+      info "Removed alias '${name}'"
+      ;;
+    rollback)
+      name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark alias rollback <alias>"
+      [[ -f "$ALIASES_BACKUP_FILE" ]] || die "No rollback copy for '${name}'"
+      definition=$(jq -ce --arg name "$name" '.[$name] // empty' "$ALIASES_BACKUP_FILE" 2>/dev/null || true) \
+        || die "No rollback copy for '${name}'"
+      confirm "Restore previous '${name}'?" || { printf '    Aborted.\n'; return 0; }
+      alias_save_definition "$name" "$definition" 1
+      info "Rolled back alias '${name}'"
+      ;;
+    help|-h|--help)
+      cat <<EOF
+
+  ${BOLD}Usage:${NC} spark alias <command>
+
+    create <alias>            Guided alias creation
+    capture <alias> [--force] Capture a live vLLM run exactly
+    edit <alias>              Recreate an alias with the guide
+    list                      List local aliases
+    show <alias>              Print an alias definition
+    remove <alias>            Remove an alias
+    rollback <alias>          Restore its previous definition
+
+  Run an alias with: spark run <alias>
+
+EOF
+      ;;
+    *) die "Unknown alias command: ${action}" "Run 'spark alias --help' for usage" ;;
   esac
 }
 
@@ -396,6 +678,14 @@ build_launch() {
     fi
   fi
   [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt image=0)
+
+  # Captured aliases preserve the effective vLLM command, including flags that
+  # Spark normally derives from the hardware/model profile. Docker safety and
+  # capacity checks are still rebuilt for the current host below.
+  if [[ -n "${ALIAS_VLLM_ARGS_JSON:-}" ]]; then
+    vllm_args=()
+    while IFS= read -r arg; do vllm_args+=("$arg"); done < <(jq -r '.[]' <<<"$ALIAS_VLLM_ARGS_JSON")
+  fi
 
   # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
   # set higher (by the provisioned swap) so the LOAD-time peak — the loader transiently needs ~2x the

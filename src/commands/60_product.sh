@@ -509,6 +509,7 @@ cmd_help() {
     doctor           Check all prerequisites (read-only)
     models           Recommend models for this hardware
     run <model>      Start serving a model (can run several at once)
+    alias            Save, inspect, and restore launch aliases
     calibrate <model> Measure launch configs and save the fastest one
     stop [<model>]   Stop a model (no arg: the only one; --all: every one)
     pull <model>     Download a model from HuggingFace
