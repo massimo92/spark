@@ -1828,6 +1828,9 @@ add_recommended_command_flags() {
   value="$(hf_command_value --load-format)"
   [[ "$value" =~ ^[A-Za-z0-9_.-]+$ ]] && add_vllm_flag_once --load-format "$value"
 
+  value="$(hf_command_value --quantization)"
+  [[ "$value" =~ ^[A-Za-z0-9_.+-]+$ ]] && add_vllm_flag_once --quantization "$value"
+
   value="$(hf_command_value --max-num-batched-tokens)"
   [[ "$value" =~ ^[0-9]+$ ]] && add_vllm_flag_once --max-num-batched-tokens "$value"
 
