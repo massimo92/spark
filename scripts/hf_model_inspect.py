@@ -132,6 +132,12 @@ def extract_command(card_text: str) -> str:
     return candidates[0][1]
 
 
+def extract_recommended_image(card_text: str) -> str:
+    """Return only the official vLLM image explicitly named by the model card."""
+    match = re.search(r"\b(vllm/vllm-openai:[A-Za-z0-9_.-]+)\b", card_text)
+    return match.group(1) if match else ""
+
+
 def extract_card_context(card_text: str, command: str) -> int | None:
     match = re.search(r"--max-model-len\s+([0-9][0-9,_.]*[kKmM]?)", command)
     if match:
@@ -387,6 +393,7 @@ def main() -> int:
         "card": {
             "license": card_license,
             "recommended_runtime": recommended_runtime(card_text, tags, command),
+            "recommended_image": extract_recommended_image(card_text),
             "recommended_command": command,
             "long_context": bool((card_ctx or cfg_ctx or 0) >= 65536),
             "recommended_context": card_ctx,

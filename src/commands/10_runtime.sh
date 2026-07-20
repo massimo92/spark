@@ -722,9 +722,17 @@ build_launch() {
     --label "spark.weights_gb=${WEIGHTS_GB}"
     --label "spark.kv_gb=${KV_GB}"
     --label "spark.max_model_len=${MAX_MODEL_LEN}")
+  if [[ "$ngc_image" == vllm/vllm-openai:* ]]; then
+    # The official image already has `vllm serve` as its entrypoint. USER and
+    # LOGNAME also let its Python runtime resolve Spark's unprivileged host UID.
+    docker_cmd+=(-e USER=spark -e LOGNAME=spark)
+  fi
   [[ "$use_marlin_atomic" == "1" ]] && docker_cmd+=(-e VLLM_MARLIN_USE_ATOMIC_ADD=1)
   [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_swap_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
   docker_cmd+=("$ngc_image")
+  container_vllm_args=("${vllm_args[@]}")
+  [[ "$ngc_image" == vllm/vllm-openai:* ]] && container_vllm_args=("${vllm_args[@]:2}")
+  return 0
 }
 
 # Watch a just-launched vLLM container until it serves or stops. Echoes one of:
@@ -924,6 +932,11 @@ run_backend_vllm() {
   # Detect NGC image
   local ngc_image
   ngc_image=$(detect_ngc_image)
+  if [[ -z "${SPARK_VLLM_IMAGE:-}" && \
+        "${HF_RECOMMENDED_IMAGE:-}" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ ]] && \
+     docker image inspect "$HF_RECOMMENDED_IMAGE" >/dev/null 2>&1; then
+    ngc_image="$HF_RECOMMENDED_IMAGE"
+  fi
   [[ -z "$ngc_image" ]] && die "No NGC vLLM container found" "Run: spark setup"
 
   # Concurrency cap (raise with --max-num-seqs); cgroup headroom for the startup peak (cached per
@@ -944,7 +957,7 @@ run_backend_vllm() {
   headroom_gb=$(awk -v p="$mode_peak" -v n="$NEED_GB" -v d="$WARMUP_HEADROOM_GB" \
     'BEGIN{ if(p+0<=0){ printf "%d", d; exit } h=p-n; if(h<4)h=4; printf "%.0f", h }')
   [[ "${EAGER_CALIBRATING:-0}" == "1" ]] && info "Calibrating: trying CUDA graphs once to measure the real peak (auto-falls back to eager if it doesn't fit)."
-  local vllm_args=() docker_cmd=() mem_limit_mib=""
+  local vllm_args=() container_vllm_args=() docker_cmd=() mem_limit_mib=""
   build_launch
 
   # Memory accounting breakdown (shown in dry-run and at launch).
@@ -956,7 +969,7 @@ run_backend_vllm() {
   if [[ "$dry_run" == "1" ]]; then
     print_launch_explain
     printf "${DIM}# Docker command that would be executed:${NC}\n"
-    shell_join "${docker_cmd[@]}" "${vllm_args[@]}"
+    shell_join "${docker_cmd[@]}" "${container_vllm_args[@]}"
     printf "\n"
     return 0
   fi
@@ -972,7 +985,7 @@ run_backend_vllm() {
     printf "\n"
     local run_log run_exit=0
     run_log=$(mktemp)
-    "${docker_cmd[@]}" "${vllm_args[@]}" >"$run_log" 2>&1 || run_exit=$?
+    "${docker_cmd[@]}" "${container_vllm_args[@]}" >"$run_log" 2>&1 || run_exit=$?
     if [[ "$run_exit" -ne 0 ]]; then
       err "docker run failed (exit $run_exit)"
       if docker logs "$cname" >/dev/null 2>&1; then
