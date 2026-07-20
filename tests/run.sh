@@ -1797,6 +1797,30 @@ test_workspace_restart_orders_stop_then_start() {
   [[ "$out" == $'stop\nstart' ]]
 }
 
+test_workspace_bridge_waits_for_delayed_readiness() {
+  local tmp out
+  tmp=$(mktemp -d)
+  out=$(HOME="${tmp}/home" bash -c '
+    source "$1"
+    probes=0
+    workspace_openshell_bridge_ip() { printf "172.19.0.1\n"; }
+    docker() {
+      case "${1:-}" in
+        inspect) printf "true\n" ;;
+      esac
+    }
+    curl() {
+      probes=$((probes + 1))
+      [[ "$probes" -ge 8 ]]
+    }
+    sleep() { :; }
+    workspace_start_hermes_gateway_proxy
+    printf "probes=%s\n" "$probes"
+  ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$out" == "probes=8" ]]
+}
+
 test_workspace_model_start_disables_mtp_for_reliable_recovery() {
   local tmp out
   tmp=$(mktemp -d)
@@ -6253,6 +6277,7 @@ run_test "setup --full continues after swap reconcile" test_setup_full_continues
 run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
+run_test "workspace bridge waits for delayed readiness" test_workspace_bridge_waits_for_delayed_readiness
 run_test "workspace model recovery disables MTP" test_workspace_model_start_disables_mtp_for_reliable_recovery
 run_test "workspace status uses Tailscale Services config" test_workspace_status_uses_tailscale_services_config
 run_test "workspace normalizes Hermes container name" test_workspace_normalizes_hermes_name
