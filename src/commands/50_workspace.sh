@@ -588,7 +588,7 @@ HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
 HERMES_MODEL=${model}
 HERMES_LITELLM_MODEL=${litellm_model}
-HERMES_LITELLM_BASE_URL=http://127.0.0.1:${GATEWAY_PORT}/v1
+HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
 HERMES_POLICY_TIER=restricted
 HERMES_ONBOARD_STATUS=$(workspace_env_or_value HERMES_ONBOARD_STATUS pending)
 WORKSPACE_MENTION_SECRET=${mention_secret}
@@ -1457,6 +1457,73 @@ workspace_nemohermes_maintained_release() {
   ! workspace_nemohermes_update_available
 }
 
+workspace_openshell_bridge_ip() {
+  local bridge_ip
+  bridge_ip=$(docker network inspect openshell-docker \
+    --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null | head -n 1)
+  [[ "$bridge_ip" =~ ^[0-9]+([.][0-9]+){3}$ ]] || return 1
+  printf '%s\n' "$bridge_ip"
+}
+
+workspace_start_hermes_gateway_proxy() {
+  local bridge_ip proxy_script attempt
+  bridge_ip=$(workspace_openshell_bridge_ip) || return 1
+  proxy_script="${WORKSPACE_CONFIG_DIR}/hermes-litellm-proxy.py"
+  mkdir -p "$WORKSPACE_CONFIG_DIR"
+  cat > "$proxy_script" <<'PY'
+import asyncio
+import sys
+
+
+async def relay(reader, writer):
+    try:
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+    finally:
+        writer.close()
+
+
+async def handle(client_reader, client_writer):
+    try:
+        server_reader, server_writer = await asyncio.open_connection(sys.argv[3], int(sys.argv[4]))
+        await asyncio.gather(
+            relay(client_reader, server_writer),
+            relay(server_reader, client_writer),
+        )
+    except Exception:
+        client_writer.close()
+
+
+async def main():
+    server = await asyncio.start_server(handle, sys.argv[1], int(sys.argv[2]))
+    async with server:
+        await server.serve_forever()
+
+
+asyncio.run(main())
+PY
+  chmod 600 "$proxy_script"
+  docker rm -f "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --network host \
+    --name "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" \
+    --restart unless-stopped \
+    -v "${proxy_script}:/app/hermes-litellm-proxy.py:ro" \
+    --entrypoint python "$LITELLM_IMAGE" \
+    /app/hermes-litellm-proxy.py "$bridge_ip" "$GATEWAY_PORT" 127.0.0.1 "$GATEWAY_PORT" \
+    >/dev/null 2>&1 || return 1
+  for attempt in 1 2 3 4 5; do
+    curl -fsS --max-time 2 "http://${bridge_ip}:${GATEWAY_PORT}/v1/models" >/dev/null 2>&1 && return 0
+    [[ "$(docker inspect --format '{{.State.Running}}' "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" 2>/dev/null)" == "true" ]] || return 1
+    sleep 1
+  done
+  return 1
+}
+
+workspace_stop_hermes_gateway_proxy() {
+  docker rm -f "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" >/dev/null 2>&1 || true
+}
+
 workspace_setup_hermes() {
   local model="$1" tailnet="$2" check_only="$3" hermes_url litellm_model
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
@@ -1490,7 +1557,7 @@ workspace_setup_hermes() {
       NEMOCLAW_NO_GPU=1 \
       NEMOCLAW_SANDBOX_GPU=0 \
       NEMOCLAW_PROVIDER=custom \
-      NEMOCLAW_ENDPOINT_URL="http://127.0.0.1:${GATEWAY_PORT}/v1" \
+      NEMOCLAW_ENDPOINT_URL="http://host.openshell.internal:${GATEWAY_PORT}/v1" \
       NEMOCLAW_MODEL="$litellm_model" \
       NEMOCLAW_PREFERRED_API=openai-completions \
       NEMOCLAW_DASHBOARD_PORT="$WORKSPACE_HERMES_PORT" \
@@ -1520,7 +1587,7 @@ workspace_setup_hermes() {
       NEMOCLAW_NO_GPU=1 \
       NEMOCLAW_SANDBOX_GPU=0 \
       NEMOCLAW_PROVIDER=custom \
-      NEMOCLAW_ENDPOINT_URL="http://127.0.0.1:${GATEWAY_PORT}/v1" \
+      NEMOCLAW_ENDPOINT_URL="http://host.openshell.internal:${GATEWAY_PORT}/v1" \
       NEMOCLAW_MODEL="$litellm_model" \
       NEMOCLAW_PREFERRED_API=openai-completions \
       NEMOCLAW_DASHBOARD_PORT="$WORKSPACE_HERMES_PORT" \
@@ -1529,10 +1596,13 @@ workspace_setup_hermes() {
       NEMOCLAW_POLICY_MODE=suggested \
       COMPATIBLE_API_KEY=dummy \
       CHAT_UI_URL="$hermes_url" \
-      bash -c 'curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash' \
-      && workspace_start_hermes_private_proxy \
-      && { workspace_set_env_key HERMES_ONBOARD_STATUS configured; info "Installed Hermes with NemoClaw"; } \
-      || { workspace_set_env_key HERMES_ONBOARD_STATUS manual; setup_fail "Hermes/NemoClaw install failed"; }
+      bash -c 'curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash' || true
+    if command -v nemohermes >/dev/null 2>&1 && workspace_start_hermes_gateway_proxy; then
+      workspace_setup_hermes "$model" "$tailnet" "$check_only"
+    else
+      workspace_set_env_key HERMES_ONBOARD_STATUS manual
+      setup_fail "Hermes/NemoClaw install failed"
+    fi
   fi
 }
 
@@ -1949,7 +2019,13 @@ workspace_setup() {
   workspace_ensure_postgres_databases
   workspace_configure_tailscale "$tailnet" "$check_only" "$funnel_action" "$auto_yes"
   if workspace_tailscale_services_mode && workspace_tailscale_service_host_advertised; then
-    workspace_setup_hermes "$model" "$tailnet" "$check_only"
+    if command -v nemohermes >/dev/null 2>&1; then
+      workspace_start_hermes_gateway_proxy \
+        && workspace_setup_hermes "$model" "$tailnet" "$check_only" \
+        || setup_fail "Could not expose LiteLLM on the private OpenShell bridge"
+    else
+      workspace_setup_hermes "$model" "$tailnet" "$check_only"
+    fi
   else
     workspace_set_env_key HERMES_ONBOARD_STATUS manual
     setup_fail "Hermes onboarding skipped until Tailscale private access is configured"
@@ -2053,6 +2129,10 @@ workspace_start() {
     rc=1
   fi
 
+  workspace_start_hermes_gateway_proxy \
+    && info "Hermes inference bridge started" \
+    || { err "Could not start Hermes inference bridge"; rc=1; }
+
   tailnet=$(workspace_tailnet_suffix 2>/dev/null || true)
   if workspace_tailscale_services_configured; then
     info "Tailscale workspace access configured"
@@ -2092,6 +2172,9 @@ workspace_stop() {
   else
     info "Hermes/NemoClaw already stopped"
   fi
+
+  workspace_stop_hermes_gateway_proxy
+  info "Stopped Hermes inference bridge"
 
   gateway_stop || rc=1
 
@@ -2140,6 +2223,7 @@ cmd_workspace_health() {
   workspace_status_item "Hermes private URL" workspace_hermes_private_status_url_ready
   workspace_status_item "No public listeners" workspace_host_listeners_loopback_only
   workspace_status_item "LiteLLM gateway" workspace_gateway_running
+  workspace_status_item "Hermes inference bridge" workspace_hermes_gateway_proxy_running
   workspace_status_item "LiteLLM Hermes route" workspace_litellm_model_routed
   workspace_status_item "Hermes model" workspace_model_running "$model"
   workspace_status_item "Hermes/NemoClaw" workspace_hermes_running
@@ -3415,6 +3499,10 @@ workspace_tailscale_services_mode() {
 
 workspace_gateway_running() {
   docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$GATEWAY_CONTAINER"
+}
+
+workspace_hermes_gateway_proxy_running() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER"
 }
 
 workspace_model_running() {

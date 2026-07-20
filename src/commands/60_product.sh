@@ -86,7 +86,10 @@ nemohermes_rebuild_with_workspace_env() {
   [[ -n "$compatible_api_key" ]] || compatible_api_key=dummy
 
   base_url="${NEMOCLAW_ENDPOINT_URL:-$(workspace_read_env HERMES_LITELLM_BASE_URL 2>/dev/null || true)}"
-  [[ -n "$base_url" ]] || base_url="http://127.0.0.1:${GATEWAY_PORT}/v1"
+  [[ -n "$base_url" ]] || base_url="http://host.openshell.internal:${GATEWAY_PORT}/v1"
+  base_url="${base_url/http:\/\/127.0.0.1:${GATEWAY_PORT}/http:\/\/host.openshell.internal:${GATEWAY_PORT}}"
+  base_url="${base_url/http:\/\/localhost:${GATEWAY_PORT}/http:\/\/host.openshell.internal:${GATEWAY_PORT}}"
+  workspace_start_hermes_gateway_proxy || return 1
 
   model="${NEMOCLAW_MODEL:-$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)}"
   if [[ -z "$model" ]]; then
