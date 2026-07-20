@@ -310,7 +310,7 @@ workspace_ensure_gateway() {
     elif [[ "$auto_yes" == "1" ]] || confirm "Start ${model} now with spark run?"; then
       # Workspace recovery favors a reliable full-context launch. MTP can add enough
       # runtime headroom to exceed unified-memory hosts even when the base model fits.
-      cmd_run "$model" --no-wait --no-mtp
+      cmd_run "$model" --no-mtp
     else
       setup_fail "Hermes model not started: $model"
     fi

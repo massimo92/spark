@@ -1800,7 +1800,7 @@ test_workspace_model_start_disables_mtp_for_reliable_recovery() {
     workspace_ensure_gateway 0 1 Org/Model
   ' _ "$SPARK")
   rm -rf "$tmp"
-  [[ "$out" == *"Org/Model --no-wait --no-mtp"* ]]
+  [[ "$out" == *"Org/Model --no-mtp"* ]] && [[ "$out" != *"--no-wait"* ]]
 }
 
 test_workspace_status_uses_tailscale_services_config() {
@@ -1980,7 +1980,7 @@ test_workspace_rejects_partial_model() {
     [[ "$out" == *"Model not found or not fully downloaded in spark list: Org/Partial"* ]]
 }
 
-test_workspace_setup_starts_model_detached() {
+test_workspace_setup_waits_for_model() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -1993,8 +1993,8 @@ test_workspace_setup_starts_model_detached() {
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1 || true)
   rm -rf "$tmp"
   [[ "$out" == *"Container '"*"started"* ]] &&
-    [[ "$out" == *"Logs: "*"spark logs Org/Alpha"* ]] &&
-    [[ "$out" != *"waiting for it to serve"* ]]
+    [[ "$out" == *"started. "*"serving"* ]] &&
+    [[ "$out" == *"waiting for it to serve"* ]]
 }
 
 test_workspace_setup_writes_compose_names() {
@@ -5472,6 +5472,23 @@ test_hf_recommended_official_image_entrypoint() {
     [[ "$out" != *"vllm/vllm-openai:nightly vllm serve"* ]]
 }
 
+test_hf_recommended_image_falls_back_to_local_readme() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta model_dir
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/ReadmeImage" "$KV_CONFIG"
+  model_dir="${tmp}/home/.cache/huggingface/hub/models--Org--ReadmeImage/snapshots/1"
+  printf 'Use docker image `vllm/vllm-openai:nightly`.\n' > "${model_dir}/README.md"
+  meta=$(hf_inspect_json false false 32768 false dense nvfp4 \
+    "vllm serve Org/ReadmeImage --quantization modelopt")
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    FAKE_DOCKER_IMAGE=$'vllm/vllm-openai:nightly\nnvcr.io/nvidia/vllm:26.05-py3' \
+    "$SPARK" run Org/ReadmeImage --dry-run --no-mtp </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"vllm/vllm-openai:nightly Org/ReadmeImage"* ]]
+}
+
 test_mtp_batched_tokens_overrides_recommended_command() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out meta
@@ -6180,6 +6197,7 @@ run_test "HF MTP raises memory floor" test_hf_mtp_raises_memory_floor
 run_test "HF recommended command maps stream interval" test_hf_stream_interval_from_recommended_command
 run_test "HF recommended command maps quantization" test_hf_quantization_from_recommended_command
 run_test "HF recommended official image uses its entrypoint" test_hf_recommended_official_image_entrypoint
+run_test "HF recommended image falls back to local README" test_hf_recommended_image_falls_back_to_local_readme
 run_test "MTP batched tokens override HF command" test_mtp_batched_tokens_overrides_recommended_command
 run_test "Blackwell single-stream MTP uses flashinfer_cutlass + stream64" test_blackwell_single_stream_mtp_uses_flashinfer_cutlass_and_stream64
 run_test "HF MTP launch sets batched tokens" test_hf_mtp_launch_sets_batched_tokens
@@ -6228,7 +6246,7 @@ run_test "workspace setup --check preserves existing config" test_workspace_chec
 run_test "workspace setup --check reports missing Compose plugin" test_workspace_check_reports_missing_compose_plugin
 run_test "workspace setup model picker uses spark list data" test_workspace_model_tui_uses_list
 run_test "workspace setup rejects partial model" test_workspace_rejects_partial_model
-run_test "workspace setup starts Hermes model detached" test_workspace_setup_starts_model_detached
+run_test "workspace setup waits for Hermes model" test_workspace_setup_waits_for_model
 run_test "workspace setup rejects invalid Tailscale mode" test_workspace_setup_rejects_bad_tailscale_mode
 run_test "workspace setup rejects invalid Docker image refs" test_workspace_setup_rejects_bad_image_ref
 run_test "workspace setup rejects multiline secrets" test_workspace_setup_rejects_multiline_secret
