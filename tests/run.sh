@@ -1851,18 +1851,24 @@ test_workspace_status_uses_tailscale_services_config() {
     [[ "$out" == *"Tailscale Services configured"* ]]
 }
 
-test_workspace_normalizes_hermes_name() {
-  local tmp fake_bin calls status
-  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  set +e
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NAMES='openshell-hermes-test\n' \
-    FAKE_DOCKER_STOP_FILE="${tmp}/docker-calls" \
-    bash -c 'source "$1"; workspace_normalize_hermes_container_name' _ "$SPARK"
-  status=$?
-  set -e
-  calls=$(cat "${tmp}/docker-calls" 2>/dev/null || echo "")
-  rm -rf "$tmp"
-  [[ "$status" -eq 0 ]] && [[ "$calls" == *"rename openshell-hermes-test workspace-hermes"* ]]
+test_workspace_restores_openshell_hermes_name() {
+  local out
+  out=$(bash -c '
+    source "$1"
+    renamed=""
+    workspace_hermes_container_name() { printf "workspace-hermes\n"; }
+    docker() {
+      case "$*" in
+        *sandbox-name*) printf "hermes\n" ;;
+        *sandbox-id*) printf "abc-123\n" ;;
+        "ps -a --format "*) return 0 ;;
+        "rename workspace-hermes openshell-hermes-abc-123") renamed="$*" ;;
+      esac
+    }
+    workspace_restore_hermes_container_name
+    printf "%s\n" "$renamed"
+  ' _ "$SPARK")
+  [[ "$out" == "rename workspace-hermes openshell-hermes-abc-123" ]]
 }
 
 test_workspace_setup_rejects_bad_tailscale_mode() {
@@ -6280,7 +6286,7 @@ run_test "workspace restart orders stop then start" test_workspace_restart_order
 run_test "workspace bridge waits for delayed readiness" test_workspace_bridge_waits_for_delayed_readiness
 run_test "workspace model recovery disables MTP" test_workspace_model_start_disables_mtp_for_reliable_recovery
 run_test "workspace status uses Tailscale Services config" test_workspace_status_uses_tailscale_services_config
-run_test "workspace normalizes Hermes container name" test_workspace_normalizes_hermes_name
+run_test "workspace restores OpenShell Hermes container name" test_workspace_restores_openshell_hermes_name
 run_test "workspace setup --check does not write files" test_workspace_check_no_mutation
 run_test "workspace setup --check preserves existing config" test_workspace_check_existing_config_no_mutation
 run_test "workspace setup --check reports missing Compose plugin" test_workspace_check_reports_missing_compose_plugin

@@ -8560,16 +8560,16 @@ workspace_hermes_running_container_name() {
   docker ps --format '{{.Names}}' 2>/dev/null | grep -Fx "$container"
 }
 
-workspace_normalize_hermes_container_name() {
-  local current
+workspace_restore_hermes_container_name() {
+  local current sandbox_name sandbox_id expected
   current=$(workspace_hermes_container_name 2>/dev/null || true)
-  [[ -n "$current" && "$current" != "$WORKSPACE_HERMES_CONTAINER" ]] || return 0
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$WORKSPACE_HERMES_CONTAINER"; then
-    warn "Hermes container name already in use: ${WORKSPACE_HERMES_CONTAINER}"
-    return 0
-  fi
-  docker rename "$current" "$WORKSPACE_HERMES_CONTAINER" >/dev/null 2>&1 ||
-    warn "Could not rename Hermes container to ${WORKSPACE_HERMES_CONTAINER}"
+  [[ "$current" == "$WORKSPACE_HERMES_CONTAINER" ]] || return 0
+  sandbox_name=$(docker inspect --format '{{index .Config.Labels "openshell.ai/sandbox-name"}}' "$current" 2>/dev/null || true)
+  sandbox_id=$(docker inspect --format '{{index .Config.Labels "openshell.ai/sandbox-id"}}' "$current" 2>/dev/null || true)
+  [[ "$sandbox_name" == "hermes" && -n "$sandbox_id" ]] || return 1
+  expected="openshell-${sandbox_name}-${sandbox_id}"
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$expected" && return 1
+  docker rename "$current" "$expected" >/dev/null 2>&1
 }
 
 workspace_patch_hermes_dashboard_entrypoint() {
@@ -8618,10 +8618,10 @@ workspace_start_hermes_private_proxy() {
   if workspace_hermes_private_url_ready && workspace_hermes_local_api_ready; then
     return 0
   fi
+  workspace_restore_hermes_container_name || return 1
   workspace_patch_hermes_dashboard_entrypoint
   NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes recover >/dev/null 2>&1 || \
     NEMOCLAW_SANDBOX_NAME=hermes nemohermes recover >/dev/null 2>&1 || true
-  workspace_normalize_hermes_container_name
   if command -v openshell >/dev/null 2>&1; then
     workspace_hermes_private_url_ready || openshell forward start --background "$WORKSPACE_HERMES_PORT" hermes >/dev/null 2>&1 || true
     workspace_hermes_local_api_ready || openshell forward start --background "$WORKSPACE_HERMES_LOCAL_PORT" hermes >/dev/null 2>&1 || true
