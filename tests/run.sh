@@ -5436,6 +5436,20 @@ test_hf_stream_interval_from_recommended_command() {
   [[ "$out" == *"--stream-interval 32"* ]]
 }
 
+test_hf_quantization_from_recommended_command() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Quant" "$KV_CONFIG"
+  meta=$(hf_inspect_json false false 32768 false dense nvfp4 \
+    "vllm serve Org/Quant --quantization modelopt --max-model-len 32768")
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/Quant --dry-run --no-mtp </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--quantization modelopt"* ]]
+}
+
 test_mtp_batched_tokens_overrides_recommended_command() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out meta
@@ -6142,6 +6156,7 @@ run_test "HF card recommended context wins" test_hf_card_context_wins
 run_test "HF MTP auto-enables when supported" test_hf_mtp_auto_enables_when_supported
 run_test "HF MTP raises memory floor" test_hf_mtp_raises_memory_floor
 run_test "HF recommended command maps stream interval" test_hf_stream_interval_from_recommended_command
+run_test "HF recommended command maps quantization" test_hf_quantization_from_recommended_command
 run_test "MTP batched tokens override HF command" test_mtp_batched_tokens_overrides_recommended_command
 run_test "Blackwell single-stream MTP uses flashinfer_cutlass + stream64" test_blackwell_single_stream_mtp_uses_flashinfer_cutlass_and_stream64
 run_test "HF MTP launch sets batched tokens" test_hf_mtp_launch_sets_batched_tokens
