@@ -2003,32 +2003,115 @@ cmd_workspace_status() {
     warn "NemoHermes not installed"
   fi
   if command -v tailscale >/dev/null 2>&1; then
-    tailscale serve status 2>/dev/null || warn "No Tailscale Serve status"
+    workspace_print_tailscale_runtime_status
   fi
   printf "\n"
 }
 
-workspace_down() {
-  [[ $# -eq 0 ]] || die "Usage: spark ws down"
-  local hermes_container=""
-
-  printf "\n  ${BOLD}spark ws down${NC}\n\n"
-  if workspace_configured; then
-    workspace_compose down >/dev/null 2>&1 &&
-      info "Stopped workspace Compose project (${WORKSPACE_PROJECT})" ||
-      warn "Could not stop workspace Compose project"
-  else
-    warn "Workspace not configured"
+workspace_migrate_runtime_config() {
+  workspace_remove_legacy_human_passwords
+  if [[ -z "$(workspace_read_env WORKSPACE_SMTP_ENABLED 2>/dev/null || true)" ]]; then
+    workspace_set_env_key WORKSPACE_SMTP_ENABLED false
+    info "Recorded SMTP recovery as disabled; run spark ws setup --smtp to enable it"
   fi
+}
+
+workspace_print_tailscale_runtime_status() {
+  local mode out
+  mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
+  if [[ "$mode" == "services" ]]; then
+    out=$(tailscale serve get-config --all 2>/dev/null || true)
+    if workspace_tailscale_services_local_configured_from_output "$out"; then
+      info "Tailscale Services configured"
+    else
+      warn "Tailscale Services not configured"
+    fi
+    return 0
+  fi
+  tailscale serve status 2>/dev/null || warn "No Tailscale Serve status"
+}
+
+workspace_start() {
+  [[ $# -eq 0 ]] || die "Usage: spark ws start"
+  local model tailnet rc=0
+
+  printf "\n  ${BOLD}spark ws start${NC}\n\n"
+  workspace_configured || die "Workspace not configured" "Run: spark ws setup"
+  workspace_migrate_runtime_config
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  [[ -n "$model" ]] || die "Hermes model is not configured" "Run: spark ws setup"
+
+  workspace_compose up -d --remove-orphans >/dev/null 2>&1 \
+    && info "Workspace Compose project started" \
+    || { err "Could not start workspace Compose project"; rc=1; }
+
+  SETUP_FAILED=()
+  workspace_ensure_gateway 0 1 "$model"
+  if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
+    rc=1
+  fi
+
+  tailnet=$(workspace_tailnet_suffix 2>/dev/null || true)
+  if workspace_tailscale_services_configured; then
+    info "Tailscale workspace access configured"
+  elif [[ -n "$tailnet" ]]; then
+    workspace_configure_tailscale "$tailnet" 0 abort 1
+    [[ ${#SETUP_FAILED[@]} -eq 0 ]] || rc=1
+  else
+    warn "Tailscale workspace access unavailable"
+    rc=1
+  fi
+
+  if workspace_start_hermes_private_proxy; then
+    info "Hermes/NemoClaw started"
+  else
+    err "Could not start Hermes/NemoClaw"
+    rc=1
+  fi
+
+  [[ "$rc" -eq 0 ]] && info "Workspace started" || err "Workspace started with errors; run spark ws doctor"
+  printf "\n"
+  return "$rc"
+}
+
+workspace_stop() {
+  [[ $# -eq 0 ]] || die "Usage: spark ws stop"
+  local hermes_container="" model="" rc=0
+
+  printf "\n  ${BOLD}spark ws stop${NC}\n\n"
+  workspace_configured || die "Workspace not configured" "Run: spark ws setup"
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
 
   hermes_container=$(workspace_hermes_running_container_name 2>/dev/null || true)
   if [[ -n "$hermes_container" ]]; then
     docker stop "$hermes_container" >/dev/null 2>&1 &&
       info "Stopped Hermes/NemoClaw (${hermes_container})" ||
-      warn "Could not stop Hermes/NemoClaw (${hermes_container})"
+      { err "Could not stop Hermes/NemoClaw (${hermes_container})"; rc=1; }
   else
-    warn "No running Hermes/NemoClaw container"
+    info "Hermes/NemoClaw already stopped"
   fi
+
+  gateway_stop || rc=1
+
+  if [[ -n "$model" ]] && workspace_model_running "$model"; then
+    SPARK_SKIP_GATEWAY_REFRESH=1 cmd_stop "$model" || rc=1
+  else
+    info "Workspace model already stopped"
+  fi
+
+  workspace_compose stop >/dev/null 2>&1 \
+    && info "Stopped workspace Compose project (${WORKSPACE_PROJECT})" \
+    || { err "Could not stop workspace Compose project"; rc=1; }
+
+  [[ "$rc" -eq 0 ]] && info "Workspace stopped; data and configuration preserved"
+  printf "\n"
+  return "$rc"
+}
+
+workspace_restart() {
+  [[ $# -eq 0 ]] || die "Usage: spark ws restart"
+  workspace_stop
+  workspace_start
 }
 
 workspace_status_item() {
@@ -2050,7 +2133,9 @@ cmd_workspace_health() {
   workspace_status_item "Compose n8n" workspace_compose_service_running n8n
   workspace_status_item "Vikunja HTTP local" workspace_vikunja_http_ready
   workspace_status_item "n8n HTTP local" workspace_n8n_http_ready
-  workspace_status_item "Tailscale URLs" workspace_tailscale_https_urls_ready
+  workspace_status_item "Vikunja private URL" workspace_vikunja_private_url_ready
+  workspace_status_item "n8n private URL" workspace_n8n_private_url_ready
+  workspace_status_item "Hermes private URL" workspace_hermes_private_status_url_ready
   workspace_status_item "No public listeners" workspace_host_listeners_loopback_only
   workspace_status_item "LiteLLM gateway" workspace_gateway_running
   workspace_status_item "LiteLLM Hermes route" workspace_litellm_model_routed
@@ -2682,6 +2767,24 @@ workspace_tailscale_https_urls_ready() {
   workspace_http_ready "${vikunja%/}/api/v1/info" &&
     workspace_http_ready "${n8n%/}/healthz" &&
     workspace_hermes_dashboard_ready_at "$hermes"
+}
+
+workspace_vikunja_private_url_ready() {
+  local url
+  url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  [[ -n "$url" ]] && workspace_http_ready "${url%/}/api/v1/info"
+}
+
+workspace_n8n_private_url_ready() {
+  local url
+  url=$(workspace_read_env N8N_URL 2>/dev/null || true)
+  [[ -n "$url" ]] && workspace_http_ready "${url%/}/healthz"
+}
+
+workspace_hermes_private_status_url_ready() {
+  local url
+  url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
+  [[ -n "$url" ]] && workspace_hermes_dashboard_ready_at "$url"
 }
 
 workspace_tailscale_urls_ready_after_setup() {
@@ -3564,7 +3667,9 @@ cmd_workspace_help() {
 
   ${BOLD}Commands:${NC}
     setup      Install/check Vikunja + n8n + Hermes
-    down       Stop Vikunja, n8n, Postgres, and Hermes/NemoClaw
+    start      Start the configured workspace runtime
+    stop       Stop the workspace runtime and preserve all data
+    restart    Stop and start the configured workspace runtime
     status     Show workspace health
     logs       Follow logs for vikunja, n8n, postgres, hermes, or gateway
     doctor     Read-only workspace check
@@ -3602,7 +3707,9 @@ cmd_workspace() {
   [[ -n "$subcmd" ]] && shift || true
   case "$subcmd" in
     setup)  workspace_setup "$@" ;;
-    down)   workspace_down "$@" ;;
+    start)  workspace_start "$@" ;;
+    stop)   workspace_stop "$@" ;;
+    restart) workspace_restart "$@" ;;
     status) cmd_workspace_status ;;
     logs)   cmd_workspace_logs "$@" ;;
     doctor) cmd_workspace_doctor "$@" ;;
