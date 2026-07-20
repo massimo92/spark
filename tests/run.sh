@@ -113,6 +113,11 @@ ${stdin_payload}"
     [[ -n "${FAKE_DOCKER_PULL_FILE:-}" ]] && printf '%s\n' "${2:-}" >> "${FAKE_DOCKER_PULL_FILE}"
     exit "${FAKE_DOCKER_PULL_EXIT:-0}"
     ;;
+  network)
+    case "$args" in
+      *"inspect openshell-docker"*) printf '%s\n' "${FAKE_OPENSHELL_BRIDGE_IP:-172.19.0.1}" ;;
+    esac
+    ;;
   run)
     [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_DOCKER_ARGS_FILE}"
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
@@ -126,6 +131,7 @@ ${stdin_payload}"
     _att=0
     [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run ' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
     case "$args" in
+      *State.Running*) echo "${FAKE_STATE_RUNNING:-true}" ;;
       *State.Status*)
         if [[ -n "${FAKE_RETRY:-}" && "${_att}" -le 1 ]]; then echo "exited"
         else echo "${FAKE_STATE_STATUS:-running}"; fi ;;
@@ -1747,6 +1753,8 @@ test_workspace_lifecycle_commands() {
     workspace_compose() { printf "compose %s\n" "$*" >> "$CALLS"; }
     workspace_ensure_gateway() { printf "gateway %s\n" "$*" >> "$CALLS"; }
     workspace_tailscale_services_configured() { return 0; }
+    workspace_start_hermes_gateway_proxy() { printf "bridge start\n" >> "$CALLS"; }
+    workspace_stop_hermes_gateway_proxy() { printf "bridge stop\n" >> "$CALLS"; }
     workspace_start_hermes_private_proxy() { printf "hermes start\n" >> "$CALLS"; }
     workspace_hermes_running_container_name() { printf "workspace-hermes\n"; }
     gateway_stop() { printf "gateway stop\n" >> "$CALLS"; }
@@ -1766,9 +1774,11 @@ test_workspace_lifecycle_commands() {
   [[ "$calls" == *"migrate"* ]] &&
     [[ "$calls" == *"compose up -d --remove-orphans"* ]] &&
     [[ "$calls" == *"gateway 0 1 Org/Model"* ]] &&
+    [[ "$calls" == *"bridge start"* ]] &&
     [[ "$calls" == *"hermes start"* ]] &&
     [[ "$calls" == *"docker exec -u root workspace-hermes"* ]] &&
     [[ "$calls" == *"gateway stop"* ]] &&
+    [[ "$calls" == *"bridge stop"* ]] &&
     [[ "$calls" == *"model stop Org/Model"* ]] &&
     [[ "$calls" == *"compose stop"* ]] &&
     [[ "$out" == *"start"* && "$out" == *"stop"* && "$out" == *"restart"* ]] &&
@@ -1999,7 +2009,7 @@ test_workspace_setup_waits_for_model() {
 
 test_workspace_setup_writes_compose_names() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out compose init tailscale_calls nemo_calls curl_calls env postgres_env vikunja_env n8n_env workspace_mode compose_mode gateway_mode litellm_mode
+  local tmp fake_bin out compose init tailscale_calls nemo_calls curl_calls docker_calls env postgres_env vikunja_env n8n_env workspace_mode compose_mode gateway_mode litellm_mode
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
@@ -2008,6 +2018,7 @@ test_workspace_setup_writes_compose_names() {
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_DOCKER_ARGS_FILE="${tmp}/docker.log" \
     FAKE_CURL_FILE="${tmp}/curl.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1 || true)
@@ -2016,6 +2027,7 @@ test_workspace_setup_writes_compose_names() {
   tailscale_calls=$(cat "${tmp}/tailscale.log" 2>/dev/null || echo "")
   nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
   curl_calls=$(cat "${tmp}/curl.log" 2>/dev/null || echo "")
+  docker_calls=$(cat "${tmp}/docker.log" 2>/dev/null || echo "")
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
   postgres_env=$(cat "${tmp}/home/.config/spark/workspace/postgres.env" 2>/dev/null || echo "")
   vikunja_env=$(cat "${tmp}/home/.config/spark/workspace/vikunja.env" 2>/dev/null || echo "")
@@ -2052,7 +2064,10 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"NEMOCLAW_SANDBOX_READY_TIMEOUT=600"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_NO_GPU=1"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_SANDBOX_GPU=0"* ]] &&
+    [[ "$nemo_calls" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
+    [[ "$docker_calls" == *"--name spark-hermes-litellm-proxy"* ]] &&
+    [[ "$docker_calls" == *"172.19.0.1 4000 127.0.0.1 4000"* ]] &&
     [[ "$curl_calls" == *'"expires_at":"2099-12-31T23:59:59Z"'* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$env" == *"HERMES_DASHBOARD_PORT=18789"* ]] &&
@@ -5958,7 +5973,7 @@ EOF
     [[ "$compose_log" == *"pull n8n"* ]] &&
     [[ "$compose_log" == *"up -d --remove-orphans"* ]] &&
     [[ "$nemo_log" == *"hermes rebuild"* ]] &&
-    [[ "$nemo_log" == *"NEMOCLAW_ENDPOINT_URL=http://127.0.0.1:4000/v1"* ]] &&
+    [[ "$nemo_log" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_MODEL=vllm/Org/Alpha"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_NO_GPU=1"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_SANDBOX_GPU=0"* ]] &&
