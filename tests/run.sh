@@ -1767,7 +1767,7 @@ test_workspace_lifecycle_commands() {
     [[ "$calls" == *"compose up -d --remove-orphans"* ]] &&
     [[ "$calls" == *"gateway 0 1 Org/Model"* ]] &&
     [[ "$calls" == *"hermes start"* ]] &&
-    [[ "$calls" == *"docker stop workspace-hermes"* ]] &&
+    [[ "$calls" == *"docker exec -u root workspace-hermes"* ]] &&
     [[ "$calls" == *"gateway stop"* ]] &&
     [[ "$calls" == *"model stop Org/Model"* ]] &&
     [[ "$calls" == *"compose stop"* ]] &&
