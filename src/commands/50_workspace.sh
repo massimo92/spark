@@ -3452,6 +3452,7 @@ workspace_start_hermes_private_proxy() {
     return 0
   fi
   workspace_restore_hermes_container_name || return 1
+  NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes start >/dev/null 2>&1 || true
   workspace_patch_hermes_dashboard_entrypoint
   NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes recover >/dev/null 2>&1 || \
     NEMOCLAW_SANDBOX_NAME=hermes nemohermes recover >/dev/null 2>&1 || true
@@ -3468,14 +3469,8 @@ workspace_start_hermes_private_proxy() {
 }
 
 workspace_pause_hermes_private_proxy() {
-  local container
-  container=$(workspace_hermes_running_container_name 2>/dev/null || true)
-  [[ -n "$container" ]] || return 0
-  # OpenShell owns the sandbox lifecycle. Stopping its container directly marks
-  # the sandbox as Error, so pause only the user-facing Hermes processes.
-  docker exec -u root "$container" sh -lc \
-    'pids=$(ps -ef | awk "/bash \/usr\/local\/bin\/nemoclaw-start|hermes.real dashboard|hermes.real gateway|socat TCP-LISTEN:(18789|8642)/ && !/awk/ {print \$2}"); [ -z "$pids" ] || kill $pids 2>/dev/null || true' \
-    >/dev/null 2>&1
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes stop >/dev/null 2>&1
 }
 
 workspace_tailscale_services_configured() {

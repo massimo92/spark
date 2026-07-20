@@ -1757,6 +1757,7 @@ test_workspace_lifecycle_commands() {
     workspace_stop_hermes_gateway_proxy() { printf "bridge stop\n" >> "$CALLS"; }
     workspace_start_hermes_private_proxy() { printf "hermes start\n" >> "$CALLS"; }
     workspace_hermes_running_container_name() { printf "workspace-hermes\n"; }
+    nemohermes() { printf "nemohermes %s\n" "$*" >> "$CALLS"; }
     gateway_stop() { printf "gateway stop\n" >> "$CALLS"; }
     workspace_model_running() { return 0; }
     cmd_stop() { printf "model stop %s\n" "$*" >> "$CALLS"; }
@@ -1776,7 +1777,7 @@ test_workspace_lifecycle_commands() {
     [[ "$calls" == *"gateway 0 1 Org/Model"* ]] &&
     [[ "$calls" == *"bridge start"* ]] &&
     [[ "$calls" == *"hermes start"* ]] &&
-    [[ "$calls" == *"docker exec -u root workspace-hermes"* ]] &&
+    [[ "$calls" == *"nemohermes hermes stop"* ]] &&
     [[ "$calls" == *"gateway stop"* ]] &&
     [[ "$calls" == *"bridge stop"* ]] &&
     [[ "$calls" == *"model stop Org/Model"* ]] &&
@@ -1795,6 +1796,27 @@ test_workspace_restart_orders_stop_then_start() {
     workspace_restart
   ' _ "$SPARK")
   [[ "$out" == $'stop\nstart' ]]
+}
+
+test_workspace_hermes_start_uses_official_lifecycle() {
+  local out
+  out=$(bash -c '
+    source "$1"
+    private_probes=0
+    nemo_calls=""
+    workspace_hermes_private_url_ready() {
+      private_probes=$((private_probes + 1))
+      [[ "$private_probes" -gt 1 ]]
+    }
+    workspace_hermes_local_api_ready() { return 0; }
+    workspace_restore_hermes_container_name() { return 0; }
+    workspace_patch_hermes_dashboard_entrypoint() { :; }
+    nemohermes() { nemo_calls="${nemo_calls}${*}\n"; }
+    openshell() { :; }
+    workspace_start_hermes_private_proxy
+    printf "%b" "$nemo_calls"
+  ' _ "$SPARK")
+  [[ "$out" == *"hermes start"* ]] && [[ "$out" == *"hermes recover"* ]]
 }
 
 test_workspace_bridge_waits_for_delayed_readiness() {
@@ -6283,6 +6305,7 @@ run_test "setup --full continues after swap reconcile" test_setup_full_continues
 run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
+run_test "workspace Hermes start uses official lifecycle" test_workspace_hermes_start_uses_official_lifecycle
 run_test "workspace bridge waits for delayed readiness" test_workspace_bridge_waits_for_delayed_readiness
 run_test "workspace model recovery disables MTP" test_workspace_model_start_disables_mtp_for_reliable_recovery
 run_test "workspace status uses Tailscale Services config" test_workspace_status_uses_tailscale_services_config
