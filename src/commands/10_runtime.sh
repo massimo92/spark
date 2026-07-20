@@ -560,7 +560,7 @@ auto_fit_context_to_budget() {
   local cname="$1" config_json="$2" reserved free target=""
   [[ -n "${mem:-}" || -n "${max_len:-}" ]] && return 0
   reserved=$(reserved_budget_gb "$cname")
-  free=$(awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+  free=$(effective_free_gb "$reserved")
   awk -v n="${NEED_GB:-0}" -v f="$free" 'BEGIN{ exit !(n > f) }' || return 0
   fit_options "$free"
   if [[ "${KV_CACHE_DTYPE:-auto}" == "fp8" && "${FIT_CTX_FP8:-0}" -gt 0 ]]; then
@@ -844,7 +844,7 @@ run_backend_vllm() {
   if [[ "$needs_download" == "1" ]]; then
     local reserved free
     reserved=$(reserved_budget_gb "$cname")
-    free=$(awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+    free=$(effective_free_gb "$reserved")
     if awk -v n="$NEED_GB" -v f="$free" 'BEGIN{ exit !(n > f) }'; then
       # Does not fit at the requested context (sized from metadata, before downloading).
       err "Not enough memory to start this model"
@@ -947,7 +947,7 @@ run_backend_vllm() {
   # Memory accounting breakdown (shown in dry-run and at launch).
   local reserved free
   reserved=$(reserved_budget_gb "$cname")
-  free=$(awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+  free=$(effective_free_gb "$reserved")
   print_memory_plan "$model" "$cname" "$port" "$reserved" "$free"
 
   if [[ "$dry_run" == "1" ]]; then
@@ -1201,9 +1201,8 @@ cmd_calibrate() {
   fi
 
   port="${port:-$(next_free_port "$DEFAULT_PORT")}"
-  local results_file best_json="" best_tps=0 label seqs mtp stream batched tps stream_json batched_json kv_arg=()
+  local results_file best_json="" best_tps=0 label seqs mtp stream batched tps stream_json batched_json
   results_file=$(mktemp)
-  [[ -n "$kv_dtype" ]] && kv_arg=(--kv-cache-dtype "$kv_dtype")
   while IFS=$'\t' read -r label seqs mtp stream batched; do
     printf "\n  Calibrating %s...\n" "$label"
     if ! (
@@ -1211,7 +1210,11 @@ cmd_calibrate() {
       export MTP_ENABLED="$mtp"
       [[ -n "$stream" ]] && export SPARK_STREAM_INTERVAL="$stream"
       [[ -n "$batched" ]] && export SPARK_MAX_NUM_BATCHED_TOKENS="$batched" SPARK_MTP_MAX_NUM_BATCHED_TOKENS="$batched"
-      cmd_run "$model" --force --port "$port" --max-num-seqs "$seqs" "${kv_arg[@]}"
+      if [[ -n "$kv_dtype" ]]; then
+        cmd_run "$model" --force --port "$port" --max-num-seqs "$seqs" --kv-cache-dtype "$kv_dtype"
+      else
+        cmd_run "$model" --force --port "$port" --max-num-seqs "$seqs"
+      fi
     ); then
       docker rm -f "$cname" >/dev/null 2>&1 || true
       warn "Launch failed for ${label}; skipping"
@@ -1432,6 +1435,8 @@ cmd_stop_ollama() {
 
 cmd_stop() {
   local target="${1:-}"
+  local refresh_gateway=1
+  [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" == "1" ]] && refresh_gateway=0
 
   if [[ "$BACKEND" == "ollama" ]]; then
     cmd_stop_ollama "$target"
@@ -1484,9 +1489,17 @@ cmd_stop() {
   fi
 
   # Refresh the gateway so its routing reflects the remaining models.
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+  if [[ "$refresh_gateway" == "1" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     gateway_restart
   fi
+}
+
+cmd_down() {
+  [[ $# -eq 0 ]] || die "Usage: spark down"
+  printf "\n  ${BOLD}spark down${NC}\n\n"
+  gateway_stop
+  SPARK_SKIP_GATEWAY_REFRESH=1 cmd_stop --all
+  info "Spark services stopped"
 }
 
 cmd_pull() {

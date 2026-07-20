@@ -43,6 +43,10 @@ WORKSPACE_POSTGRES_ENV_FILE="${WORKSPACE_CONFIG_DIR}/postgres.env"
 WORKSPACE_VIKUNJA_ENV_FILE="${WORKSPACE_CONFIG_DIR}/vikunja.env"
 WORKSPACE_N8N_ENV_FILE="${WORKSPACE_CONFIG_DIR}/n8n.env"
 WORKSPACE_PROJECT="workspace"
+WORKSPACE_POSTGRES_CONTAINER="workspace-postgres"
+WORKSPACE_VIKUNJA_CONTAINER="workspace-vikunja"
+WORKSPACE_N8N_CONTAINER="workspace-n8n"
+WORKSPACE_HERMES_CONTAINER="workspace-hermes"
 WORKSPACE_VIKUNJA_PORT=3456
 WORKSPACE_N8N_PORT=5678
 WORKSPACE_HERMES_PORT=18789
@@ -750,9 +754,8 @@ profile_model() {
 
   inspect_hf_model "$model" "$model_path"
 
-  local model_type arch_list model_max
+  local model_type model_max
   model_type=$(hf_profile_value '.raw.model_type // ""')
-  arch_list=$(hf_profile_value '(.raw.architectures // []) | join(",")')
   HF_REVISION=$(hf_profile_value '.revision // ""')
   HF_TAGS=$(hf_profile_value '(.tags // []) | join(",")')
   MODEL_FAMILY=$(hf_profile_value '.features.family // ""')
@@ -1271,19 +1274,45 @@ usable_budget() {
   printf '%s\n' "$BUDGET_GB"
 }
 
+budget_free_gb() {
+  local reserved="${1:-0}"
+  awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }'
+}
+
+live_available_gb() {
+  free -m 2>/dev/null | awk '/^Mem:/ { printf "%.1f", $7/1024; found=1 } END { exit !found }'
+}
+
+effective_free_gb() {
+  local reserved="${1:-0}" budget_free live_free
+  budget_free=$(budget_free_gb "$reserved")
+  if [[ "$ACCEL" == "cuda-unified" ]] && live_free=$(live_available_gb 2>/dev/null) \
+      && [[ "$live_free" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    awk -v b="$budget_free" -v l="$live_free" 'BEGIN{ printf "%.1f", (l<b ? l : b) }'
+    return 0
+  fi
+  printf '%s\n' "$budget_free"
+}
+
 verify_capacity() {
   local new_need="$1" exclude="${2:-}" dry_run="${3:-0}" mem="${4:-}" model="${5:-}" config_json="${6:-}"
-  local reserved free eff_budget
+  local reserved free budget_free live_free
   reserved=$(reserved_budget_gb "$exclude")
-  eff_budget=$(usable_budget "$reserved")
-  free=$(awk -v b="$eff_budget" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+  budget_free=$(budget_free_gb "$reserved")
+  free=$(effective_free_gb "$reserved")
 
   awk -v n="$new_need" -v f="$free" 'BEGIN{ exit !(n > f) }' || return 0   # fits
 
   err "Not enough memory to start this model"
   printf "    Needs:      %s GB\n" "$new_need"
-  printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
-    "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
+  if [[ "$ACCEL" == "cuda-unified" ]] && live_free=$(live_available_gb 2>/dev/null) \
+      && [[ "$live_free" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+      && awk -v l="$live_free" -v b="$budget_free" 'BEGIN{ exit !(l < b) }'; then
+    printf "    Free:       %s GB  (live available; budget free %s GB)\n" "$free" "$budget_free"
+  else
+    printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
+      "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
+  fi
   local any=0 name m port need _
   while IFS=$'\t' read -r name m port need _; do
     [[ -z "$m" ]] && continue
