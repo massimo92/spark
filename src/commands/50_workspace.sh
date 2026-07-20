@@ -1512,7 +1512,10 @@ PY
     --entrypoint python "$LITELLM_IMAGE" \
     /app/hermes-litellm-proxy.py "$bridge_ip" "$GATEWAY_PORT" 127.0.0.1 "$GATEWAY_PORT" \
     >/dev/null 2>&1 || return 1
-  for attempt in 1 2 3 4 5; do
+  # The proxy can be scheduled before the freshly restarted LiteLLM gateway is
+  # ready. Give both processes enough time to become reachable before Hermes
+  # recovery probes the route.
+  for ((attempt = 1; attempt <= 30; attempt++)); do
     curl -fsS --max-time 2 "http://${bridge_ip}:${GATEWAY_PORT}/v1/models" >/dev/null 2>&1 && return 0
     [[ "$(docker inspect --format '{{.State.Running}}' "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" 2>/dev/null)" == "true" ]] || return 1
     sleep 1
