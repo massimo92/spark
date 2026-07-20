@@ -95,7 +95,9 @@ The workspace is optional. It installs a private agent environment:
 ```bash
 spark setup --full
 spark ws setup
-spark ws down
+spark ws start
+spark ws stop
+spark ws restart
 spark ws status
 spark ws doctor
 spark ws backup

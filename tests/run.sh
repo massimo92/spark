@@ -1734,23 +1734,71 @@ test_workspace_help_and_command() {
     [[ "$old" == *"Unknown command: workspace"* ]]
 }
 
-test_workspace_down_stops_compose_and_hermes() {
-  local tmp fake_bin out compose stops status
+test_workspace_lifecycle_commands() {
+  local tmp fake_bin calls out down status
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_min_workspace_config "${tmp}/home"
+  calls="${tmp}/calls"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" CALLS="$calls" bash -c '
+    source "$1"
+    workspace_configured() { return 0; }
+    workspace_migrate_runtime_config() { printf "migrate\n" >> "$CALLS"; }
+    workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Model\n"; }
+    workspace_compose() { printf "compose %s\n" "$*" >> "$CALLS"; }
+    workspace_ensure_gateway() { printf "gateway %s\n" "$*" >> "$CALLS"; }
+    workspace_tailscale_services_configured() { return 0; }
+    workspace_start_hermes_private_proxy() { printf "hermes start\n" >> "$CALLS"; }
+    workspace_hermes_running_container_name() { printf "workspace-hermes\n"; }
+    gateway_stop() { printf "gateway stop\n" >> "$CALLS"; }
+    workspace_model_running() { return 0; }
+    cmd_stop() { printf "model stop %s\n" "$*" >> "$CALLS"; }
+    docker() { printf "docker %s\n" "$*" >> "$CALLS"; }
+    workspace_start
+    workspace_stop
+  ' _ "$SPARK"
+  out=$("$SPARK" ws help 2>&1)
   set +e
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NAMES='openshell-hermes-test\n' \
-    FAKE_COMPOSE_FILE="${tmp}/compose-calls" FAKE_DOCKER_STOP_FILE="${tmp}/stops" \
-    "$SPARK" ws down 2>&1)
+  down=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws down 2>&1)
   status=$?
   set -e
-  compose=$(cat "${tmp}/compose-calls" 2>/dev/null || echo "")
-  stops=$(cat "${tmp}/stops" 2>/dev/null || echo "")
+  calls=$(cat "$calls")
   rm -rf "$tmp"
-  [[ "$status" -eq 0 ]] && [[ "$compose" == *" down"* ]] &&
-    [[ "$stops" == *"openshell-hermes-test"* ]] &&
-    [[ "$out" == *"Stopped workspace Compose project"* ]] &&
-    [[ "$out" == *"Stopped Hermes/NemoClaw"* ]]
+  [[ "$calls" == *"migrate"* ]] &&
+    [[ "$calls" == *"compose up -d --remove-orphans"* ]] &&
+    [[ "$calls" == *"gateway 0 1 Org/Model"* ]] &&
+    [[ "$calls" == *"hermes start"* ]] &&
+    [[ "$calls" == *"docker stop workspace-hermes"* ]] &&
+    [[ "$calls" == *"gateway stop"* ]] &&
+    [[ "$calls" == *"model stop Org/Model"* ]] &&
+    [[ "$calls" == *"compose stop"* ]] &&
+    [[ "$out" == *"start"* && "$out" == *"stop"* && "$out" == *"restart"* ]] &&
+    [[ "$out" != *"down       Stop"* ]] &&
+    [[ "$status" -ne 0 ]] && [[ "$down" == *"Unknown ws command: down"* ]]
+}
+
+test_workspace_restart_orders_stop_then_start() {
+  local out
+  out=$(bash -c '
+    source "$1"
+    workspace_stop() { printf "stop\n"; }
+    workspace_start() { printf "start\n"; }
+    workspace_restart
+  ' _ "$SPARK")
+  [[ "$out" == $'stop\nstart' ]]
+}
+
+test_workspace_status_uses_tailscale_services_config() {
+  local tmp fake_bin out calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_min_workspace_config "${tmp}/home"
+  printf 'WORKSPACE_TAILSCALE_MODE=services\n' > "${tmp}/home/.config/spark/workspace/secrets.env"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
+    bash -c 'source "$1"; workspace_print_tailscale_runtime_status' _ "$SPARK" 2>&1)
+  calls=$(cat "${tmp}/tailscale.log")
+  rm -rf "$tmp"
+  [[ "$calls" == *"serve get-config --all"* ]] &&
+    [[ "$calls" != *"serve status"* ]] &&
+    [[ "$out" == *"Tailscale Services configured"* ]]
 }
 
 test_workspace_normalizes_hermes_name() {
@@ -3310,7 +3358,9 @@ test_workspace_status_health_summary() {
   [[ "$out" == *"Workspace health"* ]] &&
     [[ "$out" == *"[x] Compose postgres"* ]] &&
     [[ "$out" == *"[x] Vikunja HTTP local"* ]] &&
-    [[ "$out" == *"[x] Tailscale URLs"* ]] &&
+    [[ "$out" == *"[x] Vikunja private URL"* ]] &&
+    [[ "$out" == *"[x] n8n private URL"* ]] &&
+    [[ "$out" == *"[x] Hermes private URL"* ]] &&
     [[ "$out" == *"[x] No public listeners"* ]] &&
     [[ "$out" == *"[x] LiteLLM Hermes route"* ]] &&
     [[ "$out" == *"[x] Hermes/NemoClaw"* ]] &&
@@ -6114,7 +6164,9 @@ run_test "setup rejects unknown flags" test_setup_unknown_flag_fails
 run_test "setup --full --check runs workspace phase" test_setup_full_check_runs_workspace_phase
 run_test "setup --full continues after swap reconcile" test_setup_full_continues_after_swap_reconcile
 run_test "workspace help renders only as ws" test_workspace_help_and_command
-run_test "workspace down stops Compose and Hermes" test_workspace_down_stops_compose_and_hermes
+run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
+run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
+run_test "workspace status uses Tailscale Services config" test_workspace_status_uses_tailscale_services_config
 run_test "workspace normalizes Hermes container name" test_workspace_normalizes_hermes_name
 run_test "workspace setup --check does not write files" test_workspace_check_no_mutation
 run_test "workspace setup --check preserves existing config" test_workspace_check_existing_config_no_mutation
