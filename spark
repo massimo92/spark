@@ -7252,9 +7252,9 @@ workspace_stop() {
 
   hermes_container=$(workspace_hermes_running_container_name 2>/dev/null || true)
   if [[ -n "$hermes_container" ]]; then
-    docker stop "$hermes_container" >/dev/null 2>&1 &&
-      info "Stopped Hermes/NemoClaw (${hermes_container})" ||
-      { err "Could not stop Hermes/NemoClaw (${hermes_container})"; rc=1; }
+    workspace_pause_hermes_private_proxy &&
+      info "Paused Hermes/NemoClaw (${hermes_container}); sandbox state preserved" ||
+      { err "Could not pause Hermes/NemoClaw (${hermes_container})"; rc=1; }
   else
     info "Hermes/NemoClaw already stopped"
   fi
@@ -8544,6 +8544,17 @@ workspace_start_hermes_private_proxy() {
       openshell forward start --background "$WORKSPACE_HERMES_PORT" hermes >/dev/null 2>&1 || true
   fi
   workspace_hermes_private_url_ready && workspace_hermes_local_api_ready
+}
+
+workspace_pause_hermes_private_proxy() {
+  local container
+  container=$(workspace_hermes_running_container_name 2>/dev/null || true)
+  [[ -n "$container" ]] || return 0
+  # OpenShell owns the sandbox lifecycle. Stopping its container directly marks
+  # the sandbox as Error, so pause only the user-facing Hermes processes.
+  docker exec -u root "$container" sh -lc \
+    'pids=$(ps -ef | awk "/bash \/usr\/local\/bin\/nemoclaw-start|hermes.real dashboard|hermes.real gateway|socat TCP-LISTEN:(18789|8642)/ && !/awk/ {print \$2}"); [ -z "$pids" ] || kill $pids 2>/dev/null || true' \
+    >/dev/null 2>&1
 }
 
 workspace_tailscale_services_configured() {
