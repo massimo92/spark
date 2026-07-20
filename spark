@@ -754,9 +754,8 @@ profile_model() {
 
   inspect_hf_model "$model" "$model_path"
 
-  local model_type arch_list model_max
+  local model_type model_max
   model_type=$(hf_profile_value '.raw.model_type // ""')
-  arch_list=$(hf_profile_value '(.raw.architectures // []) | join(",")')
   HF_REVISION=$(hf_profile_value '.revision // ""')
   HF_TAGS=$(hf_profile_value '(.tags // []) | join(",")')
   MODEL_FAMILY=$(hf_profile_value '.features.family // ""')
@@ -6192,9 +6191,9 @@ workspace_vikunja_api_permissions_json() {
 }
 
 workspace_create_vikunja_hermes_token() {
-  local force="${1:-0}" existing hermes_pass jwt perms payload out token base_url
+  local existing hermes_pass jwt perms payload out token base_url
   existing=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
-  if [[ "$force" != "1" ]] && [[ -n "$existing" ]] && workspace_check_vikunja_token "$existing" >/dev/null 2>&1; then
+  if [[ -n "$existing" ]] && workspace_check_vikunja_token "$existing" >/dev/null 2>&1; then
     info "Vikunja API token already works for hermes"
     return 0
   fi

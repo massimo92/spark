@@ -754,9 +754,8 @@ profile_model() {
 
   inspect_hf_model "$model" "$model_path"
 
-  local model_type arch_list model_max
+  local model_type model_max
   model_type=$(hf_profile_value '.raw.model_type // ""')
-  arch_list=$(hf_profile_value '(.raw.architectures // []) | join(",")')
   HF_REVISION=$(hf_profile_value '.revision // ""')
   HF_TAGS=$(hf_profile_value '(.tags // []) | join(",")')
   MODEL_FAMILY=$(hf_profile_value '.features.family // ""')

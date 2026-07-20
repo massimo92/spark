@@ -1047,9 +1047,9 @@ workspace_vikunja_api_permissions_json() {
 }
 
 workspace_create_vikunja_hermes_token() {
-  local force="${1:-0}" existing hermes_pass jwt perms payload out token base_url
+  local existing hermes_pass jwt perms payload out token base_url
   existing=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
-  if [[ "$force" != "1" ]] && [[ -n "$existing" ]] && workspace_check_vikunja_token "$existing" >/dev/null 2>&1; then
+  if [[ -n "$existing" ]] && workspace_check_vikunja_token "$existing" >/dev/null 2>&1; then
     info "Vikunja API token already works for hermes"
     return 0
   fi
