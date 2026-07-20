@@ -8,6 +8,7 @@ main() {
     calibrate)    shift; cmd_calibrate "$@" ;;
     dashboard)    shift; cmd_dashboard "$@" ;;
     stop)         shift; cmd_stop "$@" ;;
+    down)         shift; cmd_down "$@" ;;
     pull)         shift; cmd_pull "$@" ;;
     models)       shift; cmd_models "$@" ;;
     list)         cmd_list ;;

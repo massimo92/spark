@@ -58,6 +58,11 @@ ${stdin_payload}"
           *"CREATE USER vikunja"*|*"ALTER USER vikunja"*|*"CREATE DATABASE vikunja"*|*"ALTER DATABASE vikunja"*) exit 0 ;;
           *"CREATE USER n8n"*|*"ALTER USER n8n"*|*"CREATE DATABASE n8n"*|*"ALTER DATABASE n8n"*) exit 0 ;;
           *"n8n user-management:reset"*) exit "${FAKE_N8N_USER_RESET_EXIT:-0}" ;;
+          *"user create -u "*)
+            if [[ -n "${FAKE_VIKUNJA_CREATED_USER_FILE:-}" ]]; then
+              printf '%s\n' "$*" > "$FAKE_VIKUNJA_CREATED_USER_FILE"
+            fi
+            exit 0 ;;
           *"pg_dump -U vikunja vikunja"*) printf '%s\n' "-- vikunja dump" ;;
           *"pg_dump -U n8n n8n"*) printf '%s\n' "-- n8n dump" ;;
           *"user list -e "*) exit 2 ;;
@@ -72,7 +77,14 @@ ${stdin_payload}"
                 exit 2
               fi
             fi
-            printf '%b' "${FAKE_VIKUNJA_USER_LIST:-| 1 | massimo | m@example.com | active |\n| 2 | hermes | hermes@spark.invalid | active |\n}" ;;
+            printf '%b' "${FAKE_VIKUNJA_USER_LIST:-| 1 | massimo | m@example.com | active |\n| 2 | hermes | hermes@spark.invalid | active |\n}"
+            if [[ -n "${FAKE_VIKUNJA_CREATED_USER_FILE:-}" && -f "$FAKE_VIKUNJA_CREATED_USER_FILE" ]]; then
+              created=$(cat "$FAKE_VIKUNJA_CREATED_USER_FILE")
+              username=$(sed -n 's/.* -u \([^ ]*\).*/\1/p' <<< "$created")
+              email=$(sed -n 's/.* -e \([^ ]*\).*/\1/p' <<< "$created")
+              printf '| 9 | %s | %s | active |\n' "$username" "$email"
+            fi
+            ;;
         esac
         exit "${FAKE_COMPOSE_EXEC_EXIT:-0}" ;;
       *" cp vikunja:/tmp/vikunja.zip "*)
@@ -105,6 +117,10 @@ ${stdin_payload}"
     [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_DOCKER_ARGS_FILE}"
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
     ;;
+  stop|rm|rename)
+    [[ -n "${FAKE_DOCKER_STOP_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_DOCKER_STOP_FILE}"
+    exit "${FAKE_DOCKER_STOP_EXIT:-0}"
+    ;;
   inspect)
     # Adaptive-startup tests: vary by attempt (= number of `run` lines captured so far).
     _att=0
@@ -129,8 +145,11 @@ ${stdin_payload}"
     fi
     ;;
   exec)
+    [[ -n "${FAKE_DOCKER_EXEC_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_DOCKER_EXEC_FILE}"
     # cgroup memory reads for `spark status` live block.
     case "$args" in
+      *"grep -q 'NEMOCLAW_HERMES_DASHBOARD_HOST'"*) exit "${FAKE_HERMES_ENTRYPOINT_PATCHED_EXIT:-1}" ;;
+      *"hermes.real dashboard --host 0[.]0[.]0[.]0"*) exit "${FAKE_HERMES_PUBLIC_BOUND_EXIT:-1}" ;;
       *memory.current*) [[ -n "${FAKE_MEM_CURRENT:-}" ]] && echo "${FAKE_MEM_CURRENT}" ;;
       *memory.peak*)    [[ -n "${FAKE_MEM_PEAK:-}" ]] && echo "${FAKE_MEM_PEAK}" ;;
     esac
@@ -243,7 +262,9 @@ case "$*" in
       exit 0
     fi
     exit "${FAKE_N8N_LOGIN_EXIT:-0}" ;;
+  *:8642/health*) echo "${FAKE_HERMES_HEALTH:-{\"status\":\"ok\"}}"; exit "${FAKE_HERMES_LOCAL_API_EXIT:-0}" ;;
   *:8642/v1/models*) echo "${FAKE_HERMES_MODELS:-{\"data\":[{\"id\":\"hermes-agent\"}]}"; exit "${FAKE_HERMES_LOCAL_API_EXIT:-0}" ;;
+  *:18789/*) exit "${FAKE_HERMES_DASHBOARD_EXIT:-0}" ;;
   */v1/chat/completions*) [[ "${FAKE_LITELLM_SMOKE_EXIT:-0}" == "0" ]] && { echo "${FAKE_LITELLM_SMOKE_JSON:-{\"choices\":[{\"message\":{\"content\":\"ok\"}}],\"usage\":{\"completion_tokens\":1}}}"; exit 0; }; exit "${FAKE_LITELLM_SMOKE_EXIT:-1}" ;;
   */v1/models*) [[ "${FAKE_VLLM_READY:-1}" == "1" ]] && { echo "${FAKE_LITELLM_MODELS:-{\"data\":[{\"id\":\"vllm/Org/Alpha\"}]}"; exit 0; }; exit 7 ;;
   *)            [[ "${FAKE_OLLAMA_UP:-0}" == "1" ]] && exit 0; exit 7 ;;
@@ -490,7 +511,7 @@ else
   div=1024
 fi
 st=$(( st_mib / div )); su=$(( su_mib / div ))
-rt="${FAKE_RAM_TOTAL_GB:-121}"; ru="${FAKE_RAM_USED_GB:-40}"; rf="${FAKE_RAM_FREE_GB:-50}"; ra="${FAKE_RAM_AVAIL_GB:-78}"
+rt="${FAKE_RAM_TOTAL_GB:-121}"; ru="${FAKE_RAM_USED_GB:-40}"; rf="${FAKE_RAM_FREE_GB:-50}"; ra="${FAKE_RAM_AVAIL_GB:-114}"
 if [[ "$div" -eq 1 ]]; then
   rt=$(( rt * 1024 )); ru=$(( ru * 1024 )); rf=$(( rf * 1024 )); ra=$(( ra * 1024 ))
 fi
@@ -585,7 +606,13 @@ EOF
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_NO_GPU=%s\n' "${NEMOCLAW_NO_GPU:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_SANDBOX_GPU=%s\n' "${NEMOCLAW_SANDBOX_GPU:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'CHAT_UI_URL=%s\n' "${CHAT_UI_URL:-}" >> "${FAKE_NEMOHERMES_FILE}"
+[[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_HERMES_DASHBOARD_HOST=%s\n' "${NEMOCLAW_HERMES_DASHBOARD_HOST:-}" >> "${FAKE_NEMOHERMES_FILE}"
+[[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE=%s\n' "${NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE:-}" >> "${FAKE_NEMOHERMES_FILE}"
 case "$*" in
+  *"update --check"*) echo "${FAKE_NEMOHERMES_UPDATE_CHECK:-Current NemoHermes version: 0.0.55
+Latest maintained version: 0.0.78
+Update available:         no}"; exit "${FAKE_NEMOHERMES_UPDATE_CHECK_EXIT:-0}" ;;
+  *"update --yes"*) exit "${FAKE_NEMOHERMES_UPDATE_EXIT:-0}" ;;
   *dashboard-url*) echo "${FAKE_NEMOHERMES_DASHBOARD_URL:-http://127.0.0.1:18789}" ;;
   *"inference get --json"*) echo "${FAKE_NEMOHERMES_INFERENCE_JSON:-{\"provider\":\"compatible-endpoint\",\"model\":\"vllm/Org/Alpha\"}}" ;;
   *"inference get"*) echo "${FAKE_NEMOHERMES_INFERENCE_TEXT:-Provider: compatible-endpoint Model: vllm/Org/Alpha}" ;;
@@ -1231,6 +1258,23 @@ test_stop_all() {
   [[ "$status" -eq 0 ]] && [[ "$output" == *"spark-vllm-a"* ]] && [[ "$output" == *"spark-vllm-b"* ]]
 }
 
+test_down_stops_models_and_gateway() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out stops status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NAMES='spark-litellm\n' \
+    FAKE_MANAGED="$TWO_MODELS" FAKE_DOCKER_STOP_FILE="${tmp}/stops" \
+    "$SPARK" down 2>&1)
+  status=$?
+  set -e
+  stops=$(cat "${tmp}/stops" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ "$stops" == *"spark-litellm"* ]] &&
+    [[ "$stops" == *"spark-vllm-a"* ]] && [[ "$stops" == *"spark-vllm-b"* ]] &&
+    [[ "$out" == *"Spark services stopped"* ]]
+}
+
 test_stop_ambiguous_requires_target() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin output status
@@ -1690,6 +1734,39 @@ test_workspace_help_and_command() {
     [[ "$old" == *"Unknown command: workspace"* ]]
 }
 
+test_workspace_down_stops_compose_and_hermes() {
+  local tmp fake_bin out compose stops status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_min_workspace_config "${tmp}/home"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NAMES='openshell-hermes-test\n' \
+    FAKE_COMPOSE_FILE="${tmp}/compose-calls" FAKE_DOCKER_STOP_FILE="${tmp}/stops" \
+    "$SPARK" ws down 2>&1)
+  status=$?
+  set -e
+  compose=$(cat "${tmp}/compose-calls" 2>/dev/null || echo "")
+  stops=$(cat "${tmp}/stops" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ "$compose" == *" down"* ]] &&
+    [[ "$stops" == *"openshell-hermes-test"* ]] &&
+    [[ "$out" == *"Stopped workspace Compose project"* ]] &&
+    [[ "$out" == *"Stopped Hermes/NemoClaw"* ]]
+}
+
+test_workspace_normalizes_hermes_name() {
+  local tmp fake_bin calls status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  set +e
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NAMES='openshell-hermes-test\n' \
+    FAKE_DOCKER_STOP_FILE="${tmp}/docker-calls" \
+    bash -c 'source "$1"; workspace_normalize_hermes_container_name' _ "$SPARK"
+  status=$?
+  set -e
+  calls=$(cat "${tmp}/docker-calls" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ "$calls" == *"rename openshell-hermes-test workspace-hermes"* ]]
+}
+
 test_workspace_setup_rejects_bad_tailscale_mode() {
   local out status
   set +e
@@ -1891,6 +1968,9 @@ test_workspace_setup_writes_compose_names() {
     [[ "$compose" == *"image: postgres:18"* ]] &&
     [[ "$compose" == *"image: vikunja/vikunja:latest"* ]] &&
     [[ "$compose" == *"image: docker.n8n.io/n8nio/n8n:latest"* ]] &&
+    [[ "$compose" == *"container_name: workspace-postgres"* ]] &&
+    [[ "$compose" == *"container_name: workspace-vikunja"* ]] &&
+    [[ "$compose" == *"container_name: workspace-n8n"* ]] &&
     [[ "$compose" != *"vikunja-db"* ]] && [[ "$compose" != *"n8n-db"* ]] &&
     [[ "$compose" != *"spark-vikunja"* ]] && [[ "$init" == *"CREATE DATABASE vikunja"* ]] &&
     [[ "$init" == *"CREATE DATABASE n8n"* ]] && [[ "$init" == *"WHERE NOT EXISTS"* ]] &&
@@ -2109,6 +2189,75 @@ test_workspace_setup_fails_when_hermes_onboard_fails() {
     [[ "$out" == *"Hermes onboarding failed"* ]] &&
     [[ "$out" == *"Workspace incomplete"* ]] &&
     [[ "$env" == *"HERMES_ONBOARD_STATUS=manual"* ]]
+}
+
+test_workspace_setup_updates_stale_nemohermes() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin nemo_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_NEMOHERMES_UPDATE_CHECK=$'Current NemoHermes version: 0.0.55\nLatest maintained version: 0.0.78\nUpdate available:         yes' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$nemo_calls" == *"update --check"* ]] &&
+    [[ "$nemo_calls" == *"update --yes"* ]] &&
+    [[ "$nemo_calls" == *'NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE=["hermes"]'* ]] &&
+    [[ "$nemo_calls" == *"onboard --non-interactive"* ]]
+}
+
+test_workspace_setup_stops_when_nemohermes_update_fails() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status nemo_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_NEMOHERMES_UPDATE_CHECK=$'Current NemoHermes version: 0.0.55\nLatest maintained version: 0.0.78\nUpdate available:         yes' \
+    FAKE_NEMOHERMES_UPDATE_EXIT=9 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"NemoHermes update failed"* ]] &&
+    [[ "$nemo_calls" == *"update --yes"* ]] &&
+    [[ "$nemo_calls" != *"onboard --non-interactive"* ]]
+}
+
+test_workspace_setup_repairs_hermes_dashboard_public_bind() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin docker_calls nemo_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf 'HERMES_URL=http://127.0.0.1:18789\n' > "${tmp}/home/.config/spark/workspace/secrets.env"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" FAKE_DOCKER_EXEC_FILE="${tmp}/docker-exec.log" \
+    FAKE_NAMES=$'openshell-hermes-test\n' FAKE_HERMES_DASHBOARD_EXIT=7 FAKE_TAILSCALE_HERMES_EXIT=7 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  docker_calls=$(cat "${tmp}/docker-exec.log" 2>/dev/null || echo "")
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$nemo_calls" == *"NEMOCLAW_HERMES_DASHBOARD_HOST=0.0.0.0"* ]] &&
+    [[ "$docker_calls" == *"python3 -c"* ]] &&
+    [[ "$docker_calls" == *"exec -d -e CHAT_UI_URL=http://127.0.0.1:18789"* ]] &&
+    [[ "$docker_calls" == *"NEMOCLAW_HERMES_DASHBOARD_HOST=0.0.0.0"* ]]
 }
 
 test_workspace_tailnet_from_self_dnsname() {
@@ -2690,8 +2839,8 @@ test_workspace_setup_never_persists_human_password_on_vikunja_failure() {
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
   rm -rf "$tmp"
   [[ "$out" == *"Vikunja user not verified: massimo"* ]] &&
-    [[ "$env" == *"VIKUNJA_HUMAN_PASSWORD="* ]] &&
-    [[ "$env" != *"VIKUNJA_HUMAN_PASSWORD=secret123"* ]] &&
+    [[ "$env" != *"VIKUNJA_HUMAN_PASSWORD="* ]] &&
+    [[ "$env" != *"VIKUNJA_HUMAN_RECOVERY_PASSWORD="* ]] &&
     [[ "$env" == *"VIKUNJA_HUMAN_USER_STATUS=manual"* ]]
 }
 
@@ -2751,127 +2900,95 @@ test_workspace_setup_missing_required_values_do_not_pollute_env() {
     [[ "$env" != *"is required"* ]]
 }
 
-test_workspace_setup_ignores_password_overrides_and_generates_secrets() {
+test_workspace_setup_generates_prints_and_forgets_passwords() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out env human_pass n8n_pass
+  local tmp fake_bin out env vikunja_env n8n_env passwords first second
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
-    SPARK_WORKSPACE_VIKUNJA_PASSWORD='bad"secret' SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
-    SPARK_WORKSPACE_N8N_PASSWORD='bad"secret' FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws setup --yes --model Org/Alpha </dev/null 2>&1 || true)
-  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
-  human_pass=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
-  n8n_pass=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
-  rm -rf "$tmp"
-  [[ "$out" == *"SPARK_WORKSPACE_VIKUNJA_PASSWORD is ignored"* ]] &&
-    [[ "$out" == *"SPARK_WORKSPACE_N8N_PASSWORD is ignored"* ]] &&
-    [[ -n "$human_pass" ]] &&
-    [[ -n "$n8n_pass" ]] &&
-    [[ "$human_pass" != 'bad"secret' ]] &&
-    [[ "$n8n_pass" != 'bad"secret' ]] &&
-    [[ "$human_pass" != "$n8n_pass" ]] &&
-    [[ "$env" == *"VIKUNJA_HUMAN_PASSWORD="* ]] &&
-    [[ "$env" != *"VIKUNJA_HUMAN_PASSWORD=bad"* ]]
-}
-
-test_workspace_setup_interactive_shared_credentials() {
-  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin input env n8n_env calls user human_pass n8n_pass
-  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  make_cached_model "${tmp}/home" "Org/Alpha"
-  user=$(whoami)
-  input=$'y\nm@example.com\n'
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ASSUME_INTERACTIVE=1 \
-    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_COMPOSE_EXEC_FILE="${tmp}/compose-exec.log" \
-    FAKE_NAMES='spark-litellm\n' \
     FAKE_VIKUNJA_USER_LIST='| 2 | hermes | hermes@spark.invalid | active |\n' \
-    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws setup --model Org/Alpha <<< "$input" >/dev/null 2>&1 || true
-  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
-  n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env" 2>/dev/null || echo "")
-  calls=$(cat "${tmp}/compose-exec.log" 2>/dev/null || echo "")
-  human_pass=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
-  n8n_pass=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
-  rm -rf "$tmp"
-  [[ "$env" == *"VIKUNJA_HUMAN_USERNAME=${user}"* ]] &&
-    [[ "$env" == *"VIKUNJA_HUMAN_EMAIL=m@example.com"* ]] &&
-    [[ "$env" == *"VIKUNJA_HUMAN_RECOVERY_PASSWORD="* ]] &&
-    [[ "$env" == *"N8N_BASIC_AUTH_USER=m@example.com"* ]] &&
-    [[ -n "$human_pass" ]] &&
-    [[ -n "$n8n_pass" ]] &&
-    [[ "$human_pass" != "$n8n_pass" ]] &&
-    [[ "$n8n_env" == *"N8N_BASIC_AUTH_USER=m@example.com"* ]] &&
-    [[ "$n8n_env" == *"N8N_BASIC_AUTH_PASSWORD=${n8n_pass}"* ]] &&
-    [[ "$calls" == *"user create -u ${user} -e m@example.com -p ${human_pass}"* ]]
-}
-
-test_workspace_credentials_show_outputs_recovery_secrets() {
-  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin env out human_pass n8n_pass
-  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  make_cached_model "${tmp}/home" "Org/Alpha"
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
-    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
-    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
-  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
-  human_pass=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
-  n8n_pass=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws credentials show 2>&1)
-  rm -rf "$tmp"
-  [[ -n "$human_pass" ]] &&
-    [[ -n "$n8n_pass" ]] &&
-    [[ "$out" == *"spark ws credentials"* ]] &&
-    [[ "$out" == *"recovery password: ${human_pass}"* ]] &&
-    [[ "$out" == *"recovery password: ${n8n_pass}"* ]]
-}
-
-test_workspace_credentials_reset_rotates_local_secrets() {
-  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin env n8n_env old_human old_n8n old_token new_human new_n8n new_token compose_exec
-  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  make_cached_model "${tmp}/home" "Org/Alpha"
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
-    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
-    SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+    FAKE_VIKUNJA_CREATED_USER_FILE="${tmp}/vikunja.user" \
+    FAKE_N8N_LOGIN_EXIT=7 FAKE_N8N_LOGIN_AFTER_OWNER=1 FAKE_N8N_OWNER_MARKER="${tmp}/n8n.owner" \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --no-smtp --model Org/Alpha 2>&1 || true)
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
-  old_human=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
-  old_n8n=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
-  old_token=$(sed -n 's/^VIKUNJA_HERMES_API_TOKEN=//p' <<< "$env")
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws credentials reset vikunja >/dev/null 2>&1
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
-    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' FAKE_COMPOSE_EXEC_FILE="${tmp}/compose-exec.log" \
-    "$SPARK" ws credentials reset n8n >/dev/null 2>&1
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_VIKUNJA_CREATED_TOKEN=vk_rotated_hermes \
-    "$SPARK" ws credentials reset hermes >/dev/null 2>&1
-  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  vikunja_env=$(cat "${tmp}/home/.config/spark/workspace/vikunja.env")
   n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env")
-  compose_exec=$(cat "${tmp}/compose-exec.log" 2>/dev/null || echo "")
-  new_human=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' <<< "$env")
-  new_n8n=$(sed -n 's/^N8N_BASIC_AUTH_PASSWORD=//p' <<< "$env")
-  new_token=$(sed -n 's/^VIKUNJA_HERMES_API_TOKEN=//p' <<< "$env")
+  passwords=$(sed -n 's/^    password: //p' <<< "$out")
+  first=$(sed -n '1p' <<< "$passwords"); second=$(sed -n '2p' <<< "$passwords")
   rm -rf "$tmp"
-  [[ -n "$old_human" ]] &&
-    [[ -n "$old_n8n" ]] &&
-    [[ -n "$old_token" ]] &&
-    [[ -n "$new_human" ]] &&
-    [[ -n "$new_n8n" ]] &&
-    [[ -n "$new_token" ]] &&
-    [[ "$old_human" != "$new_human" ]] &&
-    [[ "$old_n8n" != "$new_n8n" ]] &&
-    [[ "$old_token" != "$new_token" ]] &&
-    [[ "$new_token" == "vk_rotated_hermes" ]] &&
-    [[ "$n8n_env" == *"N8N_BASIC_AUTH_PASSWORD=${new_n8n}"* ]] &&
-    [[ "$env" == *"VIKUNJA_HUMAN_USER_STATUS=manual"* ]] &&
-    [[ "$env" == *"N8N_OWNER_SETUP_STATUS=exists"* ]] &&
-    [[ "$env" == *"VIKUNJA_HERMES_API_STATUS=verified"* ]] &&
-    [[ "$compose_exec" == *"n8n user-management:reset"* ]]
+  [[ "$out" == *"Save these passwords now"* ]] &&
+    [[ -n "$first" && -n "$second" && "$first" != "$second" ]] &&
+    [[ "$env$vikunja_env$n8n_env" != *"$first"* ]] &&
+    [[ "$env$vikunja_env$n8n_env" != *"$second"* ]] &&
+    [[ "$env$vikunja_env$n8n_env" != *"VIKUNJA_HUMAN_RECOVERY_PASSWORD="* ]] &&
+    [[ "$env$vikunja_env$n8n_env" != *"N8N_BASIC_AUTH_PASSWORD="* ]]
+}
+
+test_workspace_setup_accepts_password_flags_and_files() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  printf '%s\n' 'N8nFilePassword456' > "${tmp}/n8n.pass"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    FAKE_VIKUNJA_USER_LIST='| 2 | hermes | hermes@spark.invalid | active |\n' \
+    FAKE_VIKUNJA_CREATED_USER_FILE="${tmp}/vikunja.user" \
+    FAKE_N8N_LOGIN_EXIT=7 FAKE_N8N_LOGIN_AFTER_OWNER=1 FAKE_N8N_OWNER_MARKER="${tmp}/n8n.owner" \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --no-smtp --model Org/Alpha \
+      --vikunja-password VikunjaFlagPassword123 --n8n-password-file "${tmp}/n8n.pass" 2>&1 || true)
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  rm -rf "$tmp"
+  [[ "$out" == *"password: VikunjaFlagPassword123"* ]] &&
+    [[ "$out" == *"password: N8nFilePassword456"* ]] &&
+    [[ "$out" == *"prefer --vikunja-password-file"* ]] &&
+    [[ "$env" != *"VikunjaFlagPassword123"* ]] && [[ "$env" != *"N8nFilePassword456"* ]]
+}
+
+test_workspace_credentials_command_removed() {
+  local out status
+  set +e
+  out=$("$SPARK" ws credentials 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] && [[ "$out" == *"Unknown ws command: credentials"* ]] &&
+    [[ "$("$SPARK" ws help 2>&1)" != *"credentials"* ]]
+}
+
+test_workspace_setup_configures_optional_smtp() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out rerun env vikunja_env n8n_env calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  printf '%s\n' 'smtp-key-123' > "${tmp}/smtp.pass"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    FAKE_COMPOSE_EXEC_FILE="${tmp}/compose.log" FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha --smtp --smtp-host smtp-relay.brevo.com \
+      --smtp-port 587 --smtp-user brevo-user --smtp-password-file "${tmp}/smtp.pass" \
+      --smtp-from recovery@example.com --smtp-security starttls 2>&1 || true)
+  rerun=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    FAKE_COMPOSE_EXEC_FILE="${tmp}/compose.log" FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1 || true)
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  vikunja_env=$(cat "${tmp}/home/.config/spark/workspace/vikunja.env")
+  n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env")
+  calls=$(cat "${tmp}/compose.log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"SMTP test email sent to m@example.com"* ]] &&
+    [[ "$env" == *"WORKSPACE_SMTP_PASSWORD=smtp-key-123"* ]] &&
+    [[ "$vikunja_env" == *"VIKUNJA_MAILER_ENABLED=true"* ]] &&
+    [[ "$vikunja_env" == *"VIKUNJA_MAILER_FORCESSL=false"* ]] &&
+    [[ "$n8n_env" == *"N8N_EMAIL_MODE=smtp"* ]] &&
+    [[ "$n8n_env" == *"N8N_SMTP_STARTTLS=true"* ]] &&
+    [[ "$calls" == *"testmail m@example.com"* ]] &&
+    [[ "$rerun" != *"SMTP password is required"* ]] && [[ "$rerun" != *"smtp-key-123"* ]]
 }
 
 test_workspace_setup_repairs_polluted_required_env_values() {
@@ -2937,7 +3054,7 @@ EOF_ENV
   env=$(cat "$env_file")
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"Ignoring invalid stored n8n admin/basic-auth password"* ]] &&
+    [[ "$out" == *"Removed legacy stored human passwords"* ]] &&
     [[ "$out" == *"Workspace username is required"* ]] &&
     [[ "$env" != *"✗"* ]] &&
     [[ "$env" != *"is required"* ]]
@@ -3031,7 +3148,7 @@ test_workspace_doctor_checklist_passes() {
   rm -rf "$tmp"
     [[ "$out" == *"Workspace doctor passed"* ]] &&
     [[ "$out" == *"[x] Compose service running: postgres"* ]] &&
-    [[ "$out" == *"[x] Human Vikunja password is not stored"* ]] &&
+    [[ "$out" == *"[x] Human service passwords are not stored"* ]] &&
     [[ "$out" == *"[x] Scoped service env files exist and are 0600"* ]] &&
     [[ "$out" == *"[x] Docker Compose config is valid"* ]] &&
     [[ "$out" == *"[x] Compose uses scoped env files, not full secrets.env"* ]] &&
@@ -3041,12 +3158,12 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Vikunja HTTP endpoint ready"* ]] &&
     [[ "$out" == *"[x] n8n HTTP endpoint ready"* ]] &&
     [[ "$out" == *"[x] Workspace URLs configured"* ]] &&
-    [[ "$out" == *"[x] Workspace credentials are unique per service"* ]] &&
+    [[ "$out" == *"[x] Workspace technical secrets are unique per service"* ]] &&
     [[ "$out" == *"[x] Vikunja human user exists"* ]] &&
     [[ "$out" == *"[x] Vikunja hermes user exists"* ]] &&
     [[ "$out" == *"[x] Vikunja hermes API token works"* ]] &&
     [[ "$out" == *"[x] n8n hardened for private agent workflows"* ]] &&
-    [[ "$out" == *"[x] n8n owner/admin login ready"* ]] &&
+    [[ "$out" == *"[x] n8n owner/admin ready"* ]] &&
     [[ "$out" == *"[x] Tailscale supports selected private access mode"* ]] &&
     [[ "$out" == *"[x] Tailscale Services registered/authorized"* ]] &&
     [[ "$out" == *"[x] Tailscale Serve enabled"* ]] &&
@@ -3060,10 +3177,37 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] LiteLLM exposes Hermes model route"* ]] &&
     [[ "$out" == *"[x] LiteLLM Hermes route completes smoke request"* ]] &&
     [[ "$out" == *"[x] Vikunja internal doctor passes"* ]] &&
-    [[ "$out" == *"[x] Hermes NemoClaw uses restricted policy and private API port"* ]] &&
+    [[ "$out" == *"[x] NemoHermes maintained release installed"* ]] &&
+    [[ "$out" == *"[x] Hermes NemoClaw uses restricted policy and private dashboard/API ports"* ]] &&
+    [[ "$out" == *"[x] Hermes local API is reachable"* ]] &&
     [[ "$out" == *"[x] NemoHermes sandbox doctor passes"* ]] &&
     [[ "$out" == *"[x] NemoHermes inference route uses selected LiteLLM model"* ]] &&
-    [[ "$out" == *"[x] Hermes private API URL is reachable"* ]]
+    [[ "$out" == *"[x] Hermes dashboard URL is reachable"* ]]
+}
+
+test_workspace_doctor_flags_stale_nemohermes_release() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_NEMOHERMES_UPDATE_CHECK=$'Current NemoHermes version: 0.0.55\nLatest maintained version: 0.0.78\nUpdate available:         yes' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] NemoHermes maintained release installed"* ]]
 }
 
 test_workspace_doctor_strict_checks_pinned_images() {
@@ -3708,18 +3852,20 @@ test_workspace_doctor_flags_stale_n8n_owner_status() {
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  grep -v '^N8N_OWNER_SETUP_STATUS=' "${tmp}/home/.config/spark/workspace/secrets.env" > "${tmp}/owner-status.env"
+  printf '%s\n' 'N8N_OWNER_SETUP_STATUS=manual' >> "${tmp}/owner-status.env"
+  mv "${tmp}/owner-status.env" "${tmp}/home/.config/spark/workspace/secrets.env"
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_N8N_LOGIN_EXIT=1 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] n8n owner/admin login ready"* ]]
+    [[ "$out" == *"[ ] n8n owner/admin ready"* ]]
 }
 
 test_workspace_doctor_flags_stored_human_password() {
@@ -3744,7 +3890,7 @@ test_workspace_doctor_flags_stored_human_password() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Human Vikunja password is not stored"* ]]
+    [[ "$out" == *"[ ] Human service passwords are not stored"* ]]
 }
 
 test_workspace_doctor_flags_duplicate_credentials() {
@@ -3758,9 +3904,9 @@ test_workspace_doctor_flags_duplicate_credentials() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
   env_file="${tmp}/home/.config/spark/workspace/secrets.env"
-  secret=$(sed -n 's/^VIKUNJA_HUMAN_RECOVERY_PASSWORD=//p' "$env_file")
+  secret=$(sed -n 's/^POSTGRES_PASSWORD=//p' "$env_file")
   SECRET="$secret" awk '
-    /^N8N_BASIC_AUTH_PASSWORD=/ { print "N8N_BASIC_AUTH_PASSWORD=" ENVIRON["SECRET"]; next }
+    /^VIKUNJA_DATABASE_PASSWORD=/ { print "VIKUNJA_DATABASE_PASSWORD=" ENVIRON["SECRET"]; next }
     { print }
   ' "$env_file" > "${env_file}.tmp"
   mv "${env_file}.tmp" "$env_file"
@@ -3774,7 +3920,7 @@ test_workspace_doctor_flags_duplicate_credentials() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Workspace credentials are unique per service"* ]]
+    [[ "$out" == *"[ ] Workspace technical secrets are unique per service"* ]]
 }
 
 test_workspace_doctor_flags_invalid_secrets_env() {
@@ -4018,6 +4164,7 @@ test_workspace_doctor_flags_nemohermes_doctor_failure() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] Hermes local API is reachable"* ]] &&
     [[ "$out" == *"[ ] NemoHermes sandbox doctor passes"* ]]
 }
 
@@ -4120,7 +4267,7 @@ test_workspace_doctor_flags_wrong_nemoclaw_policy() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Hermes NemoClaw uses restricted policy and private API port"* ]]
+    [[ "$out" == *"[ ] Hermes NemoClaw uses restricted policy and private dashboard/API ports"* ]]
 }
 
 test_workspace_doctor_flags_wrong_hermes_dashboard_url() {
@@ -4146,7 +4293,7 @@ test_workspace_doctor_flags_wrong_hermes_dashboard_url() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Hermes private API URL is reachable"* ]]
+    [[ "$out" == *"[ ] Hermes dashboard URL is reachable"* ]]
 }
 
 test_workspace_doctor_flags_missing_tailscale_service_config() {
@@ -4774,6 +4921,25 @@ test_dryrun_shows_fit_options() {
   [[ "$status" -eq 0 ]] &&
     [[ "$out" == *"Using max context that fits now: 109568/262144 tokens"* ]] &&
     [[ "$out" == *"--max-model-len 109568"* ]] &&
+    [[ "$out" == *"docker run"* ]]
+}
+
+test_dryrun_live_available_caps_auto_fit() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_RAM_AVAIL_GB=25 \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_MANAGED="$RESERVE_85" \
+    "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$out" == *"Using max context that fits now: 99328/262144 tokens"* ]] &&
+    [[ "$out" == *"--max-model-len 99328"* ]] &&
     [[ "$out" == *"docker run"* ]]
 }
 
@@ -5840,6 +6006,7 @@ run_test "auto-pull: fits → downloads and starts" test_autopull_fits_downloads
 run_test "auto-pull: does not fit → downloads without starting" test_autopull_no_fit_download_only
 run_test "stop <model> stops only that model" test_stop_specific_model
 run_test "stop --all stops every model" test_stop_all
+run_test "down stops models and gateway" test_down_stops_models_and_gateway
 run_test "stop with no arg and many models asks which" test_stop_ambiguous_requires_target
 run_test "status renders a table" test_status_renders_table
 run_test "dashboard web writes product UI" test_dashboard_web_once_writes_product_ui
@@ -5882,6 +6049,7 @@ run_test "ollama oversized model continues on yes" test_ollama_oversized_continu
 run_test "ollama backend blocks vLLM-only model" test_ollama_blocks_vllm_only_model
 run_test "vllm backend blocks ollama-style tag" test_vllm_blocks_ollama_tag
 run_test "dry-run shows fit options without aborting" test_dryrun_shows_fit_options
+run_test "dry-run live available caps auto-fit" test_dryrun_live_available_caps_auto_fit
 run_test "menu: choosing fp8 relaunches at 2x context" test_menu_choose_fp8_relaunches
 run_test "menu: choosing auto relaunches at the auto context" test_menu_choose_auto_relaunches
 run_test "menu: cancel aborts without starting" test_menu_cancel_aborts
@@ -5946,6 +6114,8 @@ run_test "setup rejects unknown flags" test_setup_unknown_flag_fails
 run_test "setup --full --check runs workspace phase" test_setup_full_check_runs_workspace_phase
 run_test "setup --full continues after swap reconcile" test_setup_full_continues_after_swap_reconcile
 run_test "workspace help renders only as ws" test_workspace_help_and_command
+run_test "workspace down stops Compose and Hermes" test_workspace_down_stops_compose_and_hermes
+run_test "workspace normalizes Hermes container name" test_workspace_normalizes_hermes_name
 run_test "workspace setup --check does not write files" test_workspace_check_no_mutation
 run_test "workspace setup --check preserves existing config" test_workspace_check_existing_config_no_mutation
 run_test "workspace setup --check reports missing Compose plugin" test_workspace_check_reports_missing_compose_plugin
@@ -5961,6 +6131,8 @@ run_test "workspace setup repairs compose drift without Hermes onboard" test_wor
 run_test "workspace setup backs up and normalizes invalid env" test_workspace_setup_backs_up_and_normalizes_invalid_env
 run_test "workspace setup refuses missing secret with data" test_workspace_setup_refuses_missing_secret_with_data
 run_test "workspace setup fails when Hermes onboard fails" test_workspace_setup_fails_when_hermes_onboard_fails
+run_test "workspace setup updates stale NemoHermes" test_workspace_setup_updates_stale_nemohermes
+run_test "workspace setup stops when NemoHermes update fails" test_workspace_setup_stops_when_nemohermes_update_fails
 run_test "workspace derives tailnet from Tailscale self DNSName" test_workspace_tailnet_from_self_dnsname
 run_test "workspace setup requires tailnet URLs" test_workspace_setup_requires_tailnet_urls
 run_test "workspace ports mode requires MagicDNS URLs" test_workspace_ports_requires_magicdns_urls
@@ -5985,10 +6157,10 @@ run_test "workspace setup creates Hermes with valid email" test_workspace_setup_
 run_test "workspace setup never persists human password on Vikunja failure" test_workspace_setup_never_persists_human_password_on_vikunja_failure
 run_test "workspace setup preserves existing secrets" test_workspace_setup_preserves_existing_secrets
 run_test "workspace setup missing required values does not pollute env" test_workspace_setup_missing_required_values_do_not_pollute_env
-run_test "workspace setup ignores password overrides and generates secrets" test_workspace_setup_ignores_password_overrides_and_generates_secrets
-run_test "workspace setup interactive credentials are generated" test_workspace_setup_interactive_shared_credentials
-run_test "workspace credentials show outputs recovery secrets" test_workspace_credentials_show_outputs_recovery_secrets
-run_test "workspace credentials reset rotates local secrets" test_workspace_credentials_reset_rotates_local_secrets
+run_test "workspace setup generates, prints, and forgets human passwords" test_workspace_setup_generates_prints_and_forgets_passwords
+run_test "workspace setup accepts password flags and files" test_workspace_setup_accepts_password_flags_and_files
+run_test "workspace credentials command is removed" test_workspace_credentials_command_removed
+run_test "workspace setup configures optional SMTP" test_workspace_setup_configures_optional_smtp
 run_test "workspace setup repairs polluted required env values" test_workspace_setup_repairs_polluted_required_env_values
 run_test "workspace setup cleans polluted env before missing value abort" test_workspace_setup_cleans_polluted_env_before_missing_value_abort
 run_test "workspace setup --remote delegates to remote spark" test_workspace_remote_delegates
@@ -5997,6 +6169,8 @@ run_test "workspace setup --remote --check does not forward credentials" test_wo
 run_test "workspace doctor --remote delegates doctor" test_workspace_doctor_remote_delegates_doctor
 run_test "workspace doctor --strict --remote delegates doctor" test_workspace_doctor_remote_delegates_strict
 run_test "workspace doctor checklist passes" test_workspace_doctor_checklist_passes
+run_test "workspace doctor flags stale NemoHermes release" test_workspace_doctor_flags_stale_nemohermes_release
+run_test "workspace setup repairs Hermes dashboard public bind" test_workspace_setup_repairs_hermes_dashboard_public_bind
 run_test "workspace doctor --strict checks pinned images only" test_workspace_doctor_strict_checks_pinned_images
 run_test "workspace doctor --strict flags latest images" test_workspace_doctor_strict_flags_latest_images
 run_test "workspace doctor --json emits structured checks" test_workspace_doctor_json

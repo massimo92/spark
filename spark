@@ -9,7 +9,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.1.50"
+VERSION="0.1.51"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -43,6 +43,10 @@ WORKSPACE_POSTGRES_ENV_FILE="${WORKSPACE_CONFIG_DIR}/postgres.env"
 WORKSPACE_VIKUNJA_ENV_FILE="${WORKSPACE_CONFIG_DIR}/vikunja.env"
 WORKSPACE_N8N_ENV_FILE="${WORKSPACE_CONFIG_DIR}/n8n.env"
 WORKSPACE_PROJECT="workspace"
+WORKSPACE_POSTGRES_CONTAINER="workspace-postgres"
+WORKSPACE_VIKUNJA_CONTAINER="workspace-vikunja"
+WORKSPACE_N8N_CONTAINER="workspace-n8n"
+WORKSPACE_HERMES_CONTAINER="workspace-hermes"
 WORKSPACE_VIKUNJA_PORT=3456
 WORKSPACE_N8N_PORT=5678
 WORKSPACE_HERMES_PORT=18789
@@ -1271,19 +1275,45 @@ usable_budget() {
   printf '%s\n' "$BUDGET_GB"
 }
 
+budget_free_gb() {
+  local reserved="${1:-0}"
+  awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }'
+}
+
+live_available_gb() {
+  free -m 2>/dev/null | awk '/^Mem:/ { printf "%.1f", $7/1024; found=1 } END { exit !found }'
+}
+
+effective_free_gb() {
+  local reserved="${1:-0}" budget_free live_free
+  budget_free=$(budget_free_gb "$reserved")
+  if [[ "$ACCEL" == "cuda-unified" ]] && live_free=$(live_available_gb 2>/dev/null) \
+      && [[ "$live_free" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    awk -v b="$budget_free" -v l="$live_free" 'BEGIN{ printf "%.1f", (l<b ? l : b) }'
+    return 0
+  fi
+  printf '%s\n' "$budget_free"
+}
+
 verify_capacity() {
   local new_need="$1" exclude="${2:-}" dry_run="${3:-0}" mem="${4:-}" model="${5:-}" config_json="${6:-}"
-  local reserved free eff_budget
+  local reserved free budget_free live_free
   reserved=$(reserved_budget_gb "$exclude")
-  eff_budget=$(usable_budget "$reserved")
-  free=$(awk -v b="$eff_budget" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+  budget_free=$(budget_free_gb "$reserved")
+  free=$(effective_free_gb "$reserved")
 
   awk -v n="$new_need" -v f="$free" 'BEGIN{ exit !(n > f) }' || return 0   # fits
 
   err "Not enough memory to start this model"
   printf "    Needs:      %s GB\n" "$new_need"
-  printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
-    "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
+  if [[ "$ACCEL" == "cuda-unified" ]] && live_free=$(live_available_gb 2>/dev/null) \
+      && [[ "$live_free" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+      && awk -v l="$live_free" -v b="$budget_free" 'BEGIN{ exit !(l < b) }'; then
+    printf "    Free:       %s GB  (live available; budget free %s GB)\n" "$free" "$budget_free"
+  else
+    printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
+      "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
+  fi
   local any=0 name m port need _
   while IFS=$'\t' read -r name m port need _; do
     [[ -z "$m" ]] && continue
@@ -1928,7 +1958,7 @@ auto_fit_context_to_budget() {
   local cname="$1" config_json="$2" reserved free target=""
   [[ -n "${mem:-}" || -n "${max_len:-}" ]] && return 0
   reserved=$(reserved_budget_gb "$cname")
-  free=$(awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+  free=$(effective_free_gb "$reserved")
   awk -v n="${NEED_GB:-0}" -v f="$free" 'BEGIN{ exit !(n > f) }' || return 0
   fit_options "$free"
   if [[ "${KV_CACHE_DTYPE:-auto}" == "fp8" && "${FIT_CTX_FP8:-0}" -gt 0 ]]; then
@@ -2212,7 +2242,7 @@ run_backend_vllm() {
   if [[ "$needs_download" == "1" ]]; then
     local reserved free
     reserved=$(reserved_budget_gb "$cname")
-    free=$(awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+    free=$(effective_free_gb "$reserved")
     if awk -v n="$NEED_GB" -v f="$free" 'BEGIN{ exit !(n > f) }'; then
       # Does not fit at the requested context (sized from metadata, before downloading).
       err "Not enough memory to start this model"
@@ -2315,7 +2345,7 @@ run_backend_vllm() {
   # Memory accounting breakdown (shown in dry-run and at launch).
   local reserved free
   reserved=$(reserved_budget_gb "$cname")
-  free=$(awk -v b="$(usable_budget "$reserved")" -v r="$reserved" 'BEGIN{ printf "%.1f", b-r }')
+  free=$(effective_free_gb "$reserved")
   print_memory_plan "$model" "$cname" "$port" "$reserved" "$free"
 
   if [[ "$dry_run" == "1" ]]; then
@@ -2569,9 +2599,8 @@ cmd_calibrate() {
   fi
 
   port="${port:-$(next_free_port "$DEFAULT_PORT")}"
-  local results_file best_json="" best_tps=0 label seqs mtp stream batched tps stream_json batched_json kv_arg=()
+  local results_file best_json="" best_tps=0 label seqs mtp stream batched tps stream_json batched_json
   results_file=$(mktemp)
-  [[ -n "$kv_dtype" ]] && kv_arg=(--kv-cache-dtype "$kv_dtype")
   while IFS=$'\t' read -r label seqs mtp stream batched; do
     printf "\n  Calibrating %s...\n" "$label"
     if ! (
@@ -2579,7 +2608,11 @@ cmd_calibrate() {
       export MTP_ENABLED="$mtp"
       [[ -n "$stream" ]] && export SPARK_STREAM_INTERVAL="$stream"
       [[ -n "$batched" ]] && export SPARK_MAX_NUM_BATCHED_TOKENS="$batched" SPARK_MTP_MAX_NUM_BATCHED_TOKENS="$batched"
-      cmd_run "$model" --force --port "$port" --max-num-seqs "$seqs" "${kv_arg[@]}"
+      if [[ -n "$kv_dtype" ]]; then
+        cmd_run "$model" --force --port "$port" --max-num-seqs "$seqs" --kv-cache-dtype "$kv_dtype"
+      else
+        cmd_run "$model" --force --port "$port" --max-num-seqs "$seqs"
+      fi
     ); then
       docker rm -f "$cname" >/dev/null 2>&1 || true
       warn "Launch failed for ${label}; skipping"
@@ -2800,6 +2833,8 @@ cmd_stop_ollama() {
 
 cmd_stop() {
   local target="${1:-}"
+  local refresh_gateway=1
+  [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" == "1" ]] && refresh_gateway=0
 
   if [[ "$BACKEND" == "ollama" ]]; then
     cmd_stop_ollama "$target"
@@ -2852,9 +2887,17 @@ cmd_stop() {
   fi
 
   # Refresh the gateway so its routing reflects the remaining models.
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+  if [[ "$refresh_gateway" == "1" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     gateway_restart
   fi
+}
+
+cmd_down() {
+  [[ $# -eq 0 ]] || die "Usage: spark down"
+  printf "\n  ${BOLD}spark down${NC}\n\n"
+  gateway_stop
+  SPARK_SKIP_GATEWAY_REFRESH=1 cmd_stop --all
+  info "Spark services stopped"
 }
 
 cmd_pull() {
@@ -5112,6 +5155,22 @@ workspace_random_secret() {
   fi
 }
 
+workspace_random_password() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24
+  else
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48
+  fi
+}
+
+workspace_read_secret_file() {
+  local label="$1" file="$2" value
+  [[ -f "$file" ]] || die "${label} file not found: ${file}"
+  value=$(sed -n '1p' "$file")
+  workspace_require_prompt_value "$label" "$value" text
+  printf '%s\n' "$value"
+}
+
 workspace_env_or_generated() {
   local key="$1" val=""
   val=$(workspace_read_env "$key" 2>/dev/null || true)
@@ -5497,6 +5556,8 @@ workspace_write_files() {
   local vikunja_api_status
   local vikunja_human_status vikunja_hermes_status vikunja_human_admin_status
   local postgres_image vikunja_image n8n_image old_umask
+  local smtp_enabled smtp_host smtp_port smtp_user smtp_password smtp_from smtp_security
+  local smtp_ssl=false smtp_starttls=false n8n_smtp_env=""
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
   tailscale_bind_addr=$(workspace_env_or_value WORKSPACE_TAILSCALE_BIND_ADDR 127.0.0.1)
   tailscale_dns_name=$(workspace_read_env WORKSPACE_TAILSCALE_DNS_NAME 2>/dev/null || true)
@@ -5558,6 +5619,19 @@ workspace_write_files() {
   postgres_image="${SPARK_WORKSPACE_POSTGRES_IMAGE:-$(workspace_env_or_value WORKSPACE_POSTGRES_IMAGE "$WORKSPACE_POSTGRES_IMAGE_DEFAULT")}"
   vikunja_image="${SPARK_WORKSPACE_VIKUNJA_IMAGE:-$(workspace_env_or_value WORKSPACE_VIKUNJA_IMAGE "$WORKSPACE_VIKUNJA_IMAGE_DEFAULT")}"
   n8n_image="${SPARK_WORKSPACE_N8N_IMAGE:-$(workspace_env_or_value WORKSPACE_N8N_IMAGE "$WORKSPACE_N8N_IMAGE_DEFAULT")}"
+  smtp_enabled="${SPARK_WORKSPACE_SMTP_ENABLED:-$(workspace_env_or_value WORKSPACE_SMTP_ENABLED false)}"
+  smtp_host="${SPARK_WORKSPACE_SMTP_HOST:-$(workspace_read_env WORKSPACE_SMTP_HOST 2>/dev/null || true)}"
+  smtp_port="${SPARK_WORKSPACE_SMTP_PORT:-$(workspace_read_env WORKSPACE_SMTP_PORT 2>/dev/null || true)}"
+  smtp_user="${SPARK_WORKSPACE_SMTP_USER:-$(workspace_read_env WORKSPACE_SMTP_USER 2>/dev/null || true)}"
+  smtp_password="${SPARK_WORKSPACE_SMTP_PASSWORD:-$(workspace_read_env WORKSPACE_SMTP_PASSWORD 2>/dev/null || true)}"
+  smtp_from="${SPARK_WORKSPACE_SMTP_FROM:-$(workspace_read_env WORKSPACE_SMTP_FROM 2>/dev/null || true)}"
+  smtp_security="${SPARK_WORKSPACE_SMTP_SECURITY:-$(workspace_env_or_value WORKSPACE_SMTP_SECURITY starttls)}"
+  case "$smtp_security" in
+    tls) smtp_ssl=true ;;
+    starttls) smtp_starttls=true ;;
+    none) ;;
+    *) die "SMTP security must be starttls, tls, or none" ;;
+  esac
   workspace_validate_image_ref "Postgres image" "$postgres_image"
   workspace_validate_image_ref "Vikunja image" "$vikunja_image"
   workspace_validate_image_ref "n8n image" "$n8n_image"
@@ -5576,10 +5650,8 @@ workspace_write_files() {
   fi
   workspace_require_env_value "Vikunja human username" "$human_user"
   workspace_require_env_value "Vikunja human email" "$human_email"
-  workspace_require_env_value "Vikunja human recovery password" "$human_pass"
   workspace_require_env_value "Vikunja Hermes password" "$hermes_pass"
   workspace_require_env_value "n8n admin email" "$n8n_email"
-  workspace_require_env_value "n8n admin/basic-auth password" "$n8n_pass"
   workspace_require_env_value "Hermes model" "$model"
   workspace_require_env_value "Postgres password" "$postgres_pass"
   workspace_require_env_value "Vikunja database password" "$vikunja_db_pass"
@@ -5594,6 +5666,21 @@ workspace_write_files() {
   workspace_require_env_value "workspace Postgres image" "$postgres_image"
   workspace_require_env_value "workspace Vikunja image" "$vikunja_image"
   workspace_require_env_value "workspace n8n image" "$n8n_image"
+  if [[ "$smtp_enabled" == "true" ]]; then
+    workspace_require_env_value "SMTP host" "$smtp_host"
+    [[ "$smtp_port" =~ ^[0-9]+$ ]] || die "SMTP port must be numeric"
+    workspace_require_env_value "SMTP user" "$smtp_user"
+    workspace_require_env_value "SMTP password" "$smtp_password"
+    workspace_require_prompt_value "SMTP sender" "$smtp_from" email
+    n8n_smtp_env="N8N_EMAIL_MODE=smtp
+N8N_SMTP_HOST=${smtp_host}
+N8N_SMTP_PORT=${smtp_port}
+N8N_SMTP_USER=${smtp_user}
+N8N_SMTP_PASS=${smtp_password}
+N8N_SMTP_SENDER=${smtp_from}
+N8N_SMTP_SSL=${smtp_ssl}
+N8N_SMTP_STARTTLS=${smtp_starttls}"
+  fi
   mkdir -p "$WORKSPACE_CONFIG_DIR" "$WORKSPACE_DATA_DIR"/{vikunja-files,postgres,n8n,backups}
   chmod 700 "$WORKSPACE_CONFIG_DIR"
   workspace_prepare_data_dirs
@@ -5607,8 +5694,6 @@ VIKUNJA_DATABASE_PASSWORD=${vikunja_db_pass}
 VIKUNJA_SERVICE_SECRET=${vikunja_secret}
 VIKUNJA_HUMAN_USERNAME=${human_user}
 VIKUNJA_HUMAN_EMAIL=${human_email}
-VIKUNJA_HUMAN_RECOVERY_PASSWORD=${human_pass}
-VIKUNJA_HUMAN_PASSWORD=
 VIKUNJA_HUMAN_USER_STATUS=${vikunja_human_status}
 VIKUNJA_HUMAN_ADMIN_STATUS=${vikunja_human_admin_status}
 VIKUNJA_HERMES_USERNAME=hermes
@@ -5616,9 +5701,7 @@ VIKUNJA_HERMES_PASSWORD=${hermes_pass}
 VIKUNJA_HERMES_USER_STATUS=${vikunja_hermes_status}
 DB_POSTGRESDB_PASSWORD=${n8n_db_pass}
 N8N_ENCRYPTION_KEY=${n8n_key}
-N8N_BASIC_AUTH_ACTIVE=true
 N8N_BASIC_AUTH_USER=${n8n_email}
-N8N_BASIC_AUTH_PASSWORD=${n8n_pass}
 N8N_OWNER_FIRST_NAME=${human_user}
 N8N_OWNER_LAST_NAME=Spark
 N8N_OWNER_SETUP_STATUS=${n8n_owner_status}
@@ -5660,6 +5743,13 @@ WORKSPACE_TAILSCALE_DNS_NAME=${tailscale_dns_name}
 WORKSPACE_POSTGRES_IMAGE=${postgres_image}
 WORKSPACE_VIKUNJA_IMAGE=${vikunja_image}
 WORKSPACE_N8N_IMAGE=${n8n_image}
+WORKSPACE_SMTP_ENABLED=${smtp_enabled}
+WORKSPACE_SMTP_HOST=${smtp_host}
+WORKSPACE_SMTP_PORT=${smtp_port}
+WORKSPACE_SMTP_USER=${smtp_user}
+WORKSPACE_SMTP_PASSWORD=${smtp_password}
+WORKSPACE_SMTP_FROM=${smtp_from}
+WORKSPACE_SMTP_SECURITY=${smtp_security}
 EOF
   workspace_install_file "$WORKSPACE_POSTGRES_ENV_FILE" 600 <<EOF
 POSTGRES_DB=workspace
@@ -5679,6 +5769,15 @@ VIKUNJA_SERVICE_PUBLICURL=${vikunja_url}
 VIKUNJA_SERVICE_ENABLEREGISTRATION=false
 VIKUNJA_SERVICE_ENABLELINKSHARING=false
 VIKUNJA_SERVICE_INTERFACE=:3456
+VIKUNJA_MAILER_ENABLED=${smtp_enabled}
+VIKUNJA_MAILER_HOST=${smtp_host}
+VIKUNJA_MAILER_PORT=${smtp_port}
+VIKUNJA_MAILER_AUTHTYPE=login
+VIKUNJA_MAILER_USERNAME=${smtp_user}
+VIKUNJA_MAILER_PASSWORD=${smtp_password}
+VIKUNJA_MAILER_FROMEMAIL=${smtp_from}
+VIKUNJA_MAILER_FORCESSL=${smtp_ssl}
+VIKUNJA_MAILER_SKIPTLSVERIFY=false
 EOF
   workspace_install_file "$WORKSPACE_N8N_ENV_FILE" 600 <<EOF
 DB_TYPE=postgresdb
@@ -5687,9 +5786,6 @@ DB_POSTGRESDB_DATABASE=n8n
 DB_POSTGRESDB_USER=n8n
 DB_POSTGRESDB_PASSWORD=${n8n_db_pass}
 N8N_ENCRYPTION_KEY=${n8n_key}
-N8N_BASIC_AUTH_ACTIVE=true
-N8N_BASIC_AUTH_USER=${n8n_email}
-N8N_BASIC_AUTH_PASSWORD=${n8n_pass}
 N8N_HOST=${n8n_host}
 N8N_PROTOCOL=${n8n_protocol}
 N8N_SECURE_COOKIE=${n8n_secure_cookie}
@@ -5711,6 +5807,7 @@ N8N_COMMUNITY_PACKAGES_MANAGED_BY_ENV=true
 N8N_COMMUNITY_PACKAGES=[]
 N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
 NODES_EXCLUDE=["n8n-nodes-base.executeCommand","n8n-nodes-base.readWriteFile"]
+${n8n_smtp_env}
 EOF
   workspace_install_file "${WORKSPACE_CONFIG_DIR}/init-db.sh" 700 <<'EOF'
 #!/usr/bin/env bash
@@ -5739,9 +5836,10 @@ SQL
 EOF
   umask 022
   workspace_install_file "$WORKSPACE_COMPOSE_FILE" 644 <<EOF
-services:
+  services:
   postgres:
     image: ${postgres_image}
+    container_name: ${WORKSPACE_POSTGRES_CONTAINER}
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
@@ -5766,6 +5864,7 @@ services:
 
   vikunja:
     image: ${vikunja_image}
+    container_name: ${WORKSPACE_VIKUNJA_CONTAINER}
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
@@ -5789,6 +5888,7 @@ services:
 
   n8n:
     image: ${n8n_image}
+    container_name: ${WORKSPACE_N8N_CONTAINER}
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
@@ -5812,8 +5912,7 @@ services:
 EOF
   umask "$old_umask"
   info "Workspace files reconciled"
-  info "Generated secure workspace credentials"
-  info "Stored workspace credentials locally with 0600 permissions"
+  info "Stored technical workspace secrets locally with 0600 permissions"
   info "Workspace access restricted to Tailscale/private bindings"
 }
 
@@ -5944,17 +6043,14 @@ workspace_create_vikunja_users() {
   human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME)
   human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL)
   hermes_pass=$(workspace_read_env VIKUNJA_HERMES_PASSWORD)
-  [[ -n "$human_pass" ]] || human_pass=$(workspace_read_env VIKUNJA_HUMAN_RECOVERY_PASSWORD 2>/dev/null || true)
-  [[ -n "$human_pass" ]] || human_pass=$(workspace_read_env VIKUNJA_HUMAN_PASSWORD 2>/dev/null || true)
+  [[ -n "$human_pass" ]] || { warn "Vikunja user password unavailable; existing user left unchanged"; return 0; }
   workspace_ensure_vikunja_user "$human_user" "$human_email" "$human_pass" VIKUNJA_HUMAN_USER_STATUS || true
-  [[ "$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)" =~ ^(created|exists)$ ]] \
-    && workspace_set_env_key VIKUNJA_HUMAN_PASSWORD ""
   workspace_vikunja_cli user set-admin "$human_user" --admin >/dev/null 2>&1 \
     && { workspace_set_env_key VIKUNJA_HUMAN_ADMIN_STATUS enabled; info "Vikunja admin set: ${human_user}"; } \
     || { workspace_set_env_key VIKUNJA_HUMAN_ADMIN_STATUS manual; warn "Could not promote ${human_user}; set admin manually if needed"; }
   workspace_ensure_vikunja_user hermes "$WORKSPACE_VIKUNJA_HERMES_EMAIL" "$hermes_pass" VIKUNJA_HERMES_USER_STATUS || true
   workspace_create_vikunja_hermes_token \
-    || warn "Create a Vikunja API token for user 'hermes' in the UI, or rerun: spark ws credentials reset hermes"
+    || warn "Create a Vikunja API token for user 'hermes' in the UI, then rerun spark ws setup"
 }
 
 workspace_set_env_key() {
@@ -5990,6 +6086,29 @@ workspace_set_env_file_key() {
   printf '%s=%s\n' "$key" "$value" >> "$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$file"
+}
+
+workspace_remove_env_file_key() {
+  local file="$1" key="$2" tmp
+  [[ -f "$file" ]] || return 0
+  tmp="${file}.tmp"
+  grep -v "^${key}=" "$file" > "$tmp" || true
+  chmod 600 "$tmp"
+  mv "$tmp" "$file"
+}
+
+workspace_remove_legacy_human_passwords() {
+  local file key removed=0
+  for file in "$WORKSPACE_ENV_FILE" "$WORKSPACE_VIKUNJA_ENV_FILE" "$WORKSPACE_N8N_ENV_FILE"; do
+    [[ -f "$file" ]] || continue
+    for key in VIKUNJA_HUMAN_PASSWORD VIKUNJA_HUMAN_RECOVERY_PASSWORD N8N_BASIC_AUTH_PASSWORD; do
+      if grep -q "^${key}=" "$file" 2>/dev/null; then
+        workspace_remove_env_file_key "$file" "$key"
+        removed=1
+      fi
+    done
+  done
+  [[ "$removed" == "0" ]] || info "Removed legacy stored human passwords"
 }
 
 workspace_clear_public_urls() {
@@ -6106,14 +6225,10 @@ workspace_create_vikunja_hermes_token() {
   info "Vikunja API token created for hermes"
 }
 
-workspace_rotate_vikunja_hermes_token() {
-  workspace_create_vikunja_hermes_token 1
-}
-
 workspace_check_vikunja_token() {
   local token="${1:-}" out base_url
   [[ -n "$token" ]] || token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
-  [[ -n "$token" ]] || die "No Vikunja Hermes API token stored" "Create it in Vikunja UI, then rerun: spark ws credentials reset hermes"
+  [[ -n "$token" ]] || die "No Vikunja Hermes API token stored" "Create it in Vikunja UI, then rerun spark ws setup"
   command -v curl >/dev/null 2>&1 || die "curl missing"
   base_url=$(workspace_vikunja_api_base_url) || return 1
   out=$(curl -fsS --max-time 5 \
@@ -6154,34 +6269,25 @@ workspace_n8n_base_url() {
 }
 
 workspace_n8n_post_json() {
-  local path="$1" payload="$2" email pass base_url
-  local auth_args=()
+  local path="$1" payload="$2" base_url
   base_url=$(workspace_n8n_base_url) || return 1
-  email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
-  pass=$(workspace_read_env N8N_BASIC_AUTH_PASSWORD 2>/dev/null || true)
-  [[ -n "$email" ]] && auth_args=(-u "${email}:${pass}")
   curl -fsS --max-time 10 \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json' \
-    "${auth_args[@]}" \
     -X POST "${base_url}${path}" \
     --data "$payload" >/dev/null
 }
 
 workspace_n8n_login() {
-  local email pass payload
-  email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
-  pass=$(workspace_read_env N8N_BASIC_AUTH_PASSWORD 2>/dev/null || true)
+  local email="${1:-}" pass="${2:-}" payload
   [[ -n "$email" && -n "$pass" ]] || return 1
   payload=$(printf '{"emailOrLdapLoginId":"%s","password":"%s"}' "$(workspace_json_escape "$email")" "$(workspace_json_escape "$pass")")
   workspace_n8n_post_json /rest/login "$payload"
 }
 
 workspace_create_n8n_owner() {
-  local email pass first last payload i
+  local email="${1:-}" pass="${2:-}" first last payload i
   command -v curl >/dev/null 2>&1 || { workspace_set_env_key N8N_OWNER_SETUP_STATUS manual; warn "curl missing; create n8n owner manually"; return 1; }
-  email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
-  pass=$(workspace_read_env N8N_BASIC_AUTH_PASSWORD 2>/dev/null || true)
   first=$(workspace_read_env N8N_OWNER_FIRST_NAME 2>/dev/null || true)
   last=$(workspace_read_env N8N_OWNER_LAST_NAME 2>/dev/null || true)
   [[ -n "$email" && -n "$pass" ]] || { workspace_set_env_key N8N_OWNER_SETUP_STATUS manual; warn "n8n owner credentials missing"; return 1; }
@@ -6192,7 +6298,7 @@ workspace_create_n8n_owner() {
     curl -fsS --max-time 2 "$(workspace_n8n_base_url)/healthz" >/dev/null 2>&1 && break
     sleep 1
   done
-  if workspace_n8n_login; then
+  if workspace_n8n_login "$email" "$pass"; then
     workspace_set_env_key N8N_OWNER_SETUP_STATUS exists
     info "n8n owner already works: ${email}"
     return 0
@@ -6202,14 +6308,14 @@ workspace_create_n8n_owner() {
     "$(workspace_json_escape "$email")" "$(workspace_json_escape "$first")" \
     "$(workspace_json_escape "$last")" "$(workspace_json_escape "$pass")")
   if workspace_n8n_post_json /rest/owner/setup "$payload"; then
-    if workspace_n8n_login; then
+    if workspace_n8n_login "$email" "$pass"; then
       workspace_set_env_key N8N_OWNER_SETUP_STATUS created
       info "n8n owner bootstrapped: ${email}"
       return 0
     fi
     warn "n8n owner setup endpoint returned success, but login is not verified yet"
   fi
-  if workspace_n8n_login; then
+  if workspace_n8n_login "$email" "$pass"; then
     workspace_set_env_key N8N_OWNER_SETUP_STATUS exists
     info "n8n owner login verified: ${email}"
     return 0
@@ -6217,11 +6323,6 @@ workspace_create_n8n_owner() {
   workspace_set_env_key N8N_OWNER_SETUP_STATUS manual
   warn "Could not bootstrap n8n owner automatically; finish first-run setup in the n8n UI"
   return 1
-}
-
-workspace_reset_n8n_user_management() {
-  workspace_compose_service_running n8n || return 1
-  workspace_compose exec -T n8n n8n user-management:reset >/dev/null 2>&1
 }
 
 workspace_configure_tailscale() {
@@ -6476,6 +6577,29 @@ workspace_hermes_config_ready() {
   workspace_hermes_dashboard_url_ready || return 1
 }
 
+workspace_nemohermes_update_available() {
+  local out
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  out=$(nemohermes update --check 2>/dev/null || true)
+  [[ "$out" == *"Update available:"*"yes"* || "$out" == *"Update available:         yes"* ]]
+}
+
+workspace_update_nemohermes_if_needed() {
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  workspace_nemohermes_update_available || return 0
+  warn "Updating NemoHermes to the maintained release"
+  NEMOCLAW_AGENT=hermes \
+    NEMOCLAW_NON_INTERACTIVE=1 \
+    NEMOCLAW_YES=1 \
+    NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE="${NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE:-[\"hermes\"]}" \
+    nemohermes update --yes >/dev/null 2>&1
+}
+
+workspace_nemohermes_maintained_release() {
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  ! workspace_nemohermes_update_available
+}
+
 workspace_setup_hermes() {
   local model="$1" tailnet="$2" check_only="$3" hermes_url litellm_model
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
@@ -6488,6 +6612,12 @@ workspace_setup_hermes() {
   if command -v nemohermes >/dev/null 2>&1; then
     info "NemoHermes: installed"
     [[ "$check_only" == "1" ]] && return 0
+    if workspace_update_nemohermes_if_needed; then
+      :
+    else
+      setup_fail "NemoHermes update failed; run nemohermes update --yes manually"
+      return 0
+    fi
     if workspace_hermes_config_ready "$litellm_model"; then
       workspace_set_env_key HERMES_ONBOARD_STATUS configured
       info "Hermes already configured with ${litellm_model}"
@@ -6507,6 +6637,7 @@ workspace_setup_hermes() {
       NEMOCLAW_MODEL="$litellm_model" \
       NEMOCLAW_PREFERRED_API=openai-completions \
       NEMOCLAW_DASHBOARD_PORT="$WORKSPACE_HERMES_PORT" \
+      NEMOCLAW_HERMES_DASHBOARD_HOST=0.0.0.0 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
       COMPATIBLE_API_KEY=dummy \
@@ -6536,6 +6667,7 @@ workspace_setup_hermes() {
       NEMOCLAW_MODEL="$litellm_model" \
       NEMOCLAW_PREFERRED_API=openai-completions \
       NEMOCLAW_DASHBOARD_PORT="$WORKSPACE_HERMES_PORT" \
+      NEMOCLAW_HERMES_DASHBOARD_HOST=0.0.0.0 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
       COMPATIBLE_API_KEY=dummy \
@@ -6635,6 +6767,52 @@ workspace_prompt_secret_confirm() {
   done
 }
 
+workspace_configure_smtp_inputs() {
+  local auto_yes="$1" existing_enabled security
+  existing_enabled=$(workspace_read_env WORKSPACE_SMTP_ENABLED 2>/dev/null || true)
+  if [[ -z "${SPARK_WORKSPACE_SMTP_ENABLED:-}" ]]; then
+    if [[ "$existing_enabled" == "true" ]]; then
+      SPARK_WORKSPACE_SMTP_ENABLED=true
+    elif [[ "$auto_yes" == "1" ]] || ! is_interactive; then
+      SPARK_WORKSPACE_SMTP_ENABLED=false
+    elif confirm "Enable SMTP password recovery for Vikunja and n8n?"; then
+      SPARK_WORKSPACE_SMTP_ENABLED=true
+    else
+      SPARK_WORKSPACE_SMTP_ENABLED=false
+    fi
+  fi
+  if [[ "$SPARK_WORKSPACE_SMTP_ENABLED" != "true" ]]; then
+    warn "SMTP disabled: forgotten passwords may require destructive service reinitialization and data may be lost"
+    return 0
+  fi
+  SPARK_WORKSPACE_SMTP_HOST="${SPARK_WORKSPACE_SMTP_HOST:-$(workspace_read_env WORKSPACE_SMTP_HOST 2>/dev/null || true)}"
+  SPARK_WORKSPACE_SMTP_PORT="${SPARK_WORKSPACE_SMTP_PORT:-$(workspace_read_env WORKSPACE_SMTP_PORT 2>/dev/null || true)}"
+  SPARK_WORKSPACE_SMTP_USER="${SPARK_WORKSPACE_SMTP_USER:-$(workspace_read_env WORKSPACE_SMTP_USER 2>/dev/null || true)}"
+  SPARK_WORKSPACE_SMTP_PASSWORD="${SPARK_WORKSPACE_SMTP_PASSWORD:-$(workspace_read_env WORKSPACE_SMTP_PASSWORD 2>/dev/null || true)}"
+  SPARK_WORKSPACE_SMTP_FROM="${SPARK_WORKSPACE_SMTP_FROM:-$(workspace_read_env WORKSPACE_SMTP_FROM 2>/dev/null || true)}"
+  SPARK_WORKSPACE_SMTP_SECURITY="${SPARK_WORKSPACE_SMTP_SECURITY:-$(workspace_read_env WORKSPACE_SMTP_SECURITY 2>/dev/null || true)}"
+  SPARK_WORKSPACE_SMTP_HOST=$(workspace_prompt SPARK_WORKSPACE_SMTP_HOST "SMTP host" "$(workspace_read_env WORKSPACE_SMTP_HOST 2>/dev/null || true)" 0 text)
+  SPARK_WORKSPACE_SMTP_PORT=$(workspace_prompt SPARK_WORKSPACE_SMTP_PORT "SMTP port" "$(workspace_read_env WORKSPACE_SMTP_PORT 2>/dev/null || printf 587)" 0 text)
+  [[ "$SPARK_WORKSPACE_SMTP_PORT" =~ ^[0-9]+$ ]] || die "SMTP port must be numeric"
+  SPARK_WORKSPACE_SMTP_USER=$(workspace_prompt SPARK_WORKSPACE_SMTP_USER "SMTP username" "$(workspace_read_env WORKSPACE_SMTP_USER 2>/dev/null || true)" 0 text)
+  SPARK_WORKSPACE_SMTP_PASSWORD=$(workspace_prompt SPARK_WORKSPACE_SMTP_PASSWORD "SMTP password" "$(workspace_read_env WORKSPACE_SMTP_PASSWORD 2>/dev/null || true)" 1 text)
+  SPARK_WORKSPACE_SMTP_FROM=$(workspace_prompt SPARK_WORKSPACE_SMTP_FROM "SMTP sender email" "$(workspace_read_env WORKSPACE_SMTP_FROM 2>/dev/null || true)" 0 email)
+  security="${SPARK_WORKSPACE_SMTP_SECURITY:-starttls}"
+  case "$security" in starttls|tls|none) ;; *) die "SMTP security must be starttls, tls, or none" ;; esac
+  SPARK_WORKSPACE_SMTP_SECURITY="$security"
+}
+
+workspace_test_smtp() {
+  local email="$1"
+  [[ "$(workspace_read_env WORKSPACE_SMTP_ENABLED 2>/dev/null || true)" == "true" ]] || return 0
+  if workspace_vikunja_cli testmail "$email" >/dev/null 2>&1; then
+    info "SMTP test email sent to ${email}"
+  else
+    setup_fail "SMTP test failed; check server, sender, TLS, and credentials"
+    return 1
+  fi
+}
+
 workspace_reconcile_identity_overrides() {
   if [[ -n "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "${SPARK_WORKSPACE_N8N_EMAIL:-}" \
     && "$SPARK_WORKSPACE_VIKUNJA_EMAIL" != "$SPARK_WORKSPACE_N8N_EMAIL" ]]; then
@@ -6667,7 +6845,10 @@ workspace_remote_workspace_cmd() {
   if [[ "$send_workspace_env" == "1" ]]; then
     for key in \
       SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL SPARK_WORKSPACE_VIKUNJA_TOKEN \
-      SPARK_WORKSPACE_N8N_EMAIL; do
+      SPARK_WORKSPACE_VIKUNJA_PASSWORD SPARK_WORKSPACE_N8N_EMAIL SPARK_WORKSPACE_N8N_PASSWORD \
+      SPARK_WORKSPACE_SMTP_ENABLED SPARK_WORKSPACE_SMTP_HOST SPARK_WORKSPACE_SMTP_PORT \
+      SPARK_WORKSPACE_SMTP_USER SPARK_WORKSPACE_SMTP_PASSWORD SPARK_WORKSPACE_SMTP_FROM \
+      SPARK_WORKSPACE_SMTP_SECURITY; do
       value="${!key:-}"
       if [[ -n "$value" ]]; then
         printf -v q '%q' "$value"
@@ -6707,7 +6888,8 @@ workspace_setup_remote() {
 workspace_setup() {
   local auto_yes=0 check_only=0 requested_model="" remote_spec="" requested_tail_mode=""
   local postgres_image="" vikunja_image="" n8n_image="" model tailnet
-  local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_token="" n8n_email_arg="" n8n_password_arg="" funnel_action=""
+  local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_password_file="" vikunja_token="" n8n_email_arg="" n8n_password_arg="" n8n_password_file="" funnel_action=""
+  local smtp_enabled_arg="" smtp_host="" smtp_port="" smtp_user="" smtp_password="" smtp_password_file="" smtp_from="" smtp_security=""
   local existing_model="" existing_tail_mode="" effective_tail_mode="" env_tail_mode="" setup_overrides=0
   env_tail_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-}"
   while [[ $# -gt 0 ]]; do
@@ -6731,9 +6913,20 @@ workspace_setup() {
       --vikunja-username) vikunja_username="${2:-}"; [[ -n "$vikunja_username" ]] || die "--vikunja-username requires a value"; shift 2 ;;
       --vikunja-email) vikunja_email="${2:-}"; [[ -n "$vikunja_email" ]] || die "--vikunja-email requires a value"; shift 2 ;;
       --vikunja-password) vikunja_password="${2:-}"; [[ -n "$vikunja_password" ]] || die "--vikunja-password requires a value"; shift 2 ;;
+      --vikunja-password-file) vikunja_password_file="${2:-}"; [[ -n "$vikunja_password_file" ]] || die "--vikunja-password-file requires a path"; shift 2 ;;
       --vikunja-token) vikunja_token="${2:-}"; [[ -n "$vikunja_token" ]] || die "--vikunja-token requires a value"; shift 2 ;;
       --n8n-email) n8n_email_arg="${2:-}"; [[ -n "$n8n_email_arg" ]] || die "--n8n-email requires a value"; shift 2 ;;
       --n8n-password) n8n_password_arg="${2:-}"; [[ -n "$n8n_password_arg" ]] || die "--n8n-password requires a value"; shift 2 ;;
+      --n8n-password-file) n8n_password_file="${2:-}"; [[ -n "$n8n_password_file" ]] || die "--n8n-password-file requires a path"; shift 2 ;;
+      --smtp) smtp_enabled_arg=true; shift ;;
+      --no-smtp) smtp_enabled_arg=false; shift ;;
+      --smtp-host) smtp_host="${2:-}"; [[ -n "$smtp_host" ]] || die "--smtp-host requires a value"; shift 2 ;;
+      --smtp-port) smtp_port="${2:-}"; [[ -n "$smtp_port" ]] || die "--smtp-port requires a value"; shift 2 ;;
+      --smtp-user) smtp_user="${2:-}"; [[ -n "$smtp_user" ]] || die "--smtp-user requires a value"; shift 2 ;;
+      --smtp-password) smtp_password="${2:-}"; [[ -n "$smtp_password" ]] || die "--smtp-password requires a value"; shift 2 ;;
+      --smtp-password-file) smtp_password_file="${2:-}"; [[ -n "$smtp_password_file" ]] || die "--smtp-password-file requires a path"; shift 2 ;;
+      --smtp-from) smtp_from="${2:-}"; [[ -n "$smtp_from" ]] || die "--smtp-from requires a value"; shift 2 ;;
+      --smtp-security) smtp_security="${2:-}"; [[ -n "$smtp_security" ]] || die "--smtp-security requires a value"; shift 2 ;;
       --funnel-action)
         funnel_action="${2:-}"
         tailscale_funnel_action_valid "$funnel_action" || die "--funnel-action must be reset or abort"
@@ -6745,18 +6938,26 @@ workspace_setup() {
   done
   [[ -n "$vikunja_username" ]] && SPARK_WORKSPACE_VIKUNJA_USERNAME="$vikunja_username"
   [[ -n "$vikunja_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$vikunja_email"
-  [[ -n "$vikunja_password" ]] && warn "--vikunja-password is ignored; spark generates a recovery secret"
+  [[ -z "$vikunja_password" || -z "$vikunja_password_file" ]] || die "Use only one of --vikunja-password or --vikunja-password-file"
+  [[ -z "$n8n_password_arg" || -z "$n8n_password_file" ]] || die "Use only one of --n8n-password or --n8n-password-file"
+  [[ -z "$smtp_password" || -z "$smtp_password_file" ]] || die "Use only one of --smtp-password or --smtp-password-file"
+  [[ -n "$vikunja_password_file" ]] && vikunja_password=$(workspace_read_secret_file "Vikunja password" "$vikunja_password_file")
+  [[ -n "$n8n_password_file" ]] && n8n_password_arg=$(workspace_read_secret_file "n8n password" "$n8n_password_file")
+  [[ -n "$smtp_password_file" ]] && smtp_password=$(workspace_read_secret_file "SMTP password" "$smtp_password_file")
+  [[ -n "$vikunja_password" ]] && { workspace_require_prompt_value "Vikunja password" "$vikunja_password" text; warn "Direct password flags may remain in shell history; prefer --vikunja-password-file"; }
+  [[ -n "$vikunja_password" ]] && SPARK_WORKSPACE_VIKUNJA_PASSWORD="$vikunja_password"
   [[ -n "$vikunja_token" ]] && SPARK_WORKSPACE_VIKUNJA_TOKEN="$vikunja_token"
   [[ -n "$n8n_email_arg" ]] && SPARK_WORKSPACE_N8N_EMAIL="$n8n_email_arg"
-  [[ -n "$n8n_password_arg" ]] && warn "--n8n-password is ignored; spark generates a recovery secret"
-  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" ]]; then
-    warn "SPARK_WORKSPACE_VIKUNJA_PASSWORD is ignored; spark generates a recovery secret"
-    unset SPARK_WORKSPACE_VIKUNJA_PASSWORD
-  fi
-  if [[ -n "${SPARK_WORKSPACE_N8N_PASSWORD:-}" ]]; then
-    warn "SPARK_WORKSPACE_N8N_PASSWORD is ignored; spark generates a recovery secret"
-    unset SPARK_WORKSPACE_N8N_PASSWORD
-  fi
+  [[ -n "$n8n_password_arg" ]] && { workspace_require_prompt_value "n8n password" "$n8n_password_arg" text; warn "Direct password flags may remain in shell history; prefer --n8n-password-file"; }
+  [[ -n "$n8n_password_arg" ]] && SPARK_WORKSPACE_N8N_PASSWORD="$n8n_password_arg"
+  [[ -n "$smtp_password" && -z "$smtp_password_file" ]] && warn "Direct SMTP password flags may remain in shell history; prefer --smtp-password-file"
+  [[ -n "$smtp_enabled_arg" ]] && SPARK_WORKSPACE_SMTP_ENABLED="$smtp_enabled_arg"
+  [[ -n "$smtp_host" ]] && SPARK_WORKSPACE_SMTP_HOST="$smtp_host"
+  [[ -n "$smtp_port" ]] && SPARK_WORKSPACE_SMTP_PORT="$smtp_port"
+  [[ -n "$smtp_user" ]] && SPARK_WORKSPACE_SMTP_USER="$smtp_user"
+  [[ -n "$smtp_password" ]] && SPARK_WORKSPACE_SMTP_PASSWORD="$smtp_password"
+  [[ -n "$smtp_from" ]] && SPARK_WORKSPACE_SMTP_FROM="$smtp_from"
+  [[ -n "$smtp_security" ]] && SPARK_WORKSPACE_SMTP_SECURITY="$smtp_security"
   workspace_reconcile_identity_overrides
   [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && workspace_require_env_value "Vikunja Hermes API token" "$SPARK_WORKSPACE_VIKUNJA_TOKEN"
   [[ -n "$postgres_image" ]] && workspace_validate_image_ref "Postgres image" "$postgres_image"
@@ -6771,6 +6972,7 @@ workspace_setup() {
       workspace_require_prompt_value "Vikunja human username" "$SPARK_WORKSPACE_VIKUNJA_USERNAME" username
       workspace_require_prompt_value "Vikunja human email" "$SPARK_WORKSPACE_VIKUNJA_EMAIL" email
       workspace_require_prompt_value "n8n admin email" "$SPARK_WORKSPACE_N8N_EMAIL" email
+      workspace_configure_smtp_inputs "$auto_yes"
       export SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL
       [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && export SPARK_WORKSPACE_VIKUNJA_TOKEN
       export SPARK_WORKSPACE_N8N_EMAIL
@@ -6798,7 +7000,7 @@ workspace_setup() {
   existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   existing_tail_mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   effective_tail_mode="${requested_tail_mode:-services}"
-  if [[ -n "$requested_model" || -n "$postgres_image" || -n "$vikunja_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
+  if [[ -n "$requested_model" || -n "$postgres_image" || -n "$vikunja_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || -n "$smtp_enabled_arg" || -n "$smtp_host" || -n "$smtp_port" || -n "$smtp_user" || -n "$smtp_password" || -n "$smtp_from" || -n "$smtp_security" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
     setup_overrides=1
   fi
   if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
@@ -6854,13 +7056,12 @@ workspace_setup() {
     workspace_summary
     return $?
   fi
-  local human_user human_email human_pass n8n_email n8n_pass hermes_pass
-  local existing_human_user existing_human_email existing_human_pass existing_n8n_email existing_n8n_pass
+  workspace_remove_legacy_human_passwords
+  local human_user human_email human_pass n8n_email n8n_pass hermes_pass vikunja_previous_status n8n_previous_status setup_rc
+  local existing_human_user existing_human_email existing_n8n_email
   existing_human_user=$(workspace_existing_prompt_value VIKUNJA_HUMAN_USERNAME "Vikunja human username" username || true)
   existing_human_email=$(workspace_existing_prompt_value VIKUNJA_HUMAN_EMAIL "Vikunja human email" email || true)
-  existing_human_pass=$(workspace_existing_prompt_value VIKUNJA_HUMAN_RECOVERY_PASSWORD "Vikunja human recovery password" text || true)
   existing_n8n_email=$(workspace_existing_prompt_value N8N_BASIC_AUTH_USER "n8n admin email" email || true)
-  existing_n8n_pass=$(workspace_existing_prompt_value N8N_BASIC_AUTH_PASSWORD "n8n admin/basic-auth password" text || true)
   workspace_existing_prompt_value N8N_OWNER_FIRST_NAME "n8n owner first name" username >/dev/null || true
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_USERNAME:-}" && -n "$existing_human_user" ]] && SPARK_WORKSPACE_VIKUNJA_USERNAME="$existing_human_user"
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "$existing_human_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$existing_human_email"
@@ -6871,12 +7072,18 @@ workspace_setup() {
   human_email=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Workspace email" "$existing_human_email" 0 email)
   n8n_email="$human_email"
   SPARK_WORKSPACE_N8N_EMAIL="$n8n_email"
-  human_pass="${existing_human_pass:-$(workspace_random_secret)}"
-  n8n_pass="${existing_n8n_pass:-$(workspace_random_secret)}"
+  workspace_configure_smtp_inputs "$auto_yes"
+  human_pass="${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-$(workspace_random_password)}"
+  n8n_pass="${SPARK_WORKSPACE_N8N_PASSWORD:-$(workspace_random_password)}"
+  [[ "$human_pass" != "$n8n_pass" ]] || die "Vikunja and n8n passwords must be different"
   workspace_require_prompt_value "Vikunja human username" "$human_user" username
   workspace_require_prompt_value "Vikunja human email" "$human_email" email
   workspace_require_prompt_value "n8n admin email" "$n8n_email" email
   hermes_pass=$(workspace_random_secret)
+  vikunja_previous_status=$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)
+  n8n_previous_status=$(workspace_read_env N8N_OWNER_SETUP_STATUS 2>/dev/null || true)
+  WORKSPACE_SHOW_VIKUNJA_PASSWORD=0
+  WORKSPACE_SHOW_N8N_PASSWORD=0
   workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$hermes_pass" "$model" || {
     workspace_summary
     return $?
@@ -6891,7 +7098,15 @@ workspace_setup() {
     setup_fail "Hermes onboarding skipped until Tailscale private access is configured"
   fi
   workspace_create_vikunja_users "$human_pass"
-  workspace_create_n8n_owner || true
+  [[ ! "$vikunja_previous_status" =~ ^(created|exists)$ && "$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)" == "created" ]] \
+    && WORKSPACE_SHOW_VIKUNJA_PASSWORD=1
+  if [[ "$n8n_previous_status" =~ ^(created|exists)$ ]]; then
+    info "n8n owner already configured: ${n8n_email}"
+  else
+    workspace_create_n8n_owner "$n8n_email" "$n8n_pass" || true
+    [[ "$(workspace_read_env N8N_OWNER_SETUP_STATUS 2>/dev/null || true)" == "created" ]] && WORKSPACE_SHOW_N8N_PASSWORD=1
+  fi
+  workspace_test_smtp "$human_email" || true
   if workspace_tailscale_services_mode && workspace_tailscale_service_host_advertised; then
     if workspace_tailscale_urls_ready_after_setup; then
       workspace_tailscale_clear_error
@@ -6901,136 +7116,11 @@ workspace_setup() {
       setup_fail "Tailscale workspace URLs are not reachable yet"
     fi
   fi
-  workspace_summary
-}
-
-cmd_workspace_credentials_help() {
-  cat <<EOF
-
-  ${BOLD}Usage:${NC} spark ws credentials <show|rotate|reset> [target]
-
-  Shows or rotates local recovery credentials generated by spark and Hermes' API token.
-  These are technical secrets stored on the server, not human passwords.
-
-  ${BOLD}Commands:${NC}
-    show              Show workspace URLs and recovery credentials
-    rotate            Rotate all supported recovery credentials and Hermes API token
-    reset vikunja     Rotate Vikunja human recovery secret
-    reset hermes      Rotate Hermes' Vikunja API token
-    reset n8n         Rotate n8n recovery/basic-auth secret
-
-EOF
-}
-
-workspace_credentials_require_config() {
-  [[ -f "$WORKSPACE_ENV_FILE" ]] || die "Workspace is not configured" "Run 'spark ws setup' first"
-}
-
-workspace_credentials_read() {
-  workspace_read_env "$1" 2>/dev/null || true
-}
-
-cmd_workspace_credentials_show() {
-  workspace_credentials_require_config
-  local vikunja_url n8n_url hermes_url human_user human_email human_pass n8n_user n8n_pass hermes_user hermes_pass token
-  vikunja_url=$(workspace_credentials_read VIKUNJA_URL)
-  n8n_url=$(workspace_credentials_read N8N_URL)
-  hermes_url=$(workspace_credentials_read HERMES_URL)
-  human_user=$(workspace_credentials_read VIKUNJA_HUMAN_USERNAME)
-  human_email=$(workspace_credentials_read VIKUNJA_HUMAN_EMAIL)
-  human_pass=$(workspace_credentials_read VIKUNJA_HUMAN_RECOVERY_PASSWORD)
-  n8n_user=$(workspace_credentials_read N8N_BASIC_AUTH_USER)
-  n8n_pass=$(workspace_credentials_read N8N_BASIC_AUTH_PASSWORD)
-  hermes_user=$(workspace_credentials_read VIKUNJA_HERMES_USERNAME)
-  hermes_pass=$(workspace_credentials_read VIKUNJA_HERMES_PASSWORD)
-  token=$(workspace_credentials_read VIKUNJA_HERMES_API_TOKEN)
-  cat <<EOF
-
-  ${BOLD}spark ws credentials${NC}
-
-  Vikunja
-    URL:               ${vikunja_url:-n/a}
-    username:          ${human_user:-n/a}
-    email:             ${human_email:-n/a}
-    recovery password: ${human_pass:-n/a}
-
-  n8n
-    URL:               ${n8n_url:-n/a}
-    email:             ${n8n_user:-n/a}
-    recovery password: ${n8n_pass:-n/a}
-
-  Hermes/Vikunja
-    API URL:           ${hermes_url:-n/a}
-    username:          ${hermes_user:-hermes}
-    password:          ${hermes_pass:-n/a}
-    API token:         ${token:-n/a}
-
-EOF
-}
-
-cmd_workspace_credentials_reset() {
-  local target="${1:-}" secret
-  workspace_credentials_require_config
-  [[ -n "$target" ]] || die "credentials reset requires a target" "Use vikunja, n8n, or all"
-  case "$target" in
-    all)
-      local rc=0
-      cmd_workspace_credentials_reset vikunja || rc=1
-      cmd_workspace_credentials_reset hermes || rc=1
-      cmd_workspace_credentials_reset n8n || rc=1
-      return "$rc"
-      ;;
-    vikunja)
-      secret=$(workspace_random_secret)
-      workspace_set_env_key VIKUNJA_HUMAN_RECOVERY_PASSWORD "$secret"
-      workspace_set_env_key VIKUNJA_HUMAN_USER_STATUS manual
-      info "Vikunja human recovery secret rotated locally"
-      warn "If the Vikunja user already exists, update that user's password in Vikunja or recreate it, then rerun spark ws setup"
-      ;;
-    hermes)
-      workspace_rotate_vikunja_hermes_token || {
-        workspace_set_env_key VIKUNJA_HERMES_API_STATUS manual
-        warn "Could not rotate Hermes' Vikunja API token automatically; rerun spark ws setup after fixing Hermes/Vikunja access"
-        return 1
-      }
-      info "Hermes Vikunja API token rotated locally"
-      ;;
-    n8n)
-      secret=$(workspace_random_secret)
-      workspace_set_env_key N8N_BASIC_AUTH_PASSWORD "$secret"
-      workspace_set_env_file_key "$WORKSPACE_N8N_ENV_FILE" N8N_BASIC_AUTH_PASSWORD "$secret"
-      workspace_set_env_key N8N_OWNER_SETUP_STATUS manual
-      info "n8n recovery/basic-auth secret rotated locally"
-      workspace_compose up -d n8n >/dev/null 2>&1 || true
-      if workspace_reset_n8n_user_management && workspace_create_n8n_owner; then
-        info "n8n owner reset to generated recovery credential"
-      else
-        warn "Could not reset n8n owner automatically; finish first-run setup in n8n or rerun spark ws setup"
-      fi
-      ;;
-    *)
-      die "Unknown credentials target: $target" "Use vikunja, n8n, or all"
-      ;;
-  esac
-}
-
-cmd_workspace_credentials() {
-  local subcmd="${1:-show}" target
-  [[ -n "${1:-}" ]] && shift || true
-  case "$subcmd" in
-    show) cmd_workspace_credentials_show "$@" ;;
-    rotate)
-      [[ $# -eq 0 ]] || die "credentials rotate does not take extra arguments"
-      cmd_workspace_credentials_reset all
-      ;;
-    reset)
-      target="${1:-}"
-      [[ $# -le 1 ]] || die "credentials reset accepts one target"
-      cmd_workspace_credentials_reset "$target"
-      ;;
-    help|--help|-h) cmd_workspace_credentials_help ;;
-    *) die "Unknown ws credentials command: $subcmd" "Run 'spark ws credentials help'" ;;
-  esac
+  setup_rc=0
+  workspace_summary || setup_rc=$?
+  workspace_print_initial_credentials "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass"
+  unset SPARK_WORKSPACE_VIKUNJA_PASSWORD SPARK_WORKSPACE_N8N_PASSWORD human_pass n8n_pass
+  return "$setup_rc"
 }
 
 cmd_workspace_status() {
@@ -7061,6 +7151,29 @@ cmd_workspace_status() {
     tailscale serve status 2>/dev/null || warn "No Tailscale Serve status"
   fi
   printf "\n"
+}
+
+workspace_down() {
+  [[ $# -eq 0 ]] || die "Usage: spark ws down"
+  local hermes_container=""
+
+  printf "\n  ${BOLD}spark ws down${NC}\n\n"
+  if workspace_configured; then
+    workspace_compose down >/dev/null 2>&1 &&
+      info "Stopped workspace Compose project (${WORKSPACE_PROJECT})" ||
+      warn "Could not stop workspace Compose project"
+  else
+    warn "Workspace not configured"
+  fi
+
+  hermes_container=$(workspace_hermes_running_container_name 2>/dev/null || true)
+  if [[ -n "$hermes_container" ]]; then
+    docker stop "$hermes_container" >/dev/null 2>&1 &&
+      info "Stopped Hermes/NemoClaw (${hermes_container})" ||
+      warn "Could not stop Hermes/NemoClaw (${hermes_container})"
+  else
+    warn "No running Hermes/NemoClaw container"
+  fi
 }
 
 workspace_status_item() {
@@ -7331,8 +7444,11 @@ workspace_env_has() {
 }
 
 workspace_human_password_not_stored() {
-  [[ -f "$WORKSPACE_ENV_FILE" ]] || return 1
-  ! grep -Eq '^VIKUNJA_HUMAN_PASSWORD=.+$' "$WORKSPACE_ENV_FILE"
+  local file
+  for file in "$WORKSPACE_ENV_FILE" "$WORKSPACE_VIKUNJA_ENV_FILE" "$WORKSPACE_N8N_ENV_FILE"; do
+    [[ -f "$file" ]] || return 1
+    ! grep -Eq '^(VIKUNJA_HUMAN_(PASSWORD|RECOVERY_PASSWORD)|N8N_BASIC_AUTH_PASSWORD)=' "$file" || return 1
+  done
 }
 
 workspace_credentials_are_distinct() {
@@ -7340,8 +7456,7 @@ workspace_credentials_are_distinct() {
   seen=""
   for key in \
     POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD DB_POSTGRESDB_PASSWORD VIKUNJA_SERVICE_SECRET \
-    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_RECOVERY_PASSWORD \
-    VIKUNJA_HERMES_PASSWORD N8N_BASIC_AUTH_PASSWORD VIKUNJA_HERMES_API_TOKEN; do
+    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HERMES_PASSWORD VIKUNJA_HERMES_API_TOKEN; do
     val=$(workspace_read_env "$key" || true)
     [[ -n "$val" ]] || return 1
     if printf '%s\n' "$seen" | grep -Fqx -- "$val"; then
@@ -7350,6 +7465,18 @@ workspace_credentials_are_distinct() {
     seen="${seen}${val}"$'\n'
   done
   return 0
+}
+
+workspace_smtp_config_valid() {
+  local enabled security
+  enabled=$(workspace_read_env WORKSPACE_SMTP_ENABLED 2>/dev/null || true)
+  [[ "$enabled" == "false" ]] && return 0
+  [[ "$enabled" == "true" ]] || return 1
+  security=$(workspace_read_env WORKSPACE_SMTP_SECURITY 2>/dev/null || true)
+  [[ "$security" =~ ^(starttls|tls|none)$ ]] || return 1
+  workspace_env_has WORKSPACE_SMTP_HOST WORKSPACE_SMTP_PORT WORKSPACE_SMTP_USER WORKSPACE_SMTP_PASSWORD WORKSPACE_SMTP_FROM || return 1
+  grep -q '^VIKUNJA_MAILER_ENABLED=true$' "$WORKSPACE_VIKUNJA_ENV_FILE" &&
+    grep -q '^N8N_EMAIL_MODE=smtp$' "$WORKSPACE_N8N_ENV_FILE"
 }
 
 workspace_env_file_syntax_valid() {
@@ -7559,7 +7686,9 @@ workspace_compose_runtime_hardened() {
 }
 
 workspace_n8n_owner_ready() {
-  workspace_n8n_login >/dev/null 2>&1
+  local status
+  status=$(workspace_read_env N8N_OWNER_SETUP_STATUS 2>/dev/null || true)
+  [[ "$status" =~ ^(created|exists)$ ]] && workspace_n8n_http_ready
 }
 
 workspace_vikunja_user_ready() {
@@ -7697,7 +7826,7 @@ workspace_tailscale_https_urls_ready() {
   fi
   workspace_http_ready "${vikunja%/}/api/v1/info" &&
     workspace_http_ready "${n8n%/}/healthz" &&
-    workspace_hermes_api_ready_at "$hermes"
+    workspace_hermes_dashboard_ready_at "$hermes"
 }
 
 workspace_tailscale_urls_ready_after_setup() {
@@ -8081,20 +8210,18 @@ workspace_tailscale_offer_ports_fallback() {
 }
 
 workspace_tailscale_ports_fallback() {
-  local tailnet="$1" human_user="" human_email="" human_pass="" n8n_email="" n8n_pass="" hermes_pass="" model="" bind_addr="" dns_name=""
+  local tailnet="$1" human_user="" human_email="" n8n_email="" hermes_pass="" model="" bind_addr="" dns_name=""
   human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
   human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
-  human_pass=$(workspace_read_env VIKUNJA_HUMAN_RECOVERY_PASSWORD 2>/dev/null || true)
   n8n_email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
-  n8n_pass=$(workspace_read_env N8N_BASIC_AUTH_PASSWORD 2>/dev/null || true)
   hermes_pass=$(workspace_read_env VIKUNJA_HERMES_PASSWORD 2>/dev/null || true)
   model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   bind_addr=$(workspace_tailscale_ipv4 2>/dev/null || true)
   dns_name=$(workspace_tailscale_dns_name 2>/dev/null || true)
-  [[ -n "$human_user" && -n "$human_email" && -n "$human_pass" && -n "$n8n_email" && -n "$n8n_pass" && -n "$hermes_pass" && -n "$model" ]] || return 1
+  [[ -n "$human_user" && -n "$human_email" && -n "$n8n_email" && -n "$hermes_pass" && -n "$model" ]] || return 1
   [[ -n "$bind_addr" && -n "$dns_name" ]] || return 1
   SPARK_WORKSPACE_TAILSCALE_MODE=ports \
-    workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$hermes_pass" "$model" || return 1
+    workspace_write_files "$tailnet" "$human_user" "$human_email" unused "$n8n_email" unused "$hermes_pass" "$model" || return 1
   workspace_compose up -d --remove-orphans >/dev/null 2>&1 || return 1
   info "Tailscale Serve is not enabled on this tailnet; using ports fallback"
   return 0
@@ -8179,10 +8306,17 @@ workspace_tailscale_services_local_configured_from_output() {
     ! printf '%s\n' "$out" | grep -Eq "0[.]0[.]0[.]0:(${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT})|[[]::[]]:(${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT})"
 }
 
+workspace_hermes_dashboard_ready_at() {
+  local base_url="$1"
+  [[ -n "$base_url" ]] || return 1
+  workspace_http_ready "${base_url%/}/"
+}
+
 workspace_hermes_api_ready_at() {
   local base_url="$1"
   [[ -n "$base_url" ]] || return 1
-  workspace_http_ready "${base_url%/}/v1/models"
+  workspace_http_ready "${base_url%/}/health" ||
+    workspace_http_ready "${base_url%/}/v1/models"
 }
 
 workspace_hermes_local_api_ready() {
@@ -8192,79 +8326,98 @@ workspace_hermes_local_api_ready() {
 workspace_hermes_private_url_ready() {
   local url
   url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
-  workspace_hermes_api_ready_at "$url"
+  workspace_hermes_dashboard_ready_at "$url"
 }
 
-workspace_hermes_proxy_pid_file() {
-  printf '%s/hermes-proxy.pid\n' "$WORKSPACE_CONFIG_DIR"
+workspace_hermes_container_name() {
+  local containers
+  command -v docker >/dev/null 2>&1 || return 1
+  containers=$(docker ps -a --filter label=openshell.ai/sandbox-name=hermes --format '{{.Names}}' 2>/dev/null || true)
+  if [[ -z "$containers" ]]; then
+    containers=$(docker ps -a --filter name=hermes --format '{{.Names}}' 2>/dev/null || true)
+  fi
+  printf '%s\n' "$containers" | grep -E "^(${WORKSPACE_HERMES_CONTAINER}|openshell-hermes-)" | head -n 1
 }
 
-workspace_hermes_proxy_log_file() {
-  printf '%s/hermes-proxy.log\n' "$WORKSPACE_CONFIG_DIR"
+workspace_hermes_running_container_name() {
+  local container
+  container=$(workspace_hermes_container_name 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -Fx "$container"
 }
 
-workspace_hermes_proxy_bind_addr() {
-  local mode bind_addr
-  mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-  if [[ "$mode" == "ports" ]]; then
-    bind_addr=$(workspace_read_env WORKSPACE_TAILSCALE_BIND_ADDR 2>/dev/null || true)
-    workspace_tailscale_bind_addr_ok "$bind_addr" || return 1
-    printf '%s\n' "$bind_addr"
+workspace_normalize_hermes_container_name() {
+  local current
+  current=$(workspace_hermes_container_name 2>/dev/null || true)
+  [[ -n "$current" && "$current" != "$WORKSPACE_HERMES_CONTAINER" ]] || return 0
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$WORKSPACE_HERMES_CONTAINER"; then
+    warn "Hermes container name already in use: ${WORKSPACE_HERMES_CONTAINER}"
     return 0
   fi
-  printf '127.0.0.1\n'
+  docker rename "$current" "$WORKSPACE_HERMES_CONTAINER" >/dev/null 2>&1 ||
+    warn "Could not rename Hermes container to ${WORKSPACE_HERMES_CONTAINER}"
+}
+
+workspace_patch_hermes_dashboard_entrypoint() {
+  local container py
+  container=$(workspace_hermes_container_name) || return 0
+  [[ -n "$container" ]] || return 0
+  docker exec "$container" sh -lc "grep -q 'NEMOCLAW_HERMES_DASHBOARD_HOST' /usr/local/bin/nemoclaw-start" >/dev/null 2>&1 && return 0
+  py='from pathlib import Path
+p = Path("/usr/local/bin/nemoclaw-start")
+s = p.read_text()
+s = s.replace("    --host\n    127.0.0.1\n", "    --host\n    \"${NEMOCLAW_HERMES_DASHBOARD_HOST:-0.0.0.0}\"\n")
+s = s.replace("    --no-open\n  )\n", "    --no-open\n  )\n  case \"${NEMOCLAW_HERMES_DASHBOARD_HOST:-0.0.0.0}\" in\n    127.0.0.1|localhost|::1) ;;\n    *) HERMES_DASHBOARD_ARGS+=(--insecure) ;;\n  esac\n")
+p.write_text(s)
+'
+  docker exec -u root "$container" python3 -c "$py" >/dev/null 2>&1 || return 0
+  docker exec -u root "$container" chmod +x /usr/local/bin/nemoclaw-start >/dev/null 2>&1 || true
+}
+
+workspace_hermes_dashboard_bound_public() {
+  local container
+  container=$(workspace_hermes_container_name) || return 1
+  [[ -n "$container" ]] || return 1
+  docker exec "$container" sh -lc "ps -ef | grep -q 'hermes.real dashboard --host 0[.]0[.]0[.]0'" >/dev/null 2>&1
+}
+
+workspace_restart_hermes_dashboard_public() {
+  local container
+  container=$(workspace_hermes_container_name) || return 0
+  [[ -n "$container" ]] || return 0
+  workspace_patch_hermes_dashboard_entrypoint
+  workspace_hermes_dashboard_bound_public && return 0
+  docker exec -u root "$container" sh -lc \
+    'pids=$(ps -ef | awk "/bash \\/usr\\/local\\/bin\\/nemoclaw-start|hermes.real dashboard|hermes.real gateway|socat TCP-LISTEN:(18789|8642)/ && !/awk/ {print \$2}"); [ -z "$pids" ] || kill $pids 2>/dev/null || true' \
+    >/dev/null 2>&1 || true
+  sleep 2
+  docker exec -d \
+    -e CHAT_UI_URL="http://127.0.0.1:${WORKSPACE_HERMES_PORT}" \
+    -e NEMOCLAW_DASHBOARD_PORT="$WORKSPACE_HERMES_PORT" \
+    -e NEMOCLAW_HERMES_DASHBOARD_HOST=0.0.0.0 \
+    "$container" /usr/local/bin/nemoclaw-start >/dev/null 2>&1 || true
+  sleep 5
 }
 
 workspace_start_hermes_private_proxy() {
-  local bind_addr pid_file log_file py pid
-  workspace_hermes_private_url_ready && return 0
-  workspace_hermes_local_api_ready || return 1
-  bind_addr=$(workspace_hermes_proxy_bind_addr) || return 1
-  pid_file=$(workspace_hermes_proxy_pid_file)
-  log_file=$(workspace_hermes_proxy_log_file)
-  pid=$(cat "$pid_file" 2>/dev/null || true)
-  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
-    sleep 1
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  if workspace_hermes_private_url_ready && workspace_hermes_local_api_ready; then
+    return 0
   fi
-  py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
-  [[ -n "$py" ]] || return 1
-  mkdir -p "$WORKSPACE_CONFIG_DIR"
-  nohup "$py" -c '
-import socket, sys, threading
-bind_addr, listen_port, target_port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-def relay(src, dst):
-    try:
-        while True:
-            data = src.recv(65536)
-            if not data:
-                break
-            dst.sendall(data)
-    except OSError:
-        pass
-    finally:
-        for s in (src, dst):
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                s.close()
-            except OSError:
-                pass
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind((bind_addr, listen_port))
-srv.listen(64)
-while True:
-    client, _ = srv.accept()
-    upstream = socket.create_connection(("127.0.0.1", target_port), timeout=10)
-    threading.Thread(target=relay, args=(client, upstream), daemon=True).start()
-    threading.Thread(target=relay, args=(upstream, client), daemon=True).start()
-' "$bind_addr" "$WORKSPACE_HERMES_PORT" "$WORKSPACE_HERMES_LOCAL_PORT" >>"$log_file" 2>&1 &
-  printf '%s\n' "$!" >"$pid_file"
-  sleep 1
-  workspace_hermes_private_url_ready
+  workspace_patch_hermes_dashboard_entrypoint
+  NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes recover >/dev/null 2>&1 || \
+    NEMOCLAW_SANDBOX_NAME=hermes nemohermes recover >/dev/null 2>&1 || true
+  workspace_normalize_hermes_container_name
+  if command -v openshell >/dev/null 2>&1; then
+    workspace_hermes_private_url_ready || openshell forward start --background "$WORKSPACE_HERMES_PORT" hermes >/dev/null 2>&1 || true
+    workspace_hermes_local_api_ready || openshell forward start --background "$WORKSPACE_HERMES_LOCAL_PORT" hermes >/dev/null 2>&1 || true
+  fi
+  if ! workspace_hermes_private_url_ready; then
+    workspace_restart_hermes_dashboard_public
+    command -v openshell >/dev/null 2>&1 && \
+      openshell forward start --background "$WORKSPACE_HERMES_PORT" hermes >/dev/null 2>&1 || true
+  fi
+  workspace_hermes_private_url_ready && workspace_hermes_local_api_ready
 }
 
 workspace_tailscale_services_configured() {
@@ -8333,9 +8486,10 @@ workspace_hermes_inference_route_ready() {
 workspace_hermes_dashboard_url_ready() {
   local out expected
   command -v nemohermes >/dev/null 2>&1 || return 1
-  workspace_hermes_private_url_ready && return 0
   expected=$(workspace_read_env HERMES_URL 2>/dev/null || true)
-  out=$(nemohermes hermes dashboard-url 2>/dev/null || true)
+  workspace_hermes_private_url_ready || return 1
+  out=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes dashboard-url --quiet 2>/dev/null || \
+    NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes dashboard-url 2>/dev/null || true)
   [[ -n "$out" ]] || return 1
   [[ -n "$expected" && "$out" == *"$expected"* ]] && return 0
   printf '%s\n' "$out" | grep -Eq "https?://(127[.]0[.]0[.]1|localhost|\[::1\]):${WORKSPACE_HERMES_PORT}(/|[[:space:]]|$)"
@@ -8392,7 +8546,7 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Secrets file exists" test -f "$WORKSPACE_ENV_FILE"
   workspace_doctor_check "Secrets file mode is 0600" workspace_file_mode_is "$WORKSPACE_ENV_FILE" 600
   workspace_doctor_check "Secrets env syntax is valid" workspace_env_file_syntax_valid "$WORKSPACE_ENV_FILE"
-  workspace_doctor_check "Human Vikunja password is not stored" workspace_human_password_not_stored
+  workspace_doctor_check "Human service passwords are not stored" workspace_human_password_not_stored
   workspace_doctor_check "Compose file exists" test -f "$WORKSPACE_COMPOSE_FILE"
   workspace_doctor_check "Scoped service env files exist and are 0600" workspace_service_env_files_ready
   workspace_doctor_check "Scoped service env syntax is valid" workspace_service_env_files_syntax_valid
@@ -8411,15 +8565,16 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Vikunja hermes user exists" workspace_vikunja_hermes_ready
   workspace_doctor_check "Vikunja hermes API token works" workspace_vikunja_hermes_api_ready
   workspace_doctor_check "n8n hardened for private agent workflows" workspace_n8n_hardened
-  workspace_doctor_check "n8n owner/admin login ready" workspace_n8n_owner_ready
+  workspace_doctor_check "n8n owner/admin ready" workspace_n8n_owner_ready
+  workspace_doctor_check "Optional SMTP recovery configuration is valid" workspace_smtp_config_valid
   workspace_doctor_check "Workspace URLs configured" workspace_urls_configured
-  workspace_doctor_check "Workspace secrets include human recovery, hermes, n8n, token, Hermes model" workspace_env_has \
+  workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
     POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD VIKUNJA_SERVICE_SECRET DB_POSTGRESDB_PASSWORD \
-    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HUMAN_RECOVERY_PASSWORD VIKUNJA_HERMES_PASSWORD N8N_BASIC_AUTH_USER \
-    N8N_BASIC_AUTH_PASSWORD N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
+    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HERMES_PASSWORD N8N_BASIC_AUTH_USER \
+    N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
     HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
-    VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_USER_STATUS
-  workspace_doctor_check "Workspace credentials are unique per service" workspace_credentials_are_distinct
+    VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_USER_STATUS WORKSPACE_SMTP_ENABLED
+  workspace_doctor_check "Workspace technical secrets are unique per service" workspace_credentials_are_distinct
   workspace_doctor_check "Compose service running: postgres" workspace_compose_service_running postgres
   workspace_doctor_check "Shared Postgres runtime has Vikunja and n8n roles/databases" workspace_postgres_shared_runtime_ready
   workspace_doctor_check "Compose service running: vikunja" workspace_compose_service_running vikunja
@@ -8442,10 +8597,12 @@ cmd_workspace_doctor() {
   workspace_doctor_check "LiteLLM Hermes route completes smoke request" workspace_litellm_model_smoke
   workspace_doctor_check "Hermes model running: ${model:-none}" workspace_model_running "$model"
   workspace_doctor_check "Hermes/NemoClaw running" workspace_hermes_running
-  workspace_doctor_check "Hermes NemoClaw uses restricted policy and private API port" workspace_hermes_nemoclaw_configured
+  workspace_doctor_check "NemoHermes maintained release installed" workspace_nemohermes_maintained_release
+  workspace_doctor_check "Hermes NemoClaw uses restricted policy and private dashboard/API ports" workspace_hermes_nemoclaw_configured
+  workspace_doctor_check "Hermes local API is reachable" workspace_hermes_local_api_ready
   workspace_doctor_check "NemoHermes sandbox doctor passes" workspace_hermes_doctor_ready
   workspace_doctor_check "NemoHermes inference route uses selected LiteLLM model" workspace_hermes_inference_route_ready
-  workspace_doctor_check "Hermes private API URL is reachable" workspace_hermes_dashboard_url_ready
+  workspace_doctor_check "Hermes dashboard URL is reachable" workspace_hermes_dashboard_url_ready
   if [[ "$strict_mode" == "1" ]]; then
     workspace_doctor_check "Compose image refs are pinned for production" workspace_compose_images_pinned
   fi
@@ -8461,6 +8618,24 @@ cmd_workspace_doctor() {
     return 1
   fi
   printf "\n  ${GREEN}${BOLD}Workspace doctor passed${NC}\n\n"
+}
+
+workspace_print_initial_credentials() {
+  local vikunja_user="$1" vikunja_email="$2" vikunja_pass="$3" n8n_email="$4" n8n_pass="$5"
+  local shown=0
+  if [[ "${WORKSPACE_SHOW_VIKUNJA_PASSWORD:-0}" == "1" || "${WORKSPACE_SHOW_N8N_PASSWORD:-0}" == "1" ]]; then
+    printf "\n  ${YELLOW}${BOLD}Save these passwords now. Spark does not store or show them again.${NC}\n\n"
+  fi
+  if [[ "${WORKSPACE_SHOW_VIKUNJA_PASSWORD:-0}" == "1" ]]; then
+    printf "  Vikunja\n    user:     %s\n    email:    %s\n    password: %s\n" "$vikunja_user" "$vikunja_email" "$vikunja_pass"
+    shown=1
+  fi
+  if [[ "${WORKSPACE_SHOW_N8N_PASSWORD:-0}" == "1" ]]; then
+    [[ "$shown" == "0" ]] || printf "\n"
+    printf "  n8n\n    email:    %s\n    password: %s\n" "$n8n_email" "$n8n_pass"
+    shown=1
+  fi
+  [[ "$shown" == "0" ]] || printf "\n"
 }
 
 workspace_summary() {
@@ -8504,10 +8679,21 @@ cmd_workspace_setup_help() {
     --n8n-image IMAGE           Override n8n image ref.
     --vikunja-username NAME     Human Vikunja username.
     --vikunja-email EMAIL       Human Vikunja email.
+    --vikunja-password PASS     Initial password; visible to shell history/process tools.
+    --vikunja-password-file FILE
+                                Read initial password from the first line of FILE.
     --vikunja-token TOKEN       Store/verify Hermes' Vikunja API token.
     --n8n-email EMAIL           n8n owner/admin email.
-    --vikunja-password PASS     Deprecated: ignored; spark generates recovery secrets.
-    --n8n-password PASS         Deprecated: ignored; spark generates recovery secrets.
+    --n8n-password PASS         Initial password; visible to shell history/process tools.
+    --n8n-password-file FILE    Read initial password from the first line of FILE.
+    --smtp / --no-smtp          Enable or disable email password recovery.
+    --smtp-host HOST            SMTP server hostname.
+    --smtp-port PORT            SMTP port; usually 587 (STARTTLS) or 465 (TLS).
+    --smtp-user USER            SMTP login.
+    --smtp-password PASS        SMTP password; prefer --smtp-password-file.
+    --smtp-password-file FILE   Read SMTP password from the first line of FILE.
+    --smtp-from EMAIL           Verified sender address.
+    --smtp-security MODE        starttls, tls, or none.
 
   ${BOLD}Funnel rule:${NC}
     reset = this host should have no public Funnel exposure.
@@ -8523,12 +8709,11 @@ cmd_workspace_help() {
 
   ${BOLD}Commands:${NC}
     setup      Install/check Vikunja + n8n + Hermes
+    down       Stop Vikunja, n8n, Postgres, and Hermes/NemoClaw
     status     Show workspace health
     logs       Follow logs for vikunja, n8n, postgres, hermes, or gateway
     doctor     Read-only workspace check
     backup     Back up Vikunja, n8n, and Hermes state
-    credentials
-              Show or rotate local workspace recovery credentials and Hermes API token
 
   Run ${BOLD}spark ws <command> --help${NC} for command-specific flags.
 
@@ -8545,10 +8730,14 @@ cmd_workspace_help() {
     --n8n-image IMAGE           Override n8n image ref
     --vikunja-username NAME     Human Vikunja username
     --vikunja-email EMAIL       Human Vikunja email
+    --vikunja-password PASS     Choose initial Vikunja password
+    --vikunja-password-file FILE
+                                Safer initial Vikunja password input
     --vikunja-token TOKEN       Store/verify Hermes' Vikunja API token
     --n8n-email EMAIL           n8n owner/admin email
-    --vikunja-password PASS     Deprecated: ignored; spark generates recovery secrets
-    --n8n-password PASS         Deprecated: ignored; spark generates recovery secrets
+    --n8n-password PASS         Choose initial n8n password
+    --n8n-password-file FILE    Safer initial n8n password input
+    --smtp / --no-smtp          Optional email password recovery
 
 EOF
 }
@@ -8558,11 +8747,11 @@ cmd_workspace() {
   [[ -n "$subcmd" ]] && shift || true
   case "$subcmd" in
     setup)  workspace_setup "$@" ;;
+    down)   workspace_down "$@" ;;
     status) cmd_workspace_status ;;
     logs)   cmd_workspace_logs "$@" ;;
     doctor) cmd_workspace_doctor "$@" ;;
     backup) cmd_workspace_backup "$@" ;;
-    credentials) cmd_workspace_credentials "$@" ;;
     help|--help|-h|"") cmd_workspace_help ;;
     *) die "Unknown ws command: $subcmd" "Run 'spark ws help'" ;;
   esac
@@ -9078,6 +9267,7 @@ cmd_help() {
     doctor           Check all prerequisites (read-only)
     models           Recommend models for this hardware
     run <model>      Start serving a model (can run several at once)
+    down             Stop all Spark-managed model and gateway services
     alias            Save, inspect, and restore launch aliases
     calibrate <model> Measure launch configs and save the fastest one
     stop [<model>]   Stop a model (no arg: the only one; --all: every one)
@@ -9668,6 +9858,7 @@ main() {
     calibrate)    shift; cmd_calibrate "$@" ;;
     dashboard)    shift; cmd_dashboard "$@" ;;
     stop)         shift; cmd_stop "$@" ;;
+    down)         shift; cmd_down "$@" ;;
     pull)         shift; cmd_pull "$@" ;;
     models)       shift; cmd_models "$@" ;;
     list)         cmd_list ;;

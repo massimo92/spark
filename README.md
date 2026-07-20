@@ -79,6 +79,7 @@ spark alias list             # saved local launch aliases
 spark alias capture <alias>  # capture a live vLLM launch exactly
 spark logs [model]           # model logs
 spark stop [model|--all]     # stop running models
+spark down                   # stop all model and gateway services
 ```
 
 ## Workspace
@@ -94,10 +95,22 @@ The workspace is optional. It installs a private agent environment:
 ```bash
 spark setup --full
 spark ws setup
+spark ws down
 spark ws status
 spark ws doctor
 spark ws backup
 ```
+
+Workspace containers use stable names: `workspace-postgres`, `workspace-vikunja`,
+`workspace-n8n`, and `workspace-hermes`.
+
+Setup creates different strong passwords for Vikunja and n8n, prints them once,
+and never stores them. Choose initial passwords with `--vikunja-password-file`
+and `--n8n-password-file` (direct password flags also exist but may remain in
+shell history). SMTP password recovery is optional: interactive setup asks for
+the server details, or use `--smtp` with the SMTP flags shown by
+`spark ws setup --help`. Without SMTP, losing a password may require destructive
+service reinitialization and data may be lost.
 
 Use `spark ws doctor --strict` before treating it as production-ready.
 
