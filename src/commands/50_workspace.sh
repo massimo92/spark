@@ -1564,7 +1564,7 @@ workspace_setup_hermes() {
       NEMOCLAW_MODEL="$litellm_model" \
       NEMOCLAW_PREFERRED_API=openai-completions \
       NEMOCLAW_DASHBOARD_PORT="$WORKSPACE_HERMES_PORT" \
-      NEMOCLAW_HERMES_DASHBOARD_HOST=0.0.0.0 \
+      NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
       COMPATIBLE_API_KEY=dummy \
@@ -1594,7 +1594,7 @@ workspace_setup_hermes() {
       NEMOCLAW_MODEL="$litellm_model" \
       NEMOCLAW_PREFERRED_API=openai-completions \
       NEMOCLAW_DASHBOARD_PORT="$WORKSPACE_HERMES_PORT" \
-      NEMOCLAW_HERMES_DASHBOARD_HOST=0.0.0.0 \
+      NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
       COMPATIBLE_API_KEY=dummy \
@@ -3405,67 +3405,25 @@ workspace_restore_hermes_container_name() {
   docker rename "$current" "$expected" >/dev/null 2>&1
 }
 
-workspace_patch_hermes_dashboard_entrypoint() {
-  local container py
-  container=$(workspace_hermes_container_name) || return 0
-  [[ -n "$container" ]] || return 0
-  docker exec "$container" sh -lc "grep -q 'NEMOCLAW_HERMES_DASHBOARD_HOST' /usr/local/bin/nemoclaw-start" >/dev/null 2>&1 && return 0
-  py='from pathlib import Path
-p = Path("/usr/local/bin/nemoclaw-start")
-s = p.read_text()
-s = s.replace("    --host\n    127.0.0.1\n", "    --host\n    \"${NEMOCLAW_HERMES_DASHBOARD_HOST:-0.0.0.0}\"\n")
-s = s.replace("    --no-open\n  )\n", "    --no-open\n  )\n  case \"${NEMOCLAW_HERMES_DASHBOARD_HOST:-0.0.0.0}\" in\n    127.0.0.1|localhost|::1) ;;\n    *) HERMES_DASHBOARD_ARGS+=(--insecure) ;;\n  esac\n")
-p.write_text(s)
-'
-  docker exec -u root "$container" python3 -c "$py" >/dev/null 2>&1 || return 0
-  docker exec -u root "$container" chmod +x /usr/local/bin/nemoclaw-start >/dev/null 2>&1 || true
-}
-
-workspace_hermes_dashboard_bound_public() {
-  local container
-  container=$(workspace_hermes_container_name) || return 1
-  [[ -n "$container" ]] || return 1
-  docker exec "$container" sh -lc "ps -ef | grep -q 'hermes.real dashboard --host 0[.]0[.]0[.]0'" >/dev/null 2>&1
-}
-
-workspace_restart_hermes_dashboard_public() {
-  local container
-  container=$(workspace_hermes_container_name) || return 0
-  [[ -n "$container" ]] || return 0
-  workspace_patch_hermes_dashboard_entrypoint
-  workspace_hermes_dashboard_bound_public && return 0
-  docker exec -u root "$container" sh -lc \
-    'pids=$(ps -ef | awk "/bash \\/usr\\/local\\/bin\\/nemoclaw-start|hermes.real dashboard|hermes.real gateway|socat TCP-LISTEN:(18789|8642)/ && !/awk/ {print \$2}"); [ -z "$pids" ] || kill $pids 2>/dev/null || true' \
-    >/dev/null 2>&1 || true
-  sleep 2
-  docker exec -d \
-    -e CHAT_UI_URL="http://127.0.0.1:${WORKSPACE_HERMES_PORT}" \
-    -e NEMOCLAW_DASHBOARD_PORT="$WORKSPACE_HERMES_PORT" \
-    -e NEMOCLAW_HERMES_DASHBOARD_HOST=0.0.0.0 \
-    "$container" /usr/local/bin/nemoclaw-start >/dev/null 2>&1 || true
-  sleep 5
-}
-
 workspace_start_hermes_private_proxy() {
+  local attempt
   command -v nemohermes >/dev/null 2>&1 || return 1
   if workspace_hermes_private_url_ready && workspace_hermes_local_api_ready; then
     return 0
   fi
   workspace_restore_hermes_container_name || return 1
   NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes start >/dev/null 2>&1 || true
-  workspace_patch_hermes_dashboard_entrypoint
   NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes recover >/dev/null 2>&1 || \
     NEMOCLAW_SANDBOX_NAME=hermes nemohermes recover >/dev/null 2>&1 || true
   if command -v openshell >/dev/null 2>&1; then
     workspace_hermes_private_url_ready || openshell forward start --background "$WORKSPACE_HERMES_PORT" hermes >/dev/null 2>&1 || true
     workspace_hermes_local_api_ready || openshell forward start --background "$WORKSPACE_HERMES_LOCAL_PORT" hermes >/dev/null 2>&1 || true
   fi
-  if ! workspace_hermes_private_url_ready; then
-    workspace_restart_hermes_dashboard_public
-    command -v openshell >/dev/null 2>&1 && \
-      openshell forward start --background "$WORKSPACE_HERMES_PORT" hermes >/dev/null 2>&1 || true
-  fi
-  workspace_hermes_private_url_ready && workspace_hermes_local_api_ready
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    workspace_hermes_private_url_ready && workspace_hermes_local_api_ready && return 0
+    sleep 1
+  done
+  return 1
 }
 
 workspace_pause_hermes_private_proxy() {

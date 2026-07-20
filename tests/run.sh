@@ -1810,7 +1810,6 @@ test_workspace_hermes_start_uses_official_lifecycle() {
     }
     workspace_hermes_local_api_ready() { return 0; }
     workspace_restore_hermes_container_name() { return 0; }
-    workspace_patch_hermes_dashboard_entrypoint() { :; }
     nemohermes() { nemo_calls="${nemo_calls}${*}\n"; }
     openshell() { :; }
     workspace_start_hermes_private_proxy
@@ -2368,7 +2367,7 @@ test_workspace_setup_stops_when_nemohermes_update_fails() {
     [[ "$nemo_calls" != *"onboard --non-interactive"* ]]
 }
 
-test_workspace_setup_repairs_hermes_dashboard_public_bind() {
+test_workspace_setup_keeps_hermes_dashboard_on_loopback() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin docker_calls nemo_calls
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -2385,10 +2384,9 @@ test_workspace_setup_repairs_hermes_dashboard_public_bind() {
   docker_calls=$(cat "${tmp}/docker-exec.log" 2>/dev/null || echo "")
   nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$nemo_calls" == *"NEMOCLAW_HERMES_DASHBOARD_HOST=0.0.0.0"* ]] &&
-    [[ "$docker_calls" == *"python3 -c"* ]] &&
-    [[ "$docker_calls" == *"exec -d -e CHAT_UI_URL=http://127.0.0.1:18789"* ]] &&
-    [[ "$docker_calls" == *"NEMOCLAW_HERMES_DASHBOARD_HOST=0.0.0.0"* ]]
+  [[ "$nemo_calls" == *"NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1"* ]] &&
+    [[ "$docker_calls" != *"python3 -c"* ]] &&
+    [[ "$docker_calls" != *"exec -d -e CHAT_UI_URL=http://127.0.0.1:18789"* ]]
 }
 
 test_workspace_tailnet_from_self_dnsname() {
@@ -6364,7 +6362,7 @@ run_test "workspace doctor --remote delegates doctor" test_workspace_doctor_remo
 run_test "workspace doctor --strict --remote delegates doctor" test_workspace_doctor_remote_delegates_strict
 run_test "workspace doctor checklist passes" test_workspace_doctor_checklist_passes
 run_test "workspace doctor flags stale NemoHermes release" test_workspace_doctor_flags_stale_nemohermes_release
-run_test "workspace setup repairs Hermes dashboard public bind" test_workspace_setup_repairs_hermes_dashboard_public_bind
+run_test "workspace setup keeps Hermes dashboard on loopback" test_workspace_setup_keeps_hermes_dashboard_on_loopback
 run_test "workspace doctor --strict checks pinned images only" test_workspace_doctor_strict_checks_pinned_images
 run_test "workspace doctor --strict flags latest images" test_workspace_doctor_strict_flags_latest_images
 run_test "workspace doctor --json emits structured checks" test_workspace_doctor_json
