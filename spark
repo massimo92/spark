@@ -9077,7 +9077,9 @@ nemohermes_rebuild_with_workspace_env() {
   [[ -n "$base_url" ]] || base_url="http://host.openshell.internal:${GATEWAY_PORT}/v1"
   base_url="${base_url/http:\/\/127.0.0.1:${GATEWAY_PORT}/http:\/\/host.openshell.internal:${GATEWAY_PORT}}"
   base_url="${base_url/http:\/\/localhost:${GATEWAY_PORT}/http:\/\/host.openshell.internal:${GATEWAY_PORT}}"
-  workspace_start_hermes_gateway_proxy || return 1
+  if [[ "$SPARK_OS" == "Linux" ]]; then
+    workspace_start_hermes_gateway_proxy || return 1
+  fi
 
   model="${NEMOCLAW_MODEL:-$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)}"
   if [[ -z "$model" ]]; then
