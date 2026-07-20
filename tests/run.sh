@@ -983,11 +983,11 @@ KV_CONFIG='{ "model_type":"qwen3", "architectures":["Qwen3ForCausalLM"],
 
 hf_inspect_json() {
   local mtp="${1:-false}" kv_fp8="${2:-false}" ctx="${3:-null}" tools="${4:-false}" arch="${5:-dense}" quant="${6:-nvfp4}"
-  local cmd="${7:-vllm serve Org/Test --load-format fastsafetensors}"
+  local cmd="${7:-vllm serve Org/Test --load-format fastsafetensors}" image="${8:-}"
   jq -nc --argjson mtp "$mtp" --argjson kv "$kv_fp8" --argjson ctx "$ctx" --argjson tools "$tools" \
-    --arg arch "$arch" --arg quant "$quant" --arg cmd "$cmd" '{
+    --arg arch "$arch" --arg quant "$quant" --arg cmd "$cmd" --arg image "$image" '{
       model_id:"Org/Test", revision:"rev-test", tags:["vllm","blackwell"],
-      card:{license:"test", recommended_runtime:"vllm", recommended_command:$cmd, long_context:($ctx != null), recommended_context:$ctx, config_context:262144, kv_cache_fp8_recommended:$kv},
+      card:{license:"test", recommended_runtime:"vllm", recommended_image:$image, recommended_command:$cmd, long_context:($ctx != null), recommended_context:$ctx, config_context:262144, kv_cache_fp8_recommended:$kv},
       features:{family:"qwen", architecture:$arch, quantization:$quant, has_mtp:$mtp, has_reasoning:true, supports_tools:$tools, is_multimodal:false, is_moe:($arch == "moe"), is_nvfp4:($quant == "nvfp4"), is_fp8:($quant == "fp8"), is_gguf:false},
       raw:{model_type:"qwen3", architectures:["Qwen3ForCausalLM"], quantization_config:{quant_method:$quant}}
     }'
@@ -5318,7 +5318,7 @@ test_hf_inspector_modelopt_hf_quant_nvfp4_tag() {
 test_hf_inspector_prefers_recommended_multiline_command_from_readme() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   command -v python3 >/dev/null 2>&1 || { printf "skip - python3 not installed\n"; return 0; }
-  local tmp dir cmd
+  local tmp dir cmd image
   tmp=$(mktemp -d)
   make_model "${tmp}/home" "Org/Model-Readme" '{ "model_type":"qwen3", "architectures":["Qwen3MoeForCausalLM"],
     "max_position_embeddings":262144, "num_experts":128,
@@ -5326,6 +5326,8 @@ test_hf_inspector_prefers_recommended_multiline_command_from_readme() {
   dir="${tmp}/home/.cache/huggingface/hub/models--Org--Model-Readme/snapshots/1"
   cat > "${dir}/README.md" <<'EOF'
 # Test
+
+Use the official `vllm/vllm-openai:nightly` container.
 
 vllm serve Org/Model-Readme --port 8000 --quantization modelopt --max-model-len 262144
 
@@ -5351,9 +5353,12 @@ vllm serve Org/Model-Readme \
 EOF
   cmd=$(python3 -S "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Readme \
     --local-path "$dir" --local-files-only | jq -r '.card.recommended_command')
+  image=$(python3 -S "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Readme \
+    --local-path "$dir" --local-files-only | jq -r '.card.recommended_image')
   rm -rf "$tmp"
   [[ "$cmd" == *"--attention-backend flashinfer"* ]] &&
-    [[ "$cmd" == *"--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"moe_backend\":\"triton\"}'"* ]]
+    [[ "$cmd" == *"--speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"moe_backend\":\"triton\"}'"* ]] &&
+    [[ "$image" == "vllm/vllm-openai:nightly" ]]
 }
 
 test_hf_inspector_tools_requires_tool_calling_signal() {
@@ -5448,6 +5453,23 @@ test_hf_quantization_from_recommended_command() {
     "$SPARK" run Org/Quant --dry-run --no-mtp </dev/null 2>&1 || true)
   rm -rf "$tmp"
   [[ "$out" == *"--quantization modelopt"* ]]
+}
+
+test_hf_recommended_official_image_entrypoint() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Official" "$KV_CONFIG"
+  meta=$(hf_inspect_json false false 32768 false dense nvfp4 \
+    "vllm serve Org/Official --quantization modelopt" "vllm/vllm-openai:nightly")
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    FAKE_DOCKER_IMAGE=$'vllm/vllm-openai:nightly\nnvcr.io/nvidia/vllm:26.05-py3' \
+    "$SPARK" run Org/Official --dry-run --no-mtp </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"-e USER=spark -e LOGNAME=spark"* ]] &&
+    [[ "$out" == *"vllm/vllm-openai:nightly Org/Official"* ]] &&
+    [[ "$out" != *"vllm/vllm-openai:nightly vllm serve"* ]]
 }
 
 test_mtp_batched_tokens_overrides_recommended_command() {
@@ -5609,7 +5631,7 @@ test_profile_schema_autoregen() {
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1 || true)
   sv=$(jq -r '.schema_version // "none"' "$pf" 2>/dev/null || echo none)
   rm -rf "$tmp"
-  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "5" ]]
+  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "6" ]]
 }
 
 # CUDA-graph calibration over the two-column peak table: eager peak on record + no graph peak →
@@ -5621,7 +5643,7 @@ _write_cal_profile() {
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
   jq -n --arg m "$2" --arg ep "$3" --arg cp "$4" '{
-    schema_version:5, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    schema_version:6, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
     warmup: {"8192/auto": ({date:"2026-01-01"}
@@ -5636,7 +5658,7 @@ _write_legacy_cal_profile() {
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
   jq -n --arg m "$2" --arg p "$3" --arg e "$4" --arg c "$5" '{
-    schema_version:5, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    schema_version:6, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
     warmup: {"8192/auto": {peak_gb:$p, enforce_eager:$e, cudagraph_oom:$c, date:"2026-01-01"}}
@@ -6157,6 +6179,7 @@ run_test "HF MTP auto-enables when supported" test_hf_mtp_auto_enables_when_supp
 run_test "HF MTP raises memory floor" test_hf_mtp_raises_memory_floor
 run_test "HF recommended command maps stream interval" test_hf_stream_interval_from_recommended_command
 run_test "HF recommended command maps quantization" test_hf_quantization_from_recommended_command
+run_test "HF recommended official image uses its entrypoint" test_hf_recommended_official_image_entrypoint
 run_test "MTP batched tokens override HF command" test_mtp_batched_tokens_overrides_recommended_command
 run_test "Blackwell single-stream MTP uses flashinfer_cutlass + stream64" test_blackwell_single_stream_mtp_uses_flashinfer_cutlass_and_stream64
 run_test "HF MTP launch sets batched tokens" test_hf_mtp_launch_sets_batched_tokens

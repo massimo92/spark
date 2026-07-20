@@ -202,7 +202,7 @@ SWAPPINESS="${SPARK_SWAPPINESS:-10}"
 # Profile cache schema. Bumped when new fields are added (e.g. is_moe). A cached profile older than
 # this is auto-refreshed on the next `spark run` so new fields (and the decisions that depend on them,
 # like auto enforce-eager) are populated — no user action needed.
-PROFILE_SCHEMA_VERSION=5
+PROFILE_SCHEMA_VERSION=6
 
 # Detect the latest pulled NGC vLLM image
 ngc_vllm_image_blocked() {
@@ -630,6 +630,7 @@ load_profile() {
   MODEL_ARCHITECTURE=$(jq -r '.hf.features.architecture // ""' "$profile_file") || die "Could not read profile: $profile_file"
   MODEL_QUANTIZATION=$(jq -r '.hf.features.quantization // ""' "$profile_file") || die "Could not read profile: $profile_file"
   HF_RECOMMENDED_RUNTIME=$(jq -r '.hf.card.recommended_runtime // ""' "$profile_file") || die "Could not read profile: $profile_file"
+  HF_RECOMMENDED_IMAGE=$(jq -r '.hf.card.recommended_image // ""' "$profile_file") || die "Could not read profile: $profile_file"
   HF_RECOMMENDED_COMMAND=$(jq -r '.hf.card.recommended_command // ""' "$profile_file") || die "Could not read profile: $profile_file"
   HF_RECOMMENDED_CONTEXT=$(jq -r '.hf.card.recommended_context // ""' "$profile_file") || die "Could not read profile: $profile_file"
   HF_KV_CACHE_FP8_RECOMMENDED=$(jq -r '.hf.card.kv_cache_fp8_recommended // false' "$profile_file") || die "Could not read profile: $profile_file"
@@ -762,6 +763,7 @@ profile_model() {
   MODEL_ARCHITECTURE=$(hf_profile_value '.features.architecture // ""')
   MODEL_QUANTIZATION=$(hf_profile_value '.features.quantization // ""')
   HF_RECOMMENDED_RUNTIME=$(hf_profile_value '.card.recommended_runtime // ""')
+  HF_RECOMMENDED_IMAGE=$(hf_profile_value '.card.recommended_image // ""')
   HF_RECOMMENDED_COMMAND=$(hf_profile_value '.card.recommended_command // ""')
   HF_RECOMMENDED_CONTEXT=$(hf_profile_value '.card.recommended_context // ""')
   HF_KV_CACHE_FP8_RECOMMENDED=$(hf_profile_value '.card.kv_cache_fp8_recommended // false')
