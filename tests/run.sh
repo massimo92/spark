@@ -5283,7 +5283,7 @@ vllm serve Org/Model-Readme \
   --load-format fastsafetensors
 ```
 EOF
-  cmd=$(python3 "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Readme \
+  cmd=$(python3 -S "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Readme \
     --local-path "$dir" --local-files-only | jq -r '.card.recommended_command')
   rm -rf "$tmp"
   [[ "$cmd" == *"--attention-backend flashinfer"* ]] &&
@@ -5299,10 +5299,10 @@ test_hf_inspector_tools_requires_tool_calling_signal() {
     "max_position_embeddings":32768 }'
   dir="${tmp}/home/.cache/huggingface/hub/models--Org--Model-Tools/snapshots/1"
   printf '# Test\n\nUseful developer tools and examples.\n' > "${dir}/README.md"
-  generic=$(python3 "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Tools \
+  generic=$(python3 -S "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Tools \
     --local-path "$dir" --local-files-only | jq -r '.features.supports_tools')
   printf '# Test\n\nSupports tool calling with <tool_call> blocks.\n' > "${dir}/README.md"
-  explicit=$(python3 "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Tools \
+  explicit=$(python3 -S "${ROOT_DIR}/scripts/hf_model_inspect.py" --model-id Org/Model-Tools \
     --local-path "$dir" --local-files-only | jq -r '.features.supports_tools')
   rm -rf "$tmp"
   [[ "$generic" == "false" ]] && [[ "$explicit" == "true" ]]

@@ -256,15 +256,17 @@ def load_card(
         except Exception:
             card_path = None
     if card_path is not None:
-        try:
-            card = model_card_cls.load(card_path)
-            return str(card), str(getattr(getattr(card, "data", None), "license", "") or "")
-        except Exception:
+        if model_card_cls is not None:
             try:
-                return card_path.read_text(encoding="utf-8"), ""
+                card = model_card_cls.load(card_path)
+                return str(card), str(getattr(getattr(card, "data", None), "license", "") or "")
             except Exception:
-                return "", ""
-    if revision is None and not local_files_only:
+                pass
+        try:
+            return card_path.read_text(encoding="utf-8"), ""
+        except Exception:
+            return "", ""
+    if model_card_cls is not None and revision is None and not local_files_only:
         try:
             card = model_card_cls.load(model_id)
             return str(card), str(getattr(getattr(card, "data", None), "license", "") or "")
@@ -335,15 +337,14 @@ def main() -> int:
 
     card_text = ""
     card_license = ""
-    if ModelCard is not None:
-        card_text, card_license = load_card(
-            args.model_id,
-            args.revision,
-            local_path,
-            args.local_files_only,
-            ModelCard,
-            hf_hub_download,
-        )
+    card_text, card_license = load_card(
+        args.model_id,
+        args.revision,
+        local_path,
+        args.local_files_only,
+        ModelCard,
+        hf_hub_download,
+    )
 
     config = load_json(paths.get("config.json"))
     generation_config = load_json(paths.get("generation_config.json"))
