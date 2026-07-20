@@ -1297,7 +1297,7 @@ workspace_configure_tailscale() {
   hermes_log="${status_dir}/hermes.log"
   workspace_tailscale_serve_launch_bg "svc:vikunja" "http://127.0.0.1:${WORKSPACE_VIKUNJA_PORT}" "$vikunja_status" "$vikunja_log"
   workspace_tailscale_serve_launch_bg "svc:n8n" "http://127.0.0.1:${WORKSPACE_N8N_PORT}" "$n8n_status" "$n8n_log"
-  workspace_tailscale_serve_launch_bg "svc:hermes" "http://127.0.0.1:${WORKSPACE_HERMES_PORT}" "$hermes_status" "$hermes_log"
+  workspace_tailscale_serve_launch_bg "svc:hermes" "http://127.0.0.1:${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT}" "$hermes_status" "$hermes_log"
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
     if [[ -s "$vikunja_status" && -s "$n8n_status" && -s "$hermes_status" ]]; then
       vikunja_rc=$(cat "$vikunja_status" 2>/dev/null || echo 1)
@@ -1357,7 +1357,7 @@ workspace_configure_tailscale() {
         printf "    Configure manually:\n"
         printf "    tailscale serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_VIKUNJA_PORT"
         printf "    tailscale serve --bg --service=svc:n8n --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_N8N_PORT"
-        printf "    tailscale serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_HERMES_PORT"
+        printf "    tailscale serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_HERMES_TAILSCALE_PROXY_PORT"
         printf "    The host may need tag-based identity and admin approval in Tailscale Services.\n"
         return 0
       fi
@@ -1415,7 +1415,7 @@ workspace_configure_tailscale() {
     printf "    Configure manually:\n"
     printf "    tailscale serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_VIKUNJA_PORT"
     printf "    tailscale serve --bg --service=svc:n8n --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_N8N_PORT"
-    printf "    tailscale serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_HERMES_PORT"
+    printf "    tailscale serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_HERMES_TAILSCALE_PROXY_PORT"
     printf "    The host may need tag-based identity and admin approval in Tailscale Services.\n"
   fi
 }
@@ -1521,6 +1521,77 @@ PY
     sleep 1
   done
   return 1
+}
+
+workspace_start_hermes_dashboard_proxy() {
+  local proxy_script
+  proxy_script="${WORKSPACE_CONFIG_DIR}/hermes-dashboard-proxy.py"
+  mkdir -p "$WORKSPACE_CONFIG_DIR"
+  cat > "$proxy_script" <<'PY'
+import asyncio
+import sys
+
+
+async def relay(reader, writer):
+    try:
+        while data := await reader.read(65536):
+            writer.write(data)
+            await writer.drain()
+    finally:
+        writer.close()
+
+
+async def handle(client_reader, client_writer):
+    try:
+        header = await client_reader.readuntil(b"\r\n\r\n")
+        lines = header.split(b"\r\n")
+        websocket = any(line.lower().startswith(b"upgrade: websocket") for line in lines)
+        rewritten = []
+        saw_connection = False
+        for line in lines:
+            lower = line.lower()
+            if lower.startswith(b"host:"):
+                line = f"Host: 127.0.0.1:{sys.argv[2]}".encode()
+            elif lower.startswith(b"connection:"):
+                saw_connection = True
+                if not websocket:
+                    line = b"Connection: close"
+            rewritten.append(line)
+        if not websocket and not saw_connection:
+            rewritten.insert(-2, b"Connection: close")
+        upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", int(sys.argv[2]))
+        upstream_writer.write(b"\r\n".join(rewritten))
+        await upstream_writer.drain()
+        await asyncio.gather(relay(client_reader, upstream_writer), relay(upstream_reader, client_writer))
+    except Exception:
+        client_writer.close()
+
+
+async def main():
+    server = await asyncio.start_server(handle, "127.0.0.1", int(sys.argv[1]))
+    async with server:
+        await server.serve_forever()
+
+
+asyncio.run(main())
+PY
+  chmod 600 "$proxy_script"
+  docker rm -f "$WORKSPACE_HERMES_TAILSCALE_PROXY_CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --network host \
+    --name "$WORKSPACE_HERMES_TAILSCALE_PROXY_CONTAINER" \
+    --restart unless-stopped \
+    -v "${proxy_script}:/app/hermes-dashboard-proxy.py:ro" \
+    --entrypoint python "$LITELLM_IMAGE" \
+    /app/hermes-dashboard-proxy.py "$WORKSPACE_HERMES_TAILSCALE_PROXY_PORT" "$WORKSPACE_HERMES_PORT" \
+    >/dev/null 2>&1
+}
+
+workspace_stop_hermes_dashboard_proxy() {
+  docker rm -f "$WORKSPACE_HERMES_TAILSCALE_PROXY_CONTAINER" >/dev/null 2>&1 || true
+}
+
+workspace_hermes_dashboard_proxy_running() {
+  [[ "$(docker inspect --format '{{.State.Running}}' "$WORKSPACE_HERMES_TAILSCALE_PROXY_CONTAINER" 2>/dev/null)" == "true" ]]
 }
 
 workspace_stop_hermes_gateway_proxy() {
@@ -2020,6 +2091,9 @@ workspace_setup() {
   }
   workspace_compose up -d --remove-orphans && info "Compose project ${WORKSPACE_PROJECT} started" || setup_fail "Could not start workspace compose"
   workspace_ensure_postgres_databases
+  if [[ "$check_only" != "1" ]]; then
+    workspace_start_hermes_dashboard_proxy || setup_fail "Could not start Hermes Tailscale dashboard proxy"
+  fi
   workspace_configure_tailscale "$tailnet" "$check_only" "$funnel_action" "$auto_yes"
   if workspace_tailscale_services_mode && workspace_tailscale_service_host_advertised; then
     if command -v nemohermes >/dev/null 2>&1; then
@@ -2136,6 +2210,10 @@ workspace_start() {
     && info "Hermes inference bridge started" \
     || { err "Could not start Hermes inference bridge"; rc=1; }
 
+  workspace_start_hermes_dashboard_proxy \
+    && info "Hermes dashboard proxy started" \
+    || { err "Could not start Hermes dashboard proxy"; rc=1; }
+
   tailnet=$(workspace_tailnet_suffix 2>/dev/null || true)
   if workspace_tailscale_services_configured; then
     info "Tailscale workspace access configured"
@@ -2178,6 +2256,8 @@ workspace_stop() {
 
   workspace_stop_hermes_gateway_proxy
   info "Stopped Hermes inference bridge"
+  workspace_stop_hermes_dashboard_proxy
+  info "Stopped Hermes dashboard proxy"
 
   gateway_stop || rc=1
 
@@ -2227,6 +2307,7 @@ cmd_workspace_health() {
   workspace_status_item "No public listeners" workspace_host_listeners_loopback_only
   workspace_status_item "LiteLLM gateway" workspace_gateway_running
   workspace_status_item "Hermes inference bridge" workspace_hermes_gateway_proxy_running
+  workspace_status_item "Hermes dashboard proxy" workspace_hermes_dashboard_proxy_running
   workspace_status_item "LiteLLM Hermes route" workspace_litellm_model_routed
   workspace_status_item "Hermes model" workspace_model_running "$model"
   workspace_status_item "Hermes/NemoClaw" workspace_hermes_running
@@ -2887,22 +2968,23 @@ workspace_tailscale_urls_ready_after_setup() {
 
 workspace_runtime_ports_not_public() {
   local ports out
-  ports="${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${GATEWAY_PORT}"
+  ports="${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT}|${GATEWAY_PORT}"
   out=$(docker ps --format '{{.Ports}}' 2>/dev/null | grep -E "(${ports})->" || true)
   [[ "$out" != *"0.0.0.0:"* && "$out" != *":::"* && "$out" != *"[::]:"* ]]
 }
 
 workspace_host_listeners_loopback_only() {
-  local ports bind_addr mode
-  ports="${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${GATEWAY_PORT}"
+  local ports bind_addr bridge_ip mode
+  ports="${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT}|${GATEWAY_PORT}"
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   bind_addr=""
+  bridge_ip=$(workspace_openshell_bridge_ip 2>/dev/null || true)
   if [[ "$mode" == "ports" ]]; then
     bind_addr=$(workspace_read_env WORKSPACE_TAILSCALE_BIND_ADDR 2>/dev/null || true)
     workspace_tailscale_bind_addr_ok "$bind_addr" || bind_addr=""
   fi
   if command -v ss >/dev/null 2>&1; then
-    ss -ltnH 2>/dev/null | awk -v ports="$ports" -v bind_addr="$bind_addr" '
+    ss -ltnH 2>/dev/null | awk -v ports="$ports" -v bind_addr="$bind_addr" -v bridge_ip="$bridge_ip" -v gateway_port="$GATEWAY_PORT" '
       BEGIN { split(ports, p, "|"); for (i in p) wanted[p[i]]=1 }
       {
         local_addr=$4
@@ -2910,6 +2992,7 @@ workspace_host_listeners_loopback_only() {
         sub(/^.*:/, "", port)
         allowed = (local_addr ~ /(^|[^0-9])127[.]0[.]0[.]1:/ || local_addr ~ /\[::1\]:/ || local_addr ~ /(^|[^:])::1:/ || local_addr ~ /localhost:/)
         if (bind_addr != "" && index(local_addr, bind_addr ":") > 0) allowed=1
+        if (bridge_ip != "" && port == gateway_port && index(local_addr, bridge_ip ":") > 0) allowed=1
         if (wanted[port] && ! allowed) bad=1
       }
       END { exit bad }
@@ -2917,13 +3000,14 @@ workspace_host_listeners_loopback_only() {
     return $?
   fi
   if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk -v ports="$ports" -v bind_addr="$bind_addr" '
+    lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk -v ports="$ports" -v bind_addr="$bind_addr" -v bridge_ip="$bridge_ip" -v gateway_port="$GATEWAY_PORT" '
       BEGIN { split(ports, p, "|"); for (i in p) wanted[p[i]]=1 }
       {
         line=$0
         for (port in wanted) {
-          allowed = (line ~ /127[.]0[.]1:/ || line ~ /\[::1\]:/ || line ~ /localhost:/)
+          allowed = (line ~ /127[.]0[.]0[.]1:/ || line ~ /\[::1\]:/ || line ~ /localhost:/)
           if (bind_addr != "" && index(line, bind_addr ":" port) > 0) allowed=1
+          if (bridge_ip != "" && port == gateway_port && index(line, bridge_ip ":" port) > 0) allowed=1
           if (line ~ ":" port "([[:space:]]|$|[)])" && ! allowed) bad=1
         }
       }
@@ -3349,8 +3433,8 @@ workspace_tailscale_services_local_configured_from_output() {
   [[ "$out" == *"svc:vikunja"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]] &&
     workspace_tailscale_service_target_private "$out" vikunja "$WORKSPACE_VIKUNJA_PORT" &&
     workspace_tailscale_service_target_private "$out" n8n "$WORKSPACE_N8N_PORT" &&
-    workspace_tailscale_service_target_private "$out" hermes "$WORKSPACE_HERMES_PORT" &&
-    ! printf '%s\n' "$out" | grep -Eq "0[.]0[.]0[.]0:(${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT})|[[]::[]]:(${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT})"
+    workspace_tailscale_service_target_private "$out" hermes "$WORKSPACE_HERMES_TAILSCALE_PROXY_PORT" &&
+    ! printf '%s\n' "$out" | grep -Eq "0[.]0[.]0[.]0:(${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT})|[[]::[]]:(${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT})"
 }
 
 workspace_hermes_dashboard_ready_at() {

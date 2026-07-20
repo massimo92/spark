@@ -573,7 +573,7 @@ case "${1:-}" in
     exit "${FAKE_TAILSCALE_STATUS_EXIT:-1}" ;;
   serve)
     if [[ "${2:-}" == "get-config" && "${3:-}" == "--all" ]]; then
-      echo "${FAKE_TAILSCALE_SERVE_CONFIG:-svc:vikunja 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18789}"
+      echo "${FAKE_TAILSCALE_SERVE_CONFIG:-svc:vikunja 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790}"
       exit "${FAKE_TAILSCALE_GET_CONFIG_EXIT:-0}"
     fi
     [[ "${2:-}" == "status" ]] && exit 0
@@ -1755,6 +1755,8 @@ test_workspace_lifecycle_commands() {
     workspace_tailscale_services_configured() { return 0; }
     workspace_start_hermes_gateway_proxy() { printf "bridge start\n" >> "$CALLS"; }
     workspace_stop_hermes_gateway_proxy() { printf "bridge stop\n" >> "$CALLS"; }
+    workspace_start_hermes_dashboard_proxy() { printf "dashboard proxy start\n" >> "$CALLS"; }
+    workspace_stop_hermes_dashboard_proxy() { printf "dashboard proxy stop\n" >> "$CALLS"; }
     workspace_start_hermes_private_proxy() { printf "hermes start\n" >> "$CALLS"; }
     workspace_hermes_running_container_name() { printf "workspace-hermes\n"; }
     nemohermes() { printf "nemohermes %s\n" "$*" >> "$CALLS"; }
@@ -1776,10 +1778,12 @@ test_workspace_lifecycle_commands() {
     [[ "$calls" == *"compose up -d --remove-orphans"* ]] &&
     [[ "$calls" == *"gateway 0 1 Org/Model"* ]] &&
     [[ "$calls" == *"bridge start"* ]] &&
+    [[ "$calls" == *"dashboard proxy start"* ]] &&
     [[ "$calls" == *"hermes start"* ]] &&
     [[ "$calls" == *"nemohermes hermes stop"* ]] &&
     [[ "$calls" == *"gateway stop"* ]] &&
     [[ "$calls" == *"bridge stop"* ]] &&
+    [[ "$calls" == *"dashboard proxy stop"* ]] &&
     [[ "$calls" == *"model stop Org/Model"* ]] &&
     [[ "$calls" == *"compose stop"* ]] &&
     [[ "$out" == *"start"* && "$out" == *"stop"* && "$out" == *"restart"* ]] &&
@@ -1840,6 +1844,34 @@ test_workspace_bridge_waits_for_delayed_readiness() {
   ' _ "$SPARK")
   rm -rf "$tmp"
   [[ "$out" == "probes=8" ]]
+}
+
+test_workspace_dashboard_proxy_rewrites_host_on_loopback() {
+  local tmp fake_bin docker_args proxy_script
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_ARGS_FILE="${tmp}/docker.log" bash -c '
+    source "$1"
+    workspace_start_hermes_dashboard_proxy
+  ' _ "$SPARK"
+  docker_args=$(cat "${tmp}/docker.log")
+  proxy_script="${tmp}/home/.config/spark/workspace/hermes-dashboard-proxy.py"
+  [[ "$docker_args" == *"--network host"* ]] &&
+    [[ "$docker_args" == *"hermes-dashboard-proxy.py 18790 18789"* ]] &&
+    grep -Fq 'asyncio.start_server(handle, "127.0.0.1"' "$proxy_script" &&
+    grep -Fq 'Host: 127.0.0.1:' "$proxy_script"
+  local status=$?
+  rm -rf "$tmp"
+  return "$status"
+}
+
+test_workspace_listener_check_allows_only_openshell_gateway_bridge() {
+  bash -c '
+    source "$1"
+    workspace_read_env() { [[ "$1" == WORKSPACE_TAILSCALE_MODE ]] && printf "services\n"; }
+    workspace_openshell_bridge_ip() { printf "172.19.0.1\n"; }
+    ss() { printf "LISTEN 0 4096 172.19.0.1:4000 0.0.0.0:*\n"; }
+    workspace_host_listeners_loopback_only
+  ' _ "$SPARK"
 }
 
 test_workspace_model_start_disables_mtp_for_reliable_recovery() {
@@ -2578,7 +2610,7 @@ test_workspace_setup_defaults_to_services_from_ports_workspace() {
     [[ "$env" == *"HERMES_URL=https://hermes.test-tailnet.ts.net"* ]] &&
     [[ "$tailscale_calls" == *"serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456"* ]] &&
     [[ "$tailscale_calls" == *"serve --bg --service=svc:n8n --https=443 --yes http://127.0.0.1:5678"* ]] &&
-    [[ "$tailscale_calls" == *"serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:18789"* ]]
+    [[ "$tailscale_calls" == *"serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:18790"* ]]
 }
 
 test_workspace_setup_reports_missing_tailscale_services_hitl() {
@@ -2644,7 +2676,7 @@ test_workspace_setup_reports_tailscale_service_pending_approval() {
   local tmp fake_bin out status env nemo_calls serve_config
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
-  serve_config='{"version":"0.0.1","services":{"svc:vikunja":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18789"}}}}'
+  serve_config='{"version":"0.0.1","services":{"svc:vikunja":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18790"}}}}'
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
@@ -4492,7 +4524,7 @@ test_workspace_doctor_rejects_public_tailscale_service_target() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_TAILSCALE_SERVE_CONFIG='svc:vikunja 0.0.0.0:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18789' \
+    FAKE_TAILSCALE_SERVE_CONFIG='svc:vikunja 0.0.0.0:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -4517,7 +4549,7 @@ test_workspace_doctor_rejects_swapped_tailscale_service_ports() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_TAILSCALE_SERVE_CONFIG='svc:vikunja 127.0.0.1:5678\nsvc:n8n 127.0.0.1:3456\nsvc:hermes 127.0.0.1:18789' \
+    FAKE_TAILSCALE_SERVE_CONFIG='svc:vikunja 127.0.0.1:5678\nsvc:n8n 127.0.0.1:3456\nsvc:hermes 127.0.0.1:18790' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -4541,7 +4573,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
   serve_config=$'{
     "svc:vikunja": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:3456" } } },
     "svc:n8n": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:5678" } } },
-    "svc:hermes": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:18789" } } }
+    "svc:hermes": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:18790" } } }
   }'
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
@@ -4564,7 +4596,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
-  serve_config='{"version":"0.0.1","services":{"svc:vikunja":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18789"}}}}'
+  serve_config='{"version":"0.0.1","services":{"svc:vikunja":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18790"}}}}'
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
@@ -6305,6 +6337,8 @@ run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
 run_test "workspace Hermes start uses official lifecycle" test_workspace_hermes_start_uses_official_lifecycle
 run_test "workspace bridge waits for delayed readiness" test_workspace_bridge_waits_for_delayed_readiness
+run_test "workspace dashboard proxy rewrites Host on loopback" test_workspace_dashboard_proxy_rewrites_host_on_loopback
+run_test "workspace listener check allows OpenShell gateway bridge" test_workspace_listener_check_allows_only_openshell_gateway_bridge
 run_test "workspace model recovery disables MTP" test_workspace_model_start_disables_mtp_for_reliable_recovery
 run_test "workspace status uses Tailscale Services config" test_workspace_status_uses_tailscale_services_config
 run_test "workspace restores OpenShell Hermes container name" test_workspace_restores_openshell_hermes_name
