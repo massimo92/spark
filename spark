@@ -2329,12 +2329,16 @@ run_backend_vllm() {
   fi
 
   # Detect NGC image
-  local ngc_image
+  local ngc_image recommended_image="${HF_RECOMMENDED_IMAGE:-}"
   ngc_image=$(detect_ngc_image)
+  if [[ ! "$recommended_image" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ && \
+        -f "${model_path}/README.md" ]]; then
+    recommended_image=$(grep -Eo 'vllm/vllm-openai:[A-Za-z0-9_.-]+' "${model_path}/README.md" 2>/dev/null | head -1 || true)
+  fi
   if [[ -z "${SPARK_VLLM_IMAGE:-}" && \
-        "${HF_RECOMMENDED_IMAGE:-}" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ ]] && \
-     docker image inspect "$HF_RECOMMENDED_IMAGE" >/dev/null 2>&1; then
-    ngc_image="$HF_RECOMMENDED_IMAGE"
+        "$recommended_image" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ ]] && \
+     docker image inspect "$recommended_image" >/dev/null 2>&1; then
+    ngc_image="$recommended_image"
   fi
   [[ -z "$ngc_image" ]] && die "No NGC vLLM container found" "Run: spark setup"
 
@@ -5472,7 +5476,7 @@ workspace_ensure_gateway() {
     elif [[ "$auto_yes" == "1" ]] || confirm "Start ${model} now with spark run?"; then
       # Workspace recovery favors a reliable full-context launch. MTP can add enough
       # runtime headroom to exceed unified-memory hosts even when the base model fits.
-      cmd_run "$model" --no-wait --no-mtp
+      cmd_run "$model" --no-mtp
     else
       setup_fail "Hermes model not started: $model"
     fi

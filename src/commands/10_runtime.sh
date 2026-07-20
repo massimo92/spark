@@ -930,12 +930,16 @@ run_backend_vllm() {
   fi
 
   # Detect NGC image
-  local ngc_image
+  local ngc_image recommended_image="${HF_RECOMMENDED_IMAGE:-}"
   ngc_image=$(detect_ngc_image)
+  if [[ ! "$recommended_image" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ && \
+        -f "${model_path}/README.md" ]]; then
+    recommended_image=$(grep -Eo 'vllm/vllm-openai:[A-Za-z0-9_.-]+' "${model_path}/README.md" 2>/dev/null | head -1 || true)
+  fi
   if [[ -z "${SPARK_VLLM_IMAGE:-}" && \
-        "${HF_RECOMMENDED_IMAGE:-}" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ ]] && \
-     docker image inspect "$HF_RECOMMENDED_IMAGE" >/dev/null 2>&1; then
-    ngc_image="$HF_RECOMMENDED_IMAGE"
+        "$recommended_image" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ ]] && \
+     docker image inspect "$recommended_image" >/dev/null 2>&1; then
+    ngc_image="$recommended_image"
   fi
   [[ -z "$ngc_image" ]] && die "No NGC vLLM container found" "Run: spark setup"
 
