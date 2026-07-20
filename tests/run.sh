@@ -1787,6 +1787,22 @@ test_workspace_restart_orders_stop_then_start() {
   [[ "$out" == $'stop\nstart' ]]
 }
 
+test_workspace_model_start_disables_mtp_for_reliable_recovery() {
+  local tmp out
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '{}\n' > "${tmp}/home/.config/spark/gateway.json"
+  out=$(HOME="${tmp}/home" bash -c '
+    source "$1"
+    docker() { [[ "$*" == *"ps --format"* ]] && printf "%s\n" "$GATEWAY_CONTAINER"; }
+    workspace_model_state() { printf "stopped\n"; }
+    cmd_run() { printf "%s\n" "$*"; }
+    workspace_ensure_gateway 0 1 Org/Model
+  ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$out" == *"Org/Model --no-wait --no-mtp"* ]]
+}
+
 test_workspace_status_uses_tailscale_services_config() {
   local tmp fake_bin out calls
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -6166,6 +6182,7 @@ run_test "setup --full continues after swap reconcile" test_setup_full_continues
 run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
+run_test "workspace model recovery disables MTP" test_workspace_model_start_disables_mtp_for_reliable_recovery
 run_test "workspace status uses Tailscale Services config" test_workspace_status_uses_tailscale_services_config
 run_test "workspace normalizes Hermes container name" test_workspace_normalizes_hermes_name
 run_test "workspace setup --check does not write files" test_workspace_check_no_mutation
