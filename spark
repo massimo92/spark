@@ -7303,7 +7303,19 @@ workspace_setup() {
 }
 
 cmd_workspace_status() {
-  local vikunja_url="" n8n_url="" hermes_url="" tailscale_mode=""
+  local vikunja_url="" n8n_url="" hermes_url="" tailscale_mode="" verbose=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --verbose) verbose=1 ;;
+      --help|-h)
+        printf "Usage: spark ws status [--verbose]\n"
+        printf "  --verbose  Include full NemoHermes sandbox and policy details.\n"
+        return 0
+        ;;
+      *) die "Unknown ws status option: $1" "Usage: spark ws status [--verbose]" ;;
+    esac
+    shift
+  done
   printf "\n  ${BOLD}spark ws status${NC}\n\n"
   if [[ -f "$WORKSPACE_COMPOSE_FILE" ]]; then
     workspace_compose ps 2>/dev/null || warn "Compose project ${WORKSPACE_PROJECT} not reachable"
@@ -7321,9 +7333,9 @@ cmd_workspace_status() {
   cmd_workspace_health
   printf "\n"
   gateway_status
-  if command -v nemohermes >/dev/null 2>&1; then
+  if [[ "$verbose" == "1" ]] && command -v nemohermes >/dev/null 2>&1; then
     nemohermes hermes status 2>/dev/null || nemohermes status 2>/dev/null || true
-  else
+  elif ! command -v nemohermes >/dev/null 2>&1; then
     warn "NemoHermes not installed"
   fi
   if command -v tailscale >/dev/null 2>&1; then
@@ -8980,7 +8992,7 @@ cmd_workspace_help() {
     start      Start the configured workspace runtime
     stop       Stop the workspace runtime and preserve all data
     restart    Stop and start the configured workspace runtime
-    status     Show workspace health
+    status     Show workspace health; --verbose includes full policy details
     logs       Follow logs for vikunja, n8n, postgres, hermes, or gateway
     doctor     Read-only workspace check
     backup     Back up Vikunja, n8n, and Hermes state
@@ -9020,7 +9032,7 @@ cmd_workspace() {
     start)  workspace_start "$@" ;;
     stop)   workspace_stop "$@" ;;
     restart) workspace_restart "$@" ;;
-    status) cmd_workspace_status ;;
+    status) cmd_workspace_status "$@" ;;
     logs)   cmd_workspace_logs "$@" ;;
     doctor) cmd_workspace_doctor "$@" ;;
     backup) cmd_workspace_backup "$@" ;;

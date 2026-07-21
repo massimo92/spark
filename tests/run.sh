@@ -3453,7 +3453,7 @@ test_workspace_doctor_json() {
 
 test_workspace_status_health_summary() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out
+  local tmp fake_bin out verbose_out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
@@ -3464,9 +3464,16 @@ test_workspace_status_health_summary() {
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_NEMOHERMES_STATUS=$'Sandbox: Ready\nPolicy:\nprivate policy detail' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws status 2>&1)
+  verbose_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_NEMOHERMES_STATUS=$'Sandbox: Ready\nPolicy:\nprivate policy detail' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws status --verbose 2>&1)
   rm -rf "$tmp"
   [[ "$out" == *"Workspace health"* ]] &&
     [[ "$out" == *"[x] Compose postgres"* ]] &&
@@ -3477,7 +3484,11 @@ test_workspace_status_health_summary() {
     [[ "$out" == *"[x] No public listeners"* ]] &&
     [[ "$out" == *"[x] LiteLLM Hermes route"* ]] &&
     [[ "$out" == *"[x] Hermes/NemoClaw"* ]] &&
-    [[ "$out" == *"[x] NemoHermes inference route"* ]]
+    [[ "$out" == *"[x] NemoHermes inference route"* ]] &&
+    [[ "$out" != *"Policy:"* ]] &&
+    [[ "$out" != *"private policy detail"* ]] &&
+    [[ "$verbose_out" == *"Policy:"* ]] &&
+    [[ "$verbose_out" == *"private policy detail"* ]]
 }
 
 test_workspace_doctor_flags_public_host_listener() {
