@@ -9362,9 +9362,17 @@ workspace_vikunja_human_user_id() {
   username=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
   email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
   [[ -n "$username" && -n "$email" ]] || return 1
-  workspace_vikunja_cli user list 2>/dev/null | awk -F'|' -v username="$username" -v email="$email" '
+  workspace_vikunja_cli user list 2>/dev/null | awk -v username="$username" -v email="$email" '
     function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
-    NF >= 5 && trim($3) == username && trim($4) == email { print trim($2); exit }
+    {
+      row = $0
+      gsub(/│/, "|", row)
+      n = split(row, cols, "|")
+      if (n >= 5 && trim(cols[3]) == username && trim(cols[4]) == email) {
+        print trim(cols[2])
+        exit
+      }
+    }
   '
 }
 
