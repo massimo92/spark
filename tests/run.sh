@@ -58,6 +58,9 @@ ${stdin_payload}"
           *"CREATE USER vikunja"*|*"ALTER USER vikunja"*|*"CREATE DATABASE vikunja"*|*"ALTER DATABASE vikunja"*) exit 0 ;;
           *"CREATE USER n8n"*|*"ALTER USER n8n"*|*"CREATE DATABASE n8n"*|*"ALTER DATABASE n8n"*) exit 0 ;;
           *"n8n user-management:reset"*) exit "${FAKE_N8N_USER_RESET_EXIT:-0}" ;;
+          *"n8n --version"*) printf '%s\n' "${FAKE_N8N_VERSION:-2.30.5}" ;;
+          *"bcryptjs"*) printf '%s\n' "${FAKE_N8N_PASSWORD_HASH:-\$2b\$10\$12345678901234567890123456789012345678901234567890123}" ;;
+          *"user reset-password "*) exit "${FAKE_VIKUNJA_PASSWORD_RESET_EXIT:-0}" ;;
           *"user create -u "*)
             if [[ -n "${FAKE_VIKUNJA_CREATED_USER_FILE:-}" ]]; then
               printf '%s\n' "$*" > "$FAKE_VIKUNJA_CREATED_USER_FILE"
@@ -241,7 +244,11 @@ EOF
   # (FAKE_VLLM_READY, default ready so supervised launches don't block in tests).
 cat > "${dir}/curl" <<'EOF'
 #!/usr/bin/env bash
-case "$*" in
+stdin_payload=""
+[[ "$*" == *"@-"* ]] && stdin_payload=$(cat || true)
+args="$*
+${stdin_payload}"
+case "$args" in
   *https://vikunja.test-tailnet.ts.net/api/v1/info*) exit "${FAKE_TAILSCALE_VIKUNJA_EXIT:-0}" ;;
   *https://n8n.test-tailnet.ts.net/healthz*) exit "${FAKE_TAILSCALE_N8N_EXIT:-0}" ;;
   *https://hermes.test-tailnet.ts.net/*) exit "${FAKE_TAILSCALE_HERMES_EXIT:-0}" ;;
@@ -256,11 +263,11 @@ case "$*" in
   *:5678/healthz*) exit "${FAKE_N8N_HEALTH_EXIT:-0}" ;;
   *:5678/rest/owner/setup*) [[ -n "${FAKE_N8N_OWNER_MARKER:-}" ]] && : > "$FAKE_N8N_OWNER_MARKER"; echo '{"data":{"id":"owner"}}'; exit "${FAKE_N8N_OWNER_EXIT:-0}" ;;
   *:5678/rest/login*)
-    if [[ "${FAKE_N8N_LOGIN_FORBID_EMAIL_FIELD:-0}" == "1" && "$*" == *'"email"'* ]]; then
+    if [[ "${FAKE_N8N_LOGIN_FORBID_EMAIL_FIELD:-0}" == "1" && "$args" == *'"email"'* ]]; then
       echo '{"code":"email_field_forbidden"}'
       exit 400
     fi
-    if [[ "${FAKE_N8N_LOGIN_REQUIRE_EMAIL_OR_LDAP:-0}" == "1" && "$*" != *"emailOrLdapLoginId"* ]]; then
+    if [[ "${FAKE_N8N_LOGIN_REQUIRE_EMAIL_OR_LDAP:-0}" == "1" && "$args" != *"emailOrLdapLoginId"* ]]; then
       echo '{"code":"invalid_type","path":["emailOrLdapLoginId"],"message":"Required"}'
       exit 400
     fi
@@ -3198,37 +3205,107 @@ test_workspace_credentials_command_removed() {
     [[ "$("$SPARK" ws help 2>&1)" != *"credentials"* ]]
 }
 
-test_workspace_setup_configures_optional_smtp() {
+test_workspace_setup_rejects_removed_smtp() {
+  local out status help
+  set +e
+  out=$("$SPARK" ws setup --smtp 2>&1)
+  status=$?
+  set -e
+  help=$("$SPARK" ws setup --help 2>&1)
+  [[ "$status" -ne 0 ]] && [[ "$out" == *"SMTP support was removed"* ]] &&
+    [[ "$out" == *"spark ws recover vikunja|n8n"* ]] && [[ "$help" != *"--smtp"* ]]
+}
+
+test_workspace_setup_removes_legacy_smtp() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out rerun env vikunja_env n8n_env calls
+  local tmp fake_bin out config env vikunja_env n8n_env backup
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
-  printf '%s\n' 'smtp-key-123' > "${tmp}/smtp.pass"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  config="${tmp}/home/.config/spark/workspace"
+  printf '%s\n' 'WORKSPACE_SMTP_PASSWORD=legacy-secret' >> "${config}/secrets.env"
+  printf '%s\n' 'VIKUNJA_MAILER_PASSWORD=legacy-secret' >> "${config}/vikunja.env"
+  printf '%s\n' 'N8N_SMTP_PASS=legacy-secret' >> "${config}/n8n.env"
+  cp "${config}/n8n.env" "${config}/n8n.env.bak.legacy"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
-    FAKE_COMPOSE_EXEC_FILE="${tmp}/compose.log" FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws setup --yes --model Org/Alpha --smtp --smtp-host smtp-relay.brevo.com \
-      --smtp-port 587 --smtp-user brevo-user --smtp-password-file "${tmp}/smtp.pass" \
-      --smtp-from recovery@example.com --smtp-security starttls 2>&1 || true)
-  rerun=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
-    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
-    FAKE_COMPOSE_EXEC_FILE="${tmp}/compose.log" FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1 || true)
-  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
-  vikunja_env=$(cat "${tmp}/home/.config/spark/workspace/vikunja.env")
-  n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env")
-  calls=$(cat "${tmp}/compose.log" 2>/dev/null || true)
+  env=$(cat "${config}/secrets.env")
+  vikunja_env=$(cat "${config}/vikunja.env")
+  n8n_env=$(cat "${config}/n8n.env")
+  backup=$(cat "${config}/n8n.env.bak.legacy")
   rm -rf "$tmp"
-  [[ "$out" == *"SMTP test email sent to m@example.com"* ]] &&
-    [[ "$env" == *"WORKSPACE_SMTP_PASSWORD=smtp-key-123"* ]] &&
-    [[ "$vikunja_env" == *"VIKUNJA_MAILER_ENABLED=true"* ]] &&
-    [[ "$vikunja_env" == *"VIKUNJA_MAILER_FORCESSL=false"* ]] &&
-    [[ "$n8n_env" == *"N8N_EMAIL_MODE=smtp"* ]] &&
-    [[ "$n8n_env" == *"N8N_SMTP_STARTTLS=true"* ]] &&
-    [[ "$calls" == *"testmail m@example.com"* ]] &&
-    [[ "$rerun" != *"SMTP password is required"* ]] && [[ "$rerun" != *"smtp-key-123"* ]]
+  [[ "$out" == *"Removed legacy SMTP configuration and credentials"* ]] &&
+    [[ "$env$vikunja_env$n8n_env$backup" != *"legacy-secret"* ]]
+}
+
+test_workspace_recover_vikunja() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out password config calls stored
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_COMPOSE_EXEC_FILE="${tmp}/calls" "$SPARK" ws recover vikunja --yes 2>&1)
+  password=$(sed -n 's/^    password: //p' <<< "$out")
+  config="${tmp}/home/.config/spark/workspace"
+  calls=$(cat "${tmp}/calls")
+  stored=$(cat "${config}/secrets.env" "${config}/vikunja.env" "${config}/n8n.env")
+  rm -rf "$tmp"
+  [[ "$out" == *"Vikunja access recovered for m@example.com"* ]] &&
+    [[ "$calls" == *"user reset-password 1 -d -p"* ]] &&
+    [[ -n "$password" ]] && [[ "$stored" != *"$password"* ]]
+}
+
+test_workspace_recover_n8n() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out password config calls n8n_env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_WAIT_SLEEP=0 FAKE_COMPOSE_FILE="${tmp}/calls" \
+    "$SPARK" ws recover n8n --yes 2>&1)
+  password=$(sed -n 's/^    password: //p' <<< "$out")
+  config="${tmp}/home/.config/spark/workspace"
+  calls=$(cat "${tmp}/calls")
+  n8n_env=$(cat "${config}/n8n.env")
+  rm -rf "$tmp"
+  [[ "$out" == *"n8n access recovered for m@example.com"* ]] &&
+    [[ $(grep -c 'force-recreate --no-deps n8n' <<< "$calls") -eq 2 ]] &&
+    [[ "$calls" != *"user-management:reset"* ]] &&
+    [[ "$n8n_env" != *"N8N_INSTANCE_OWNER_"* ]] &&
+    [[ -n "$password" ]] && [[ "$n8n_env" != *"$password"* ]]
+}
+
+test_workspace_recover_n8n_requires_supported_version() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_N8N_VERSION=2.16.9 "$SPARK" ws recover n8n --yes 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] && [[ "$out" == *"Update n8n to 2.17.0 or newer"* ]]
 }
 
 test_workspace_setup_repairs_polluted_required_env_values() {
@@ -6557,7 +6634,11 @@ run_test "workspace setup missing required values does not pollute env" test_wor
 run_test "workspace setup generates, prints, and forgets human passwords" test_workspace_setup_generates_prints_and_forgets_passwords
 run_test "workspace setup accepts password flags and files" test_workspace_setup_accepts_password_flags_and_files
 run_test "workspace credentials command is removed" test_workspace_credentials_command_removed
-run_test "workspace setup configures optional SMTP" test_workspace_setup_configures_optional_smtp
+run_test "workspace setup rejects removed SMTP" test_workspace_setup_rejects_removed_smtp
+run_test "workspace setup removes legacy SMTP" test_workspace_setup_removes_legacy_smtp
+run_test "workspace recover changes Vikunja password" test_workspace_recover_vikunja
+run_test "workspace recover changes n8n password" test_workspace_recover_n8n
+run_test "workspace recover requires supported n8n" test_workspace_recover_n8n_requires_supported_version
 run_test "workspace setup repairs polluted required env values" test_workspace_setup_repairs_polluted_required_env_values
 run_test "workspace setup cleans polluted env before missing value abort" test_workspace_setup_cleans_polluted_env_before_missing_value_abort
 run_test "workspace setup --remote delegates to remote spark" test_workspace_remote_delegates
