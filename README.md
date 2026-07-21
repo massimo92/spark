@@ -98,6 +98,8 @@ spark ws setup
 spark ws start
 spark ws stop
 spark ws restart
+spark ws recover vikunja
+spark ws recover n8n
 spark ws status
 spark ws doctor
 spark ws backup
@@ -109,10 +111,10 @@ Workspace containers use stable names: `workspace-postgres`, `workspace-vikunja`
 Setup creates different strong passwords for Vikunja and n8n, prints them once,
 and never stores them. Choose initial passwords with `--vikunja-password-file`
 and `--n8n-password-file` (direct password flags also exist but may remain in
-shell history). SMTP password recovery is optional: interactive setup asks for
-the server details, or use `--smtp` with the SMTP flags shown by
-`spark ws setup --help`. Without SMTP, losing a password may require destructive
-service reinitialization and data may be lost.
+shell history). If one is lost, `spark ws recover vikunja` or
+`spark ws recover n8n` replaces it safely. Add `--yes` to generate a secure
+password without questions; Spark shows generated passwords once and never
+stores them.
 
 Use `spark ws doctor --strict` before treating it as production-ready.
 

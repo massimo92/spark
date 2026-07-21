@@ -5832,8 +5832,6 @@ workspace_write_files() {
   local vikunja_api_status
   local vikunja_human_status vikunja_hermes_status vikunja_human_admin_status
   local postgres_image vikunja_image n8n_image old_umask
-  local smtp_enabled smtp_host smtp_port smtp_user smtp_password smtp_from smtp_security
-  local smtp_ssl=false smtp_starttls=false n8n_smtp_env=""
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
   tailscale_bind_addr=$(workspace_env_or_value WORKSPACE_TAILSCALE_BIND_ADDR 127.0.0.1)
   tailscale_dns_name=$(workspace_read_env WORKSPACE_TAILSCALE_DNS_NAME 2>/dev/null || true)
@@ -5895,19 +5893,6 @@ workspace_write_files() {
   postgres_image="${SPARK_WORKSPACE_POSTGRES_IMAGE:-$(workspace_env_or_value WORKSPACE_POSTGRES_IMAGE "$WORKSPACE_POSTGRES_IMAGE_DEFAULT")}"
   vikunja_image="${SPARK_WORKSPACE_VIKUNJA_IMAGE:-$(workspace_env_or_value WORKSPACE_VIKUNJA_IMAGE "$WORKSPACE_VIKUNJA_IMAGE_DEFAULT")}"
   n8n_image="${SPARK_WORKSPACE_N8N_IMAGE:-$(workspace_env_or_value WORKSPACE_N8N_IMAGE "$WORKSPACE_N8N_IMAGE_DEFAULT")}"
-  smtp_enabled="${SPARK_WORKSPACE_SMTP_ENABLED:-$(workspace_env_or_value WORKSPACE_SMTP_ENABLED false)}"
-  smtp_host="${SPARK_WORKSPACE_SMTP_HOST:-$(workspace_read_env WORKSPACE_SMTP_HOST 2>/dev/null || true)}"
-  smtp_port="${SPARK_WORKSPACE_SMTP_PORT:-$(workspace_read_env WORKSPACE_SMTP_PORT 2>/dev/null || true)}"
-  smtp_user="${SPARK_WORKSPACE_SMTP_USER:-$(workspace_read_env WORKSPACE_SMTP_USER 2>/dev/null || true)}"
-  smtp_password="${SPARK_WORKSPACE_SMTP_PASSWORD:-$(workspace_read_env WORKSPACE_SMTP_PASSWORD 2>/dev/null || true)}"
-  smtp_from="${SPARK_WORKSPACE_SMTP_FROM:-$(workspace_read_env WORKSPACE_SMTP_FROM 2>/dev/null || true)}"
-  smtp_security="${SPARK_WORKSPACE_SMTP_SECURITY:-$(workspace_env_or_value WORKSPACE_SMTP_SECURITY starttls)}"
-  case "$smtp_security" in
-    tls) smtp_ssl=true ;;
-    starttls) smtp_starttls=true ;;
-    none) ;;
-    *) die "SMTP security must be starttls, tls, or none" ;;
-  esac
   workspace_validate_image_ref "Postgres image" "$postgres_image"
   workspace_validate_image_ref "Vikunja image" "$vikunja_image"
   workspace_validate_image_ref "n8n image" "$n8n_image"
@@ -5942,21 +5927,6 @@ workspace_write_files() {
   workspace_require_env_value "workspace Postgres image" "$postgres_image"
   workspace_require_env_value "workspace Vikunja image" "$vikunja_image"
   workspace_require_env_value "workspace n8n image" "$n8n_image"
-  if [[ "$smtp_enabled" == "true" ]]; then
-    workspace_require_env_value "SMTP host" "$smtp_host"
-    [[ "$smtp_port" =~ ^[0-9]+$ ]] || die "SMTP port must be numeric"
-    workspace_require_env_value "SMTP user" "$smtp_user"
-    workspace_require_env_value "SMTP password" "$smtp_password"
-    workspace_require_prompt_value "SMTP sender" "$smtp_from" email
-    n8n_smtp_env="N8N_EMAIL_MODE=smtp
-N8N_SMTP_HOST=${smtp_host}
-N8N_SMTP_PORT=${smtp_port}
-N8N_SMTP_USER=${smtp_user}
-N8N_SMTP_PASS=${smtp_password}
-N8N_SMTP_SENDER=${smtp_from}
-N8N_SMTP_SSL=${smtp_ssl}
-N8N_SMTP_STARTTLS=${smtp_starttls}"
-  fi
   mkdir -p "$WORKSPACE_CONFIG_DIR" "$WORKSPACE_DATA_DIR"/{vikunja-files,postgres,n8n,backups}
   chmod 700 "$WORKSPACE_CONFIG_DIR"
   workspace_prepare_data_dirs
@@ -6019,13 +5989,6 @@ WORKSPACE_TAILSCALE_DNS_NAME=${tailscale_dns_name}
 WORKSPACE_POSTGRES_IMAGE=${postgres_image}
 WORKSPACE_VIKUNJA_IMAGE=${vikunja_image}
 WORKSPACE_N8N_IMAGE=${n8n_image}
-WORKSPACE_SMTP_ENABLED=${smtp_enabled}
-WORKSPACE_SMTP_HOST=${smtp_host}
-WORKSPACE_SMTP_PORT=${smtp_port}
-WORKSPACE_SMTP_USER=${smtp_user}
-WORKSPACE_SMTP_PASSWORD=${smtp_password}
-WORKSPACE_SMTP_FROM=${smtp_from}
-WORKSPACE_SMTP_SECURITY=${smtp_security}
 EOF
   workspace_install_file "$WORKSPACE_POSTGRES_ENV_FILE" 600 <<EOF
 POSTGRES_DB=workspace
@@ -6045,15 +6008,6 @@ VIKUNJA_SERVICE_PUBLICURL=${vikunja_url}
 VIKUNJA_SERVICE_ENABLEREGISTRATION=false
 VIKUNJA_SERVICE_ENABLELINKSHARING=false
 VIKUNJA_SERVICE_INTERFACE=:3456
-VIKUNJA_MAILER_ENABLED=${smtp_enabled}
-VIKUNJA_MAILER_HOST=${smtp_host}
-VIKUNJA_MAILER_PORT=${smtp_port}
-VIKUNJA_MAILER_AUTHTYPE=login
-VIKUNJA_MAILER_USERNAME=${smtp_user}
-VIKUNJA_MAILER_PASSWORD=${smtp_password}
-VIKUNJA_MAILER_FROMEMAIL=${smtp_from}
-VIKUNJA_MAILER_FORCESSL=${smtp_ssl}
-VIKUNJA_MAILER_SKIPTLSVERIFY=false
 EOF
   workspace_install_file "$WORKSPACE_N8N_ENV_FILE" 600 <<EOF
 DB_TYPE=postgresdb
@@ -6083,7 +6037,6 @@ N8N_COMMUNITY_PACKAGES_MANAGED_BY_ENV=true
 N8N_COMMUNITY_PACKAGES=[]
 N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
 NODES_EXCLUDE=["n8n-nodes-base.executeCommand","n8n-nodes-base.readWriteFile"]
-${n8n_smtp_env}
 EOF
   workspace_install_file "${WORKSPACE_CONFIG_DIR}/init-db.sh" 700 <<'EOF'
 #!/usr/bin/env bash
@@ -6387,6 +6340,38 @@ workspace_remove_legacy_human_passwords() {
   [[ "$removed" == "0" ]] || info "Removed legacy stored human passwords"
 }
 
+workspace_remove_legacy_smtp() {
+  local file tmp removed=0
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    if grep -Eq '^(WORKSPACE_SMTP_|VIKUNJA_MAILER_|N8N_SMTP_|N8N_EMAIL_MODE=)' "$file" 2>/dev/null; then
+      tmp="${file}.tmp"
+      grep -Ev '^(WORKSPACE_SMTP_|VIKUNJA_MAILER_|N8N_SMTP_|N8N_EMAIL_MODE=)' "$file" > "$tmp" || true
+      chmod 600 "$tmp"
+      mv "$tmp" "$file"
+      removed=1
+    fi
+  done < <(find "$WORKSPACE_CONFIG_DIR" -maxdepth 1 -type f \
+    \( -name 'secrets.env' -o -name 'vikunja.env' -o -name 'n8n.env' -o -name '*.env.bak.*' \) \
+    -print 2>/dev/null)
+  [[ "$removed" == "0" ]] || info "Removed legacy SMTP configuration and credentials"
+}
+
+workspace_remove_transient_n8n_owner_config() {
+  local key removed=0
+  [[ -f "$WORKSPACE_N8N_ENV_FILE" ]] || return 0
+  for key in \
+    N8N_INSTANCE_OWNER_MANAGED_BY_ENV N8N_INSTANCE_OWNER_EMAIL \
+    N8N_INSTANCE_OWNER_FIRST_NAME N8N_INSTANCE_OWNER_LAST_NAME \
+    N8N_INSTANCE_OWNER_PASSWORD_HASH; do
+    if grep -q "^${key}=" "$WORKSPACE_N8N_ENV_FILE" 2>/dev/null; then
+      workspace_remove_env_file_key "$WORKSPACE_N8N_ENV_FILE" "$key"
+      removed=1
+    fi
+  done
+  [[ "$removed" == "0" ]] || info "Removed interrupted n8n recovery configuration"
+}
+
 workspace_clear_public_urls() {
   workspace_set_env_key WORKSPACE_TAILSCALE_MODE manual
   workspace_set_env_key VIKUNJA_URL ""
@@ -6431,11 +6416,11 @@ workspace_vikunja_login_jwt() {
   base_url=$(workspace_vikunja_api_base_url) || return 1
   payload=$(printf '{"username":"%s","password":"%s","long_token":true}' \
     "$(workspace_json_escape "$username")" "$(workspace_json_escape "$password")")
-  out=$(curl -fsS --max-time 10 \
+  out=$(printf '%s' "$payload" | curl -fsS --max-time 10 \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json' \
     -X POST "${base_url}/api/v1/login" \
-    --data "$payload" 2>/dev/null) || return 1
+    --data-binary @- 2>/dev/null) || return 1
   token=$(printf '%s\n' "$out" | workspace_json_string_field token)
   [[ -n "$token" ]] || return 1
   printf '%s\n' "$token"
@@ -6547,11 +6532,11 @@ workspace_n8n_base_url() {
 workspace_n8n_post_json() {
   local path="$1" payload="$2" base_url
   base_url=$(workspace_n8n_base_url) || return 1
-  curl -fsS --max-time 10 \
+  printf '%s' "$payload" | curl -fsS --max-time 10 \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json' \
     -X POST "${base_url}${path}" \
-    --data "$payload" >/dev/null
+    --data-binary @- >/dev/null
 }
 
 workspace_n8n_login() {
@@ -7187,52 +7172,6 @@ workspace_prompt_secret_confirm() {
   done
 }
 
-workspace_configure_smtp_inputs() {
-  local auto_yes="$1" existing_enabled security
-  existing_enabled=$(workspace_read_env WORKSPACE_SMTP_ENABLED 2>/dev/null || true)
-  if [[ -z "${SPARK_WORKSPACE_SMTP_ENABLED:-}" ]]; then
-    if [[ "$existing_enabled" == "true" ]]; then
-      SPARK_WORKSPACE_SMTP_ENABLED=true
-    elif [[ "$auto_yes" == "1" ]] || ! is_interactive; then
-      SPARK_WORKSPACE_SMTP_ENABLED=false
-    elif confirm "Enable SMTP password recovery for Vikunja and n8n?"; then
-      SPARK_WORKSPACE_SMTP_ENABLED=true
-    else
-      SPARK_WORKSPACE_SMTP_ENABLED=false
-    fi
-  fi
-  if [[ "$SPARK_WORKSPACE_SMTP_ENABLED" != "true" ]]; then
-    warn "SMTP disabled: forgotten passwords may require destructive service reinitialization and data may be lost"
-    return 0
-  fi
-  SPARK_WORKSPACE_SMTP_HOST="${SPARK_WORKSPACE_SMTP_HOST:-$(workspace_read_env WORKSPACE_SMTP_HOST 2>/dev/null || true)}"
-  SPARK_WORKSPACE_SMTP_PORT="${SPARK_WORKSPACE_SMTP_PORT:-$(workspace_read_env WORKSPACE_SMTP_PORT 2>/dev/null || true)}"
-  SPARK_WORKSPACE_SMTP_USER="${SPARK_WORKSPACE_SMTP_USER:-$(workspace_read_env WORKSPACE_SMTP_USER 2>/dev/null || true)}"
-  SPARK_WORKSPACE_SMTP_PASSWORD="${SPARK_WORKSPACE_SMTP_PASSWORD:-$(workspace_read_env WORKSPACE_SMTP_PASSWORD 2>/dev/null || true)}"
-  SPARK_WORKSPACE_SMTP_FROM="${SPARK_WORKSPACE_SMTP_FROM:-$(workspace_read_env WORKSPACE_SMTP_FROM 2>/dev/null || true)}"
-  SPARK_WORKSPACE_SMTP_SECURITY="${SPARK_WORKSPACE_SMTP_SECURITY:-$(workspace_read_env WORKSPACE_SMTP_SECURITY 2>/dev/null || true)}"
-  SPARK_WORKSPACE_SMTP_HOST=$(workspace_prompt SPARK_WORKSPACE_SMTP_HOST "SMTP host" "$(workspace_read_env WORKSPACE_SMTP_HOST 2>/dev/null || true)" 0 text)
-  SPARK_WORKSPACE_SMTP_PORT=$(workspace_prompt SPARK_WORKSPACE_SMTP_PORT "SMTP port" "$(workspace_read_env WORKSPACE_SMTP_PORT 2>/dev/null || printf 587)" 0 text)
-  [[ "$SPARK_WORKSPACE_SMTP_PORT" =~ ^[0-9]+$ ]] || die "SMTP port must be numeric"
-  SPARK_WORKSPACE_SMTP_USER=$(workspace_prompt SPARK_WORKSPACE_SMTP_USER "SMTP username" "$(workspace_read_env WORKSPACE_SMTP_USER 2>/dev/null || true)" 0 text)
-  SPARK_WORKSPACE_SMTP_PASSWORD=$(workspace_prompt SPARK_WORKSPACE_SMTP_PASSWORD "SMTP password" "$(workspace_read_env WORKSPACE_SMTP_PASSWORD 2>/dev/null || true)" 1 text)
-  SPARK_WORKSPACE_SMTP_FROM=$(workspace_prompt SPARK_WORKSPACE_SMTP_FROM "SMTP sender email" "$(workspace_read_env WORKSPACE_SMTP_FROM 2>/dev/null || true)" 0 email)
-  security="${SPARK_WORKSPACE_SMTP_SECURITY:-starttls}"
-  case "$security" in starttls|tls|none) ;; *) die "SMTP security must be starttls, tls, or none" ;; esac
-  SPARK_WORKSPACE_SMTP_SECURITY="$security"
-}
-
-workspace_test_smtp() {
-  local email="$1"
-  [[ "$(workspace_read_env WORKSPACE_SMTP_ENABLED 2>/dev/null || true)" == "true" ]] || return 0
-  if workspace_vikunja_cli testmail "$email" >/dev/null 2>&1; then
-    info "SMTP test email sent to ${email}"
-  else
-    setup_fail "SMTP test failed; check server, sender, TLS, and credentials"
-    return 1
-  fi
-}
-
 workspace_reconcile_identity_overrides() {
   if [[ -n "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "${SPARK_WORKSPACE_N8N_EMAIL:-}" \
     && "$SPARK_WORKSPACE_VIKUNJA_EMAIL" != "$SPARK_WORKSPACE_N8N_EMAIL" ]]; then
@@ -7265,10 +7204,7 @@ workspace_remote_workspace_cmd() {
   if [[ "$send_workspace_env" == "1" ]]; then
     for key in \
       SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL SPARK_WORKSPACE_VIKUNJA_TOKEN \
-      SPARK_WORKSPACE_VIKUNJA_PASSWORD SPARK_WORKSPACE_N8N_EMAIL SPARK_WORKSPACE_N8N_PASSWORD \
-      SPARK_WORKSPACE_SMTP_ENABLED SPARK_WORKSPACE_SMTP_HOST SPARK_WORKSPACE_SMTP_PORT \
-      SPARK_WORKSPACE_SMTP_USER SPARK_WORKSPACE_SMTP_PASSWORD SPARK_WORKSPACE_SMTP_FROM \
-      SPARK_WORKSPACE_SMTP_SECURITY; do
+      SPARK_WORKSPACE_VIKUNJA_PASSWORD SPARK_WORKSPACE_N8N_EMAIL SPARK_WORKSPACE_N8N_PASSWORD; do
       value="${!key:-}"
       if [[ -n "$value" ]]; then
         printf -v q '%q' "$value"
@@ -7309,7 +7245,6 @@ workspace_setup() {
   local auto_yes=0 check_only=0 requested_model="" remote_spec="" requested_tail_mode=""
   local postgres_image="" vikunja_image="" n8n_image="" model tailnet
   local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_password_file="" vikunja_token="" n8n_email_arg="" n8n_password_arg="" n8n_password_file="" funnel_action=""
-  local smtp_enabled_arg="" smtp_host="" smtp_port="" smtp_user="" smtp_password="" smtp_password_file="" smtp_from="" smtp_security=""
   local existing_model="" existing_tail_mode="" effective_tail_mode="" env_tail_mode="" setup_overrides=0
   env_tail_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-}"
   while [[ $# -gt 0 ]]; do
@@ -7338,15 +7273,8 @@ workspace_setup() {
       --n8n-email) n8n_email_arg="${2:-}"; [[ -n "$n8n_email_arg" ]] || die "--n8n-email requires a value"; shift 2 ;;
       --n8n-password) n8n_password_arg="${2:-}"; [[ -n "$n8n_password_arg" ]] || die "--n8n-password requires a value"; shift 2 ;;
       --n8n-password-file) n8n_password_file="${2:-}"; [[ -n "$n8n_password_file" ]] || die "--n8n-password-file requires a path"; shift 2 ;;
-      --smtp) smtp_enabled_arg=true; shift ;;
-      --no-smtp) smtp_enabled_arg=false; shift ;;
-      --smtp-host) smtp_host="${2:-}"; [[ -n "$smtp_host" ]] || die "--smtp-host requires a value"; shift 2 ;;
-      --smtp-port) smtp_port="${2:-}"; [[ -n "$smtp_port" ]] || die "--smtp-port requires a value"; shift 2 ;;
-      --smtp-user) smtp_user="${2:-}"; [[ -n "$smtp_user" ]] || die "--smtp-user requires a value"; shift 2 ;;
-      --smtp-password) smtp_password="${2:-}"; [[ -n "$smtp_password" ]] || die "--smtp-password requires a value"; shift 2 ;;
-      --smtp-password-file) smtp_password_file="${2:-}"; [[ -n "$smtp_password_file" ]] || die "--smtp-password-file requires a path"; shift 2 ;;
-      --smtp-from) smtp_from="${2:-}"; [[ -n "$smtp_from" ]] || die "--smtp-from requires a value"; shift 2 ;;
-      --smtp-security) smtp_security="${2:-}"; [[ -n "$smtp_security" ]] || die "--smtp-security requires a value"; shift 2 ;;
+      --no-smtp) warn "--no-smtp is no longer needed; SMTP support was removed"; shift ;;
+      --smtp|--smtp-*) die "SMTP support was removed" "Use: spark ws recover vikunja|n8n" ;;
       --funnel-action)
         funnel_action="${2:-}"
         tailscale_funnel_action_valid "$funnel_action" || die "--funnel-action must be reset or abort"
@@ -7360,24 +7288,14 @@ workspace_setup() {
   [[ -n "$vikunja_email" ]] && SPARK_WORKSPACE_VIKUNJA_EMAIL="$vikunja_email"
   [[ -z "$vikunja_password" || -z "$vikunja_password_file" ]] || die "Use only one of --vikunja-password or --vikunja-password-file"
   [[ -z "$n8n_password_arg" || -z "$n8n_password_file" ]] || die "Use only one of --n8n-password or --n8n-password-file"
-  [[ -z "$smtp_password" || -z "$smtp_password_file" ]] || die "Use only one of --smtp-password or --smtp-password-file"
   [[ -n "$vikunja_password_file" ]] && vikunja_password=$(workspace_read_secret_file "Vikunja password" "$vikunja_password_file")
   [[ -n "$n8n_password_file" ]] && n8n_password_arg=$(workspace_read_secret_file "n8n password" "$n8n_password_file")
-  [[ -n "$smtp_password_file" ]] && smtp_password=$(workspace_read_secret_file "SMTP password" "$smtp_password_file")
   [[ -n "$vikunja_password" ]] && { workspace_require_prompt_value "Vikunja password" "$vikunja_password" text; warn "Direct password flags may remain in shell history; prefer --vikunja-password-file"; }
   [[ -n "$vikunja_password" ]] && SPARK_WORKSPACE_VIKUNJA_PASSWORD="$vikunja_password"
   [[ -n "$vikunja_token" ]] && SPARK_WORKSPACE_VIKUNJA_TOKEN="$vikunja_token"
   [[ -n "$n8n_email_arg" ]] && SPARK_WORKSPACE_N8N_EMAIL="$n8n_email_arg"
   [[ -n "$n8n_password_arg" ]] && { workspace_require_prompt_value "n8n password" "$n8n_password_arg" text; warn "Direct password flags may remain in shell history; prefer --n8n-password-file"; }
   [[ -n "$n8n_password_arg" ]] && SPARK_WORKSPACE_N8N_PASSWORD="$n8n_password_arg"
-  [[ -n "$smtp_password" && -z "$smtp_password_file" ]] && warn "Direct SMTP password flags may remain in shell history; prefer --smtp-password-file"
-  [[ -n "$smtp_enabled_arg" ]] && SPARK_WORKSPACE_SMTP_ENABLED="$smtp_enabled_arg"
-  [[ -n "$smtp_host" ]] && SPARK_WORKSPACE_SMTP_HOST="$smtp_host"
-  [[ -n "$smtp_port" ]] && SPARK_WORKSPACE_SMTP_PORT="$smtp_port"
-  [[ -n "$smtp_user" ]] && SPARK_WORKSPACE_SMTP_USER="$smtp_user"
-  [[ -n "$smtp_password" ]] && SPARK_WORKSPACE_SMTP_PASSWORD="$smtp_password"
-  [[ -n "$smtp_from" ]] && SPARK_WORKSPACE_SMTP_FROM="$smtp_from"
-  [[ -n "$smtp_security" ]] && SPARK_WORKSPACE_SMTP_SECURITY="$smtp_security"
   workspace_reconcile_identity_overrides
   [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && workspace_require_env_value "Vikunja Hermes API token" "$SPARK_WORKSPACE_VIKUNJA_TOKEN"
   [[ -n "$postgres_image" ]] && workspace_validate_image_ref "Postgres image" "$postgres_image"
@@ -7392,7 +7310,6 @@ workspace_setup() {
       workspace_require_prompt_value "Vikunja human username" "$SPARK_WORKSPACE_VIKUNJA_USERNAME" username
       workspace_require_prompt_value "Vikunja human email" "$SPARK_WORKSPACE_VIKUNJA_EMAIL" email
       workspace_require_prompt_value "n8n admin email" "$SPARK_WORKSPACE_N8N_EMAIL" email
-      workspace_configure_smtp_inputs "$auto_yes"
       export SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL
       [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && export SPARK_WORKSPACE_VIKUNJA_TOKEN
       export SPARK_WORKSPACE_N8N_EMAIL
@@ -7420,7 +7337,7 @@ workspace_setup() {
   existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   existing_tail_mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   effective_tail_mode="${requested_tail_mode:-services}"
-  if [[ -n "$requested_model" || -n "$postgres_image" || -n "$vikunja_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || -n "$smtp_enabled_arg" || -n "$smtp_host" || -n "$smtp_port" || -n "$smtp_user" || -n "$smtp_password" || -n "$smtp_from" || -n "$smtp_security" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
+  if [[ -n "$requested_model" || -n "$postgres_image" || -n "$vikunja_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
     setup_overrides=1
   fi
   if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
@@ -7476,7 +7393,7 @@ workspace_setup() {
     workspace_summary
     return $?
   fi
-  workspace_remove_legacy_human_passwords
+  workspace_migrate_runtime_config
   local human_user human_email human_pass n8n_email n8n_pass hermes_pass vikunja_previous_status n8n_previous_status setup_rc
   local existing_human_user existing_human_email existing_n8n_email
   existing_human_user=$(workspace_existing_prompt_value VIKUNJA_HUMAN_USERNAME "Vikunja human username" username || true)
@@ -7492,7 +7409,6 @@ workspace_setup() {
   human_email=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Workspace email" "$existing_human_email" 0 email)
   n8n_email="$human_email"
   SPARK_WORKSPACE_N8N_EMAIL="$n8n_email"
-  workspace_configure_smtp_inputs "$auto_yes"
   human_pass="${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-$(workspace_random_password)}"
   n8n_pass="${SPARK_WORKSPACE_N8N_PASSWORD:-$(workspace_random_password)}"
   [[ "$human_pass" != "$n8n_pass" ]] || die "Vikunja and n8n passwords must be different"
@@ -7535,7 +7451,6 @@ workspace_setup() {
     workspace_create_n8n_owner "$n8n_email" "$n8n_pass" || true
     [[ "$(workspace_read_env N8N_OWNER_SETUP_STATUS 2>/dev/null || true)" == "created" ]] && WORKSPACE_SHOW_N8N_PASSWORD=1
   fi
-  workspace_test_smtp "$human_email" || true
   if workspace_tailscale_services_mode && workspace_tailscale_service_host_advertised; then
     if workspace_tailscale_urls_ready_after_setup; then
       workspace_tailscale_clear_error
@@ -7729,10 +7644,8 @@ cmd_workspace_status() {
 
 workspace_migrate_runtime_config() {
   workspace_remove_legacy_human_passwords
-  if [[ -z "$(workspace_read_env WORKSPACE_SMTP_ENABLED 2>/dev/null || true)" ]]; then
-    workspace_set_env_key WORKSPACE_SMTP_ENABLED false
-    info "Recorded SMTP recovery as disabled; run spark ws setup --smtp to enable it"
-  fi
+  workspace_remove_legacy_smtp
+  workspace_remove_transient_n8n_owner_config
 }
 
 workspace_print_tailscale_runtime_status() {
@@ -8208,16 +8121,12 @@ workspace_credentials_are_distinct() {
   return 0
 }
 
-workspace_smtp_config_valid() {
-  local enabled security
-  enabled=$(workspace_read_env WORKSPACE_SMTP_ENABLED 2>/dev/null || true)
-  [[ "$enabled" == "false" ]] && return 0
-  [[ "$enabled" == "true" ]] || return 1
-  security=$(workspace_read_env WORKSPACE_SMTP_SECURITY 2>/dev/null || true)
-  [[ "$security" =~ ^(starttls|tls|none)$ ]] || return 1
-  workspace_env_has WORKSPACE_SMTP_HOST WORKSPACE_SMTP_PORT WORKSPACE_SMTP_USER WORKSPACE_SMTP_PASSWORD WORKSPACE_SMTP_FROM || return 1
-  grep -q '^VIKUNJA_MAILER_ENABLED=true$' "$WORKSPACE_VIKUNJA_ENV_FILE" &&
-    grep -q '^N8N_EMAIL_MODE=smtp$' "$WORKSPACE_N8N_ENV_FILE"
+workspace_no_legacy_recovery_config() {
+  local file
+  for file in "$WORKSPACE_ENV_FILE" "$WORKSPACE_VIKUNJA_ENV_FILE" "$WORKSPACE_N8N_ENV_FILE"; do
+    [[ -f "$file" ]] || return 1
+    ! grep -Eq '^(WORKSPACE_SMTP_|VIKUNJA_MAILER_|N8N_SMTP_|N8N_EMAIL_MODE=|N8N_INSTANCE_OWNER_(MANAGED_BY_ENV|EMAIL|FIRST_NAME|LAST_NAME|PASSWORD_HASH)=)' "$file" || return 1
+  done
 }
 
 workspace_env_file_syntax_valid() {
@@ -9325,14 +9234,14 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Vikunja hermes API token works" workspace_vikunja_hermes_api_ready
   workspace_doctor_check "n8n hardened for private agent workflows" workspace_n8n_hardened
   workspace_doctor_check "n8n owner/admin ready" workspace_n8n_owner_ready
-  workspace_doctor_check "Optional SMTP recovery configuration is valid" workspace_smtp_config_valid
+  workspace_doctor_check "No legacy or temporary password recovery configuration is stored" workspace_no_legacy_recovery_config
   workspace_doctor_check "Workspace URLs configured" workspace_urls_configured
   workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
     POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD VIKUNJA_SERVICE_SECRET DB_POSTGRESDB_PASSWORD \
     N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HERMES_PASSWORD N8N_BASIC_AUTH_USER \
     N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
     HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
-    VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_USER_STATUS WORKSPACE_SMTP_ENABLED
+    VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_USER_STATUS
   workspace_doctor_check "Workspace technical secrets are unique per service" workspace_credentials_are_distinct
 
   workspace_doctor_section "Runtime services" "spark ws restart"
@@ -9396,7 +9305,241 @@ workspace_print_initial_credentials() {
     printf "  n8n\n    email:    %s\n    password: %s\n" "$n8n_email" "$n8n_pass"
     shown=1
   fi
-  [[ "$shown" == "0" ]] || printf "\n"
+  if [[ "$shown" != "0" ]]; then
+    printf "\n  If you lose one: ${BOLD}spark ws recover vikunja${NC} or ${BOLD}spark ws recover n8n${NC}\n\n"
+  fi
+}
+
+workspace_recovery_password_valid() {
+  local value="${1-}" length
+  [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+  length=${#value}
+  [[ "$length" -ge 8 && "$length" -le 64 ]]
+}
+
+workspace_choose_recovery_password() {
+  local auto_yes="$1" password_var="$2" generated_var="$3"
+  local choice="" value="" confirmation=""
+  if [[ "$auto_yes" == "1" ]]; then
+    printf -v "$password_var" '%s' "$(workspace_random_password)"
+    printf -v "$generated_var" '%s' 1
+    return 0
+  fi
+  is_interactive || die "Interactive password recovery requires a terminal" "Use --yes to generate a secure password automatically"
+  printf "\n  ${BOLD}New password${NC}\n\n" >&2
+  printf "    [1] Generate a secure password (recommended)\n" >&2
+  printf "    [2] Choose my own password\n\n" >&2
+  while true; do
+    printf "  > " >&2
+    read -r choice || true
+    case "$choice" in
+      ""|1)
+        printf -v "$password_var" '%s' "$(workspace_random_password)"
+        printf -v "$generated_var" '%s' 1
+        return 0
+        ;;
+      2)
+        while true; do
+          printf "  New password: " >&2
+          read -rs value || die "Password is required"
+          printf "\n  Confirm password: " >&2
+          read -rs confirmation || die "Password confirmation is required"
+          printf "\n" >&2
+          [[ "$value" == "$confirmation" ]] || { warn "Passwords did not match; try again"; continue; }
+          workspace_recovery_password_valid "$value" || { warn "Use 8-64 characters on one line"; continue; }
+          printf -v "$password_var" '%s' "$value"
+          printf -v "$generated_var" '%s' 0
+          return 0
+        done
+        ;;
+      *) warn "Choose 1 or 2" ;;
+    esac
+  done
+}
+
+workspace_vikunja_human_user_id() {
+  local username email
+  username=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
+  email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
+  [[ -n "$username" && -n "$email" ]] || return 1
+  workspace_vikunja_cli user list 2>/dev/null | awk -F'|' -v username="$username" -v email="$email" '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    NF >= 5 && trim($3) == username && trim($4) == email { print trim($2); exit }
+  '
+}
+
+workspace_recover_vikunja() {
+  local password="$1" user email user_id
+  user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
+  email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
+  user_id=$(workspace_vikunja_human_user_id) || true
+  [[ "$user_id" =~ ^[0-9]+$ ]] || {
+    err "Could not identify the configured Vikunja user: ${user:-unknown}"
+    return 1
+  }
+  workspace_vikunja_cli user reset-password "$user_id" -d -p "$password" >/dev/null 2>&1 || {
+    err "Vikunja rejected the password change"
+    return 1
+  }
+  workspace_vikunja_login_jwt "$user" "$password" >/dev/null 2>&1 || {
+    err "Vikunja password changed, but login verification failed"
+    return 1
+  }
+  info "Vikunja access recovered for ${email}"
+}
+
+workspace_semver_at_least() {
+  local current="${1#v}" required="${2#v}"
+  current="${current%%-*}"
+  required="${required%%-*}"
+  awk -v current="$current" -v required="$required" 'BEGIN {
+    split(current, a, "."); split(required, b, ".")
+    for (i=1; i<=3; i++) {
+      av=a[i]+0; bv=b[i]+0
+      if (av > bv) exit 0
+      if (av < bv) exit 1
+    }
+    exit 0
+  }'
+}
+
+workspace_n8n_version() {
+  workspace_compose exec -T n8n n8n --version 2>/dev/null | tail -1 | tr -d '\r'
+}
+
+workspace_n8n_password_hash() {
+  local password="$1" hash
+  hash=$(printf '%s' "$password" | workspace_compose exec -T n8n node -e '
+    const fs = require("fs");
+    let bcrypt;
+    try { bcrypt = require("bcryptjs"); }
+    catch { bcrypt = require("/usr/local/lib/node_modules/n8n/node_modules/bcryptjs"); }
+    bcrypt.hash(fs.readFileSync(0, "utf8"), 10).then((value) => process.stdout.write(value + "\n"));
+  ' 2>/dev/null | tail -1) || return 1
+  [[ "$hash" =~ ^\$2[aby]\$[0-9][0-9]\$[./A-Za-z0-9]{53}$ ]] || return 1
+  printf '%s\n' "$hash"
+}
+
+workspace_n8n_wait_ready() {
+  local i
+  for i in {1..30}; do
+    workspace_n8n_http_ready && return 0
+    sleep "${SPARK_WORKSPACE_WAIT_SLEEP:-1}"
+  done
+  return 1
+}
+
+workspace_n8n_restore_env() {
+  local backup="$1"
+  [[ -f "$backup" ]] || return 1
+  cp "$backup" "$WORKSPACE_N8N_ENV_FILE" || return 1
+  chmod 600 "$WORKSPACE_N8N_ENV_FILE"
+}
+
+workspace_n8n_write_recovery_env() {
+  local email="$1" first="$2" last="$3" hash="$4"
+  workspace_require_prompt_value "n8n owner email" "$email" email
+  workspace_require_prompt_value "n8n owner first name" "$first" username
+  workspace_require_prompt_value "n8n owner last name" "$last" username
+  cat >> "$WORKSPACE_N8N_ENV_FILE" <<EOF
+N8N_INSTANCE_OWNER_MANAGED_BY_ENV=true
+N8N_INSTANCE_OWNER_EMAIL=${email}
+N8N_INSTANCE_OWNER_FIRST_NAME=${first}
+N8N_INSTANCE_OWNER_LAST_NAME=${last}
+N8N_INSTANCE_OWNER_PASSWORD_HASH='${hash}'
+EOF
+  chmod 600 "$WORKSPACE_N8N_ENV_FILE"
+}
+
+workspace_recover_n8n() {
+  local password="$1" version email first last hash backup="" rc=0
+  version=$(workspace_n8n_version) || true
+  [[ -n "$version" ]] || { err "Could not read the n8n version"; return 1; }
+  workspace_semver_at_least "$version" 2.17.0 || {
+    err "n8n ${version} cannot recover its owner safely"
+    printf "    Update n8n to 2.17.0 or newer, then retry.\n" >&2
+    return 1
+  }
+  email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
+  first=$(workspace_read_env N8N_OWNER_FIRST_NAME 2>/dev/null || true)
+  last=$(workspace_read_env N8N_OWNER_LAST_NAME 2>/dev/null || true)
+  [[ -n "$first" ]] || first=Spark
+  [[ -n "$last" ]] || last=Admin
+  hash=$(workspace_n8n_password_hash "$password") || {
+    err "Could not create the n8n bcrypt password hash"
+    return 1
+  }
+  backup=$(mktemp "${WORKSPACE_CONFIG_DIR}/.n8n.env.recover.XXXXXX") || return 1
+  chmod 600 "$backup"
+  cp "$WORKSPACE_N8N_ENV_FILE" "$backup" || { rm -f "$backup"; return 1; }
+  workspace_n8n_write_recovery_env "$email" "$first" "$last" "$hash" || rc=1
+  if [[ "$rc" == "0" ]]; then
+    workspace_compose up -d --force-recreate --no-deps n8n >/dev/null 2>&1 || rc=1
+  fi
+  if [[ "$rc" == "0" ]]; then
+    workspace_n8n_wait_ready || rc=1
+  fi
+  if [[ "$rc" == "0" ]]; then
+    workspace_n8n_login "$email" "$password" || rc=1
+  fi
+  workspace_n8n_restore_env "$backup" || rc=1
+  rm -f "$backup"
+  workspace_compose up -d --force-recreate --no-deps n8n >/dev/null 2>&1 || rc=1
+  workspace_n8n_wait_ready || rc=1
+  if [[ "$rc" == "0" ]]; then
+    workspace_n8n_login "$email" "$password" || rc=1
+  fi
+  if [[ "$rc" != "0" ]]; then
+    err "n8n recovery did not complete cleanly"
+    printf "    Retry: spark ws recover n8n\n" >&2
+    return 1
+  fi
+  info "n8n access recovered for ${email}"
+}
+
+workspace_recover() {
+  local service="${1:-}" auto_yes=0 password="" generated=0 identity=""
+  [[ -n "$service" ]] && shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) auto_yes=1; shift ;;
+      --help|-h)
+        printf "Usage: spark ws recover vikunja|n8n [--yes]\n"
+        printf "  --yes  Generate a secure password and recover access without questions.\n"
+        return 0
+        ;;
+      *) die "Unknown ws recover option: $1" "Usage: spark ws recover vikunja|n8n [--yes]" ;;
+    esac
+  done
+  case "$service" in
+    vikunja|n8n) ;;
+    help|--help|-h|"")
+      printf "Usage: spark ws recover vikunja|n8n [--yes]\n"
+      return 0
+      ;;
+    *) die "Unknown workspace service: $service" "Choose vikunja or n8n" ;;
+  esac
+  workspace_require_config
+  workspace_migrate_runtime_config
+  printf "\n  ${BOLD}spark ws recover ${service}${NC}\n\n"
+  if [[ "$auto_yes" != "1" ]]; then
+    is_interactive || die "Recovery confirmation requires a terminal" "Use --yes to continue automatically"
+    confirm "Replace the ${service} password now?" || { info "No changes made"; printf "\n"; return 0; }
+  fi
+  workspace_choose_recovery_password "$auto_yes" password generated
+  if [[ "$service" == "vikunja" ]]; then
+    workspace_recover_vikunja "$password" || { unset password; return 1; }
+    identity=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
+  else
+    workspace_recover_n8n "$password" || { unset password; return 1; }
+    identity=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
+  fi
+  if [[ "$generated" == "1" ]]; then
+    printf "\n  ${YELLOW}${BOLD}Save this password now. Spark will not store or show it again.${NC}\n\n"
+    printf "  %s\n    email:    %s\n    password: %s\n" "$service" "$identity" "$password"
+  fi
+  printf "\n"
+  unset password
 }
 
 workspace_summary() {
@@ -9447,15 +9590,6 @@ cmd_workspace_setup_help() {
     --n8n-email EMAIL           n8n owner/admin email.
     --n8n-password PASS         Initial password; visible to shell history/process tools.
     --n8n-password-file FILE    Read initial password from the first line of FILE.
-    --smtp / --no-smtp          Enable or disable email password recovery.
-    --smtp-host HOST            SMTP server hostname.
-    --smtp-port PORT            SMTP port; usually 587 (STARTTLS) or 465 (TLS).
-    --smtp-user USER            SMTP login.
-    --smtp-password PASS        SMTP password; prefer --smtp-password-file.
-    --smtp-password-file FILE   Read SMTP password from the first line of FILE.
-    --smtp-from EMAIL           Verified sender address.
-    --smtp-security MODE        starttls, tls, or none.
-
   ${BOLD}Funnel rule:${NC}
     reset = this host should have no public Funnel exposure.
     abort = stop and inspect because Funnel might belong to something else.
@@ -9473,6 +9607,7 @@ cmd_workspace_help() {
     start      Start the configured workspace runtime
     stop       Stop the workspace runtime and preserve all data
     restart    Stop and start the configured workspace runtime
+    recover    Recover Vikunja or n8n access with a new password
     status     Show operational workspace state
     containers Show raw workspace container state
     logs       Follow logs for vikunja, n8n, postgres, hermes, or gateway
@@ -9501,8 +9636,6 @@ cmd_workspace_help() {
     --n8n-email EMAIL           n8n owner/admin email
     --n8n-password PASS         Choose initial n8n password
     --n8n-password-file FILE    Safer initial n8n password input
-    --smtp / --no-smtp          Optional email password recovery
-
 EOF
 }
 
@@ -9514,6 +9647,7 @@ cmd_workspace() {
     start)  workspace_start "$@" ;;
     stop)   workspace_stop "$@" ;;
     restart) workspace_restart "$@" ;;
+    recover) workspace_recover "$@" ;;
     status) cmd_workspace_status "$@" ;;
     containers) cmd_workspace_containers "$@" ;;
     logs)   cmd_workspace_logs "$@" ;;
