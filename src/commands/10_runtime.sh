@@ -1759,43 +1759,42 @@ print_services_overview() {
 
 print_vllm_model_table() {
   local models=() needs=() wts=() kvs=() ports=() ups=() cnames=()
-  local reserved=0 maxw=5 name model port need wt kv
+  local reserved=0 name model port need wt kv
   while IFS=$'\t' read -r name model port need wt kv; do
     [[ -z "$name" ]] && continue
     model="${model:-unknown}"
     models+=("$model"); needs+=("${need:-?}"); wts+=("${wt:-?}"); kvs+=("${kv:-?}")
     ports+=("${port:-?}"); ups+=("$(container_uptime "$name")"); cnames+=("$name")
     [[ "${need:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] && reserved=$(awk -v a="$reserved" -v b="$need" 'BEGIN{printf "%.1f", a+b}')
-    [[ ${#model} -gt $maxw ]] && maxw=${#model}
   done < <(list_managed_containers)
 
   if [[ ${#models[@]} -eq 0 ]]; then
-    dashboard_row missing "vLLM models" "none running"
+    dashboard_row missing "models" "none being served"
     return 0
   fi
 
-  printf "  ${DIM}%-${maxw}s  %6s  %7s  %6s  %5s  %-8s${NC}\n" "MODEL" "NEED" "WEIGHTS" "KV" "PORT" "UP"
-  local i
+  local i now pk
   for i in "${!models[@]}"; do
-    printf "  %-${maxw}s  %6s  %7s  %6s  %5s  %-8s\n" \
-      "${models[$i]}" "${needs[$i]}" "${wts[$i]}" "${kvs[$i]}" "${ports[$i]}" "${ups[$i]}"
+    printf "  ${GREEN}●${NC} ${BOLD}%s${NC}\n" "${models[$i]}"
+    printf "    Serving: vLLM · http://localhost:%s/v1 · up %s\n" "${ports[$i]}" "${ups[$i]}"
+    printf "    Memory:  %s GB weights · %s GB KV cache · %s GB reserved\n" \
+      "${wts[$i]}" "${kvs[$i]}" "${needs[$i]}"
+    now=$(container_current_gb "${cnames[$i]}"); pk=$(container_peak_gb "${cnames[$i]}")
+    if [[ -n "$now" || -n "$pk" ]]; then
+      printf "    Live:    %s GB now · %s GB peak\n" "${now:-—}" "${pk:-—}"
+    fi
   done
   local free
   free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{printf "%.1f", b-r}')
-  printf "  ${DIM}Memory (GB): %s total · %s OS · %s reserved · %s free${NC}\n" "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  printf "  ${DIM}Capacity: %s GB total · %s GB OS · %s GB models · %s GB free${NC}\n" \
+    "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
 
-  local host_line now pk
+  local host_line
   host_line=$(free -g 2>/dev/null | awk '
     /^Mem:/  { m=sprintf("RAM %d/%d GB used · %d avail", $3, $2, $7) }
     /^Swap:/ { if ($2+0>0) s=sprintf("swap %d/%d GB", $3, $2) }
     END      { if (m!="") printf "%s%s", m, (s!="" ? " · " s : "") }')
   [[ -n "$host_line" ]] && printf "  ${DIM}Live:        %s${NC}\n" "$host_line"
-  for i in "${!models[@]}"; do
-    now=$(container_current_gb "${cnames[$i]}"); pk=$(container_peak_gb "${cnames[$i]}")
-    [[ -z "$now" && -z "$pk" ]] && continue
-    printf "  ${DIM}  %-${maxw}s  reserved %s · now %s · peak %s GB${NC}\n" \
-      "${models[$i]}" "${needs[$i]}" "${now:-—}" "${pk:-—}"
-  done
   return 0
 }
 
@@ -1804,26 +1803,28 @@ print_ollama_model_table() {
     dashboard_row missing "Ollama models" "Ollama not installed"
     return 0
   fi
-  local rows loaded
-  rows=$(ollama list 2>/dev/null | awk 'NR>1{printf "  %-32s %s %s\n", $1, $3, $4}' || true)
-  if [[ -z "$rows" ]]; then
-    dashboard_row missing "Ollama models" "none pulled"
-  else
-    printf "  ${DIM}%-32s %s${NC}\n" "MODEL" "SIZE"
-    printf "%s\n" "$rows"
+  local model loaded=()
+  while IFS= read -r model; do
+    [[ -n "$model" ]] && loaded+=("$model")
+  done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
+  if [[ ${#loaded[@]} -eq 0 ]]; then
+    dashboard_row missing "models" "none being served"
+    return 0
   fi
-  loaded=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}' | tr '\n' ' ' || true)
-  [[ -n "${loaded// /}" ]] && printf "  ${DIM}Loaded now: %s${NC}\n" "$loaded"
+  for model in "${loaded[@]}"; do
+    printf "  ${GREEN}●${NC} ${BOLD}%s${NC}\n" "$model"
+    printf "    Serving: Ollama · http://localhost:11434/api\n"
+  done
   return 0
 }
 
 print_models_overview() {
-  printf "\n  ${BOLD}Models${NC}\n"
+  local title="${1:-Models}"
+  printf "\n  ${BOLD}%s${NC}\n" "$title"
   if [[ "$BACKEND" == "ollama" ]]; then
     print_ollama_model_table
   else
     print_vllm_model_table
-    dashboard_row ok "HF cache" "$(count_downloaded_hf_models) downloaded model(s)"
   fi
   return 0
 }

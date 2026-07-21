@@ -5,8 +5,7 @@ cmd_status_ollama() {
   printf "  ${DIM}Engine: Ollama (%s) · %s GB unified memory${NC}\n" "$ACCEL" "$TOTAL_MEM_GB"
   print_setup_overview
   print_services_overview
-  print_models_overview
-  print_workspace_overview
+  print_models_overview "Served models"
   print_next_steps
   printf "\n"
   return 0
@@ -58,8 +57,7 @@ cmd_status() {
   print_system_overview
   print_setup_overview
   print_services_overview
-  print_models_overview
-  print_workspace_overview
+  print_models_overview "Served models"
   print_next_steps
   printf "\n"
 }

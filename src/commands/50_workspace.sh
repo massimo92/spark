@@ -2133,8 +2133,34 @@ workspace_setup() {
   return "$setup_rc"
 }
 
+workspace_print_verbose_hermes_status() {
+  local out
+  out=$(nemohermes hermes status 2>/dev/null || nemohermes status 2>/dev/null || true)
+  printf '%s\n' "$out" | awk '
+    /Sandbox-scoped status for/ { capture=1 }
+    capture {
+      scoped = scoped $0 ORS
+      if ($0 ~ /^[[:space:]]*Agent:[[:space:]]/) {
+        capture=0
+        captured=1
+      }
+      next
+    }
+    {
+      print
+      if (captured && ! inserted && $0 ~ /Revision:/) {
+        printf "\n%s", scoped
+        inserted=1
+      }
+    }
+    END {
+      if (captured && ! inserted) printf "\n%s", scoped
+    }
+  '
+}
+
 cmd_workspace_status() {
-  local vikunja_url="" n8n_url="" hermes_url="" tailscale_mode="" verbose=0
+  local verbose=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --verbose) verbose=1 ;;
@@ -2147,25 +2173,16 @@ cmd_workspace_status() {
     esac
     shift
   done
-  printf "\n  ${BOLD}spark ws status${NC}\n\n"
+  printf "\n  ${BOLD}spark ws containers${NC}\n\n"
   if [[ -f "$WORKSPACE_COMPOSE_FILE" ]]; then
     workspace_compose ps 2>/dev/null || warn "Compose project ${WORKSPACE_PROJECT} not reachable"
   else
     warn "Workspace not configured"
   fi
-  if [[ -f "$WORKSPACE_ENV_FILE" ]]; then
-    vikunja_url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
-    n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
-    hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
-    tailscale_mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-    printf "\n  URLs: Vikunja=%s n8n=%s Hermes=%s\n" "${vikunja_url:-unset}" "${n8n_url:-unset}" "${hermes_url:-unset}"
-    printf "  Tailscale: %s\n" "${tailscale_mode:-unset}"
-  fi
-  cmd_workspace_health
-  printf "\n"
-  gateway_status
+  print_workspace_overview
   if [[ "$verbose" == "1" ]] && command -v nemohermes >/dev/null 2>&1; then
-    nemohermes hermes status 2>/dev/null || nemohermes status 2>/dev/null || true
+    printf "\n"
+    workspace_print_verbose_hermes_status
   elif ! command -v nemohermes >/dev/null 2>&1; then
     warn "NemoHermes not installed"
   fi

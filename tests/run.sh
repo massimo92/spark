@@ -1294,15 +1294,20 @@ test_stop_ambiguous_requires_target() {
   [[ "$status" -ne 0 ]] && [[ "$output" == *"Multiple models running"* ]]
 }
 
-test_status_renders_table() {
+test_status_renders_served_models() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin output
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_MANAGED="$TWO_MODELS" \
     "$SPARK" status 2>&1)
   rm -rf "$tmp"
-  [[ "$output" == *"MODEL"* ]] && [[ "$output" == *"NEED"* ]] && [[ "$output" == *"WEIGHTS"* ]] &&
-    [[ "$output" == *"org/Alpha"* ]] && [[ "$output" == *"Memory (GB):"* ]]
+  [[ "$output" == *"Served models"* ]] &&
+    [[ "$output" == *"org/Alpha"* ]] &&
+    [[ "$output" == *"Serving: vLLM · http://localhost:8000/v1"* ]] &&
+    [[ "$output" == *"Memory:"* && "$output" == *"GB weights"* && "$output" == *"GB KV cache"* ]] &&
+    [[ "$output" == *"Capacity:"* ]] &&
+    [[ "$output" != *"Agent workspace"* ]] &&
+    [[ "$output" != *"HF cache"* ]]
 }
 
 test_dashboard_web_once_writes_product_ui() {
@@ -1655,7 +1660,7 @@ test_status_live_memory() {
     "$SPARK" status 2>&1 || true)
   rm -rf "$tmp"
   [[ "$out" == *"Live:"* ]] && [[ "$out" == *"RAM 108/121 GB used"* ]] && [[ "$out" == *"swap 2/176 GB"* ]] &&
-    [[ "$out" == *"reserved 80.1"* ]] && [[ "$out" == *"now 84.0"* ]] && [[ "$out" == *"peak 90.0"* ]]
+    [[ "$out" == *"80.1 GB reserved"* ]] && [[ "$out" == *"84.0 GB now"* ]] && [[ "$out" == *"90.0 GB peak"* ]]
 }
 
 # --- Unified setup wizard (host vs server picker, parity, bootstrap) ---
@@ -3451,9 +3456,9 @@ test_workspace_doctor_json() {
   ' >/dev/null
 }
 
-test_workspace_status_health_summary() {
+test_workspace_status_renders_containers_and_agent_workspace() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out verbose_out
+  local tmp fake_bin out verbose_out revision_line scoped_line
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
@@ -3464,31 +3469,35 @@ test_workspace_status_health_summary() {
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
-    FAKE_NEMOHERMES_STATUS=$'Sandbox: Ready\nPolicy:\nprivate policy detail' \
+    FAKE_COMPOSE_PS=$'NAME STATUS\nworkspace-n8n Up' \
+    FAKE_NEMOHERMES_STATUS=$'Sandbox-scoped status for hermes:\n  Model: vllm/Org/Alpha\n  Agent: Hermes Agent\n\nSandbox:\n  Id: abc-123\n  Revision: 1\n\nPolicy:\nprivate policy detail' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws status 2>&1)
   verbose_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
-    FAKE_NEMOHERMES_STATUS=$'Sandbox: Ready\nPolicy:\nprivate policy detail' \
+    FAKE_COMPOSE_PS=$'NAME STATUS\nworkspace-n8n Up' \
+    FAKE_NEMOHERMES_STATUS=$'Sandbox-scoped status for hermes:\n  Model: vllm/Org/Alpha\n  Agent: Hermes Agent\n\nSandbox:\n  Id: abc-123\n  Revision: 1\n\nPolicy:\nprivate policy detail' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws status --verbose 2>&1)
+  revision_line=$(printf '%s\n' "$verbose_out" | grep -n 'Revision:' | cut -d: -f1)
+  scoped_line=$(printf '%s\n' "$verbose_out" | grep -n 'Sandbox-scoped status' | cut -d: -f1)
   rm -rf "$tmp"
-  [[ "$out" == *"Workspace health"* ]] &&
-    [[ "$out" == *"[x] Compose postgres"* ]] &&
-    [[ "$out" == *"[x] Vikunja HTTP local"* ]] &&
-    [[ "$out" == *"[x] Vikunja private URL"* ]] &&
-    [[ "$out" == *"[x] n8n private URL"* ]] &&
-    [[ "$out" == *"[x] Hermes private URL"* ]] &&
-    [[ "$out" == *"[x] No public listeners"* ]] &&
-    [[ "$out" == *"[x] LiteLLM Hermes route"* ]] &&
-    [[ "$out" == *"[x] Hermes/NemoClaw"* ]] &&
-    [[ "$out" == *"[x] NemoHermes inference route"* ]] &&
+  [[ "$out" == *"spark ws containers"* ]] &&
+    [[ "$out" == *"workspace-n8n Up"* ]] &&
+    [[ "$out" == *"Agent workspace"* ]] &&
+    [[ "$out" == *"Hermes model"* && "$out" == *"Org/Alpha"* ]] &&
+    [[ "$out" == *"https://vikunja.test-tailnet.ts.net"* ]] &&
+    [[ "$out" != *"Workspace health"* ]] &&
+    [[ "$out" != *"URLs:"* ]] &&
+    [[ "$out" != *"LiteLLM"* ]] &&
     [[ "$out" != *"Policy:"* ]] &&
+    [[ "$out" != *"Sandbox-scoped status"* ]] &&
     [[ "$out" != *"private policy detail"* ]] &&
     [[ "$verbose_out" == *"Policy:"* ]] &&
-    [[ "$verbose_out" == *"private policy detail"* ]]
+    [[ "$verbose_out" == *"private policy detail"* ]] &&
+    [[ -n "$revision_line" && -n "$scoped_line" && "$scoped_line" -gt "$revision_line" ]]
 }
 
 test_workspace_doctor_flags_public_host_listener() {
@@ -6191,9 +6200,11 @@ test_status_ollama_lists() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
-    FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMOD\nqwen3:30b\tabc\t18\tGB\n" "$SPARK" status 2>&1)
+    FAKE_OLLAMA_PS="NAME\tID\nqwen3:30b\tabc\n" "$SPARK" status 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"qwen3:30b"* ]] && [[ "$out" == *"Engine: Ollama"* ]]
+  [[ "$out" == *"Served models"* ]] && [[ "$out" == *"qwen3:30b"* ]] &&
+    [[ "$out" == *"Serving: Ollama"* ]] && [[ "$out" == *"Engine: Ollama"* ]] &&
+    [[ "$out" != *"Agent workspace"* ]]
 }
 
 test_stop_ollama_unloads() {
@@ -6235,7 +6246,7 @@ run_test "stop <model> stops only that model" test_stop_specific_model
 run_test "stop --all stops every model" test_stop_all
 run_test "down stops models and gateway" test_down_stops_models_and_gateway
 run_test "stop with no arg and many models asks which" test_stop_ambiguous_requires_target
-run_test "status renders a table" test_status_renders_table
+run_test "status renders served models clearly" test_status_renders_served_models
 run_test "dashboard web writes product UI" test_dashboard_web_once_writes_product_ui
 run_test "dashboard terminal renders product snapshot" test_dashboard_terminal_still_renders_snapshot
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
@@ -6411,7 +6422,7 @@ run_test "workspace setup keeps Hermes dashboard on loopback" test_workspace_set
 run_test "workspace doctor --strict checks pinned images only" test_workspace_doctor_strict_checks_pinned_images
 run_test "workspace doctor --strict flags latest images" test_workspace_doctor_strict_flags_latest_images
 run_test "workspace doctor --json emits structured checks" test_workspace_doctor_json
-run_test "workspace status renders health summary" test_workspace_status_health_summary
+run_test "workspace status renders containers and Agent workspace" test_workspace_status_renders_containers_and_agent_workspace
 run_test "workspace doctor flags public host listener" test_workspace_doctor_flags_public_host_listener
 run_test "workspace doctor rejects public bind addr allowlist" test_workspace_doctor_rejects_public_bind_addr_allowlist
 run_test "workspace doctor rejects non-Tailscale host listener allowlist" test_workspace_doctor_rejects_non_tailscale_host_listener_allowlist
