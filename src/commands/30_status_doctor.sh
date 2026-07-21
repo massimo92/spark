@@ -128,197 +128,296 @@ cmd_logs() {
   fi
 }
 
-# vLLM/NVIDIA health checks. Updates cmd_doctor's passed/total via dynamic scope.
+# Doctor collects evidence first, then renders it for humans or automation.
+DOCTOR_CATEGORIES=()
+DOCTOR_LABELS=()
+DOCTOR_RESULTS=()
+DOCTOR_DETAILS=()
+DOCTOR_ACTIONS=()
+
+doctor_record() {
+  DOCTOR_CATEGORIES+=("$1")
+  DOCTOR_LABELS+=("$2")
+  DOCTOR_RESULTS+=("$3")
+  DOCTOR_DETAILS+=("${4:-}")
+  DOCTOR_ACTIONS+=("${5:-}")
+}
+
+doctor_pass() { doctor_record "$1" "$2" ok "${3:-}"; }
+doctor_fail() { doctor_record "$1" "$2" fail "${3:-}" "${4:-}"; }
+doctor_skip() { doctor_record "$1" "$2" skipped "${3:-}"; }
+
+doctor_id_from_label() {
+  LC_ALL=C printf '%s\n' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9]\{1,\}/_/g; s/^_//; s/_$//'
+}
+
+doctor_count() {
+  local wanted="$1" result count=0
+  for result in "${DOCTOR_RESULTS[@]}"; do
+    [[ "$result" == "$wanted" ]] && count=$((count + 1))
+  done
+  printf '%d\n' "$count"
+}
+
+doctor_area_counts() {
+  local area="$1" i result area_passed=0 area_failed=0
+  for i in "${!DOCTOR_CATEGORIES[@]}"; do
+    [[ "${DOCTOR_CATEGORIES[$i]}" == "$area" ]] || continue
+    result="${DOCTOR_RESULTS[$i]}"
+    [[ "$result" == "ok" ]] && area_passed=$((area_passed + 1))
+    [[ "$result" == "fail" ]] && area_failed=$((area_failed + 1))
+  done
+  printf '%d %d\n' "$area_passed" "$area_failed"
+}
+
+doctor_print_json() {
+  local passed failed total first=1 i area area_passed area_failed
+  passed=$(doctor_count ok)
+  failed=$(doctor_count fail)
+  total=$((passed + failed))
+  printf '{"ok":%s,"target":{"os":"%s","arch":"%s","accelerator":"%s","backend":"%s"},"passed":%d,"failed":%d,"total":%d,"areas":[' \
+    "$( [[ "$failed" -eq 0 ]] && printf true || printf false )" \
+    "$(status_json_escape "$SPARK_OS")" "$(status_json_escape "$SPARK_ARCH")" \
+    "$(status_json_escape "$ACCEL")" "$(status_json_escape "$BACKEND")" \
+    "$passed" "$failed" "$total"
+  for area in "Runtime" "Model assets" "Host safety" "Exposure" "Gateway"; do
+    read -r area_passed area_failed <<< "$(doctor_area_counts "$area")"
+    [[ $((area_passed + area_failed)) -gt 0 ]] || continue
+    [[ "$first" == "1" ]] || printf ','
+    first=0
+    printf '{"name":"%s","passed":%d,"failed":%d,"total":%d}' \
+      "$(status_json_escape "$area")" "$area_passed" "$area_failed" "$((area_passed + area_failed))"
+  done
+  printf '],"checks":['
+  first=1
+  for i in "${!DOCTOR_LABELS[@]}"; do
+    [[ "$first" == "1" ]] || printf ','
+    first=0
+    printf '{"id":"%s","area":"%s","label":"%s","state":"%s","detail":"%s","action":"%s"}' \
+      "$(status_json_escape "$(doctor_id_from_label "${DOCTOR_LABELS[$i]}")")" \
+      "$(status_json_escape "${DOCTOR_CATEGORIES[$i]}")" \
+      "$(status_json_escape "${DOCTOR_LABELS[$i]}")" \
+      "$(status_json_escape "${DOCTOR_RESULTS[$i]}")" \
+      "$(status_json_escape "${DOCTOR_DETAILS[$i]}")" \
+      "$(status_json_escape "${DOCTOR_ACTIONS[$i]}")"
+  done
+  printf ']}\n'
+}
+
+doctor_print_human() {
+  local verbose="$1" passed failed total i area area_passed area_failed detail action state
+  passed=$(doctor_count ok)
+  failed=$(doctor_count fail)
+  total=$((passed + failed))
+  printf "\n  ${BOLD}spark doctor${NC}\n\n"
+  printf "  ${BOLD}Result${NC}\n"
+  if [[ "$failed" -eq 0 ]]; then
+    printf "  ${GREEN}ok${NC}         %d/%d checks passed\n" "$passed" "$total"
+  else
+    printf "  ${RED}attention${NC}  %d/%d checks passed · %d issue(s)\n" "$passed" "$total" "$failed"
+  fi
+  printf "  target     %s/%s · %s · backend %s\n\n" "$SPARK_OS" "$SPARK_ARCH" "$ACCEL" "$BACKEND"
+
+  printf "  ${BOLD}Areas${NC}\n"
+  for area in "Runtime" "Model assets" "Host safety" "Exposure" "Gateway"; do
+    read -r area_passed area_failed <<< "$(doctor_area_counts "$area")"
+    [[ $((area_passed + area_failed)) -gt 0 ]] || continue
+    if [[ "$area_failed" -eq 0 ]]; then state="${GREEN}ok${NC}"; else state="${RED}issue${NC}"; fi
+    printf "  %-16b %-24s %d/%d\n" "$state" "$area" "$area_passed" "$((area_passed + area_failed))"
+  done
+
+  if [[ "$failed" -gt 0 ]]; then
+    printf "\n  ${BOLD}Issues${NC}\n"
+    for i in "${!DOCTOR_LABELS[@]}"; do
+      [[ "${DOCTOR_RESULTS[$i]}" == "fail" ]] || continue
+      detail="${DOCTOR_DETAILS[$i]}"; action="${DOCTOR_ACTIONS[$i]}"
+      printf "  ${RED}failed${NC}     %s > %s\n" "${DOCTOR_CATEGORIES[$i]}" "${DOCTOR_LABELS[$i]}"
+      [[ -z "$detail" ]] || printf "             %s\n" "$detail"
+      [[ -z "$action" ]] || printf "             Try: %s\n" "$action"
+    done
+  fi
+
+  if [[ "$verbose" == "1" ]]; then
+    printf "\n  ${BOLD}Checks${NC}\n"
+    for i in "${!DOCTOR_LABELS[@]}"; do
+      case "${DOCTOR_RESULTS[$i]}" in
+        ok) state="${GREEN}✓${NC}" ;;
+        fail) state="${RED}✗${NC}" ;;
+        *) state="${DIM}–${NC}" ;;
+      esac
+      printf "  %b %-24s %s" "$state" "${DOCTOR_CATEGORIES[$i]}" "${DOCTOR_LABELS[$i]}"
+      [[ -z "${DOCTOR_DETAILS[$i]}" ]] || printf " · %s" "${DOCTOR_DETAILS[$i]}"
+      printf "\n"
+    done
+  fi
+  printf "\n"
+}
+
+# vLLM/NVIDIA health checks.
 doctor_checks_vllm() {
-  # GPU
-  total=$((total + 1))
-  local gpu_info
+  local gpu_info hf_ver bad_cache_path ngc_image model_count=0
   if gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null) && [[ -n "$gpu_info" ]]; then
-    info "GPU: ${gpu_info}"
-    passed=$((passed + 1))
+    doctor_pass "Runtime" "GPU" "$gpu_info"
   else
-    err "GPU: nvidia-smi not available or no GPU detected"
+    doctor_fail "Runtime" "GPU" "nvidia-smi unavailable or no GPU detected" "check the NVIDIA driver, then rerun spark doctor"
   fi
 
-  # NVIDIA Container Toolkit (lets Docker use the GPU with --gpus all)
-  total=$((total + 1))
   if docker info 2>/dev/null | grep -qi nvidia || command -v nvidia-ctk >/dev/null 2>&1; then
-    info "NVIDIA Container Toolkit: present"
-    passed=$((passed + 1))
+    doctor_pass "Runtime" "NVIDIA Container Toolkit" "present"
   else
-    err "NVIDIA Container Toolkit: not detected — needed for 'docker run --gpus all'"
+    doctor_fail "Runtime" "NVIDIA Container Toolkit" "not detected; Docker cannot use the GPU" "spark setup"
   fi
 
-  # Docker group
-  total=$((total + 1))
   if groups 2>/dev/null | grep -q docker; then
-    info "Docker group: user $(whoami) in docker group"
-    passed=$((passed + 1))
+    doctor_pass "Runtime" "Docker access" "user $(whoami) belongs to the docker group"
   else
-    err "Docker group: user $(whoami) not in docker group"
+    doctor_fail "Runtime" "Docker access" "user $(whoami) is not in the docker group" "spark setup, then sign in again"
   fi
 
-  # NGC
-  total=$((total + 1))
   if [[ -f "${HOME}/.docker/config.json" ]] && grep -q "nvcr.io" "${HOME}/.docker/config.json" 2>/dev/null; then
-    info "NGC: authenticated (nvcr.io)"
-    passed=$((passed + 1))
+    doctor_pass "Model assets" "NGC authentication" "nvcr.io credentials present"
   else
-    err "NGC: not authenticated — run 'spark setup' phase 3"
+    doctor_fail "Model assets" "NGC authentication" "nvcr.io credentials missing" "spark setup"
   fi
 
-  # HF CLI
-  total=$((total + 1))
   if command -v hf >/dev/null 2>&1; then
-    local hf_ver
-    hf_ver=$(hf version 2>/dev/null || hf --version 2>/dev/null || echo "unknown")
-    info "HF CLI: ${hf_ver}"
-    passed=$((passed + 1))
+    hf_ver=$(hf version 2>/dev/null || hf --version 2>/dev/null || printf 'unknown\n')
+    hf_ver=$(printf '%s\n' "$hf_ver" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
+    doctor_pass "Model assets" "Hugging Face CLI" "$hf_ver"
   else
-    err "HF CLI: not installed — run 'uv tool install huggingface-hub[cli]'"
+    doctor_fail "Model assets" "Hugging Face CLI" "not installed" "uv tool install 'huggingface-hub[cli]'"
   fi
 
-  # HF cache permissions
-  total=$((total + 1))
-  local bad_cache_path=""
   bad_cache_path=$(hf_cache_first_unwritable "$HF_CACHE_DIR" || true)
   if [[ -n "$bad_cache_path" ]]; then
-    err "HF cache permissions: not writable at ${bad_cache_path}"
-    printf "    Fix manually, then retry. Example: sudo chown -R %s:%s %s\n" "$(id -u)" "$(id -g)" "$HF_CACHE_DIR"
+    doctor_fail "Model assets" "HF cache permissions" "not writable: ${bad_cache_path}" \
+      "sudo chown -R $(id -u):$(id -g) ${HF_CACHE_DIR}"
   else
-    info "HF cache permissions: writable"
-    passed=$((passed + 1))
+    doctor_pass "Model assets" "HF cache permissions" "writable"
   fi
 
-  # NGC container
-  total=$((total + 1))
-  local ngc_image
   ngc_image=$(detect_ngc_image)
   if [[ -n "$ngc_image" ]]; then
-    info "NGC container: ${ngc_image}"
-    passed=$((passed + 1))
+    doctor_pass "Model assets" "NGC container" "$ngc_image"
   else
-    err "NGC container: vLLM image not pulled"
+    doctor_fail "Model assets" "NGC container" "vLLM image not pulled" "spark setup"
   fi
 
-  # Models
-  total=$((total + 1))
-  local model_count=0
   if [[ -d "${HF_CACHE_DIR}/hub" ]]; then
     model_count=$(find "${HF_CACHE_DIR}/hub" -maxdepth 1 -name "models--*" -type d 2>/dev/null | wc -l | tr -d ' ')
   fi
   if [[ "$model_count" -gt 0 ]]; then
-    info "Models: ${model_count} downloaded"
-    passed=$((passed + 1))
+    doctor_pass "Model assets" "Downloaded models" "${model_count} found"
   else
     if [[ -d "${HF_CACHE_DIR}/hub" ]]; then
-      err "No model downloaded yet — run 'spark pull <model>'"
+      doctor_fail "Model assets" "Downloaded models" "none found" "spark pull <model>"
     else
-      err "HF cache not found at ${HF_CACHE_DIR} — run 'spark pull <model>' to initialize"
+      doctor_fail "Model assets" "Downloaded models" "HF cache not found at ${HF_CACHE_DIR}" "spark pull <model>"
     fi
   fi
 }
 
 # Ollama health checks. Updates cmd_doctor's passed/total via dynamic scope.
 doctor_checks_ollama() {
-  # Ollama installed
-  total=$((total + 1))
+  local ollama_ver n=0
   if command -v ollama >/dev/null 2>&1; then
-    info "Ollama: $(ollama --version 2>/dev/null | head -1 || echo installed)"
-    passed=$((passed + 1))
+    ollama_ver=$(ollama --version 2>/dev/null | head -1 || printf 'installed\n')
+    doctor_pass "Runtime" "Ollama" "$ollama_ver"
   else
-    err "Ollama: not installed — run 'spark setup' to set it up"
+    doctor_fail "Runtime" "Ollama" "not installed" "spark setup"
   fi
 
-  # Ollama service reachable
-  total=$((total + 1))
   if ollama_reachable; then
-    info "Ollama service: reachable on :11434"
-    passed=$((passed + 1))
+    doctor_pass "Runtime" "Ollama API" "reachable on port 11434"
   else
-    err "Ollama service: not reachable on :11434 — start it (ollama serve / Ollama app)"
+    doctor_fail "Runtime" "Ollama API" "not reachable on port 11434" "start ollama serve or the Ollama app"
   fi
 
-  # Models pulled
-  total=$((total + 1))
-  local n=0
   command -v ollama >/dev/null 2>&1 && n=$(ollama list 2>/dev/null | awk 'NR>1 && NF>0' | wc -l | tr -d ' ')
   if [[ "${n:-0}" -gt 0 ]]; then
-    info "Models: ${n} pulled"
-    passed=$((passed + 1))
+    doctor_pass "Model assets" "Pulled models" "${n} found"
   else
-    err "No models pulled yet — run 'spark run <model>'"
+    doctor_fail "Model assets" "Pulled models" "none found" "spark run <model>"
   fi
 
-  # Apple Silicon advisory (MLX engages on 32 GB+ unified memory).
-  [[ "$ACCEL" == "metal" ]] && info "Apple Silicon: Ollama uses MLX on 32 GB+ unified memory (have ${TOTAL_MEM_GB} GB)"
+  [[ "$ACCEL" == "metal" ]] && doctor_skip "Runtime" "Apple Silicon memory" "${TOTAL_MEM_GB} GB unified memory"
 }
 
-# Report host hardening drift (Linux + systemd). Shares cmd_doctor's passed/total via dynamic scope.
+# Report host hardening drift (Linux + systemd).
 doctor_checks_hardening() {
   { [[ "$SPARK_OS" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; } || return 0
   local sw_mib sw_source sw_diag swp target_mib oom_ssh oom_dbus
-  total=$((total + 1))
   swap_read_total sw_mib sw_source sw_diag
   target_mib=$(( SWAP_PROVISION_GB * 1024 ))
   swp="$(sysctl -n vm.swappiness 2>/dev/null || true)"
   if { [[ "$target_mib" -le 0 && "$sw_mib" -gt 0 ]] || [[ "$target_mib" -gt 0 && "$sw_mib" -ge "$target_mib" ]]; } && [[ "$swp" == "$SWAPPINESS" ]]; then
-    info "Swap: on (${sw_mib}MiB total) $(swap_total_context "$sw_source" "$sw_diag") + swappiness=${swp} (absorbs load peaks)"; passed=$((passed + 1))
+    doctor_pass "Host safety" "Swap and swappiness" \
+      "${sw_mib} MiB $(swap_total_context "$sw_source" "$sw_diag") · swappiness ${swp}"
   else
-    err "Swap/swappiness not configured (swap=${sw_mib}MiB $(swap_total_context "$sw_source" "$sw_diag"), target≥${target_mib}MiB, swappiness='${swp:-?}') — run 'spark setup'"
+    doctor_fail "Host safety" "Swap and swappiness" \
+      "${sw_mib} MiB $(swap_total_context "$sw_source" "$sw_diag"); target ≥${target_mib} MiB; swappiness ${swp:-unknown}" "spark setup"
   fi
-  total=$((total + 1))
   if systemctl is-active --quiet earlyoom 2>/dev/null; then
-    info "early-OOM: earlyoom active (runaway backstop)"; passed=$((passed + 1))
+    doctor_pass "Host safety" "early-OOM" "active"
   else
-    err "early-OOM: earlyoom not active — run 'spark setup'"
+    doctor_fail "Host safety" "early-OOM" "not active" "spark setup"
   fi
-  total=$((total + 1))
   oom_ssh="$(systemctl show -p OOMScoreAdjust --value ssh.service 2>/dev/null)"
   oom_dbus="$(systemctl show -p OOMScoreAdjust --value dbus.service 2>/dev/null)"
   if [[ "$oom_ssh" == "-1000" && "$oom_dbus" == "-1000" ]]; then
-    info "control-plane: sshd + dbus OOM-protected"; passed=$((passed + 1))
+    doctor_pass "Host safety" "Control-plane OOM protection" "sshd and dbus protected"
   else
-    err "control-plane not fully OOM-protected (sshd='${oom_ssh:-?}', dbus='${oom_dbus:-?}') — run 'spark setup'"
+    doctor_fail "Host safety" "Control-plane OOM protection" \
+      "sshd ${oom_ssh:-unknown}; dbus ${oom_dbus:-unknown}" "spark setup"
   fi
 }
 
 cmd_doctor_help() {
   cat <<EOF
 
-  ${BOLD}Usage:${NC} spark doctor [--help]
+  ${BOLD}Usage:${NC} spark doctor [--verbose] [--json|--quiet]
 
   Read-only check for the model server: Docker, backend prerequisites, OS hardening,
   LiteLLM gateway, and global Tailscale Funnel exposure.
+
+  ${BOLD}Flags:${NC}
+    --verbose  Show every check and its evidence.
+    --json     Machine-readable result.
+    --quiet    Print nothing; use only the exit code.
 
 EOF
 }
 
 cmd_doctor() {
-  if [[ $# -gt 0 ]]; then
+  local verbose=0 json_mode=0 quiet=0 failed docker_ver gw_enabled
+  while [[ $# -gt 0 ]]; do
     case "$1" in
+      --verbose) verbose=1 ;;
+      --json) json_mode=1 ;;
+      --quiet) quiet=1 ;;
       -h|--help) cmd_doctor_help; return 0 ;;
       *) die "Unknown doctor flag: $1" ;;
     esac
-  fi
-  printf "\n"
-  local passed=0 total=0
+    shift
+  done
+  [[ "$json_mode" == "1" && "$quiet" == "1" ]] && die "Choose either --json or --quiet"
 
-  # Detected hardware (informational).
-  info "Detected: ${SPARK_OS}/${SPARK_ARCH} · accelerator ${ACCEL} · backend ${BACKEND}"
+  DOCTOR_CATEGORIES=()
+  DOCTOR_LABELS=()
+  DOCTOR_RESULTS=()
+  DOCTOR_DETAILS=()
+  DOCTOR_ACTIONS=()
 
-  # Docker — the LiteLLM gateway runs in a container on both backends.
-  total=$((total + 1))
-  local docker_ver
   if docker_ver=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
     if docker info >/dev/null 2>&1; then
-      info "Docker: ${docker_ver}, running"
-      passed=$((passed + 1))
+      doctor_pass "Runtime" "Docker" "${docker_ver}, running"
     else
-      err "Docker: ${docker_ver} installed but not running"
+      doctor_fail "Runtime" "Docker" "${docker_ver} installed but not running" "start Docker"
     fi
   else
-    err "Docker: not installed"
+    doctor_fail "Runtime" "Docker" "not installed" "spark setup"
   fi
 
   if [[ "$BACKEND" == "ollama" ]]; then
@@ -330,35 +429,35 @@ cmd_doctor() {
   doctor_checks_hardening
 
   if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then
-    total=$((total + 1))
     if tailscale_funnel_status_active; then
-      err "Tailscale Funnel: active public exposure — run 'tailscale funnel reset'"
+      doctor_fail "Exposure" "Tailscale Funnel" "active public exposure" "tailscale funnel reset"
     else
-      info "Tailscale Funnel: disabled"
-      passed=$((passed + 1))
+      doctor_pass "Exposure" "Tailscale Funnel" "disabled"
     fi
   else
-    info "Tailscale Funnel: skipped (Tailscale not connected)"
+    doctor_skip "Exposure" "Tailscale Funnel" "skipped; Tailscale not connected"
   fi
 
-  # Gateway
   if [[ -f "$GATEWAY_CONFIG" ]]; then
-    local gw_enabled
     gw_enabled=$(jq -r '.enabled // false' "$GATEWAY_CONFIG" 2>/dev/null || echo "false")
     if [[ "$gw_enabled" == "true" ]]; then
-      total=$((total + 1))
       if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-        info "Gateway: LiteLLM running (${GATEWAY_CONTAINER})"
-        passed=$((passed + 1))
+        doctor_pass "Gateway" "LiteLLM" "running as ${GATEWAY_CONTAINER}"
       else
-        err "Gateway: LiteLLM configured but not running — run 'spark gateway start'"
+        doctor_fail "Gateway" "LiteLLM" "configured but not running" "spark gateway start"
       fi
+    else
+      doctor_skip "Gateway" "LiteLLM" "disabled"
     fi
+  else
+    doctor_skip "Gateway" "LiteLLM" "not configured"
   fi
 
-  printf "\n  %d/%d checks passed." "$passed" "$total"
-  if [[ "$passed" -lt "$total" ]]; then
-    printf " Run '${BOLD}spark setup${NC}' to fix issues."
+  failed=$(doctor_count fail)
+  if [[ "$json_mode" == "1" ]]; then
+    doctor_print_json
+  elif [[ "$quiet" == "0" ]]; then
+    doctor_print_human "$verbose"
   fi
-  printf "\n\n"
+  [[ "$failed" -eq 0 ]]
 }
