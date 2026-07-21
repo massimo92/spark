@@ -9505,6 +9505,21 @@ workspace_recover_n8n() {
   info "n8n access recovered for ${email}"
 }
 
+workspace_show_recovery_password() {
+  local service="$1" identity="$2" password="$3" output
+  output=$(printf "\n  ${YELLOW}${BOLD}Save this password now. Spark will not store or show it again.${NC}\n\n  %s\n    email:    %s\n    password: %s\n\n  Press q to close.\n" \
+    "$service" "$identity" "$password")
+
+  if command -v less >/dev/null 2>&1 && \
+    { [[ -t 0 && -t 1 && -t 2 ]] || [[ "${SPARK_WORKSPACE_FORCE_PAGER:-0}" == "1" ]]; }; then
+    LESS='' LESSOPEN='' less -R <<< "$output"
+    return 0
+  fi
+
+  printf "%s\n" "$output"
+  warn "Password shown without a pager; use an interactive terminal to hide it after pressing q"
+}
+
 workspace_recover() {
   local service="${1:-}" auto_yes=0 password="" generated=0 identity=""
   [[ -n "$service" ]] && shift || true
@@ -9543,8 +9558,7 @@ workspace_recover() {
     identity=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
   fi
   if [[ "$generated" == "1" ]]; then
-    printf "\n  ${YELLOW}${BOLD}Save this password now. Spark will not store or show it again.${NC}\n\n"
-    printf "  %s\n    email:    %s\n    password: %s\n" "$service" "$identity" "$password"
+    workspace_show_recovery_password "$service" "$identity" "$password"
   fi
   printf "\n"
   unset password

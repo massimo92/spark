@@ -3247,8 +3247,13 @@ test_workspace_setup_removes_legacy_smtp() {
 
 test_workspace_recover_vikunja() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out password config calls stored user_list
+  local tmp fake_bin out pager password config calls stored user_list
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  cat > "${fake_bin}/less" <<'EOF'
+#!/usr/bin/env bash
+cat > "${FAKE_LESS_OUTPUT_FILE}"
+EOF
+  chmod +x "${fake_bin}/less"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
@@ -3256,16 +3261,19 @@ test_workspace_recover_vikunja() {
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
   user_list='┌────┬──────────┬─────────────────┬────────┐\n│ ID │ USERNAME │      EMAIL      │ STATUS │\n├────┼──────────┼─────────────────┼────────┤\n│ 1  │ massimo  │ m@example.com   │ Active │\n└────┴──────────┴─────────────────┴────────┘\n'
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_FORCE_PAGER=1 FAKE_LESS_OUTPUT_FILE="${tmp}/pager" \
     FAKE_VIKUNJA_USER_LIST="$user_list" FAKE_COMPOSE_EXEC_FILE="${tmp}/calls" \
     "$SPARK" ws recover vikunja --yes 2>&1)
-  password=$(sed -n 's/^    password: //p' <<< "$out")
+  pager=$(cat "${tmp}/pager")
+  password=$(sed -n 's/^    password: //p' <<< "$pager")
   config="${tmp}/home/.config/spark/workspace"
   calls=$(cat "${tmp}/calls")
   stored=$(cat "${config}/secrets.env" "${config}/vikunja.env" "${config}/n8n.env")
   rm -rf "$tmp"
   [[ "$out" == *"Vikunja access recovered for m@example.com"* ]] &&
     [[ "$calls" == *"user reset-password 1 -d -p"* ]] &&
-    [[ -n "$password" ]] && [[ "$stored" != *"$password"* ]]
+    [[ -n "$password" ]] && [[ "$stored" != *"$password"* ]] &&
+    [[ "$pager" == *"Press q to close."* ]] && [[ "$out" != *"password: $password"* ]]
 }
 
 test_workspace_recover_n8n() {
