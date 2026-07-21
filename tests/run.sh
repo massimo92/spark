@@ -3247,15 +3247,17 @@ test_workspace_setup_removes_legacy_smtp() {
 
 test_workspace_recover_vikunja() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out password config calls stored
+  local tmp fake_bin out password config calls stored user_list
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  user_list='┌────┬──────────┬─────────────────┬────────┐\n│ ID │ USERNAME │      EMAIL      │ STATUS │\n├────┼──────────┼─────────────────┼────────┤\n│ 1  │ massimo  │ m@example.com   │ Active │\n└────┴──────────┴─────────────────┴────────┘\n'
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
-    FAKE_COMPOSE_EXEC_FILE="${tmp}/calls" "$SPARK" ws recover vikunja --yes 2>&1)
+    FAKE_VIKUNJA_USER_LIST="$user_list" FAKE_COMPOSE_EXEC_FILE="${tmp}/calls" \
+    "$SPARK" ws recover vikunja --yes 2>&1)
   password=$(sed -n 's/^    password: //p' <<< "$out")
   config="${tmp}/home/.config/spark/workspace"
   calls=$(cat "${tmp}/calls")
