@@ -1705,6 +1705,121 @@ container_uptime() {
   fi
 }
 
+status_json_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  printf '%s' "$s"
+}
+
+status_json_number() {
+  local value="${1:-}"
+  if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then printf '%s' "$value"; else printf 'null'; fi
+}
+
+container_age_seconds() {
+  local name="$1" started_at start_epoch now_epoch
+  started_at=$(docker inspect "$name" --format '{{.State.StartedAt}}' 2>/dev/null || true)
+  [[ -n "$started_at" ]] || return 1
+  start_epoch=$(date -d "$started_at" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%S" "${started_at%%.*}" +%s 2>/dev/null || true)
+  [[ "$start_epoch" =~ ^[0-9]+$ ]] || return 1
+  now_epoch=$(date +%s)
+  printf '%s\n' "$(( now_epoch - start_epoch ))"
+}
+
+model_api_ready() {
+  local port="$1"
+  curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1
+}
+
+gateway_api_ready() {
+  gateway_running_state || return 1
+  curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" >/dev/null 2>&1
+}
+
+gateway_model_routed() {
+  local engine="$1" model="$2" id out
+  case "$engine" in
+    vllm) id="vllm/${model}" ;;
+    ollama) id="ollama_chat/${model}" ;;
+    *) return 1 ;;
+  esac
+  out=$(curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" 2>/dev/null) || return 1
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s\n' "$out" | jq -e --arg id "$id" 'any(.data[]?; .id == $id)' >/dev/null 2>&1
+  else
+    printf '%s\n' "$out" | grep -Fq "\"id\":\"${id}\""
+  fi
+}
+
+status_model_runtime_state() {
+  local name="$1" port="$2" age
+  model_api_ready "$port" && { printf 'ready\n'; return 0; }
+  age=$(container_age_seconds "$name" 2>/dev/null || true)
+  if [[ "$age" =~ ^[0-9]+$ && "$age" -lt 600 ]]; then printf 'starting\n'; else printf 'unhealthy\n'; fi
+  return 1
+}
+
+status_operational() {
+  local name model port rest ready=0
+  docker_running || return 1
+  gateway_api_ready || return 1
+  if [[ "$BACKEND" == "ollama" ]]; then
+    ollama_reachable || return 1
+    while IFS= read -r model; do
+      [[ -n "$model" ]] && gateway_model_routed ollama "$model" && ready=1
+    done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
+    [[ "$ready" == "1" ]]
+    return $?
+  fi
+  while IFS=$'\t' read -r name model port rest; do
+    [[ -n "$name" ]] && model_api_ready "$port" && gateway_model_routed vllm "$model" && ready=1
+  done < <(list_managed_containers)
+  [[ "$ready" == "1" ]]
+}
+
+status_models_json() {
+  local first=1 name model port need wt kv state now pk routed
+  printf '['
+  if [[ "$BACKEND" == "ollama" ]]; then
+    while IFS= read -r model; do
+      [[ -n "$model" ]] || continue
+      [[ "$first" == "1" ]] || printf ','
+      first=0
+      if ollama_reachable; then state=ready; else state=unhealthy; fi
+      if gateway_model_routed ollama "$model"; then routed=true; else routed=false; fi
+      printf '{"name":"%s","engine":"ollama","state":"%s","endpoint":"http://localhost:11434/api","gateway_model":"ollama_chat/%s","gateway_routed":%s}' \
+        "$(status_json_escape "$model")" "$state" "$(status_json_escape "$model")" "$routed"
+    done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
+  else
+    while IFS=$'\t' read -r name model port need wt kv; do
+      [[ -n "$name" ]] || continue
+      [[ "$first" == "1" ]] || printf ','
+      first=0
+      state=$(status_model_runtime_state "$name" "$port" || true)
+      if gateway_model_routed vllm "$model"; then routed=true; else routed=false; fi
+      now=$(container_current_gb "$name"); pk=$(container_peak_gb "$name")
+      printf '{"name":"%s","engine":"vllm","state":"%s","endpoint":"http://localhost:%s/v1","gateway_model":"vllm/%s","gateway_routed":%s,"reserved_gb":%s,"live_gb":%s,"peak_gb":%s}' \
+        "$(status_json_escape "${model:-unknown}")" "$state" "$(status_json_escape "$port")" \
+        "$(status_json_escape "${model:-unknown}")" "$routed" "$(status_json_number "$need")" \
+        "$(status_json_number "$now")" "$(status_json_number "$pk")"
+    done < <(list_managed_containers)
+  fi
+  printf ']'
+}
+
+cmd_status_json() {
+  local ok=false gateway_state=stopped models
+  status_operational && ok=true
+  if gateway_api_ready; then gateway_state=ready; elif gateway_running_state; then gateway_state=not-ready; fi
+  models=$(status_models_json)
+  printf '{"ok":%s,"backend":"%s","docker":"%s","gateway":{"state":"%s","port":%s,"endpoint":"http://localhost:%s/v1"},"models":%s}\n' \
+    "$ok" "$(status_json_escape "$BACKEND")" "$(docker_running && printf running || printf stopped)" \
+    "$gateway_state" "$(status_json_number "$(gateway_configured_port)")" "$(gateway_configured_port)" "$models"
+  [[ "$ok" == "true" ]]
+}
+
 # spark status on the Ollama backend: list pulled + loaded models and the gateway route.
 print_system_overview() {
   printf "  ${BOLD}System${NC}\n"
@@ -1715,11 +1830,12 @@ print_system_overview() {
 }
 
 print_setup_overview() {
-  local summary state="partial"
+  local verbose="${1:-1}" summary state="partial"
   summary=$(setup_status_summary)
   [[ "$summary" == */* && "$summary" != *"missing:"* ]] && state="ok"
   printf "\n  ${BOLD}Setup${NC}\n"
   dashboard_row "$state" "prerequisites" "$summary"
+  [[ "$verbose" != "1" && "$state" == "ok" ]] && return 0
   if [[ "$BACKEND" == "vllm" ]]; then
     if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
       dashboard_row ok "GPU" "$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1 || echo detected)"
@@ -1735,12 +1851,18 @@ print_setup_overview() {
 }
 
 print_services_overview() {
-  local gw_state="stopped" gw_detail ws_count
+  local inference_only="${1:-0}" gw_state="stopped" gw_detail ws_count
   printf "\n  ${BOLD}Services${NC}\n"
-  if gateway_running_state; then gw_state="running"; fi
-  gw_detail="port $(gateway_configured_port) · providers $(gateway_provider_list)"
+  if gateway_api_ready; then
+    gw_state="ready"; gw_detail="ready · port $(gateway_configured_port) · providers $(gateway_provider_list)"
+  elif gateway_running_state; then
+    gw_state="warn"; gw_detail="not ready · port $(gateway_configured_port) · providers $(gateway_provider_list)"
+  else
+    gw_detail="stopped · port $(gateway_configured_port) · providers $(gateway_provider_list)"
+  fi
   dashboard_row "$gw_state" "LiteLLM gateway" "$gw_detail"
   if docker_running; then dashboard_row ok "Docker" "running"; else dashboard_row missing "Docker" "not running"; fi
+  [[ "$inference_only" == "1" ]] && return 0
   if workspace_configured; then
     ws_count=$(workspace_service_count)
     if [[ "$ws_count" -gt 0 ]]; then dashboard_row running "Workspace compose" "${ws_count} service(s) running"; else dashboard_row stopped "Workspace compose" "configured, no running services"; fi
@@ -1759,43 +1881,47 @@ print_services_overview() {
 
 print_vllm_model_table() {
   local models=() needs=() wts=() kvs=() ports=() ups=() cnames=()
-  local reserved=0 maxw=5 name model port need wt kv
+  local reserved=0 name model port need wt kv
   while IFS=$'\t' read -r name model port need wt kv; do
     [[ -z "$name" ]] && continue
     model="${model:-unknown}"
     models+=("$model"); needs+=("${need:-?}"); wts+=("${wt:-?}"); kvs+=("${kv:-?}")
     ports+=("${port:-?}"); ups+=("$(container_uptime "$name")"); cnames+=("$name")
     [[ "${need:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] && reserved=$(awk -v a="$reserved" -v b="$need" 'BEGIN{printf "%.1f", a+b}')
-    [[ ${#model} -gt $maxw ]] && maxw=${#model}
   done < <(list_managed_containers)
 
   if [[ ${#models[@]} -eq 0 ]]; then
-    dashboard_row missing "vLLM models" "none running"
+    dashboard_row missing "models" "none being served"
     return 0
   fi
 
-  printf "  ${DIM}%-${maxw}s  %6s  %7s  %6s  %5s  %-8s${NC}\n" "MODEL" "NEED" "WEIGHTS" "KV" "PORT" "UP"
-  local i
+  local i now pk state state_color route_state
   for i in "${!models[@]}"; do
-    printf "  %-${maxw}s  %6s  %7s  %6s  %5s  %-8s\n" \
-      "${models[$i]}" "${needs[$i]}" "${wts[$i]}" "${kvs[$i]}" "${ports[$i]}" "${ups[$i]}"
+    state=$(status_model_runtime_state "${cnames[$i]}" "${ports[$i]}" || true)
+    case "$state" in ready) state_color="$GREEN" ;; starting) state_color="$YELLOW" ;; *) state_color="$RED" ;; esac
+    printf "  ${state_color}●${NC} ${BOLD}%s${NC}  %s%s%s\n" "${models[$i]}" "$state_color" "$state" "$NC"
+    printf "    Direct:  http://localhost:%s/v1 · up %s\n" "${ports[$i]}" "${ups[$i]}"
+    if gateway_model_routed vllm "${models[$i]}"; then route_state="routed"; else route_state="not routed"; fi
+    printf "    Gateway: http://localhost:%s/v1 · model vllm/%s · %s\n" \
+      "$(gateway_configured_port)" "${models[$i]}" "$route_state"
+    printf "    Memory:  %s GB weights · %s GB KV cache · %s GB reserved\n" \
+      "${wts[$i]}" "${kvs[$i]}" "${needs[$i]}"
+    now=$(container_current_gb "${cnames[$i]}"); pk=$(container_peak_gb "${cnames[$i]}")
+    if [[ -n "$now" || -n "$pk" ]]; then
+      printf "    Live:    %s GB now · %s GB peak\n" "${now:-—}" "${pk:-—}"
+    fi
   done
   local free
   free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{printf "%.1f", b-r}')
-  printf "  ${DIM}Memory (GB): %s total · %s OS · %s reserved · %s free${NC}\n" "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
+  printf "  ${DIM}Capacity: %s GB total · %s GB OS · %s GB allocated · %s GB allocatable${NC}\n" \
+    "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
 
-  local host_line now pk
+  local host_line
   host_line=$(free -g 2>/dev/null | awk '
     /^Mem:/  { m=sprintf("RAM %d/%d GB used · %d avail", $3, $2, $7) }
     /^Swap:/ { if ($2+0>0) s=sprintf("swap %d/%d GB", $3, $2) }
     END      { if (m!="") printf "%s%s", m, (s!="" ? " · " s : "") }')
   [[ -n "$host_line" ]] && printf "  ${DIM}Live:        %s${NC}\n" "$host_line"
-  for i in "${!models[@]}"; do
-    now=$(container_current_gb "${cnames[$i]}"); pk=$(container_peak_gb "${cnames[$i]}")
-    [[ -z "$now" && -z "$pk" ]] && continue
-    printf "  ${DIM}  %-${maxw}s  reserved %s · now %s · peak %s GB${NC}\n" \
-      "${models[$i]}" "${needs[$i]}" "${now:-—}" "${pk:-—}"
-  done
   return 0
 }
 
@@ -1804,26 +1930,32 @@ print_ollama_model_table() {
     dashboard_row missing "Ollama models" "Ollama not installed"
     return 0
   fi
-  local rows loaded
-  rows=$(ollama list 2>/dev/null | awk 'NR>1{printf "  %-32s %s %s\n", $1, $3, $4}' || true)
-  if [[ -z "$rows" ]]; then
-    dashboard_row missing "Ollama models" "none pulled"
-  else
-    printf "  ${DIM}%-32s %s${NC}\n" "MODEL" "SIZE"
-    printf "%s\n" "$rows"
+  local model loaded=() state state_color route_state
+  while IFS= read -r model; do
+    [[ -n "$model" ]] && loaded+=("$model")
+  done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
+  if [[ ${#loaded[@]} -eq 0 ]]; then
+    dashboard_row missing "models" "none being served"
+    return 0
   fi
-  loaded=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}' | tr '\n' ' ' || true)
-  [[ -n "${loaded// /}" ]] && printf "  ${DIM}Loaded now: %s${NC}\n" "$loaded"
+  if ollama_reachable; then state=ready; state_color="$GREEN"; else state=unhealthy; state_color="$RED"; fi
+  for model in "${loaded[@]}"; do
+    printf "  ${state_color}●${NC} ${BOLD}%s${NC}  %s%s%s\n" "$model" "$state_color" "$state" "$NC"
+    printf "    Direct:  http://localhost:11434/api\n"
+    if gateway_model_routed ollama "$model"; then route_state="routed"; else route_state="not routed"; fi
+    printf "    Gateway: http://localhost:%s/v1 · model ollama_chat/%s · %s\n" \
+      "$(gateway_configured_port)" "$model" "$route_state"
+  done
   return 0
 }
 
 print_models_overview() {
-  printf "\n  ${BOLD}Models${NC}\n"
+  local title="${1:-Models}"
+  printf "\n  ${BOLD}%s${NC}\n" "$title"
   if [[ "$BACKEND" == "ollama" ]]; then
     print_ollama_model_table
   else
     print_vllm_model_table
-    dashboard_row ok "HF cache" "$(count_downloaded_hf_models) downloaded model(s)"
   fi
   return 0
 }

@@ -2133,34 +2133,179 @@ workspace_setup() {
   return "$setup_rc"
 }
 
-cmd_workspace_status() {
-  local vikunja_url="" n8n_url="" hermes_url="" tailscale_mode=""
-  printf "\n  ${BOLD}spark ws status${NC}\n\n"
-  if [[ -f "$WORKSPACE_COMPOSE_FILE" ]]; then
-    workspace_compose ps 2>/dev/null || warn "Compose project ${WORKSPACE_PROJECT} not reachable"
-  else
-    warn "Workspace not configured"
+workspace_print_verbose_hermes_status() {
+  local out json
+  json=$(nemohermes hermes status --json 2>/dev/null || true)
+  if command -v jq >/dev/null 2>&1 && printf '%s\n' "$json" | jq -e . >/dev/null 2>&1; then
+    printf "  ${BOLD}NemoHermes details${NC}\n"
+    printf '%s\n' "$json" | jq .
+    return 0
   fi
-  if [[ -f "$WORKSPACE_ENV_FILE" ]]; then
-    vikunja_url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
-    n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
-    hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
-    tailscale_mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-    printf "\n  URLs: Vikunja=%s n8n=%s Hermes=%s\n" "${vikunja_url:-unset}" "${n8n_url:-unset}" "${hermes_url:-unset}"
-    printf "  Tailscale: %s\n" "${tailscale_mode:-unset}"
-  fi
-  cmd_workspace_health
+  out=$(nemohermes hermes status 2>/dev/null || nemohermes status 2>/dev/null || true)
+  printf '%s\n' "$out" | awk '
+    /Sandbox-scoped status for/ { capture=1 }
+    capture {
+      scoped = scoped $0 ORS
+      if ($0 ~ /^[[:space:]]*Agent:[[:space:]]/) {
+        capture=0
+        captured=1
+      }
+      next
+    }
+    {
+      print
+      if (captured && ! inserted && $0 ~ /Revision:/) {
+        printf "\n%s", scoped
+        inserted=1
+      }
+    }
+    END {
+      if (captured && ! inserted) printf "\n%s", scoped
+    }
+  '
+}
+
+workspace_service_runtime_state() {
+  local service="$1"
+  workspace_compose_service_running "$service" || { printf 'stopped\n'; return 1; }
+  case "$service" in
+    vikunja) workspace_vikunja_http_ready && { printf 'ready\n'; return 0; } ;;
+    n8n) workspace_n8n_http_ready && { printf 'ready\n'; return 0; } ;;
+    postgres) printf 'running\n'; return 0 ;;
+  esac
+  printf 'running-not-ready\n'
+  return 1
+}
+
+workspace_hermes_runtime_state() {
+  local container age
+  container=$(workspace_hermes_running_container_name 2>/dev/null || true)
+  [[ -n "$container" ]] || { printf 'stopped\n'; return 1; }
+  workspace_hermes_local_api_ready && { printf 'ready\n'; return 0; }
+  age=$(container_age_seconds "$container" 2>/dev/null || true)
+  if [[ "$age" =~ ^[0-9]+$ && "$age" -lt 600 ]]; then printf 'starting\n'; else printf 'unhealthy\n'; fi
+  return 1
+}
+
+workspace_access_runtime_state() {
+  workspace_tailscale_connected || { printf 'disconnected\n'; return 1; }
+  workspace_tailscale_services_configured || { printf 'not-configured\n'; return 1; }
+  printf 'ready\n'
+}
+
+workspace_status_operational() {
+  workspace_configured || return 1
+  [[ "$(workspace_service_runtime_state postgres || true)" == "running" ]] || return 1
+  [[ "$(workspace_service_runtime_state vikunja || true)" == "ready" ]] || return 1
+  [[ "$(workspace_service_runtime_state n8n || true)" == "ready" ]] || return 1
+  [[ "$(workspace_hermes_runtime_state || true)" == "ready" ]] || return 1
+  [[ "$(workspace_access_runtime_state || true)" == "ready" ]]
+}
+
+workspace_print_service_row() {
+  local state="$1" service="$2" access="$3" color
+  case "$state" in
+    ready|running) color="$GREEN" ;;
+    stopped|starting|running-not-ready) color="$YELLOW" ;;
+    unhealthy) color="$RED" ;;
+    *) color="$DIM" ;;
+  esac
+  printf "  ${color}%-20s${NC} %-22s %s\n" "$state" "$service" "$access"
+}
+
+workspace_print_status_summary() {
+  local postgres_state vikunja_state n8n_state hermes_state access_state mode model
+  local vikunja_url n8n_url hermes_url
+  postgres_state=$(workspace_service_runtime_state postgres || true)
+  vikunja_state=$(workspace_service_runtime_state vikunja || true)
+  n8n_state=$(workspace_service_runtime_state n8n || true)
+  hermes_state=$(workspace_hermes_runtime_state || true)
+  access_state=$(workspace_access_runtime_state || true)
+  mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  vikunja_url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
+  hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
+
+  printf "\n  ${BOLD}Workspace services${NC}\n"
+  printf "  ${DIM}%-20s %-22s %s${NC}\n" "STATE" "SERVICE" "ACCESS"
+  workspace_print_service_row "$postgres_state" "Postgres" "internal"
+  workspace_print_service_row "$vikunja_state" "Vikunja" "${vikunja_url:-unset}"
+  workspace_print_service_row "$n8n_state" "n8n" "${n8n_url:-unset}"
+  workspace_print_service_row "$hermes_state" "Hermes" "${hermes_url:-unset}"
+
+  printf "\n  ${BOLD}Agent workspace${NC}\n"
+  printf "  %-22s %s\n" "Mode" "${mode:-unset}"
+  printf "  %-22s %s\n" "Hermes model" "${model:-unset}"
+  printf "  %-22s %s\n" "Private access" "$access_state"
+}
+
+workspace_status_json() {
+  local ok=false postgres_state vikunja_state n8n_state hermes_state access_state mode model
+  local vikunja_url n8n_url hermes_url
+  workspace_status_operational && ok=true
+  postgres_state=$(workspace_service_runtime_state postgres || true)
+  vikunja_state=$(workspace_service_runtime_state vikunja || true)
+  n8n_state=$(workspace_service_runtime_state n8n || true)
+  hermes_state=$(workspace_hermes_runtime_state || true)
+  access_state=$(workspace_access_runtime_state || true)
+  mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  vikunja_url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
+  hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
+  printf '{"ok":%s,"mode":"%s","hermes_model":"%s","access":"%s","services":{"postgres":{"state":"%s"},"vikunja":{"state":"%s","url":"%s"},"n8n":{"state":"%s","url":"%s"},"hermes":{"state":"%s","url":"%s"}}}\n' \
+    "$ok" "$(workspace_json_escape "$mode")" "$(workspace_json_escape "$model")" \
+    "$access_state" "$postgres_state" "$vikunja_state" "$(workspace_json_escape "$vikunja_url")" \
+    "$n8n_state" "$(workspace_json_escape "$n8n_url")" "$hermes_state" "$(workspace_json_escape "$hermes_url")"
+  [[ "$ok" == "true" ]]
+}
+
+cmd_workspace_containers() {
+  [[ $# -eq 0 ]] || die "Usage: spark ws containers"
+  printf "\n  ${BOLD}spark ws containers${NC}\n\n"
+  workspace_configured || die "Workspace not configured" "Run: spark ws setup"
+  workspace_compose ps 2>/dev/null || warn "Compose project ${WORKSPACE_PROJECT} not reachable"
   printf "\n"
-  gateway_status
-  if command -v nemohermes >/dev/null 2>&1; then
-    nemohermes hermes status 2>/dev/null || nemohermes status 2>/dev/null || true
-  else
+  docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null \
+    | grep -E '(^NAMES|openshell-hermes|spark-hermes-(litellm|dashboard)-proxy)' || true
+  printf "\n"
+}
+
+cmd_workspace_status() {
+  local verbose=0 json_mode=0 quiet=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --verbose) verbose=1 ;;
+      --json) json_mode=1 ;;
+      --quiet) quiet=1 ;;
+      --help|-h)
+        printf "Usage: spark ws status [--verbose] [--json|--quiet]\n"
+        printf "  --verbose  Include full NemoHermes sandbox and policy details.\n"
+        return 0
+        ;;
+      *) die "Unknown ws status option: $1" "Usage: spark ws status [--verbose] [--json|--quiet]" ;;
+    esac
+    shift
+  done
+  [[ "$json_mode" == "1" && "$quiet" == "1" ]] && die "Choose either --json or --quiet"
+  [[ "$json_mode" == "1" ]] && { workspace_status_json; return $?; }
+  [[ "$quiet" == "1" ]] && { workspace_status_operational; return $?; }
+  printf "\n  ${BOLD}spark ws status${NC}\n"
+  if ! workspace_configured; then
+    warn "Workspace not configured"
+    printf "\n"
+    return 1
+  fi
+  workspace_print_status_summary
+  if [[ "$verbose" == "1" ]] && command -v nemohermes >/dev/null 2>&1; then
+    printf "\n"
+    workspace_print_verbose_hermes_status
+  elif ! command -v nemohermes >/dev/null 2>&1; then
     warn "NemoHermes not installed"
   fi
-  if command -v tailscale >/dev/null 2>&1; then
-    workspace_print_tailscale_runtime_status
-  fi
   printf "\n"
+  workspace_status_operational
 }
 
 workspace_migrate_runtime_config() {
@@ -3811,7 +3956,8 @@ cmd_workspace_help() {
     start      Start the configured workspace runtime
     stop       Stop the workspace runtime and preserve all data
     restart    Stop and start the configured workspace runtime
-    status     Show workspace health
+    status     Show operational workspace state
+    containers Show raw workspace container state
     logs       Follow logs for vikunja, n8n, postgres, hermes, or gateway
     doctor     Read-only workspace check
     backup     Back up Vikunja, n8n, and Hermes state
@@ -3851,7 +3997,8 @@ cmd_workspace() {
     start)  workspace_start "$@" ;;
     stop)   workspace_stop "$@" ;;
     restart) workspace_restart "$@" ;;
-    status) cmd_workspace_status ;;
+    status) cmd_workspace_status "$@" ;;
+    containers) cmd_workspace_containers "$@" ;;
     logs)   cmd_workspace_logs "$@" ;;
     doctor) cmd_workspace_doctor "$@" ;;
     backup) cmd_workspace_backup "$@" ;;

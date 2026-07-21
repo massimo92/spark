@@ -132,6 +132,7 @@ ${stdin_payload}"
     [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run ' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
     case "$args" in
       *State.Running*) echo "${FAKE_STATE_RUNNING:-true}" ;;
+      *State.StartedAt*) echo "${FAKE_STARTED_AT:-}" ;;
       *State.Status*)
         if [[ -n "${FAKE_RETRY:-}" && "${_att}" -le 1 ]]; then echo "exited"
         else echo "${FAKE_STATE_STATUS:-running}"; fi ;;
@@ -272,7 +273,16 @@ case "$*" in
   *:8642/v1/models*) echo "${FAKE_HERMES_MODELS:-{\"data\":[{\"id\":\"hermes-agent\"}]}"; exit "${FAKE_HERMES_LOCAL_API_EXIT:-0}" ;;
   *:18789/*) exit "${FAKE_HERMES_DASHBOARD_EXIT:-0}" ;;
   */v1/chat/completions*) [[ "${FAKE_LITELLM_SMOKE_EXIT:-0}" == "0" ]] && { echo "${FAKE_LITELLM_SMOKE_JSON:-{\"choices\":[{\"message\":{\"content\":\"ok\"}}],\"usage\":{\"completion_tokens\":1}}}"; exit 0; }; exit "${FAKE_LITELLM_SMOKE_EXIT:-1}" ;;
-  */v1/models*) [[ "${FAKE_VLLM_READY:-1}" == "1" ]] && { echo "${FAKE_LITELLM_MODELS:-{\"data\":[{\"id\":\"vllm/Org/Alpha\"}]}"; exit 0; }; exit 7 ;;
+  */v1/models*)
+    if [[ "${FAKE_VLLM_READY:-1}" == "1" ]]; then
+      if [[ -n "${FAKE_LITELLM_MODELS:-}" ]]; then
+        printf '%s\n' "$FAKE_LITELLM_MODELS"
+      else
+        printf '%s\n' '{"data":[{"id":"vllm/Org/Alpha"}]}'
+      fi
+      exit 0
+    fi
+    exit 7 ;;
   *)            [[ "${FAKE_OLLAMA_UP:-0}" == "1" ]] && exit 0; exit 7 ;;
 esac
 EOF
@@ -1294,15 +1304,60 @@ test_stop_ambiguous_requires_target() {
   [[ "$status" -ne 0 ]] && [[ "$output" == *"Multiple models running"* ]]
 }
 
-test_status_renders_table() {
+test_status_renders_served_models() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin output
-  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
-  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_MANAGED="$TWO_MODELS" \
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"vllm":{"enabled":true}}}' > "${tmp}/home/.config/spark/gateway.json"
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_INFO_EXIT=0 FAKE_NAMES='spark-litellm\n' FAKE_MANAGED="$TWO_MODELS" \
+    FAKE_LITELLM_MODELS='{"data":[{"id":"vllm/org/Alpha"},{"id":"vllm/org/Beta"}]}' \
     "$SPARK" status 2>&1)
   rm -rf "$tmp"
-  [[ "$output" == *"MODEL"* ]] && [[ "$output" == *"NEED"* ]] && [[ "$output" == *"WEIGHTS"* ]] &&
-    [[ "$output" == *"org/Alpha"* ]] && [[ "$output" == *"Memory (GB):"* ]]
+  [[ "$output" == *"Served models"* ]] &&
+    [[ "$output" == *"org/Alpha"* ]] &&
+    [[ "$output" == *"ready"* ]] &&
+    [[ "$output" == *"Direct:  http://localhost:8000/v1"* ]] &&
+    [[ "$output" == *"Gateway: http://localhost:4000/v1 · model vllm/org/Alpha · routed"* ]] &&
+    [[ "$output" == *"Memory:"* && "$output" == *"GB weights"* && "$output" == *"GB KV cache"* ]] &&
+    [[ "$output" == *"Capacity:"* ]] &&
+    [[ "$output" == *"GB allocatable"* ]] &&
+    [[ "$output" != *"Agent workspace"* ]] &&
+    [[ "$output" != *"Workspace compose"* ]] &&
+    [[ "$output" != *"Tailscale"* ]] &&
+    [[ "$output" != *"HF cache"* ]] &&
+    [[ "$output" != *"Next steps"* ]]
+}
+
+test_status_json_quiet_and_exit_codes() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin json unhealthy_json quiet_out bad_out good_status bad_status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"vllm":{"enabled":true}}}' > "${tmp}/home/.config/spark/gateway.json"
+  json=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_INFO_EXIT=0 \
+    FAKE_NAMES='spark-litellm\n' FAKE_MANAGED="$TWO_MODELS" \
+    FAKE_LITELLM_MODELS='{"data":[{"id":"vllm/org/Alpha"},{"id":"vllm/org/Beta"}]}' "$SPARK" status --json)
+  set +e
+  quiet_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_INFO_EXIT=0 \
+    FAKE_NAMES='spark-litellm\n' FAKE_MANAGED="$TWO_MODELS" \
+    FAKE_LITELLM_MODELS='{"data":[{"id":"vllm/org/Alpha"},{"id":"vllm/org/Beta"}]}' "$SPARK" status --quiet 2>&1)
+  good_status=$?
+  bad_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_INFO_EXIT=0 FAKE_VLLM_READY=0 \
+    FAKE_NAMES='spark-litellm\n' FAKE_MANAGED="$TWO_MODELS" "$SPARK" status --quiet 2>&1)
+  bad_status=$?
+  unhealthy_json=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_INFO_EXIT=0 FAKE_VLLM_READY=0 \
+    FAKE_STARTED_AT=2020-01-01T00:00:00Z FAKE_NAMES='spark-litellm\n' FAKE_MANAGED="$TWO_MODELS" \
+    "$SPARK" status --json 2>/dev/null)
+  set -e
+  rm -rf "$tmp"
+  printf '%s' "$json" | jq -e '
+    .ok == true and .gateway.state == "ready" and
+    ([.models[] | select(.state == "ready" and .gateway_model == "vllm/org/Alpha" and .gateway_routed == true)] | length == 1)
+  ' >/dev/null &&
+    printf '%s' "$unhealthy_json" | jq -e '.ok == false and ([.models[] | select(.state == "unhealthy")] | length == 2)' >/dev/null &&
+    [[ "$good_status" -eq 0 && -z "$quiet_out" ]] &&
+    [[ "$bad_status" -ne 0 && -z "$bad_out" ]]
 }
 
 test_dashboard_web_once_writes_product_ui() {
@@ -1655,7 +1710,7 @@ test_status_live_memory() {
     "$SPARK" status 2>&1 || true)
   rm -rf "$tmp"
   [[ "$out" == *"Live:"* ]] && [[ "$out" == *"RAM 108/121 GB used"* ]] && [[ "$out" == *"swap 2/176 GB"* ]] &&
-    [[ "$out" == *"reserved 80.1"* ]] && [[ "$out" == *"now 84.0"* ]] && [[ "$out" == *"peak 90.0"* ]]
+    [[ "$out" == *"80.1 GB reserved"* ]] && [[ "$out" == *"84.0 GB now"* ]] && [[ "$out" == *"90.0 GB peak"* ]]
 }
 
 # --- Unified setup wizard (host vs server picker, parity, bootstrap) ---
@@ -2009,7 +2064,8 @@ test_workspace_check_existing_config_no_mutation() {
   before=$(cat "$env_file")
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
-    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\nopenshell-hermes-test\n' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_VIKUNJA_USER_EXIT=1 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
@@ -3451,9 +3507,9 @@ test_workspace_doctor_json() {
   ' >/dev/null
 }
 
-test_workspace_status_health_summary() {
+test_workspace_status_renders_containers_and_agent_workspace() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out
+  local tmp fake_bin out verbose_out revision_line scoped_line
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
@@ -3464,20 +3520,74 @@ test_workspace_status_health_summary() {
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_PS=$'NAME STATUS\nworkspace-n8n Up' \
+    FAKE_NEMOHERMES_STATUS=$'Sandbox-scoped status for hermes:\n  Model: vllm/Org/Alpha\n  Agent: Hermes Agent\n\nSandbox:\n  Id: abc-123\n  Revision: 1\n\nPolicy:\nprivate policy detail' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws status 2>&1)
+  verbose_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\nopenshell-hermes-test\n' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
+    FAKE_COMPOSE_PS=$'NAME STATUS\nworkspace-n8n Up' \
+    FAKE_NEMOHERMES_STATUS=$'Sandbox-scoped status for hermes:\n  Model: vllm/Org/Alpha\n  Agent: Hermes Agent\n\nSandbox:\n  Id: abc-123\n  Revision: 1\n\nPolicy:\nprivate policy detail' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws status --verbose 2>&1)
+  revision_line=$(printf '%s\n' "$verbose_out" | grep -n 'Revision:' | cut -d: -f1)
+  scoped_line=$(printf '%s\n' "$verbose_out" | grep -n 'Sandbox-scoped status' | cut -d: -f1)
   rm -rf "$tmp"
-  [[ "$out" == *"Workspace health"* ]] &&
-    [[ "$out" == *"[x] Compose postgres"* ]] &&
-    [[ "$out" == *"[x] Vikunja HTTP local"* ]] &&
-    [[ "$out" == *"[x] Vikunja private URL"* ]] &&
-    [[ "$out" == *"[x] n8n private URL"* ]] &&
-    [[ "$out" == *"[x] Hermes private URL"* ]] &&
-    [[ "$out" == *"[x] No public listeners"* ]] &&
-    [[ "$out" == *"[x] LiteLLM Hermes route"* ]] &&
-    [[ "$out" == *"[x] Hermes/NemoClaw"* ]] &&
-    [[ "$out" == *"[x] NemoHermes inference route"* ]]
+  [[ "$out" == *"spark ws status"* ]] &&
+    [[ "$out" == *"Workspace services"* ]] &&
+    [[ "$out" == *"Postgres"* && "$out" == *"Vikunja"* && "$out" == *"n8n"* && "$out" == *"Hermes"* ]] &&
+    [[ "$out" == *"ready"* && "$out" == *"running"* ]] &&
+    [[ "$out" == *"Agent workspace"* ]] &&
+    [[ "$out" == *"Hermes model"* && "$out" == *"Org/Alpha"* ]] &&
+    [[ "$out" == *"Private access"* && "$out" == *"ready"* ]] &&
+    [[ "$out" == *"https://vikunja.test-tailnet.ts.net"* ]] &&
+    [[ "$out" != *"Workspace health"* ]] &&
+    [[ "$out" != *"URLs:"* ]] &&
+    [[ "$out" != *"LiteLLM"* ]] &&
+    [[ "$out" != *"Policy:"* ]] &&
+    [[ "$out" != *"Sandbox-scoped status"* ]] &&
+    [[ "$out" != *"private policy detail"* ]] &&
+    [[ "$verbose_out" == *"Policy:"* ]] &&
+    [[ "$verbose_out" == *"private policy detail"* ]] &&
+    [[ -n "$revision_line" && -n "$scoped_line" && "$scoped_line" -gt "$revision_line" ]]
+}
+
+test_workspace_status_json_quiet_and_containers() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin json quiet_out containers quiet_status status_json
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_min_workspace_config "${tmp}/home"
+  cat > "${tmp}/home/.config/spark/workspace/secrets.env" <<'ENV'
+WORKSPACE_TAILSCALE_MODE=services
+HERMES_MODEL=Org/Alpha
+VIKUNJA_URL=https://vikunja.test-tailnet.ts.net
+N8N_URL=https://n8n.test-tailnet.ts.net
+HERMES_URL=https://hermes.test-tailnet.ts.net
+ENV
+  status_json='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}'
+  json=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_STATUS_JSON="$status_json" FAKE_NAMES='openshell-hermes-test\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' "$SPARK" ws status --json)
+  set +e
+  quiet_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_TAILSCALE_STATUS_JSON="$status_json" FAKE_NAMES='openshell-hermes-test\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' "$SPARK" ws status --quiet 2>&1)
+  quiet_status=$?
+  set -e
+  containers=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NAMES='openshell-hermes-test\nspark-hermes-dashboard-proxy\n' \
+    FAKE_COMPOSE_PS=$'NAME STATUS\nworkspace-n8n Up' "$SPARK" ws containers 2>&1)
+  rm -rf "$tmp"
+  printf '%s' "$json" | jq -e '
+    .ok == true and .access == "ready" and .services.vikunja.state == "ready" and
+    .services.n8n.state == "ready" and .services.hermes.state == "ready"
+  ' >/dev/null &&
+    [[ "$quiet_status" -eq 0 && -z "$quiet_out" ]] &&
+    [[ "$containers" == *"spark ws containers"* ]] &&
+    [[ "$containers" == *"workspace-n8n Up"* ]] &&
+    [[ "$containers" == *"openshell-hermes-test"* ]]
 }
 
 test_workspace_doctor_flags_public_host_listener() {
@@ -6179,10 +6289,18 @@ test_gateway_status_running() {
 test_status_ollama_lists() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"ollama":{"enabled":true}}}' > "${tmp}/home/.config/spark/gateway.json"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
-    FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMOD\nqwen3:30b\tabc\t18\tGB\n" "$SPARK" status 2>&1)
+    FAKE_DOCKER_INFO_EXIT=0 FAKE_NAMES='spark-litellm\n' FAKE_OLLAMA_UP=1 \
+    FAKE_LITELLM_MODELS='{"data":[{"id":"ollama_chat/qwen3:30b"}]}' \
+    FAKE_OLLAMA_PS="NAME\tID\nqwen3:30b\tabc\n" "$SPARK" status 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"qwen3:30b"* ]] && [[ "$out" == *"Engine: Ollama"* ]]
+  [[ "$out" == *"Served models"* ]] && [[ "$out" == *"qwen3:30b"* ]] &&
+    [[ "$out" == *"Direct:  http://localhost:11434/api"* ]] &&
+    [[ "$out" == *"Gateway: http://localhost:4000/v1 · model ollama_chat/qwen3:30b · routed"* ]] &&
+    [[ "$out" == *"Engine: Ollama"* ]] &&
+    [[ "$out" != *"Agent workspace"* ]]
 }
 
 test_stop_ollama_unloads() {
@@ -6224,7 +6342,8 @@ run_test "stop <model> stops only that model" test_stop_specific_model
 run_test "stop --all stops every model" test_stop_all
 run_test "down stops models and gateway" test_down_stops_models_and_gateway
 run_test "stop with no arg and many models asks which" test_stop_ambiguous_requires_target
-run_test "status renders a table" test_status_renders_table
+run_test "status renders served models clearly" test_status_renders_served_models
+run_test "status supports JSON, quiet, and operational exit codes" test_status_json_quiet_and_exit_codes
 run_test "dashboard web writes product UI" test_dashboard_web_once_writes_product_ui
 run_test "dashboard terminal renders product snapshot" test_dashboard_terminal_still_renders_snapshot
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
@@ -6400,7 +6519,8 @@ run_test "workspace setup keeps Hermes dashboard on loopback" test_workspace_set
 run_test "workspace doctor --strict checks pinned images only" test_workspace_doctor_strict_checks_pinned_images
 run_test "workspace doctor --strict flags latest images" test_workspace_doctor_strict_flags_latest_images
 run_test "workspace doctor --json emits structured checks" test_workspace_doctor_json
-run_test "workspace status renders health summary" test_workspace_status_health_summary
+run_test "workspace status renders containers and Agent workspace" test_workspace_status_renders_containers_and_agent_workspace
+run_test "workspace status supports JSON, quiet, and containers" test_workspace_status_json_quiet_and_containers
 run_test "workspace doctor flags public host listener" test_workspace_doctor_flags_public_host_listener
 run_test "workspace doctor rejects public bind addr allowlist" test_workspace_doctor_rejects_public_bind_addr_allowlist
 run_test "workspace doctor rejects non-Tailscale host listener allowlist" test_workspace_doctor_rejects_non_tailscale_host_listener_allowlist
