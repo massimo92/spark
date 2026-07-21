@@ -1200,22 +1200,24 @@ setup_status_summary() {
 }
 
 print_next_steps() {
-  local any=0
-  printf "\n  ${BOLD}Next steps${NC}\n"
+  local inference_only="${1:-0}" any=0 lines=()
   if ! gateway_configured; then
-    printf "  - Run ${BOLD}spark setup${NC} to configure the gateway and backend.\n"; any=1
+    lines+=("Run spark setup to configure the gateway and backend."); any=1
   elif ! gateway_running_state; then
-    printf "  - Run ${BOLD}spark gateway start${NC} to expose the OpenAI-compatible API.\n"; any=1
+    lines+=("Run spark gateway start to expose the OpenAI-compatible API."); any=1
   fi
   if [[ "$BACKEND" == "vllm" && "$(count_running_vllm_models)" -eq 0 ]]; then
-    printf "  - Run ${BOLD}spark models recommend${NC}, then ${BOLD}spark run <model>${NC}.\n"; any=1
+    lines+=("Run spark models recommend, then spark run <model>."); any=1
   elif [[ "$BACKEND" == "ollama" && "$(count_loaded_ollama_models)" -eq 0 ]]; then
-    printf "  - Run ${BOLD}spark models recommend${NC}, then ${BOLD}spark run <model>${NC}.\n"; any=1
+    lines+=("Run spark models recommend, then spark run <model>."); any=1
   fi
-  if ! workspace_configured; then
-    printf "  - Run ${BOLD}spark ws setup${NC} for the daily agent workspace.\n"; any=1
+  if [[ "$inference_only" != "1" ]] && ! workspace_configured; then
+    lines+=("Run spark ws setup for the daily agent workspace."); any=1
   fi
-  [[ "$any" -eq 0 ]] && printf "  - System looks ready. Use ${BOLD}spark dashboard --watch${NC} for live monitoring.\n"
+  [[ "$any" -eq 0 ]] && return 0
+  printf "\n  ${BOLD}Next steps${NC}\n"
+  local line
+  for line in "${lines[@]}"; do printf "  - %s\n" "$line"; done
   return 0
 }
 

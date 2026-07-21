@@ -1,12 +1,13 @@
 
 cmd_status_ollama() {
+  local verbose="${1:-0}"
   printf "  ${BOLD}spark status${NC}\n\n"
   print_system_overview
   printf "  ${DIM}Engine: Ollama (%s) · %s GB unified memory${NC}\n" "$ACCEL" "$TOTAL_MEM_GB"
-  print_setup_overview
-  print_services_overview
+  print_setup_overview "$verbose"
+  print_services_overview 1
   print_models_overview "Served models"
-  print_next_steps
+  print_next_steps 1
   printf "\n"
   return 0
 }
@@ -46,20 +47,38 @@ cmd_status_ollama_legacy() {
 }
 
 cmd_status() {
+  local verbose=0 json_mode=0 quiet=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --verbose) verbose=1 ;;
+      --json) json_mode=1 ;;
+      --quiet) quiet=1 ;;
+      --help|-h)
+        printf "Usage: spark status [--verbose] [--json|--quiet]\n"
+        return 0 ;;
+      *) die "Unknown status option: $1" "Usage: spark status [--verbose] [--json|--quiet]" ;;
+    esac
+    shift
+  done
+  [[ "$json_mode" == "1" && "$quiet" == "1" ]] && die "Choose either --json or --quiet"
+  [[ "$json_mode" == "1" ]] && { cmd_status_json; return $?; }
+  [[ "$quiet" == "1" ]] && { status_operational; return $?; }
   printf "\n"
 
   if [[ "$BACKEND" == "ollama" ]]; then
-    cmd_status_ollama
-    return
+    cmd_status_ollama "$verbose"
+    status_operational
+    return $?
   fi
 
   printf "  ${BOLD}spark status${NC}\n\n"
   print_system_overview
-  print_setup_overview
-  print_services_overview
+  print_setup_overview "$verbose"
+  print_services_overview 1
   print_models_overview "Served models"
-  print_next_steps
+  print_next_steps 1
   printf "\n"
+  status_operational
 }
 
 # spark logs [<model>] [-f] — logs of a model, or the only one running.

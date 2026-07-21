@@ -1200,22 +1200,24 @@ setup_status_summary() {
 }
 
 print_next_steps() {
-  local any=0
-  printf "\n  ${BOLD}Next steps${NC}\n"
+  local inference_only="${1:-0}" any=0 lines=()
   if ! gateway_configured; then
-    printf "  - Run ${BOLD}spark setup${NC} to configure the gateway and backend.\n"; any=1
+    lines+=("Run spark setup to configure the gateway and backend."); any=1
   elif ! gateway_running_state; then
-    printf "  - Run ${BOLD}spark gateway start${NC} to expose the OpenAI-compatible API.\n"; any=1
+    lines+=("Run spark gateway start to expose the OpenAI-compatible API."); any=1
   fi
   if [[ "$BACKEND" == "vllm" && "$(count_running_vllm_models)" -eq 0 ]]; then
-    printf "  - Run ${BOLD}spark models recommend${NC}, then ${BOLD}spark run <model>${NC}.\n"; any=1
+    lines+=("Run spark models recommend, then spark run <model>."); any=1
   elif [[ "$BACKEND" == "ollama" && "$(count_loaded_ollama_models)" -eq 0 ]]; then
-    printf "  - Run ${BOLD}spark models recommend${NC}, then ${BOLD}spark run <model>${NC}.\n"; any=1
+    lines+=("Run spark models recommend, then spark run <model>."); any=1
   fi
-  if ! workspace_configured; then
-    printf "  - Run ${BOLD}spark ws setup${NC} for the daily agent workspace.\n"; any=1
+  if [[ "$inference_only" != "1" ]] && ! workspace_configured; then
+    lines+=("Run spark ws setup for the daily agent workspace."); any=1
   fi
-  [[ "$any" -eq 0 ]] && printf "  - System looks ready. Use ${BOLD}spark dashboard --watch${NC} for live monitoring.\n"
+  [[ "$any" -eq 0 ]] && return 0
+  printf "\n  ${BOLD}Next steps${NC}\n"
+  local line
+  for line in "${lines[@]}"; do printf "  - %s\n" "$line"; done
   return 0
 }
 
@@ -3107,6 +3109,121 @@ container_uptime() {
   fi
 }
 
+status_json_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  printf '%s' "$s"
+}
+
+status_json_number() {
+  local value="${1:-}"
+  if [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then printf '%s' "$value"; else printf 'null'; fi
+}
+
+container_age_seconds() {
+  local name="$1" started_at start_epoch now_epoch
+  started_at=$(docker inspect "$name" --format '{{.State.StartedAt}}' 2>/dev/null || true)
+  [[ -n "$started_at" ]] || return 1
+  start_epoch=$(date -d "$started_at" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%S" "${started_at%%.*}" +%s 2>/dev/null || true)
+  [[ "$start_epoch" =~ ^[0-9]+$ ]] || return 1
+  now_epoch=$(date +%s)
+  printf '%s\n' "$(( now_epoch - start_epoch ))"
+}
+
+model_api_ready() {
+  local port="$1"
+  curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1
+}
+
+gateway_api_ready() {
+  gateway_running_state || return 1
+  curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" >/dev/null 2>&1
+}
+
+gateway_model_routed() {
+  local engine="$1" model="$2" id out
+  case "$engine" in
+    vllm) id="vllm/${model}" ;;
+    ollama) id="ollama_chat/${model}" ;;
+    *) return 1 ;;
+  esac
+  out=$(curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" 2>/dev/null) || return 1
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s\n' "$out" | jq -e --arg id "$id" 'any(.data[]?; .id == $id)' >/dev/null 2>&1
+  else
+    printf '%s\n' "$out" | grep -Fq "\"id\":\"${id}\""
+  fi
+}
+
+status_model_runtime_state() {
+  local name="$1" port="$2" age
+  model_api_ready "$port" && { printf 'ready\n'; return 0; }
+  age=$(container_age_seconds "$name" 2>/dev/null || true)
+  if [[ "$age" =~ ^[0-9]+$ && "$age" -lt 600 ]]; then printf 'starting\n'; else printf 'unhealthy\n'; fi
+  return 1
+}
+
+status_operational() {
+  local name model port rest ready=0
+  docker_running || return 1
+  gateway_api_ready || return 1
+  if [[ "$BACKEND" == "ollama" ]]; then
+    ollama_reachable || return 1
+    while IFS= read -r model; do
+      [[ -n "$model" ]] && gateway_model_routed ollama "$model" && ready=1
+    done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
+    [[ "$ready" == "1" ]]
+    return $?
+  fi
+  while IFS=$'\t' read -r name model port rest; do
+    [[ -n "$name" ]] && model_api_ready "$port" && gateway_model_routed vllm "$model" && ready=1
+  done < <(list_managed_containers)
+  [[ "$ready" == "1" ]]
+}
+
+status_models_json() {
+  local first=1 name model port need wt kv state now pk routed
+  printf '['
+  if [[ "$BACKEND" == "ollama" ]]; then
+    while IFS= read -r model; do
+      [[ -n "$model" ]] || continue
+      [[ "$first" == "1" ]] || printf ','
+      first=0
+      if ollama_reachable; then state=ready; else state=unhealthy; fi
+      if gateway_model_routed ollama "$model"; then routed=true; else routed=false; fi
+      printf '{"name":"%s","engine":"ollama","state":"%s","endpoint":"http://localhost:11434/api","gateway_model":"ollama_chat/%s","gateway_routed":%s}' \
+        "$(status_json_escape "$model")" "$state" "$(status_json_escape "$model")" "$routed"
+    done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
+  else
+    while IFS=$'\t' read -r name model port need wt kv; do
+      [[ -n "$name" ]] || continue
+      [[ "$first" == "1" ]] || printf ','
+      first=0
+      state=$(status_model_runtime_state "$name" "$port" || true)
+      if gateway_model_routed vllm "$model"; then routed=true; else routed=false; fi
+      now=$(container_current_gb "$name"); pk=$(container_peak_gb "$name")
+      printf '{"name":"%s","engine":"vllm","state":"%s","endpoint":"http://localhost:%s/v1","gateway_model":"vllm/%s","gateway_routed":%s,"reserved_gb":%s,"live_gb":%s,"peak_gb":%s}' \
+        "$(status_json_escape "${model:-unknown}")" "$state" "$(status_json_escape "$port")" \
+        "$(status_json_escape "${model:-unknown}")" "$routed" "$(status_json_number "$need")" \
+        "$(status_json_number "$now")" "$(status_json_number "$pk")"
+    done < <(list_managed_containers)
+  fi
+  printf ']'
+}
+
+cmd_status_json() {
+  local ok=false gateway_state=stopped models
+  status_operational && ok=true
+  if gateway_api_ready; then gateway_state=ready; elif gateway_running_state; then gateway_state=not-ready; fi
+  models=$(status_models_json)
+  printf '{"ok":%s,"backend":"%s","docker":"%s","gateway":{"state":"%s","port":%s,"endpoint":"http://localhost:%s/v1"},"models":%s}\n' \
+    "$ok" "$(status_json_escape "$BACKEND")" "$(docker_running && printf running || printf stopped)" \
+    "$gateway_state" "$(status_json_number "$(gateway_configured_port)")" "$(gateway_configured_port)" "$models"
+  [[ "$ok" == "true" ]]
+}
+
 # spark status on the Ollama backend: list pulled + loaded models and the gateway route.
 print_system_overview() {
   printf "  ${BOLD}System${NC}\n"
@@ -3117,11 +3234,12 @@ print_system_overview() {
 }
 
 print_setup_overview() {
-  local summary state="partial"
+  local verbose="${1:-1}" summary state="partial"
   summary=$(setup_status_summary)
   [[ "$summary" == */* && "$summary" != *"missing:"* ]] && state="ok"
   printf "\n  ${BOLD}Setup${NC}\n"
   dashboard_row "$state" "prerequisites" "$summary"
+  [[ "$verbose" != "1" && "$state" == "ok" ]] && return 0
   if [[ "$BACKEND" == "vllm" ]]; then
     if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
       dashboard_row ok "GPU" "$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1 || echo detected)"
@@ -3137,12 +3255,18 @@ print_setup_overview() {
 }
 
 print_services_overview() {
-  local gw_state="stopped" gw_detail ws_count
+  local inference_only="${1:-0}" gw_state="stopped" gw_detail ws_count
   printf "\n  ${BOLD}Services${NC}\n"
-  if gateway_running_state; then gw_state="running"; fi
-  gw_detail="port $(gateway_configured_port) · providers $(gateway_provider_list)"
+  if gateway_api_ready; then
+    gw_state="ready"; gw_detail="ready · port $(gateway_configured_port) · providers $(gateway_provider_list)"
+  elif gateway_running_state; then
+    gw_state="warn"; gw_detail="not ready · port $(gateway_configured_port) · providers $(gateway_provider_list)"
+  else
+    gw_detail="stopped · port $(gateway_configured_port) · providers $(gateway_provider_list)"
+  fi
   dashboard_row "$gw_state" "LiteLLM gateway" "$gw_detail"
   if docker_running; then dashboard_row ok "Docker" "running"; else dashboard_row missing "Docker" "not running"; fi
+  [[ "$inference_only" == "1" ]] && return 0
   if workspace_configured; then
     ws_count=$(workspace_service_count)
     if [[ "$ws_count" -gt 0 ]]; then dashboard_row running "Workspace compose" "${ws_count} service(s) running"; else dashboard_row stopped "Workspace compose" "configured, no running services"; fi
@@ -3175,10 +3299,15 @@ print_vllm_model_table() {
     return 0
   fi
 
-  local i now pk
+  local i now pk state state_color route_state
   for i in "${!models[@]}"; do
-    printf "  ${GREEN}●${NC} ${BOLD}%s${NC}\n" "${models[$i]}"
-    printf "    Serving: vLLM · http://localhost:%s/v1 · up %s\n" "${ports[$i]}" "${ups[$i]}"
+    state=$(status_model_runtime_state "${cnames[$i]}" "${ports[$i]}" || true)
+    case "$state" in ready) state_color="$GREEN" ;; starting) state_color="$YELLOW" ;; *) state_color="$RED" ;; esac
+    printf "  ${state_color}●${NC} ${BOLD}%s${NC}  %s%s%s\n" "${models[$i]}" "$state_color" "$state" "$NC"
+    printf "    Direct:  http://localhost:%s/v1 · up %s\n" "${ports[$i]}" "${ups[$i]}"
+    if gateway_model_routed vllm "${models[$i]}"; then route_state="routed"; else route_state="not routed"; fi
+    printf "    Gateway: http://localhost:%s/v1 · model vllm/%s · %s\n" \
+      "$(gateway_configured_port)" "${models[$i]}" "$route_state"
     printf "    Memory:  %s GB weights · %s GB KV cache · %s GB reserved\n" \
       "${wts[$i]}" "${kvs[$i]}" "${needs[$i]}"
     now=$(container_current_gb "${cnames[$i]}"); pk=$(container_peak_gb "${cnames[$i]}")
@@ -3188,7 +3317,7 @@ print_vllm_model_table() {
   done
   local free
   free=$(awk -v b="$BUDGET_GB" -v r="$reserved" 'BEGIN{printf "%.1f", b-r}')
-  printf "  ${DIM}Capacity: %s GB total · %s GB OS · %s GB models · %s GB free${NC}\n" \
+  printf "  ${DIM}Capacity: %s GB total · %s GB OS · %s GB allocated · %s GB allocatable${NC}\n" \
     "$TOTAL_MEM_GB" "$OS_RESERVE_GB" "$reserved" "$free"
 
   local host_line
@@ -3205,7 +3334,7 @@ print_ollama_model_table() {
     dashboard_row missing "Ollama models" "Ollama not installed"
     return 0
   fi
-  local model loaded=()
+  local model loaded=() state state_color route_state
   while IFS= read -r model; do
     [[ -n "$model" ]] && loaded+=("$model")
   done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
@@ -3213,9 +3342,13 @@ print_ollama_model_table() {
     dashboard_row missing "models" "none being served"
     return 0
   fi
+  if ollama_reachable; then state=ready; state_color="$GREEN"; else state=unhealthy; state_color="$RED"; fi
   for model in "${loaded[@]}"; do
-    printf "  ${GREEN}●${NC} ${BOLD}%s${NC}\n" "$model"
-    printf "    Serving: Ollama · http://localhost:11434/api\n"
+    printf "  ${state_color}●${NC} ${BOLD}%s${NC}  %s%s%s\n" "$model" "$state_color" "$state" "$NC"
+    printf "    Direct:  http://localhost:11434/api\n"
+    if gateway_model_routed ollama "$model"; then route_state="routed"; else route_state="not routed"; fi
+    printf "    Gateway: http://localhost:%s/v1 · model ollama_chat/%s · %s\n" \
+      "$(gateway_configured_port)" "$model" "$route_state"
   done
   return 0
 }
@@ -3591,13 +3724,14 @@ cmd_dashboard() {
 }
 
 cmd_status_ollama() {
+  local verbose="${1:-0}"
   printf "  ${BOLD}spark status${NC}\n\n"
   print_system_overview
   printf "  ${DIM}Engine: Ollama (%s) · %s GB unified memory${NC}\n" "$ACCEL" "$TOTAL_MEM_GB"
-  print_setup_overview
-  print_services_overview
+  print_setup_overview "$verbose"
+  print_services_overview 1
   print_models_overview "Served models"
-  print_next_steps
+  print_next_steps 1
   printf "\n"
   return 0
 }
@@ -3637,20 +3771,38 @@ cmd_status_ollama_legacy() {
 }
 
 cmd_status() {
+  local verbose=0 json_mode=0 quiet=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --verbose) verbose=1 ;;
+      --json) json_mode=1 ;;
+      --quiet) quiet=1 ;;
+      --help|-h)
+        printf "Usage: spark status [--verbose] [--json|--quiet]\n"
+        return 0 ;;
+      *) die "Unknown status option: $1" "Usage: spark status [--verbose] [--json|--quiet]" ;;
+    esac
+    shift
+  done
+  [[ "$json_mode" == "1" && "$quiet" == "1" ]] && die "Choose either --json or --quiet"
+  [[ "$json_mode" == "1" ]] && { cmd_status_json; return $?; }
+  [[ "$quiet" == "1" ]] && { status_operational; return $?; }
   printf "\n"
 
   if [[ "$BACKEND" == "ollama" ]]; then
-    cmd_status_ollama
-    return
+    cmd_status_ollama "$verbose"
+    status_operational
+    return $?
   fi
 
   printf "  ${BOLD}spark status${NC}\n\n"
   print_system_overview
-  print_setup_overview
-  print_services_overview
+  print_setup_overview "$verbose"
+  print_services_overview 1
   print_models_overview "Served models"
-  print_next_steps
+  print_next_steps 1
   printf "\n"
+  status_operational
 }
 
 # spark logs [<model>] [-f] — logs of a model, or the only one running.
@@ -7302,7 +7454,13 @@ workspace_setup() {
 }
 
 workspace_print_verbose_hermes_status() {
-  local out
+  local out json
+  json=$(nemohermes hermes status --json 2>/dev/null || true)
+  if command -v jq >/dev/null 2>&1 && printf '%s\n' "$json" | jq -e . >/dev/null 2>&1; then
+    printf "  ${BOLD}NemoHermes details${NC}\n"
+    printf '%s\n' "$json" | jq .
+    return 0
+  fi
   out=$(nemohermes hermes status 2>/dev/null || nemohermes status 2>/dev/null || true)
   printf '%s\n' "$out" | awk '
     /Sandbox-scoped status for/ { capture=1 }
@@ -7327,37 +7485,147 @@ workspace_print_verbose_hermes_status() {
   '
 }
 
+workspace_service_runtime_state() {
+  local service="$1"
+  workspace_compose_service_running "$service" || { printf 'stopped\n'; return 1; }
+  case "$service" in
+    vikunja) workspace_vikunja_http_ready && { printf 'ready\n'; return 0; } ;;
+    n8n) workspace_n8n_http_ready && { printf 'ready\n'; return 0; } ;;
+    postgres) printf 'running\n'; return 0 ;;
+  esac
+  printf 'running-not-ready\n'
+  return 1
+}
+
+workspace_hermes_runtime_state() {
+  local container age
+  container=$(workspace_hermes_running_container_name 2>/dev/null || true)
+  [[ -n "$container" ]] || { printf 'stopped\n'; return 1; }
+  workspace_hermes_local_api_ready && { printf 'ready\n'; return 0; }
+  age=$(container_age_seconds "$container" 2>/dev/null || true)
+  if [[ "$age" =~ ^[0-9]+$ && "$age" -lt 600 ]]; then printf 'starting\n'; else printf 'unhealthy\n'; fi
+  return 1
+}
+
+workspace_access_runtime_state() {
+  workspace_tailscale_connected || { printf 'disconnected\n'; return 1; }
+  workspace_tailscale_services_configured || { printf 'not-configured\n'; return 1; }
+  printf 'ready\n'
+}
+
+workspace_status_operational() {
+  workspace_configured || return 1
+  [[ "$(workspace_service_runtime_state postgres || true)" == "running" ]] || return 1
+  [[ "$(workspace_service_runtime_state vikunja || true)" == "ready" ]] || return 1
+  [[ "$(workspace_service_runtime_state n8n || true)" == "ready" ]] || return 1
+  [[ "$(workspace_hermes_runtime_state || true)" == "ready" ]] || return 1
+  [[ "$(workspace_access_runtime_state || true)" == "ready" ]]
+}
+
+workspace_print_service_row() {
+  local state="$1" service="$2" access="$3" color
+  case "$state" in
+    ready|running) color="$GREEN" ;;
+    stopped|starting|running-not-ready) color="$YELLOW" ;;
+    unhealthy) color="$RED" ;;
+    *) color="$DIM" ;;
+  esac
+  printf "  ${color}%-20s${NC} %-22s %s\n" "$state" "$service" "$access"
+}
+
+workspace_print_status_summary() {
+  local postgres_state vikunja_state n8n_state hermes_state access_state mode model
+  local vikunja_url n8n_url hermes_url
+  postgres_state=$(workspace_service_runtime_state postgres || true)
+  vikunja_state=$(workspace_service_runtime_state vikunja || true)
+  n8n_state=$(workspace_service_runtime_state n8n || true)
+  hermes_state=$(workspace_hermes_runtime_state || true)
+  access_state=$(workspace_access_runtime_state || true)
+  mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  vikunja_url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
+  hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
+
+  printf "\n  ${BOLD}Workspace services${NC}\n"
+  printf "  ${DIM}%-20s %-22s %s${NC}\n" "STATE" "SERVICE" "ACCESS"
+  workspace_print_service_row "$postgres_state" "Postgres" "internal"
+  workspace_print_service_row "$vikunja_state" "Vikunja" "${vikunja_url:-unset}"
+  workspace_print_service_row "$n8n_state" "n8n" "${n8n_url:-unset}"
+  workspace_print_service_row "$hermes_state" "Hermes" "${hermes_url:-unset}"
+
+  printf "\n  ${BOLD}Agent workspace${NC}\n"
+  printf "  %-22s %s\n" "Mode" "${mode:-unset}"
+  printf "  %-22s %s\n" "Hermes model" "${model:-unset}"
+  printf "  %-22s %s\n" "Private access" "$access_state"
+}
+
+workspace_status_json() {
+  local ok=false postgres_state vikunja_state n8n_state hermes_state access_state mode model
+  local vikunja_url n8n_url hermes_url
+  workspace_status_operational && ok=true
+  postgres_state=$(workspace_service_runtime_state postgres || true)
+  vikunja_state=$(workspace_service_runtime_state vikunja || true)
+  n8n_state=$(workspace_service_runtime_state n8n || true)
+  hermes_state=$(workspace_hermes_runtime_state || true)
+  access_state=$(workspace_access_runtime_state || true)
+  mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  vikunja_url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
+  hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
+  printf '{"ok":%s,"mode":"%s","hermes_model":"%s","access":"%s","services":{"postgres":{"state":"%s"},"vikunja":{"state":"%s","url":"%s"},"n8n":{"state":"%s","url":"%s"},"hermes":{"state":"%s","url":"%s"}}}\n' \
+    "$ok" "$(workspace_json_escape "$mode")" "$(workspace_json_escape "$model")" \
+    "$access_state" "$postgres_state" "$vikunja_state" "$(workspace_json_escape "$vikunja_url")" \
+    "$n8n_state" "$(workspace_json_escape "$n8n_url")" "$hermes_state" "$(workspace_json_escape "$hermes_url")"
+  [[ "$ok" == "true" ]]
+}
+
+cmd_workspace_containers() {
+  [[ $# -eq 0 ]] || die "Usage: spark ws containers"
+  printf "\n  ${BOLD}spark ws containers${NC}\n\n"
+  workspace_configured || die "Workspace not configured" "Run: spark ws setup"
+  workspace_compose ps 2>/dev/null || warn "Compose project ${WORKSPACE_PROJECT} not reachable"
+  printf "\n"
+  docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null \
+    | grep -E '(^NAMES|openshell-hermes|spark-hermes-(litellm|dashboard)-proxy)' || true
+  printf "\n"
+}
+
 cmd_workspace_status() {
-  local verbose=0
+  local verbose=0 json_mode=0 quiet=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --verbose) verbose=1 ;;
+      --json) json_mode=1 ;;
+      --quiet) quiet=1 ;;
       --help|-h)
-        printf "Usage: spark ws status [--verbose]\n"
+        printf "Usage: spark ws status [--verbose] [--json|--quiet]\n"
         printf "  --verbose  Include full NemoHermes sandbox and policy details.\n"
         return 0
         ;;
-      *) die "Unknown ws status option: $1" "Usage: spark ws status [--verbose]" ;;
+      *) die "Unknown ws status option: $1" "Usage: spark ws status [--verbose] [--json|--quiet]" ;;
     esac
     shift
   done
-  printf "\n  ${BOLD}spark ws containers${NC}\n\n"
-  if [[ -f "$WORKSPACE_COMPOSE_FILE" ]]; then
-    workspace_compose ps 2>/dev/null || warn "Compose project ${WORKSPACE_PROJECT} not reachable"
-  else
+  [[ "$json_mode" == "1" && "$quiet" == "1" ]] && die "Choose either --json or --quiet"
+  [[ "$json_mode" == "1" ]] && { workspace_status_json; return $?; }
+  [[ "$quiet" == "1" ]] && { workspace_status_operational; return $?; }
+  printf "\n  ${BOLD}spark ws status${NC}\n"
+  if ! workspace_configured; then
     warn "Workspace not configured"
+    printf "\n"
+    return 1
   fi
-  print_workspace_overview
+  workspace_print_status_summary
   if [[ "$verbose" == "1" ]] && command -v nemohermes >/dev/null 2>&1; then
     printf "\n"
     workspace_print_verbose_hermes_status
   elif ! command -v nemohermes >/dev/null 2>&1; then
     warn "NemoHermes not installed"
   fi
-  if command -v tailscale >/dev/null 2>&1; then
-    workspace_print_tailscale_runtime_status
-  fi
   printf "\n"
+  workspace_status_operational
 }
 
 workspace_migrate_runtime_config() {
@@ -9008,7 +9276,8 @@ cmd_workspace_help() {
     start      Start the configured workspace runtime
     stop       Stop the workspace runtime and preserve all data
     restart    Stop and start the configured workspace runtime
-    status     Show workspace health; --verbose includes full policy details
+    status     Show operational workspace state
+    containers Show raw workspace container state
     logs       Follow logs for vikunja, n8n, postgres, hermes, or gateway
     doctor     Read-only workspace check
     backup     Back up Vikunja, n8n, and Hermes state
@@ -9049,6 +9318,7 @@ cmd_workspace() {
     stop)   workspace_stop "$@" ;;
     restart) workspace_restart "$@" ;;
     status) cmd_workspace_status "$@" ;;
+    containers) cmd_workspace_containers "$@" ;;
     logs)   cmd_workspace_logs "$@" ;;
     doctor) cmd_workspace_doctor "$@" ;;
     backup) cmd_workspace_backup "$@" ;;
@@ -10159,7 +10429,10 @@ gateway_remove() {
 }
 # --- Main ---
 main() {
-  check_for_updates
+  case "${1:-}:${2:-}" in
+    status:--json|status:--quiet|ws:status) ;;
+    *) check_for_updates ;;
+  esac
 
   case "${1:-}" in
     run)          shift; cmd_run "$@" ;;
@@ -10172,7 +10445,7 @@ main() {
     models)       shift; cmd_models "$@" ;;
     list)         cmd_list ;;
     rm)           shift; cmd_rm "$@" ;;
-    status)       cmd_status ;;
+    status)       shift; cmd_status "$@" ;;
     logs)         shift; cmd_logs "$@" ;;
     doctor)       shift; cmd_doctor "$@" ;;
     setup)        shift; cmd_setup "$@" ;;

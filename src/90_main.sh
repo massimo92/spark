@@ -1,6 +1,9 @@
 # --- Main ---
 main() {
-  check_for_updates
+  case "${1:-}:${2:-}" in
+    status:--json|status:--quiet|ws:status) ;;
+    *) check_for_updates ;;
+  esac
 
   case "${1:-}" in
     run)          shift; cmd_run "$@" ;;
@@ -13,7 +16,7 @@ main() {
     models)       shift; cmd_models "$@" ;;
     list)         cmd_list ;;
     rm)           shift; cmd_rm "$@" ;;
-    status)       cmd_status ;;
+    status)       shift; cmd_status "$@" ;;
     logs)         shift; cmd_logs "$@" ;;
     doctor)       shift; cmd_doctor "$@" ;;
     setup)        shift; cmd_setup "$@" ;;
