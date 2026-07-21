@@ -2631,8 +2631,17 @@ workspace_trim() {
 }
 
 WORKSPACE_DOCTOR_FAILED=0
-WORKSPACE_DOCTOR_JSON=0
+WORKSPACE_DOCTOR_VERBOSE=0
+WORKSPACE_DOCTOR_TOTAL=0
+WORKSPACE_DOCTOR_PASSED=0
+WORKSPACE_DOCTOR_CATEGORY=""
+WORKSPACE_DOCTOR_ACTION=""
 WORKSPACE_DOCTOR_JSON_ITEMS=()
+WORKSPACE_DOCTOR_CATEGORIES=()
+WORKSPACE_DOCTOR_LABELS=()
+WORKSPACE_DOCTOR_RESULTS=()
+WORKSPACE_DOCTOR_ACTIONS=()
+WORKSPACE_DOCTOR_SECTIONS=()
 
 workspace_doctor_json_escape() {
   local s="$1"
@@ -2642,13 +2651,10 @@ workspace_doctor_json_escape() {
   printf '%s' "$s"
 }
 
-workspace_doctor_pass() {
-  printf "  [x] %s\n" "$1"
-}
-
-workspace_doctor_fail() {
-  printf "  [ ] %s\n" "$1"
-  WORKSPACE_DOCTOR_FAILED=$((WORKSPACE_DOCTOR_FAILED + 1))
+workspace_doctor_section() {
+  WORKSPACE_DOCTOR_CATEGORY="$1"
+  WORKSPACE_DOCTOR_ACTION="$2"
+  WORKSPACE_DOCTOR_SECTIONS+=("$1")
 }
 
 workspace_doctor_id_from_label() {
@@ -2661,33 +2667,94 @@ workspace_doctor_check() {
   local label="$1" id
   shift
   id=$(workspace_doctor_id_from_label "$label")
+  WORKSPACE_DOCTOR_TOTAL=$((WORKSPACE_DOCTOR_TOTAL + 1))
+  WORKSPACE_DOCTOR_CATEGORIES+=("$WORKSPACE_DOCTOR_CATEGORY")
+  WORKSPACE_DOCTOR_LABELS+=("$label")
+  WORKSPACE_DOCTOR_ACTIONS+=("$WORKSPACE_DOCTOR_ACTION")
   if "$@"; then
-    if [[ "$WORKSPACE_DOCTOR_JSON" == "1" ]]; then
-      WORKSPACE_DOCTOR_JSON_ITEMS+=("{\"id\":\"$(workspace_doctor_json_escape "$id")\",\"label\":\"$(workspace_doctor_json_escape "$label")\",\"ok\":true}")
-    else
-      workspace_doctor_pass "$label"
-    fi
+    WORKSPACE_DOCTOR_PASSED=$((WORKSPACE_DOCTOR_PASSED + 1))
+    WORKSPACE_DOCTOR_RESULTS+=("ok")
+    WORKSPACE_DOCTOR_JSON_ITEMS+=("{\"id\":\"$(workspace_doctor_json_escape "$id")\",\"category\":\"$(workspace_doctor_json_escape "$WORKSPACE_DOCTOR_CATEGORY")\",\"label\":\"$(workspace_doctor_json_escape "$label")\",\"ok\":true,\"action\":\"$(workspace_doctor_json_escape "$WORKSPACE_DOCTOR_ACTION")\"}")
   else
-    if [[ "$WORKSPACE_DOCTOR_JSON" == "1" ]]; then
-      WORKSPACE_DOCTOR_JSON_ITEMS+=("{\"id\":\"$(workspace_doctor_json_escape "$id")\",\"label\":\"$(workspace_doctor_json_escape "$label")\",\"ok\":false}")
-      WORKSPACE_DOCTOR_FAILED=$((WORKSPACE_DOCTOR_FAILED + 1))
-    else
-      workspace_doctor_fail "$label"
-    fi
+    WORKSPACE_DOCTOR_FAILED=$((WORKSPACE_DOCTOR_FAILED + 1))
+    WORKSPACE_DOCTOR_RESULTS+=("fail")
+    WORKSPACE_DOCTOR_JSON_ITEMS+=("{\"id\":\"$(workspace_doctor_json_escape "$id")\",\"category\":\"$(workspace_doctor_json_escape "$WORKSPACE_DOCTOR_CATEGORY")\",\"label\":\"$(workspace_doctor_json_escape "$label")\",\"ok\":false,\"action\":\"$(workspace_doctor_json_escape "$WORKSPACE_DOCTOR_ACTION")\"}")
   fi
 }
 
 workspace_doctor_print_json() {
-  local model="$1" items=""
+  local model="$1" items="" first=1 category i category_passed category_failed
   if [[ ${#WORKSPACE_DOCTOR_JSON_ITEMS[@]} -gt 0 ]]; then
     local IFS=,
     items="${WORKSPACE_DOCTOR_JSON_ITEMS[*]}"
   fi
-  printf '{"ok":%s,"failed":%d,"model":"%s","checks":[%s]}\n' \
+  printf '{"ok":%s,"passed":%d,"failed":%d,"total":%d,"model":"%s","areas":[' \
     "$( [[ "$WORKSPACE_DOCTOR_FAILED" -eq 0 ]] && printf true || printf false )" \
-    "$WORKSPACE_DOCTOR_FAILED" \
-    "$(workspace_doctor_json_escape "$model")" \
-    "$items"
+    "$WORKSPACE_DOCTOR_PASSED" "$WORKSPACE_DOCTOR_FAILED" "$WORKSPACE_DOCTOR_TOTAL" \
+    "$(workspace_doctor_json_escape "$model")"
+  for category in "${WORKSPACE_DOCTOR_SECTIONS[@]}"; do
+    category_passed=0; category_failed=0
+    for i in "${!WORKSPACE_DOCTOR_CATEGORIES[@]}"; do
+      [[ "${WORKSPACE_DOCTOR_CATEGORIES[$i]}" == "$category" ]] || continue
+      if [[ "${WORKSPACE_DOCTOR_RESULTS[$i]}" == "ok" ]]; then
+        category_passed=$((category_passed + 1))
+      else
+        category_failed=$((category_failed + 1))
+      fi
+    done
+    [[ "$first" == "1" ]] || printf ','
+    first=0
+    printf '{"name":"%s","passed":%d,"failed":%d,"total":%d}' \
+      "$(workspace_doctor_json_escape "$category")" "$category_passed" "$category_failed" "$((category_passed + category_failed))"
+  done
+  printf '],"checks":[%s]}\n' "$items"
+}
+
+workspace_doctor_print_human() {
+  local category i category_passed category_failed state action
+  printf "\n  ${BOLD}spark ws doctor${NC}\n\n"
+  printf "  ${BOLD}Result${NC}\n"
+  if [[ "$WORKSPACE_DOCTOR_FAILED" -eq 0 ]]; then
+    printf "  ${GREEN}ok${NC}         %d/%d checks passed\n" "$WORKSPACE_DOCTOR_PASSED" "$WORKSPACE_DOCTOR_TOTAL"
+  else
+    printf "  ${RED}attention${NC}  %d/%d checks passed · %d issue(s)\n" \
+      "$WORKSPACE_DOCTOR_PASSED" "$WORKSPACE_DOCTOR_TOTAL" "$WORKSPACE_DOCTOR_FAILED"
+  fi
+
+  printf "\n  ${BOLD}Areas${NC}\n"
+  for category in "${WORKSPACE_DOCTOR_SECTIONS[@]}"; do
+    category_passed=0; category_failed=0
+    for i in "${!WORKSPACE_DOCTOR_CATEGORIES[@]}"; do
+      [[ "${WORKSPACE_DOCTOR_CATEGORIES[$i]}" == "$category" ]] || continue
+      if [[ "${WORKSPACE_DOCTOR_RESULTS[$i]}" == "ok" ]]; then
+        category_passed=$((category_passed + 1))
+      else
+        category_failed=$((category_failed + 1))
+      fi
+    done
+    if [[ "$category_failed" -eq 0 ]]; then state="${GREEN}ok${NC}"; else state="${RED}issue${NC}"; fi
+    printf "  %-16b %-24s %d/%d\n" "$state" "$category" "$category_passed" "$((category_passed + category_failed))"
+  done
+
+  if [[ "$WORKSPACE_DOCTOR_FAILED" -gt 0 ]]; then
+    printf "\n  ${BOLD}Issues${NC}\n"
+    for i in "${!WORKSPACE_DOCTOR_LABELS[@]}"; do
+      [[ "${WORKSPACE_DOCTOR_RESULTS[$i]}" == "fail" ]] || continue
+      printf "  ${RED}[ ]${NC} %s\n" "${WORKSPACE_DOCTOR_LABELS[$i]}"
+      printf "      Area: %s\n" "${WORKSPACE_DOCTOR_CATEGORIES[$i]}"
+      action="${WORKSPACE_DOCTOR_ACTIONS[$i]}"
+      [[ -z "$action" ]] || printf "      Try:  %s\n" "$action"
+    done
+  fi
+
+  if [[ "$WORKSPACE_DOCTOR_VERBOSE" == "1" ]]; then
+    printf "\n  ${BOLD}Checks${NC}\n"
+    for i in "${!WORKSPACE_DOCTOR_LABELS[@]}"; do
+      if [[ "${WORKSPACE_DOCTOR_RESULTS[$i]}" == "ok" ]]; then state="${GREEN}[x]${NC}"; else state="${RED}[ ]${NC}"; fi
+      printf "  %b %s · %s\n" "$state" "${WORKSPACE_DOCTOR_LABELS[$i]}" "${WORKSPACE_DOCTOR_CATEGORIES[$i]}"
+    done
+  fi
+  printf "\n"
 }
 
 workspace_env_has() {
@@ -3742,13 +3809,15 @@ workspace_hermes_dashboard_url_ready() {
 cmd_workspace_doctor_help() {
   cat <<EOF
 
-  ${BOLD}Usage:${NC} spark ws doctor [--strict] [--json] [--model MODEL] [--remote user@host]
+  ${BOLD}Usage:${NC} spark ws doctor [--strict] [--verbose] [--json|--quiet] [--model MODEL] [--remote user@host]
 
   Read-only workspace diagnosis. Checks config, secrets, Compose, Postgres, Vikunja,
   n8n, Tailscale private access, LiteLLM, Hermes/NemoClaw, and public exposure risks.
 
   ${BOLD}Flags:${NC}
+    --verbose           Show every check instead of the area summary only.
     --json              Machine-readable output for CI/automation.
+    --quiet             Print nothing; use only the exit code.
     --strict            Adds production checks, currently pinned image refs.
     --model MODEL       Validate Hermes route/model when it cannot be inferred from config.
     --remote user@host  Run the doctor on a configured remote host.
@@ -3757,10 +3826,12 @@ EOF
 }
 
 cmd_workspace_doctor() {
-  local requested_model="" remote_spec="" model json_mode=0 strict_mode=0
+  local requested_model="" remote_spec="" model json_mode=0 strict_mode=0 verbose=0 quiet=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json) json_mode=1; shift ;;
+      --quiet) quiet=1; shift ;;
+      --verbose) verbose=1; shift ;;
       --strict) strict_mode=1; shift ;;
       --model) requested_model="${2:-}"; [[ -n "$requested_model" ]] || die "--model requires a value"; shift 2 ;;
       --remote) remote_spec="${2:-}"; [[ -n "$remote_spec" ]] || die "--remote requires user@host"; shift 2 ;;
@@ -3768,29 +3839,51 @@ cmd_workspace_doctor() {
       *) die "Unknown ws doctor flag: $1" ;;
     esac
   done
+  [[ "$json_mode" == "1" && "$quiet" == "1" ]] && die "Choose either --json or --quiet"
   if [[ -n "$remote_spec" ]]; then
     local args=(doctor)
     [[ "$strict_mode" == "1" ]] && args+=(--strict)
     [[ "$json_mode" == "1" ]] && args+=(--json)
+    [[ "$quiet" == "1" ]] && args+=(--quiet)
+    [[ "$verbose" == "1" ]] && args+=(--verbose)
     [[ -n "$requested_model" ]] && args+=(--model "$requested_model")
     workspace_remote_workspace_cmd "$remote_spec" "${args[@]}"
     return $?
   fi
 
   WORKSPACE_DOCTOR_FAILED=0
-  WORKSPACE_DOCTOR_JSON="$json_mode"
+  WORKSPACE_DOCTOR_VERBOSE="$verbose"
+  WORKSPACE_DOCTOR_TOTAL=0
+  WORKSPACE_DOCTOR_PASSED=0
+  WORKSPACE_DOCTOR_CATEGORY=""
+  WORKSPACE_DOCTOR_ACTION=""
   WORKSPACE_DOCTOR_JSON_ITEMS=()
+  WORKSPACE_DOCTOR_CATEGORIES=()
+  WORKSPACE_DOCTOR_LABELS=()
+  WORKSPACE_DOCTOR_RESULTS=()
+  WORKSPACE_DOCTOR_ACTIONS=()
+  WORKSPACE_DOCTOR_SECTIONS=()
   model="$requested_model"
   [[ -n "$model" ]] || model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
 
-  [[ "$json_mode" == "1" ]] || printf "\n  ${BOLD}spark ws doctor${NC}\n\n"
+  if ! workspace_configured; then
+    workspace_doctor_section "Configuration" "spark ws setup"
+    workspace_doctor_check "Workspace is configured" workspace_configured
+    if [[ "$json_mode" == "1" ]]; then
+      workspace_doctor_print_json "$model"
+    elif [[ "$quiet" == "0" ]]; then
+      workspace_doctor_print_human
+    fi
+    return 1
+  fi
+
+  workspace_doctor_section "Configuration" "spark ws setup"
   workspace_doctor_check "Config directory exists" test -d "$WORKSPACE_CONFIG_DIR"
   workspace_doctor_check "Config directory mode is 0700" workspace_file_mode_is "$WORKSPACE_CONFIG_DIR" 700
   workspace_doctor_check "Data directory exists" test -d "$WORKSPACE_DATA_DIR"
   workspace_doctor_check "Secrets file exists" test -f "$WORKSPACE_ENV_FILE"
   workspace_doctor_check "Secrets file mode is 0600" workspace_file_mode_is "$WORKSPACE_ENV_FILE" 600
   workspace_doctor_check "Secrets env syntax is valid" workspace_env_file_syntax_valid "$WORKSPACE_ENV_FILE"
-  workspace_doctor_check "Human service passwords are not stored" workspace_human_password_not_stored
   workspace_doctor_check "Compose file exists" test -f "$WORKSPACE_COMPOSE_FILE"
   workspace_doctor_check "Scoped service env files exist and are 0600" workspace_service_env_files_ready
   workspace_doctor_check "Scoped service env syntax is valid" workspace_service_env_files_syntax_valid
@@ -3803,6 +3896,9 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Compose applies runtime hardening and log rotation" workspace_compose_runtime_hardened
   workspace_doctor_check "Shared Postgres initializes Vikunja and n8n DBs" workspace_compose_shared_postgres
   workspace_doctor_check "Compose uses private host bindings only" workspace_compose_uses_loopback_ports
+
+  workspace_doctor_section "Identity & recovery" "spark ws setup"
+  workspace_doctor_check "Human service passwords are not stored" workspace_human_password_not_stored
   workspace_doctor_check "Vikunja registration/link sharing disabled" workspace_vikunja_locked_down
   workspace_doctor_check "Vikunja internal doctor passes" workspace_vikunja_doctor_ok
   workspace_doctor_check "Vikunja human user exists" workspace_vikunja_human_ready
@@ -3819,6 +3915,8 @@ cmd_workspace_doctor() {
     HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
     VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_USER_STATUS WORKSPACE_SMTP_ENABLED
   workspace_doctor_check "Workspace technical secrets are unique per service" workspace_credentials_are_distinct
+
+  workspace_doctor_section "Runtime services" "spark ws restart"
   workspace_doctor_check "Compose service running: postgres" workspace_compose_service_running postgres
   workspace_doctor_check "Shared Postgres runtime has Vikunja and n8n roles/databases" workspace_postgres_shared_runtime_ready
   workspace_doctor_check "Compose service running: vikunja" workspace_compose_service_running vikunja
@@ -3827,6 +3925,8 @@ cmd_workspace_doctor() {
   workspace_doctor_check "n8n HTTP endpoint ready" workspace_n8n_http_ready
   workspace_doctor_check "No workspace/gateway port is published on 0.0.0.0" workspace_runtime_ports_not_public
   workspace_doctor_check "Host listeners for workspace/gateway are loopback-only" workspace_host_listeners_loopback_only
+
+  workspace_doctor_section "Private access" "spark ws setup"
   workspace_doctor_check "Tailscale connected" workspace_tailscale_connected
   workspace_doctor_check "Tailscale supports selected private access mode" workspace_tailscale_requested_version_ok
   workspace_doctor_check "Tailscale Funnel disabled" workspace_tailscale_funnel_disabled
@@ -3836,6 +3936,8 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Tailscale local config maps vikunja, n8n, hermes" workspace_tailscale_services_configured
   workspace_doctor_check "Tailscale mode is Services or ports" workspace_tailscale_services_mode
   workspace_doctor_check "Tailscale workspace URLs respond" workspace_tailscale_https_urls_ready
+
+  workspace_doctor_section "Inference & agent" "spark ws restart"
   workspace_doctor_check "LiteLLM gateway running" workspace_gateway_running
   workspace_doctor_check "LiteLLM exposes Hermes model route" workspace_litellm_model_routed
   workspace_doctor_check "LiteLLM Hermes route completes smoke request" workspace_litellm_model_smoke
@@ -3848,20 +3950,16 @@ cmd_workspace_doctor() {
   workspace_doctor_check "NemoHermes inference route uses selected LiteLLM model" workspace_hermes_inference_route_ready
   workspace_doctor_check "Hermes dashboard URL is reachable" workspace_hermes_dashboard_url_ready
   if [[ "$strict_mode" == "1" ]]; then
+    workspace_doctor_section "Production" "pin workspace image versions, then run spark ws setup"
     workspace_doctor_check "Compose image refs are pinned for production" workspace_compose_images_pinned
   fi
 
   if [[ "$json_mode" == "1" ]]; then
     workspace_doctor_print_json "$model"
-    [[ "$WORKSPACE_DOCTOR_FAILED" -eq 0 ]] || return 1
-    return 0
+  elif [[ "$quiet" == "0" ]]; then
+    workspace_doctor_print_human
   fi
-
-  if [[ "$WORKSPACE_DOCTOR_FAILED" -gt 0 ]]; then
-    printf "\n  ${RED}${BOLD}Workspace doctor failed:${NC} %d check(s)\n\n" "$WORKSPACE_DOCTOR_FAILED"
-    return 1
-  fi
-  printf "\n  ${GREEN}${BOLD}Workspace doctor passed${NC}\n\n"
+  [[ "$WORKSPACE_DOCTOR_FAILED" -eq 0 ]]
 }
 
 workspace_print_initial_credentials() {

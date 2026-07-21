@@ -773,7 +773,8 @@ test_doctor_reports_no_ngc_image() {
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" doctor 2>&1)
   rm -rf "$tmp"
 
-  [[ "$output" == *"NGC container: vLLM image not pulled"* ]] &&
+  [[ "$output" == *"NGC container"* ]] &&
+    [[ "$output" == *"vLLM image not pulled"* ]] &&
     [[ "$output" == *"checks passed"* ]]
 }
 
@@ -785,10 +786,11 @@ test_doctor_skips_blocked_ngc_vllm_image() {
 
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_DOCKER_IMAGE=$'nvcr.io/nvidia/vllm:26.06-py3\nnvcr.io/nvidia/vllm:26.05-py3' \
-    "$SPARK" doctor 2>&1)
+    "$SPARK" doctor --verbose 2>&1)
   rm -rf "$tmp"
 
-  [[ "$output" == *"NGC container: nvcr.io/nvidia/vllm:26.05-py3"* ]] &&
+  [[ "$output" == *"NGC container"* ]] &&
+    [[ "$output" == *"nvcr.io/nvidia/vllm:26.05-py3"* ]] &&
     [[ "$output" != *"NGC container: nvcr.io/nvidia/vllm:26.06-py3"* ]]
 }
 
@@ -800,10 +802,10 @@ test_vllm_image_override_wins() {
 
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     SPARK_VLLM_IMAGE="eugr/spark-vllm:latest" \
-    "$SPARK" doctor 2>&1)
+    "$SPARK" doctor --verbose 2>&1)
   rm -rf "$tmp"
 
-  [[ "$output" == *"NGC container: eugr/spark-vllm:latest"* ]]
+  [[ "$output" == *"NGC container"* ]] && [[ "$output" == *"eugr/spark-vllm:latest"* ]]
 }
 
 test_doctor_reports_bad_hf_cache_permissions() {
@@ -819,8 +821,9 @@ test_doctor_reports_bad_hf_cache_permissions() {
   chmod u+w "$bad"
   rm -rf "$tmp"
 
-  [[ "$output" == *"HF cache permissions: not writable"* ]] &&
-    [[ "$output" == *"Fix manually"* ]]
+  [[ "$output" == *"HF cache permissions"* ]] &&
+    [[ "$output" == *"not writable"* ]] &&
+    [[ "$output" == *"sudo chown"* ]]
 }
 
 test_setup_check_reports_incomplete() {
@@ -876,7 +879,26 @@ test_doctor_reports_tailscale_funnel() {
     "$SPARK" doctor 2>&1)
   rm -rf "$tmp"
 
-  [[ "$output" == *"Tailscale Funnel: active public exposure"* ]]
+  [[ "$output" == *"Tailscale Funnel"* ]] && [[ "$output" == *"active public exposure"* ]]
+}
+
+test_doctor_json_quiet_and_exit_codes() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin json quiet_out json_status quiet_status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  set +e
+  json=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" doctor --json 2>/dev/null)
+  json_status=$?
+  quiet_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" doctor --quiet 2>&1)
+  quiet_status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$json_status" -ne 0 && "$quiet_status" -ne 0 && -z "$quiet_out" ]] &&
+    printf '%s' "$json" | jq -e '
+      .ok == false and .failed > 0 and .total == (.passed + .failed) and
+      ([.areas[] | select(.name == "Runtime" and .failed > 0)] | length == 1) and
+      ([.checks[] | select(.label == "Docker" and .state == "fail" and (.action | length > 0))] | length == 1)
+    ' >/dev/null
 }
 
 test_invalid_port_fails_before_side_effects() {
@@ -1599,12 +1621,13 @@ test_swap_swapon_wins_when_free_reports_zero() {
   [[ ! -s "$log" ]] || { rm -rf "$tmp"; return 1; }
   doctor_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
     SPARK_OS_OVERRIDE=Linux FAKE_SWAP_TOTAL_MIB=0 FAKE_SWAP_ON=1 FAKE_SWAPFILE_SIZE_MIB=131072 \
-    FAKE_SWAPFILE_USED_MIB=0 FAKE_SWAPPINESS=10 "$SPARK" doctor 2>&1 || true)
+    FAKE_SWAPFILE_USED_MIB=0 FAKE_SWAPPINESS=10 "$SPARK" doctor --verbose 2>&1 || true)
   rm -rf "$tmp"
   [[ "$setup_out" == *"Swap: on (131072MiB total) via swapon (free=0MiB)"* ]] &&
     [[ "$setup_out" == *"failed=0"* ]] &&
-    [[ "$doctor_out" == *"Swap: on (131072MiB total) via swapon (free=0MiB)"* ]] &&
-    [[ "$doctor_out" != *"Swap/swappiness not configured"* ]]
+    [[ "$doctor_out" == *"Swap and swappiness"* ]] &&
+    [[ "$doctor_out" == *"131072 MiB via swapon (free=0MiB)"* ]] &&
+    [[ "$doctor_out" != *"target ≥"* ]]
 }
 
 test_swap_wrong_swappiness_reconciles() {
@@ -2586,7 +2609,7 @@ test_workspace_tailscale_ports_fallback() {
     FAKE_TAILSCALE_IP=100.64.0.10 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+    "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
   [[ "$out" == *"Tailscale MagicDNS port fallback configured"* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=ports"* ]] &&
@@ -3361,9 +3384,14 @@ test_workspace_doctor_checklist_passes() {
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+    "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"Workspace doctor passed"* ]] &&
+    [[ "$out" == *"58/58 checks passed"* ]] &&
+    [[ "$out" == *"Configuration"* ]] &&
+    [[ "$out" == *"Identity & recovery"* ]] &&
+    [[ "$out" == *"Runtime services"* ]] &&
+    [[ "$out" == *"Private access"* ]] &&
+    [[ "$out" == *"Inference & agent"* ]] &&
     [[ "$out" == *"[x] Compose service running: postgres"* ]] &&
     [[ "$out" == *"[x] Human service passwords are not stored"* ]] &&
     [[ "$out" == *"[x] Scoped service env files exist and are 0600"* ]] &&
@@ -3419,7 +3447,7 @@ test_workspace_doctor_flags_stale_nemohermes_release() {
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_NEMOHERMES_UPDATE_CHECK=$'Current NemoHermes version: 0.0.55\nLatest maintained version: 0.0.78\nUpdate available:         yes' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+    "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   status=$?
   set -e
   rm -rf "$tmp"
@@ -3445,9 +3473,9 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws doctor --strict --model Org/Alpha 2>&1)
+    "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"Workspace doctor passed"* ]] &&
+  [[ "$out" == *"59/59 checks passed"* ]] &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -3498,13 +3526,35 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
+    .passed == 58 and
     .failed == 0 and
+    .total == 58 and
     .model == "Org/Alpha" and
+    ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Identity & recovery" and .passed == 12 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Inference & agent" and .passed == 11 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM Hermes route completes smoke request" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "NemoHermes inference route uses selected LiteLLM model" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Tailscale workspace URLs respond" and .ok == true)] | length == 1)
   ' >/dev/null
+}
+
+test_workspace_doctor_quiet_and_unconfigured_summary() {
+  local tmp fake_bin out quiet_out status quiet_status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws doctor 2>&1)
+  status=$?
+  quiet_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" ws doctor --quiet 2>&1)
+  quiet_status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 && "$quiet_status" -ne 0 && -z "$quiet_out" ]] &&
+    [[ "$out" == *"0/1 checks passed"* ]] &&
+    [[ "$out" == *"[ ] Workspace is configured"* ]] &&
+    [[ "$out" != *"Config directory mode is 0700"* ]]
 }
 
 test_workspace_status_renders_containers_and_agent_workspace() {
@@ -3841,7 +3891,7 @@ test_workspace_doctor_accepts_writable_vikunja_group_mismatch() {
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_VIKUNJA_DOCTOR_EXIT=1 FAKE_VIKUNJA_DOCTOR_OUTPUT="$doctor_output" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+    "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   status=$?
   set -e
   rm -rf "$tmp"
@@ -4690,9 +4740,9 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_TAILSCALE_SERVE_CONFIG="$serve_config" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+    "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"Workspace doctor passed"* ]] &&
+  [[ "$out" == *"58/58 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -4712,9 +4762,9 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_TAILSCALE_SERVE_CONFIG="$serve_config" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+    "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"Workspace doctor passed"* ]] &&
+  [[ "$out" == *"58/58 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -5083,10 +5133,11 @@ test_doctor_ollama_backend() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_ACCEL=metal \
     FAKE_OLLAMA_UP=1 FAKE_OLLAMA_LIST="NAME\tID\tSIZE\tMOD\nqwen3:30b\tabc\t18\tGB\n" \
-    "$SPARK" doctor 2>&1)
+    "$SPARK" doctor --verbose 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"backend ollama"* ]] && [[ "$out" == *"Ollama service: reachable"* ]] &&
-    [[ "$out" == *"Models: 1 pulled"* ]] && [[ "$out" != *"NGC"* ]]
+  [[ "$out" == *"backend ollama"* ]] && [[ "$out" == *"Ollama API"* ]] &&
+    [[ "$out" == *"reachable on port 11434"* ]] && [[ "$out" == *"Pulled models"* ]] &&
+    [[ "$out" == *"1 found"* ]] && [[ "$out" != *"NGC"* ]]
 }
 
 # --- Ollama advisory (estimate at default ctx + warn/confirm) ---
@@ -6322,6 +6373,7 @@ run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_ca
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "setup --check reports Tailscale Funnel" test_setup_check_reports_tailscale_funnel
 run_test "doctor reports Tailscale Funnel risk" test_doctor_reports_tailscale_funnel
+run_test "doctor supports JSON, quiet, and failure exit codes" test_doctor_json_quiet_and_exit_codes
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
 run_test "dry-run uses JSON profiles without executing model data" test_dry_run_uses_json_profile_safely
 run_test "docker run failure shows actionable error" test_docker_run_failure_shows_error
@@ -6519,6 +6571,7 @@ run_test "workspace setup keeps Hermes dashboard on loopback" test_workspace_set
 run_test "workspace doctor --strict checks pinned images only" test_workspace_doctor_strict_checks_pinned_images
 run_test "workspace doctor --strict flags latest images" test_workspace_doctor_strict_flags_latest_images
 run_test "workspace doctor --json emits structured checks" test_workspace_doctor_json
+run_test "workspace doctor quiet and unconfigured summary" test_workspace_doctor_quiet_and_unconfigured_summary
 run_test "workspace status renders containers and Agent workspace" test_workspace_status_renders_containers_and_agent_workspace
 run_test "workspace status supports JSON, quiet, and containers" test_workspace_status_json_quiet_and_containers
 run_test "workspace doctor flags public host listener" test_workspace_doctor_flags_public_host_listener

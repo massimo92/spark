@@ -1,7 +1,7 @@
 # --- Main ---
 main() {
   case "${1:-}:${2:-}" in
-    status:--json|status:--quiet|ws:status) ;;
+    status:--json|status:--quiet|ws:status|doctor:*|ws:doctor) ;;
     *) check_for_updates ;;
   esac
 
