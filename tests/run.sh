@@ -856,7 +856,7 @@ test_source_guard_loads_without_dispatch() {
 }
 
 test_super_productivity_workspace_files() {
-  local tmp compose env sync_env dockerfile gateway mode
+  local tmp compose env sync_env dockerfile gateway_absent mode
   tmp=$(mktemp -d)
   HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
     SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_WORKSPACE_TASK_MANAGER=super-productivity \
@@ -868,22 +868,25 @@ test_super_productivity_workspace_files() {
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
   sync_env=$(cat "${tmp}/home/.config/spark/workspace/super-productivity.env")
   dockerfile=$(cat "${tmp}/home/.config/spark/workspace/super-productivity-electron/Dockerfile")
-  gateway=$(cat "${tmp}/home/.config/spark/workspace/super-productivity-gateway.conf")
+  [[ ! -e "${tmp}/home/.config/spark/workspace/super-productivity-gateway.conf" ]] && gateway_absent=1 || gateway_absent=0
   mode=$(stat -c '%a' "${tmp}/home/.config/spark/workspace/super-productivity.env" 2>/dev/null || stat -f '%Lp' "${tmp}/home/.config/spark/workspace/super-productivity.env")
   rm -rf "$tmp"
   [[ "$env" == *"WORKSPACE_TASK_MANAGER=super-productivity"* ]] &&
     [[ "$env" == *"TASK_MANAGER_URL=https://tasks.robin-triceratops.ts.net"* ]] &&
     [[ "$compose" == *$'  supersync:\n'* ]] &&
-    [[ "$compose" == *$'  super-productivity-web:\n'* ]] &&
     [[ "$compose" == *$'  super-productivity-electron:\n'* ]] &&
-    [[ "$compose" == *$'  super-productivity-gateway:\n'* ]] &&
+    [[ "$compose" != *$'  super-productivity-web:\n'* ]] &&
+    [[ "$compose" != *$'  super-productivity-gateway:\n'* ]] &&
     [[ "$compose" != *$'  vikunja:\n'* ]] &&
+    [[ "$compose" == *'127.0.0.1:3456:1900'* ]] &&
+    [[ "$compose" != *'super-productivity/super-productivity:latest'* ]] &&
     [[ "$sync_env" == *"PUBLIC_URL=https://tasks.robin-triceratops.ts.net"* ]] &&
+    [[ "$sync_env" == *"CORS_ORIGINS=https://tasks.robin-triceratops.ts.net,https://app.super-productivity.com"* ]] &&
     [[ "$sync_env" == *"SUPERSYNC_INTERNAL_URL=http://supersync:1900"* ]] &&
     [[ "$sync_env" == *"SPARK_HEADLESS=1"* ]] &&
     [[ "$dockerfile" == *"TARGETARCH"* ]] &&
     [[ "$dockerfile" == *"git apply --unidiff-zero"* ]] &&
-    [[ "$gateway" == *"location /api/"* ]] &&
+    [[ "$gateway_absent" -eq 1 ]] &&
     [[ "$mode" == "600" ]]
 }
 
@@ -897,6 +900,23 @@ test_super_productivity_rejects_http_ports_mode() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] && [[ "$out" == *"SuperSync requires HTTPS"* ]]
+}
+
+test_workspace_interactive_task_manager_selector() {
+  local tmp super_productivity vikunja
+  tmp=$(mktemp -d)
+  super_productivity=$(printf '1\n' | env -u SPARK_WORKSPACE_TASK_MANAGER HOME="${tmp}/home" bash -c '
+    source "$1"
+    is_interactive() { return 0; }
+    workspace_select_task_manager "" 0
+  ' _ "$SPARK" 2>/dev/null)
+  vikunja=$(printf '2\n' | env -u SPARK_WORKSPACE_TASK_MANAGER HOME="${tmp}/home" bash -c '
+    source "$1"
+    is_interactive() { return 0; }
+    workspace_select_task_manager "" 0
+  ' _ "$SPARK" 2>/dev/null)
+  rm -rf "$tmp"
+  [[ "$super_productivity" == "super-productivity" && "$vikunja" == "vikunja" ]]
 }
 
 test_doctor_reports_no_ngc_image() {
@@ -6875,6 +6895,7 @@ run_test "single-file build matches modules" test_single_file_build_matches_modu
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "workspace generates Super Productivity alternative" test_super_productivity_workspace_files
 run_test "Super Productivity rejects insecure ports mode" test_super_productivity_rejects_http_ports_mode
+run_test "workspace asks which task manager to install" test_workspace_interactive_task_manager_selector
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vllm_image
 run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wins

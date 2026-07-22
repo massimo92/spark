@@ -142,7 +142,7 @@ cmd_update() {
   local ngc_update=0 current_ngc="" current_tag="" latest_tag=""
   local gateway_update=0 gateway_config=""
   local postgres_update=0 task_update=0 n8n_update=0 task_manager="" task_label=""
-  local postgres_image="" task_image="" n8n_image="" sp_web_image="" sp_sync_image="" sp_gateway_image=""
+  local postgres_image="" task_image="" n8n_image="" sp_sync_image=""
   local task_services=()
   local nemohermes_update=0 nemohermes_status="" nemohermes_update_line=""
   local update_count=0
@@ -201,12 +201,9 @@ cmd_update() {
     task_manager=$(workspace_task_manager)
     task_label=$(workspace_task_manager_label "$task_manager")
     if [[ "$task_manager" == "super-productivity" ]]; then
-      sp_web_image=$(workspace_read_env WORKSPACE_SUPER_PRODUCTIVITY_IMAGE 2>/dev/null || true)
       sp_sync_image=$(workspace_read_env WORKSPACE_SUPERSYNC_IMAGE 2>/dev/null || true)
-      sp_gateway_image=$(workspace_read_env WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE 2>/dev/null || true)
-      [[ -n "$sp_web_image" && -n "$sp_sync_image" && -n "$sp_gateway_image" ]] \
-        && task_image="${sp_web_image}, ${sp_sync_image}, ${sp_gateway_image}"
-      task_services=(super-productivity-web supersync super-productivity-gateway)
+      task_image="$sp_sync_image"
+      task_services=(supersync)
     else
       task_image=$(workspace_read_env WORKSPACE_VIKUNJA_IMAGE 2>/dev/null || true)
       task_services=(vikunja)

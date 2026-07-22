@@ -20,7 +20,7 @@ workspace_task_manager() {
     return 0
   fi
   # Existing workspaces predate WORKSPACE_TASK_MANAGER. Preserve their Vikunja choice.
-  if [[ -f "$compose" ]] && grep -qE '^[[:space:]]{2}super-productivity-(web|gateway):' "$compose"; then
+  if [[ -f "$compose" ]] && grep -qE '^[[:space:]]{2}(supersync|super-productivity-electron):' "$compose"; then
     printf 'super-productivity\n'
   else
     printf 'vikunja\n'
@@ -998,7 +998,7 @@ workspace_write_files_super_productivity() {
   local task_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
   local postgres_pass supersync_db_pass supersync_jwt supersync_token supersync_encryption n8n_db_pass n8n_key mention_secret
-  local n8n_owner_status postgres_image super_productivity_image supersync_image gateway_image electron_version electron_commit electron_image n8n_image rp_id old_umask
+  local n8n_owner_status postgres_image supersync_image electron_version electron_commit electron_image n8n_image rp_id old_umask
 
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
   tailscale_bind_addr=$(workspace_env_or_value WORKSPACE_TAILSCALE_BIND_ADDR 127.0.0.1)
@@ -1051,9 +1051,7 @@ workspace_write_files_super_productivity() {
   n8n_owner_status=$(workspace_env_or_value N8N_OWNER_SETUP_STATUS pending)
   mention_secret=$(workspace_env_or_generated WORKSPACE_MENTION_SECRET)
   postgres_image="${SPARK_WORKSPACE_POSTGRES_IMAGE:-$(workspace_env_or_value WORKSPACE_POSTGRES_IMAGE "$WORKSPACE_POSTGRES_IMAGE_DEFAULT")}"
-  super_productivity_image="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_IMAGE:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_IMAGE "$WORKSPACE_SUPER_PRODUCTIVITY_IMAGE_DEFAULT")}"
   supersync_image="${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-$(workspace_env_or_value WORKSPACE_SUPERSYNC_IMAGE "$WORKSPACE_SUPERSYNC_IMAGE_DEFAULT")}"
-  gateway_image="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE "$WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE_DEFAULT")}"
   electron_version="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_VERSION:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_VERSION "$WORKSPACE_SUPER_PRODUCTIVITY_VERSION_DEFAULT")}"
   electron_commit="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_COMMIT:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_COMMIT "$WORKSPACE_SUPER_PRODUCTIVITY_COMMIT_DEFAULT")}"
   electron_image="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE:-spark/super-productivity-electron:${electron_version#v}}"
@@ -1061,9 +1059,7 @@ workspace_write_files_super_productivity() {
   rp_id=$(workspace_url_host "$task_url")
 
   workspace_validate_image_ref "Postgres image" "$postgres_image"
-  workspace_validate_image_ref "Super Productivity image" "$super_productivity_image"
   workspace_validate_image_ref "SuperSync image" "$supersync_image"
-  workspace_validate_image_ref "Super Productivity gateway image" "$gateway_image"
   workspace_validate_image_ref "Super Productivity Electron image" "$electron_image"
   workspace_validate_image_ref "n8n image" "$n8n_image"
   [[ "$electron_version" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || die "Invalid Super Productivity version: ${electron_version}"
@@ -1147,9 +1143,7 @@ WORKSPACE_TAILSCALE_MODE=${tailscale_mode}
 WORKSPACE_TAILSCALE_BIND_ADDR=${tailscale_bind_addr}
 WORKSPACE_TAILSCALE_DNS_NAME=${tailscale_dns_name}
 WORKSPACE_POSTGRES_IMAGE=${postgres_image}
-WORKSPACE_SUPER_PRODUCTIVITY_IMAGE=${super_productivity_image}
 WORKSPACE_SUPERSYNC_IMAGE=${supersync_image}
-WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE=${gateway_image}
 WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE=${electron_image}
 WORKSPACE_SUPER_PRODUCTIVITY_VERSION=${electron_version}
 WORKSPACE_SUPER_PRODUCTIVITY_COMMIT=${electron_commit}
@@ -1231,31 +1225,7 @@ ALTER DATABASE supersync OWNER TO supersync;
 ALTER DATABASE n8n OWNER TO n8n;
 SQL
 EOF
-  workspace_install_file "$WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_CONFIG" 644 <<'EOF'
-server {
-  listen 3456;
-  server_name _;
-  client_max_body_size 20m;
-
-  location = /health {
-    proxy_pass http://supersync:1900/health;
-  }
-  location /api/ {
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_read_timeout 3600s;
-    proxy_pass http://supersync:1900;
-  }
-  location / {
-    proxy_set_header Host $host;
-    proxy_pass http://super-productivity-web:80;
-  }
-}
-EOF
+  rm -f "${WORKSPACE_CONFIG_DIR}/super-productivity-gateway.conf"
   umask 022
   workspace_install_file "$WORKSPACE_COMPOSE_FILE" 644 <<EOF
 services:
@@ -1303,16 +1273,8 @@ services:
       interval: 15s
       timeout: 5s
       retries: 10
-
-  super-productivity-web:
-    image: ${super_productivity_image}
-    container_name: ${WORKSPACE_SUPER_PRODUCTIVITY_CONTAINER}
-    restart: unless-stopped
-    init: true
-    stop_grace_period: 30s
-    pids_limit: 512
-    security_opt: ["no-new-privileges:true"]
-    logging: {driver: json-file, options: {max-size: "10m", max-file: "5"}}
+    ports:
+      - "${tailscale_bind_addr}:${WORKSPACE_TASK_MANAGER_PORT}:1900"
 
   super-productivity-electron:
     image: ${electron_image}
@@ -1335,23 +1297,6 @@ services:
       - "127.0.0.1:${WORKSPACE_SUPER_PRODUCTIVITY_API_PORT}:3877"
     volumes:
       - ${WORKSPACE_DATA_DIR}/super-productivity-electron:/data
-
-  super-productivity-gateway:
-    image: ${gateway_image}
-    container_name: ${WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_CONTAINER}
-    restart: unless-stopped
-    init: true
-    stop_grace_period: 30s
-    pids_limit: 512
-    security_opt: ["no-new-privileges:true"]
-    logging: {driver: json-file, options: {max-size: "10m", max-file: "5"}}
-    depends_on:
-      supersync: {condition: service_healthy}
-      super-productivity-web: {condition: service_started}
-    ports:
-      - "${tailscale_bind_addr}:${WORKSPACE_TASK_MANAGER_PORT}:3456"
-    volumes:
-      - ${WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_CONFIG}:/etc/nginx/conf.d/default.conf:ro
 
   n8n:
     image: ${n8n_image}
@@ -3197,7 +3142,7 @@ workspace_setup() {
   [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && workspace_require_env_value "Vikunja Hermes API token" "$SPARK_WORKSPACE_VIKUNJA_TOKEN"
   [[ -n "$postgres_image" ]] && workspace_validate_image_ref "Postgres image" "$postgres_image"
   [[ -n "$vikunja_image" ]] && workspace_validate_image_ref "Vikunja image" "$vikunja_image"
-  [[ -n "$super_productivity_image" ]] && workspace_validate_image_ref "Super Productivity image" "$super_productivity_image"
+  [[ -n "$super_productivity_image" ]] && workspace_validate_image_ref "Super Productivity Electron image" "$super_productivity_image"
   [[ -n "$supersync_image" ]] && workspace_validate_image_ref "SuperSync image" "$supersync_image"
   [[ -n "$n8n_image" ]] && workspace_validate_image_ref "n8n image" "$n8n_image"
   [[ -z "$remote_spec" ]] || {
@@ -3229,7 +3174,7 @@ workspace_setup() {
   [[ -n "$requested_tail_mode" ]] && SPARK_WORKSPACE_TAILSCALE_MODE="$requested_tail_mode"
   [[ -n "$postgres_image" ]] && SPARK_WORKSPACE_POSTGRES_IMAGE="$postgres_image"
   [[ -n "$vikunja_image" ]] && SPARK_WORKSPACE_VIKUNJA_IMAGE="$vikunja_image"
-  [[ -n "$super_productivity_image" ]] && SPARK_WORKSPACE_SUPER_PRODUCTIVITY_IMAGE="$super_productivity_image"
+  [[ -n "$super_productivity_image" ]] && SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE="$super_productivity_image"
   [[ -n "$supersync_image" ]] && SPARK_WORKSPACE_SUPERSYNC_IMAGE="$supersync_image"
   [[ -n "$n8n_image" ]] && SPARK_WORKSPACE_N8N_IMAGE="$n8n_image"
   SETUP_FAILED=()
@@ -3242,7 +3187,7 @@ workspace_setup() {
   if [[ -n "$requested_model" || -n "$requested_task_manager" || -n "$postgres_image" || -n "$vikunja_image" || -n "$super_productivity_image" || -n "$supersync_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
     setup_overrides=1
   fi
-  if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
+  if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
     setup_overrides=1
   fi
   if [[ "$check_only" != "1" && "$setup_overrides" == "0" && -n "$existing_model" ]] && workspace_configured; then
@@ -3432,7 +3377,6 @@ workspace_service_runtime_state() {
   workspace_compose_service_running "$service" || { printf 'stopped\n'; return 1; }
   case "$service" in
     vikunja) workspace_vikunja_http_ready && { printf 'ready\n'; return 0; } ;;
-    super-productivity-gateway) workspace_super_productivity_http_ready && { printf 'ready\n'; return 0; } ;;
     supersync) workspace_supersync_http_ready && { printf 'ready\n'; return 0; } ;;
     super-productivity-electron) workspace_super_productivity_api_ready && { printf 'ready\n'; return 0; } ;;
     n8n) workspace_n8n_http_ready && { printf 'ready\n'; return 0; } ;;
@@ -3463,11 +3407,10 @@ workspace_status_operational() {
   workspace_configured || return 1
   task_manager=$(workspace_task_manager)
   task_service=vikunja
-  [[ "$task_manager" == "super-productivity" ]] && task_service=super-productivity-gateway
+  [[ "$task_manager" == "super-productivity" ]] && task_service=supersync
   [[ "$(workspace_service_runtime_state postgres || true)" == "running" ]] || return 1
   [[ "$(workspace_service_runtime_state "$task_service" || true)" == "ready" ]] || return 1
   if [[ "$task_manager" == "super-productivity" ]]; then
-    [[ "$(workspace_service_runtime_state supersync || true)" == "ready" ]] || return 1
     [[ "$(workspace_service_runtime_state super-productivity-electron || true)" == "ready" ]] || return 1
   fi
   [[ "$(workspace_service_runtime_state n8n || true)" == "ready" ]] || return 1
@@ -3492,14 +3435,13 @@ workspace_print_service_row() {
 }
 
 workspace_print_status_summary() {
-  local postgres_state task_state supersync_state electron_state n8n_state hermes_state access_state mode model task_manager task_service
+  local postgres_state task_state electron_state n8n_state hermes_state access_state mode model task_manager task_service
   local task_url n8n_url hermes_url
   task_manager=$(workspace_task_manager)
   task_service=vikunja
-  [[ "$task_manager" == "super-productivity" ]] && task_service=super-productivity-gateway
+  [[ "$task_manager" == "super-productivity" ]] && task_service=supersync
   postgres_state=$(workspace_service_runtime_state postgres || true)
   task_state=$(workspace_service_runtime_state "$task_service" || true)
-  supersync_state=$(workspace_service_runtime_state supersync || true)
   electron_state=$(workspace_service_runtime_state super-productivity-electron || true)
   n8n_state=$(workspace_service_runtime_state n8n || true)
   hermes_state=$(workspace_hermes_runtime_state || true)
@@ -3513,10 +3455,11 @@ workspace_print_status_summary() {
   printf "\n  ${BOLD}Workspace services${NC}\n"
   printf "  ${DIM}%-20s %-22s %s${NC}\n" "STATE" "SERVICE" "ACCESS"
   workspace_print_service_row "$postgres_state" "Postgres" "internal"
-  workspace_print_service_row "$task_state" "$(workspace_task_manager_label "$task_manager")" "${task_url:-unset}"
   if [[ "$task_manager" == "super-productivity" ]]; then
-    workspace_print_service_row "$supersync_state" "SuperSync" "internal"
+    workspace_print_service_row "$task_state" "SuperSync" "${task_url:-unset}"
     workspace_print_service_row "$electron_state" "Electron API for Hermes" "private bridge"
+  else
+    workspace_print_service_row "$task_state" "Vikunja" "${task_url:-unset}"
   fi
   workspace_print_service_row "$n8n_state" "n8n" "${n8n_url:-unset}"
   workspace_print_service_row "$hermes_state" "Hermes" "${hermes_url:-unset}"
@@ -3534,11 +3477,11 @@ workspace_status_json() {
   workspace_status_operational && ok=true
   task_manager=$(workspace_task_manager)
   task_service=vikunja
-  [[ "$task_manager" == "super-productivity" ]] && task_service=super-productivity-gateway
+  [[ "$task_manager" == "super-productivity" ]] && task_service=supersync
   postgres_state=$(workspace_service_runtime_state postgres || true)
   task_state=$(workspace_service_runtime_state "$task_service" || true)
   if [[ "$task_manager" == "super-productivity" ]]; then
-    supersync_state=$(workspace_service_runtime_state supersync || true)
+    supersync_state="$task_state"
     electron_state=$(workspace_service_runtime_state super-productivity-electron || true)
     task_extra=$(printf ',"supersync":{"state":"%s"},"electron_api":{"state":"%s"}' \
       "$supersync_state" "$electron_state")
@@ -3760,7 +3703,6 @@ cmd_workspace_health() {
   printf "\n  ${BOLD}Workspace health${NC}\n"
   workspace_status_item "Compose postgres" workspace_compose_service_running postgres
   if [[ "$task_manager" == "super-productivity" ]]; then
-    workspace_status_item "Compose Super Productivity" workspace_compose_service_running super-productivity-gateway
     workspace_status_item "Compose SuperSync" workspace_compose_service_running supersync
     workspace_status_item "Compose Electron API" workspace_compose_service_running super-productivity-electron
   else
@@ -3795,13 +3737,13 @@ cmd_workspace_logs() {
     task-manager)
       workspace_require_config
       if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
-        workspace_compose logs -f super-productivity-gateway super-productivity-web supersync
+        workspace_compose logs -f supersync super-productivity-electron
       else
         workspace_compose logs -f vikunja
       fi ;;
     super-productivity)
       workspace_require_config
-      workspace_compose logs -f super-productivity-gateway super-productivity-web ;;
+      workspace_compose logs -f supersync super-productivity-electron ;;
     electron)
       workspace_require_config
       workspace_compose logs -f super-productivity-electron ;;
@@ -4288,7 +4230,7 @@ workspace_tailscale_dns_name_ok() {
 }
 
 workspace_compose_uses_loopback_ports() {
-  local mode bind_addr
+  local mode bind_addr task_container_port=3456
   [[ -f "$WORKSPACE_COMPOSE_FILE" ]] || return 1
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   bind_addr=127.0.0.1
@@ -4298,7 +4240,8 @@ workspace_compose_uses_loopback_ports() {
   else
     workspace_private_bind_addr_ok "$bind_addr" || return 1
   fi
-  grep -Fq "${bind_addr}:${WORKSPACE_TASK_MANAGER_PORT}:3456" "$WORKSPACE_COMPOSE_FILE" &&
+  [[ "$(workspace_task_manager)" != "super-productivity" ]] || task_container_port=1900
+  grep -Fq "${bind_addr}:${WORKSPACE_TASK_MANAGER_PORT}:${task_container_port}" "$WORKSPACE_COMPOSE_FILE" &&
     grep -Fq "${bind_addr}:${WORKSPACE_N8N_PORT}:5678" "$WORKSPACE_COMPOSE_FILE" &&
     { [[ "$(workspace_task_manager)" != "super-productivity" ]] || grep -Fq "127.0.0.1:${WORKSPACE_SUPER_PRODUCTIVITY_API_PORT}:3877" "$WORKSPACE_COMPOSE_FILE"; } &&
     ! grep -qE '0[.]0[.]0[.]0:|:::[0-9]+|[[]::[]]:' "$WORKSPACE_COMPOSE_FILE"
@@ -4376,7 +4319,7 @@ workspace_compose_images_configured() {
     grep -Fq "image: ${postgres_image}" "$WORKSPACE_COMPOSE_FILE" &&
     grep -Fq "image: ${n8n_image}" "$WORKSPACE_COMPOSE_FILE" || return 1
   if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
-    image_keys="WORKSPACE_SUPER_PRODUCTIVITY_IMAGE WORKSPACE_SUPERSYNC_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE"
+    image_keys="WORKSPACE_SUPERSYNC_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE"
   else
     image_keys="WORKSPACE_VIKUNJA_IMAGE"
   fi
@@ -4398,7 +4341,7 @@ workspace_compose_images_pinned() {
   workspace_image_ref_pinned "$postgres_image" &&
     workspace_image_ref_pinned "$n8n_image" || return 1
   if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
-    image_keys="WORKSPACE_SUPER_PRODUCTIVITY_IMAGE WORKSPACE_SUPERSYNC_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE"
+    image_keys="WORKSPACE_SUPERSYNC_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE"
   else
     image_keys="WORKSPACE_VIKUNJA_IMAGE"
   fi
@@ -4410,7 +4353,7 @@ workspace_compose_images_pinned() {
 
 workspace_compose_runtime_hardened() {
   local minimum=3
-  [[ "$(workspace_task_manager)" == "super-productivity" ]] && minimum=6
+  [[ "$(workspace_task_manager)" == "super-productivity" ]] && minimum=4
   [[ -f "$WORKSPACE_COMPOSE_FILE" ]] || return 1
   [[ "$(grep -c 'no-new-privileges:true' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge "$minimum" ]] &&
     [[ "$(grep -c 'init: true' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge "$minimum" ]] &&
@@ -4572,11 +4515,10 @@ workspace_super_productivity_http_ready() {
   if [[ "$mode" == "ports" ]]; then
     url=$(workspace_task_manager_url)
     [[ -n "$url" ]] || return 1
-    workspace_http_ready "${url%/}/" && workspace_http_ready "${url%/}/health"
+    workspace_http_ready "${url%/}/health"
     return $?
   fi
-  workspace_http_ready "http://127.0.0.1:${WORKSPACE_TASK_MANAGER_PORT}/" &&
-    workspace_http_ready "http://127.0.0.1:${WORKSPACE_TASK_MANAGER_PORT}/health"
+  workspace_http_ready "http://127.0.0.1:${WORKSPACE_TASK_MANAGER_PORT}/health"
 }
 
 workspace_supersync_http_ready() {
@@ -4651,7 +4593,7 @@ workspace_tailscale_https_urls_ready() {
     [[ "$task_url" == "http://${dns}:${WORKSPACE_TASK_MANAGER_PORT}" && "$n8n" == "http://${dns}:${WORKSPACE_N8N_PORT}" && "$hermes" == "http://${dns}:${WORKSPACE_HERMES_PORT}" ]] || return 1
   fi
   if [[ "$task_manager" == "super-productivity" ]]; then
-    workspace_http_ready "${task_url%/}/" && workspace_http_ready "${task_url%/}/health" || return 1
+    workspace_http_ready "${task_url%/}/health" || return 1
   else
     workspace_http_ready "${task_url%/}/api/v1/info" || return 1
   fi
@@ -4670,7 +4612,7 @@ workspace_task_manager_private_url_ready() {
   url=$(workspace_task_manager_url)
   [[ -n "$url" ]] || return 1
   if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
-    workspace_http_ready "${url%/}/" && workspace_http_ready "${url%/}/health"
+    workspace_http_ready "${url%/}/health"
   else
     workspace_http_ready "${url%/}/api/v1/info"
   fi
@@ -5415,10 +5357,8 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Scoped service env syntax is valid" workspace_service_env_files_syntax_valid
   workspace_doctor_check "Compose service exists: postgres" workspace_compose_mentions_service postgres
   if [[ "$task_manager" == "super-productivity" ]]; then
-    workspace_doctor_check "Compose service exists: Super Productivity web" workspace_compose_mentions_service super-productivity-web
     workspace_doctor_check "Compose service exists: SuperSync" workspace_compose_mentions_service supersync
     workspace_doctor_check "Compose service exists: Electron API" workspace_compose_mentions_service super-productivity-electron
-    workspace_doctor_check "Compose service exists: task gateway" workspace_compose_mentions_service super-productivity-gateway
     workspace_doctor_check "Electron build recipe is complete" workspace_super_productivity_electron_build_ready
   else
     workspace_doctor_check "Compose service exists: Vikunja" workspace_compose_mentions_service vikunja
@@ -5482,11 +5422,8 @@ cmd_workspace_doctor() {
     workspace_doctor_check "Shared Postgres runtime has Vikunja and n8n roles/databases" workspace_postgres_shared_runtime_ready
   fi
   if [[ "$task_manager" == "super-productivity" ]]; then
-    workspace_doctor_check "Compose service running: Super Productivity web" workspace_compose_service_running super-productivity-web
     workspace_doctor_check "Compose service running: SuperSync" workspace_compose_service_running supersync
     workspace_doctor_check "Compose service running: Electron API" workspace_compose_service_running super-productivity-electron
-    workspace_doctor_check "Compose service running: task gateway" workspace_compose_service_running super-productivity-gateway
-    workspace_doctor_check "Super Productivity web endpoint ready" workspace_super_productivity_http_ready
     workspace_doctor_check "SuperSync endpoint ready" workspace_supersync_http_ready
     workspace_doctor_check "Super Productivity Electron API ready" workspace_super_productivity_api_ready
   else
@@ -5878,7 +5815,7 @@ cmd_workspace_setup_help() {
     --postgres-image IMAGE      Override Postgres image ref.
     --vikunja-image IMAGE       Override Vikunja image ref.
     --super-productivity-image IMAGE
-                                Override Super Productivity web image ref.
+                                Override the custom Electron image ref.
     --supersync-image IMAGE     Override SuperSync image ref.
     --n8n-image IMAGE           Override n8n image ref.
     --vikunja-username NAME     Human Vikunja username.
@@ -5928,7 +5865,7 @@ cmd_workspace_help() {
     --postgres-image IMAGE      Override Postgres image ref
     --vikunja-image IMAGE       Override Vikunja image ref
     --super-productivity-image IMAGE
-                                Override Super Productivity web image ref
+                                Override the custom Electron image ref
     --supersync-image IMAGE     Override SuperSync image ref
     --n8n-image IMAGE           Override n8n image ref
     --vikunja-username NAME     Human Vikunja username

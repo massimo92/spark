@@ -96,7 +96,7 @@ With Vikunja, Hermes uses its REST API as the human-owned `bot-hermes`. With
 Super Productivity, browsers keep their local data in IndexedDB and sync it
 through the self-hosted SuperSync server. Spark runs one persistent headless
 Electron client only so Hermes can use Super Productivity's localhost REST API;
-the human UI remains the web app at `tasks.<tailnet>`.
+humans use the official web app at `https://app.super-productivity.com`.
 
 OpenShell restricts each API bridge to Hermes. Spark also starts the Hermes model
 with at least 64K context, vLLM automatic tool calling, and the model-specific
@@ -124,15 +124,18 @@ spark ws setup --task-manager vikunja
 spark ws setup --task-manager super-productivity
 ```
 
-The Super Productivity setup serves the web app and SuperSync through the same
-private `tasks.<tailnet>` URL. It creates a verified SuperSync user without SMTP,
-prints its access token and encryption password on first setup, and stores both
-in the 0600 workspace config. Enter the URL, token, and encryption password in
-**Settings → Sync → SuperSync** in every browser. Offline changes remain local
-and synchronize when the browser can reach the tailnet again.
+The Super Productivity setup publishes only SuperSync at the private
+`tasks.<tailnet>` URL; it does not host another copy of the web app. It creates a
+verified SuperSync user without SMTP, prints its access token and encryption
+password on first setup, and stores both in the 0600 workspace config. Open
+`https://app.super-productivity.com` and enter the private URL, token, and
+encryption password under **Settings → Sync → SuperSync** in every browser.
+Offline changes remain local and synchronize when the browser can reach the
+tailnet again.
 
 Workspace containers use stable names, including `workspace-postgres`,
-`workspace-vikunja` or `workspace-super-productivity*`, and `workspace-n8n`.
+`workspace-vikunja` or `workspace-supersync` plus
+`workspace-super-productivity-electron`, and `workspace-n8n`.
 
 For Vikunja, setup creates different strong passwords for Vikunja and n8n,
 prints them once, and never stores them. Choose initial passwords with `--vikunja-password-file`
