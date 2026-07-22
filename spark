@@ -46,6 +46,7 @@ WORKSPACE_ENV_FILE="${WORKSPACE_CONFIG_DIR}/secrets.env"
 WORKSPACE_POSTGRES_ENV_FILE="${WORKSPACE_CONFIG_DIR}/postgres.env"
 WORKSPACE_VIKUNJA_ENV_FILE="${WORKSPACE_CONFIG_DIR}/vikunja.env"
 WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE="${WORKSPACE_CONFIG_DIR}/super-productivity.env"
+WORKSPACE_SUPERSYNC_DIR="${WORKSPACE_CONFIG_DIR}/supersync"
 WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR="${WORKSPACE_CONFIG_DIR}/super-productivity-electron"
 WORKSPACE_N8N_ENV_FILE="${WORKSPACE_CONFIG_DIR}/n8n.env"
 WORKSPACE_PROJECT="workspace"
@@ -70,7 +71,7 @@ WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT="terminal file web skills memory todo cron
 WORKSPACE_HERMES_CLI_TOOLSETS_DISABLED="browser code_execution vision video image_gen video_gen x_search tts context_engine session_search clarify homeassistant spotify yuanbao computer_use"
 WORKSPACE_POSTGRES_IMAGE_DEFAULT="postgres:18"
 WORKSPACE_VIKUNJA_IMAGE_DEFAULT="vikunja/vikunja:latest"
-WORKSPACE_SUPERSYNC_IMAGE_DEFAULT="ghcr.io/super-productivity/supersync:latest"
+WORKSPACE_SUPERSYNC_IMAGE_DEFAULT="spark/supersync:18.7.0"
 WORKSPACE_SUPER_PRODUCTIVITY_VERSION_DEFAULT="v18.7.0"
 WORKSPACE_SUPER_PRODUCTIVITY_COMMIT_DEFAULT="4212ed4b0d95b3610f565d077966274fd1294831"
 WORKSPACE_N8N_IMAGE_DEFAULT="docker.n8n.io/n8nio/n8n:latest"
@@ -5955,6 +5956,59 @@ workspace_validate_image_ref() {
     || die "Invalid ${label}: ${value}" "Use a plain Docker image reference like postgres:18 or registry/name:tag"
 }
 
+workspace_write_supersync_build() {
+  mkdir -p "$WORKSPACE_SUPERSYNC_DIR"
+  workspace_install_file "${WORKSPACE_SUPERSYNC_DIR}/Dockerfile" 600 <<'EOF'
+FROM node:24-alpine AS builder
+
+ARG SUPER_PRODUCTIVITY_VERSION=v18.7.0
+ARG SUPER_PRODUCTIVITY_COMMIT=4212ed4b0d95b3610f565d077966274fd1294831
+WORKDIR /repo
+RUN apk add --no-cache git openssl libc6-compat \
+    && git config --global url."https://github.com/".insteadOf ssh://git@github.com/ \
+    && git clone --depth 1 --branch "${SUPER_PRODUCTIVITY_VERSION}" \
+      https://github.com/super-productivity/super-productivity.git . \
+    && test "$(git rev-parse HEAD)" = "${SUPER_PRODUCTIVITY_COMMIT}"
+RUN (npm ci --ignore-scripts || npm install --ignore-scripts)
+WORKDIR /repo/packages/sync-core
+RUN npm run build && npm pack
+WORKDIR /repo/packages/shared-schema
+RUN npm run build && npm pack
+WORKDIR /repo/packages/super-sync-server
+RUN npx prisma generate && rm -rf dist && npm run build
+
+FROM node:24-alpine
+ARG SUPER_PRODUCTIVITY_COMMIT=4212ed4b0d95b3610f565d077966274fd1294831
+LABEL org.opencontainers.image.revision="${SUPER_PRODUCTIVITY_COMMIT}"
+RUN apk add --no-cache openssl libc6-compat wget \
+    && addgroup -g 1001 -S nodejs \
+    && adduser -S supersync -u 1001 -G nodejs \
+    && mkdir -p /app/data && chown supersync:nodejs /app /app/data
+WORKDIR /app
+COPY --from=builder --chown=supersync:nodejs /repo/packages/super-sync-server/dist ./dist
+COPY --from=builder --chown=supersync:nodejs /repo/packages/super-sync-server/public ./public
+COPY --from=builder --chown=supersync:nodejs /repo/packages/super-sync-server/prisma ./prisma
+COPY --from=builder --chown=supersync:nodejs /repo/packages/super-sync-server/scripts ./scripts
+COPY --from=builder --chown=supersync:nodejs /repo/packages/super-sync-server/src ./src
+COPY --from=builder --chown=supersync:nodejs /repo/packages/super-sync-server/package.json ./package.json
+COPY --from=builder --chown=supersync:nodejs /repo/packages/sync-core/sp-sync-core-*.tgz ./sync-core.tgz
+COPY --from=builder --chown=supersync:nodejs /repo/packages/shared-schema/sp-shared-schema-*.tgz ./shared-schema.tgz
+RUN npm install ./sync-core.tgz ./shared-schema.tgz --ignore-scripts --omit=dev \
+    && npm install --ignore-scripts --omit=dev \
+    && npm install prisma@5.22.0 --ignore-scripts --omit=dev \
+    && npx prisma generate \
+    && rm -f sync-core.tgz shared-schema.tgz \
+    && npm cache clean --force
+USER supersync
+EXPOSE 1900
+ENV NODE_ENV=production PORT=1900 DATA_DIR=/app/data \
+    RUN_MIGRATIONS_ON_STARTUP=false NODE_OPTIONS=--max-old-space-size=576
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT}/health || exit 1
+CMD ["sh", "-c", "if [ \"${RUN_MIGRATIONS_ON_STARTUP:-false}\" = \"true\" ]; then sh scripts/migrate-deploy.sh || exit 1; fi; exec node dist/src/index.js"]
+EOF
+}
+
 workspace_write_super_productivity_electron_build() {
   mkdir -p "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR"
   workspace_install_file "${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}/Dockerfile" 600 <<'EOF'
@@ -5976,14 +6030,15 @@ WORKDIR /src/app
 COPY spark-headless.patch /tmp/spark-headless.patch
 RUN git apply --unidiff-zero --check /tmp/spark-headless.patch \
     && git apply --unidiff-zero /tmp/spark-headless.patch
-RUN npm ci --ignore-scripts && npm run prepare
+RUN (npm ci --ignore-scripts || npm install --ignore-scripts) \
+    && npm run prepare
 RUN npm run buildFrontend:prod:es6 && npm run electron:build \
     && case "${TARGETARCH}" in arm64) arch=arm64 ;; amd64) arch=x64 ;; *) exit 1 ;; esac \
     && npx electron-builder --linux dir --publish never "--${arch}"
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl dumb-init xvfb socat \
+      ca-certificates curl dumb-init xvfb xauth socat \
       libasound2 libatk-bridge2.0-0 libatk1.0-0 libcairo2 libcups2 libdbus-1-3 \
       libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnss3 libpango-1.0-0 \
       libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 libxext6 \
@@ -6022,10 +6077,11 @@ wait "$app_pid"
 EOF
   workspace_install_file "${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}/spark-headless.patch" 600 <<'EOF'
 diff --git a/electron/electronAPI.d.ts b/electron/electronAPI.d.ts
-index bda757d..d8a5085 100644
+index bda757d..fc98291 100644
 --- a/electron/electronAPI.d.ts
 +++ b/electron/electronAPI.d.ts
-@@ -33,0 +34,7 @@ export interface ElectronAPI {
+@@ -24,4 +24,11 @@
+ export interface ElectronAPI {
 +  getSparkBootstrapConfig(): {
 +    enabled: boolean;
 +    baseUrl: string;
@@ -6033,32 +6089,65 @@ index bda757d..d8a5085 100644
 +    encryptionPassword: string;
 +  };
 +
+   on(
+     channel: string,
+     listener: (event: IpcRendererEvent, ...args: unknown[]) => void,
 diff --git a/electron/preload.ts b/electron/preload.ts
-index f7ba75d..a522207 100644
+index f7ba75d..499430c 100644
 --- a/electron/preload.ts
 +++ b/electron/preload.ts
-@@ -61,0 +62,6 @@ const ea: ElectronAPI = {
+@@ -51,4 +51,10 @@
+ const ea: ElectronAPI = {
 +  getSparkBootstrapConfig: () => ({
 +    enabled: process.env.SPARK_HEADLESS === '1',
 +    baseUrl: process.env.SUPERSYNC_INTERNAL_URL || '',
 +    accessToken: process.env.SUPERSYNC_ACCESS_TOKEN || '',
 +    encryptionPassword: process.env.SUPERSYNC_ENCRYPTION_PASSWORD || '',
 +  }),
+   on: (
+     channel: string,
+     listener: (event: IpcRendererEvent, ...args: unknown[]) => void,
 diff --git a/src/app/core/startup/startup.service.ts b/src/app/core/startup/startup.service.ts
-index 296f03b..34549f8 100644
+index 296f03b..1bfe35e 100644
 --- a/src/app/core/startup/startup.service.ts
 +++ b/src/app/core/startup/startup.service.ts
-@@ -31 +31 @@ import { map, switchMap, take } from 'rxjs/operators';
+@@ -28,7 +28,7 @@ import {
+   shouldShowRateDialog,
+ } from '../../features/dialog-please-rate/rate-dialog-state';
+ import { map, switchMap, take } from 'rxjs/operators';
 -import { combineLatest } from 'rxjs';
 +import { combineLatest, firstValueFrom } from 'rxjs';
-@@ -45,0 +46,2 @@ import { CustomThemeService } from '../theme/custom-theme.service';
+ import { Store } from '@ngrx/store';
+ import { selectSyncConfig } from '../../features/config/store/global-config.reducer';
+ import { selectEnabledIssueProviders } from '../../features/issue/store/issue-provider.selectors';
+@@ -43,6 +43,7 @@ import { DataInitStateService } from '../data-init/data-init-state.service';
+ import { OnboardingHintService } from '../../features/onboarding/onboarding-hint.service';
+ import { LocalRestApiHandlerService } from '../electron/local-rest-api-handler.service';
+ import { CustomThemeService } from '../theme/custom-theme.service';
 +import { SyncProviderManager } from '../../op-log/sync-providers/provider-manager.service';
-+import { SyncProviderId } from '../../op-log/sync-providers/provider.const';
-@@ -83,0 +86 @@ export class StartupService {
+
+ const w = window as Window & { productivityTips?: string[][]; randomIndex?: number };
+
+@@ -81,6 +82,7 @@ export class StartupService {
+   private _dataInitStateService = inject(DataInitStateService);
+   private _injector = inject(Injector);
+   private _customThemeService = inject(CustomThemeService);
 +  private _syncProviderManager = inject(SyncProviderManager);
-@@ -180,0 +184 @@ export class StartupService {
+
+   constructor() {
+     // Initialize electron error handler in an effect
+@@ -178,6 +180,7 @@ export class StartupService {
+
+     if (IS_ELECTRON) {
+       this._injector.get(LocalRestApiHandlerService).init();
 +      this._applySparkBootstrapAfterDataLoad();
-@@ -211,0 +216,51 @@ export class StartupService {
+
+       window.ea.on(IPC.TRANSFER_SETTINGS_REQUESTED, () =>
+         this._sendCurrentSettingsToElectronAfterDataLoad(),
+@@ -209,6 +212,57 @@ export class StartupService {
+     }
+   }
+
 +  private _applySparkBootstrapAfterDataLoad(): void {
 +    const bootstrap = window.ea.getSparkBootstrapConfig();
 +    if (
@@ -6110,7 +6199,18 @@ index 296f03b..34549f8 100644
 +    });
 +  }
 +
+   private _sendCurrentSettingsToElectronAfterDataLoad(): void {
+     this._dataInitStateService.isAllDataLoadedInitially$
+       .pipe(
 EOF
+}
+
+workspace_postgres_volume_target() {
+  if [[ -f "${WORKSPACE_DATA_DIR}/postgres/PG_VERSION" ]]; then
+    printf '%s\n' /var/lib/postgresql/data
+  else
+    printf '%s\n' /var/lib/postgresql
+  fi
 }
 
 workspace_write_files_vikunja() {
@@ -6121,7 +6221,7 @@ workspace_write_files_vikunja() {
   local n8n_owner_status vikunja_token tailscale_mode
   local vikunja_api_status vikunja_human_id vikunja_bot_id vikunja_project_access_status
   local vikunja_human_status vikunja_bot_status vikunja_human_admin_status
-  local postgres_image vikunja_image n8n_image old_umask
+  local postgres_image postgres_volume_target vikunja_image n8n_image old_umask
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
   tailscale_bind_addr=$(workspace_env_or_value WORKSPACE_TAILSCALE_BIND_ADDR 127.0.0.1)
   tailscale_dns_name=$(workspace_read_env WORKSPACE_TAILSCALE_DNS_NAME 2>/dev/null || true)
@@ -6214,6 +6314,7 @@ workspace_write_files_vikunja() {
   workspace_require_env_value "Vikunja Hermes API token" "$vikunja_token"
   workspace_require_env_value "workspace Tailscale mode" "$tailscale_mode"
   workspace_require_env_value "workspace Tailscale bind address" "$tailscale_bind_addr"
+  postgres_volume_target=$(workspace_postgres_volume_target)
   workspace_require_env_value "workspace Tailscale DNS name" "$tailscale_dns_name"
   workspace_require_env_value "workspace Postgres image" "$postgres_image"
   workspace_require_env_value "workspace Vikunja image" "$vikunja_image"
@@ -6336,7 +6437,7 @@ N8N_COMMUNITY_PACKAGES=[]
 N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
 NODES_EXCLUDE=["n8n-nodes-base.executeCommand","n8n-nodes-base.readWriteFile"]
 EOF
-  workspace_install_file "${WORKSPACE_CONFIG_DIR}/init-db.sh" 700 <<'EOF'
+  workspace_install_file "${WORKSPACE_CONFIG_DIR}/init-db.sh" 644 <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -6386,7 +6487,7 @@ services:
       timeout: 5s
       retries: 10
     volumes:
-      - ${WORKSPACE_DATA_DIR}/postgres:/var/lib/postgresql/data
+      - ${WORKSPACE_DATA_DIR}/postgres:${postgres_volume_target}
       - ${WORKSPACE_CONFIG_DIR}/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
 
   vikunja:
@@ -6447,7 +6548,7 @@ workspace_write_files_super_productivity() {
   local tailnet="$1" human_user="$2" human_email="$3" _human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
   local task_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
-  local postgres_pass supersync_db_pass supersync_jwt supersync_token supersync_encryption n8n_db_pass n8n_key mention_secret
+  local postgres_pass postgres_volume_target supersync_db_pass supersync_jwt supersync_token supersync_encryption n8n_db_pass n8n_key mention_secret
   local n8n_owner_status postgres_image supersync_image electron_version electron_commit electron_image n8n_image rp_id old_umask
 
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
@@ -6533,10 +6634,12 @@ workspace_write_files_super_productivity() {
   workspace_require_env_value "SuperSync encryption password" "$supersync_encryption"
   workspace_require_env_value "workspace Tailscale mode" "$tailscale_mode"
   workspace_require_env_value "workspace Tailscale bind address" "$tailscale_bind_addr"
+  postgres_volume_target=$(workspace_postgres_volume_target)
 
   mkdir -p "$WORKSPACE_CONFIG_DIR" "$WORKSPACE_DATA_DIR"/{postgres,n8n,super-productivity-electron,backups}
   chmod 700 "$WORKSPACE_CONFIG_DIR"
   workspace_prepare_data_dirs
+  workspace_write_supersync_build
   workspace_write_super_productivity_electron_build
   old_umask=$(umask)
   umask 077
@@ -6652,7 +6755,7 @@ N8N_COMMUNITY_PACKAGES=[]
 N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
 NODES_EXCLUDE=["n8n-nodes-base.executeCommand","n8n-nodes-base.readWriteFile"]
 EOF
-  workspace_install_file "${WORKSPACE_CONFIG_DIR}/init-db.sh" 700 <<'EOF'
+  workspace_install_file "${WORKSPACE_CONFIG_DIR}/init-db.sh" 644 <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 psql -v ON_ERROR_STOP=1 \
@@ -6695,11 +6798,16 @@ services:
       timeout: 5s
       retries: 10
     volumes:
-      - ${WORKSPACE_DATA_DIR}/postgres:/var/lib/postgresql/data
+      - ${WORKSPACE_DATA_DIR}/postgres:${postgres_volume_target}
       - ${WORKSPACE_CONFIG_DIR}/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
 
   supersync-migrate:
     image: ${supersync_image}
+    build:
+      context: ${WORKSPACE_SUPERSYNC_DIR}
+      args:
+        SUPER_PRODUCTIVITY_VERSION: ${electron_version}
+        SUPER_PRODUCTIVITY_COMMIT: ${electron_commit}
     profiles: [tools]
     env_file: [${WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE}]
     depends_on:
@@ -6708,6 +6816,11 @@ services:
 
   supersync:
     image: ${supersync_image}
+    build:
+      context: ${WORKSPACE_SUPERSYNC_DIR}
+      args:
+        SUPER_PRODUCTIVITY_VERSION: ${electron_version}
+        SUPER_PRODUCTIVITY_COMMIT: ${electron_commit}
     container_name: ${WORKSPACE_SUPERSYNC_CONTAINER}
     restart: unless-stopped
     init: true
@@ -6802,6 +6915,16 @@ workspace_postgres_psql() {
     return "$rc"
   fi
   return "$rc"
+}
+
+workspace_wait_for_postgres() {
+  local i
+  for i in {1..60}; do
+    workspace_postgres_psql -tAc 'SELECT 1' >/dev/null 2>&1 && return 0
+    sleep "${SPARK_WORKSPACE_WAIT_SLEEP:-1}"
+  done
+  setup_fail "Postgres did not become ready"
+  return 1
 }
 
 workspace_postgres_role_exists() {
@@ -6922,13 +7045,43 @@ workspace_supersync_mint_token() {
     ' 2>/dev/null
 }
 
+workspace_supersync_schema_exists() {
+  local pass out
+  pass=$(workspace_read_env SUPERSYNC_DATABASE_PASSWORD 2>/dev/null || true)
+  [[ -n "$pass" ]] || return 1
+  out=$(workspace_compose exec -T -e PGPASSWORD="$pass" postgres \
+    psql -qAt -U supersync -d supersync \
+      -c "SELECT COALESCE(to_regclass('public.users')::text, '');" 2>/dev/null || true)
+  [[ "$out" == "users" ]]
+}
+
+workspace_supersync_bootstrap_schema() {
+  workspace_supersync_schema_exists && return 0
+  workspace_compose run --rm --no-deps -T supersync \
+    npx prisma db push --skip-generate >/dev/null 2>&1 || return 1
+  workspace_compose run --rm --no-deps -T supersync sh -c '
+    set -eu
+    for dir in prisma/migrations/*; do
+      [ -d "$dir" ] || continue
+      name=${dir##*/}
+      npx prisma migrate resolve --rolled-back "$name" >/dev/null 2>&1 || true
+      npx prisma migrate resolve --applied "$name" >/dev/null
+    done
+  ' >/dev/null 2>&1
+}
+
 workspace_prepare_super_productivity_runtime() {
   local email record user_id token_version token
   [[ "$(workspace_task_manager)" == "super-productivity" ]] || return 0
   email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
   [[ -n "$email" ]] || return 1
   workspace_compose up -d postgres >/dev/null 2>&1 || return 1
+  workspace_wait_for_postgres || return 1
   workspace_ensure_postgres_databases
+  workspace_compose build supersync >/dev/null 2>&1 \
+    || { setup_fail "Could not build the pinned SuperSync image"; return 1; }
+  workspace_supersync_bootstrap_schema \
+    || { setup_fail "Could not initialize the SuperSync database schema"; return 1; }
   workspace_compose run --rm supersync-migrate >/dev/null 2>&1 \
     || { setup_fail "Could not apply SuperSync database migrations"; return 1; }
   record=$(workspace_supersync_user_record "$email" 2>/dev/null | grep -E '^[1-9][0-9]*:[0-9]+$' | head -1) || {

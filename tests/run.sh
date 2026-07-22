@@ -856,7 +856,7 @@ test_source_guard_loads_without_dispatch() {
 }
 
 test_super_productivity_workspace_files() {
-  local tmp compose env sync_env dockerfile gateway_absent mode
+  local tmp compose env sync_env dockerfile supersync_dockerfile headless_patch gateway_absent mode init_mode
   tmp=$(mktemp -d)
   HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
     SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_WORKSPACE_TASK_MANAGER=super-productivity \
@@ -868,8 +868,11 @@ test_super_productivity_workspace_files() {
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
   sync_env=$(cat "${tmp}/home/.config/spark/workspace/super-productivity.env")
   dockerfile=$(cat "${tmp}/home/.config/spark/workspace/super-productivity-electron/Dockerfile")
+  supersync_dockerfile=$(cat "${tmp}/home/.config/spark/workspace/supersync/Dockerfile")
+  headless_patch=$(cat "${tmp}/home/.config/spark/workspace/super-productivity-electron/spark-headless.patch")
   [[ ! -e "${tmp}/home/.config/spark/workspace/super-productivity-gateway.conf" ]] && gateway_absent=1 || gateway_absent=0
   mode=$(stat -c '%a' "${tmp}/home/.config/spark/workspace/super-productivity.env" 2>/dev/null || stat -f '%Lp' "${tmp}/home/.config/spark/workspace/super-productivity.env")
+  init_mode=$(stat -c '%a' "${tmp}/home/.config/spark/workspace/init-db.sh" 2>/dev/null || stat -f '%Lp' "${tmp}/home/.config/spark/workspace/init-db.sh")
   rm -rf "$tmp"
   [[ "$env" == *"WORKSPACE_TASK_MANAGER=super-productivity"* ]] &&
     [[ "$env" == *"TASK_MANAGER_URL=https://tasks.robin-triceratops.ts.net"* ]] &&
@@ -879,6 +882,8 @@ test_super_productivity_workspace_files() {
     [[ "$compose" != *$'  super-productivity-gateway:\n'* ]] &&
     [[ "$compose" != *$'  vikunja:\n'* ]] &&
     [[ "$compose" == *'127.0.0.1:3456:1900'* ]] &&
+    [[ "$compose" == *":/var/lib/postgresql"$'\n'* ]] &&
+    [[ "$compose" == *"context: ${tmp}/home/.config/spark/workspace/supersync"* ]] &&
     [[ "$compose" != *'super-productivity/super-productivity:latest'* ]] &&
     [[ "$sync_env" == *"PUBLIC_URL=https://tasks.robin-triceratops.ts.net"* ]] &&
     [[ "$sync_env" == *"CORS_ORIGINS=https://tasks.robin-triceratops.ts.net,https://app.super-productivity.com"* ]] &&
@@ -886,8 +891,28 @@ test_super_productivity_workspace_files() {
     [[ "$sync_env" == *"SPARK_HEADLESS=1"* ]] &&
     [[ "$dockerfile" == *"TARGETARCH"* ]] &&
     [[ "$dockerfile" == *"git apply --unidiff-zero"* ]] &&
+    [[ "$dockerfile" == *"npm ci --ignore-scripts || npm install --ignore-scripts"* ]] &&
+    [[ "$dockerfile" == *"xvfb xauth socat"* ]] &&
+    [[ "$supersync_dockerfile" == *"packages/super-sync-server"* ]] &&
+    [[ "$supersync_dockerfile" == *"SUPER_PRODUCTIVITY_COMMIT=4212ed4b0d95b3610f565d077966274fd1294831"* ]] &&
+    [[ "$headless_patch" != *$'+import { SyncProviderId '* ]] &&
     [[ "$gateway_absent" -eq 1 ]] &&
-    [[ "$mode" == "600" ]]
+    [[ "$mode" == "600" ]] &&
+    [[ "$init_mode" == "644" ]]
+}
+
+test_workspace_preserves_legacy_postgres_mount() {
+  local tmp target
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.local/share/spark/workspace/postgres"
+  printf '17\n' > "${tmp}/home/.local/share/spark/workspace/postgres/PG_VERSION"
+  target=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      workspace_postgres_volume_target
+    ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$target" == "/var/lib/postgresql/data" ]]
 }
 
 test_super_productivity_rejects_http_ports_mode() {
@@ -6894,6 +6919,7 @@ run_test "architecture command maps core boundaries" test_architecture_command_m
 run_test "single-file build matches modules" test_single_file_build_matches_modules
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "workspace generates Super Productivity alternative" test_super_productivity_workspace_files
+run_test "workspace preserves legacy Postgres mount" test_workspace_preserves_legacy_postgres_mount
 run_test "Super Productivity rejects insecure ports mode" test_super_productivity_rejects_http_ports_mode
 run_test "workspace asks which task manager to install" test_workspace_interactive_task_manager_selector
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
