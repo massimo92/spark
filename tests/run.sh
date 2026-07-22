@@ -667,6 +667,9 @@ Update available:         no}"; exit "${FAKE_NEMOHERMES_UPDATE_CHECK_EXIT:-0}" ;
   *"policy-explain"*) echo "${FAKE_NEMOHERMES_POLICY_TEXT:-Policy tier: restricted}" ;;
   *"policy-list"*) echo "${FAKE_NEMOHERMES_POLICY_LIST:-restricted}" ;;
   *"channels status --channel whatsapp --json"*) echo "${FAKE_WHATSAPP_STATUS_JSON:-{\"verdict\":\"healthy\"}}" ;;
+  *"hermes exec"*"/user"*)
+    echo "${FAKE_HERMES_VIKUNJA_USER_JSON:-{\"id\":3,\"username\":\"bot-hermes\",\"bot_owner_id\":1}}"
+    exit "${FAKE_HERMES_VIKUNJA_API_EXIT:-0}" ;;
   *doctor*) exit "${FAKE_NEMOHERMES_DOCTOR_EXIT:-0}" ;;
   *status*) echo "${FAKE_NEMOHERMES_STATUS:-Hermes ready}" ;;
   *logs*) echo "Hermes logs" ;;
@@ -674,6 +677,35 @@ esac
 exit "${FAKE_NEMOHERMES_EXIT:-0}"
 EOF
   chmod +x "${dir}/nemohermes"
+
+  cat > "${dir}/openshell" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+[[ -n "${FAKE_OPENSHELL_FILE:-}" ]] && printf '%s\n' "$args" >> "$FAKE_OPENSHELL_FILE"
+case "$args" in
+  "settings get --global --json")
+    printf '{"settings":{"providers_v2_enabled":"%s"}}\n' "${FAKE_OPENSHELL_PROVIDERS_V2:-true}" ;;
+  "settings set --global --key providers_v2_enabled --value true --yes")
+    exit "${FAKE_OPENSHELL_SETTINGS_EXIT:-0}" ;;
+  "provider list -o json")
+    if [[ "${FAKE_OPENSHELL_PROVIDER_EXISTS:-1}" == "1" ]]; then
+      printf '[{"name":"spark-vikunja","type":"generic","credential_keys":["VIKUNJA_API_TOKEN"]}]\n'
+    else
+      printf '[]\n'
+    fi ;;
+  provider\ create*|provider\ update*)
+    exit "${FAKE_OPENSHELL_PROVIDER_EXIT:-0}" ;;
+  "sandbox provider list hermes")
+    if [[ "${FAKE_OPENSHELL_PROVIDER_ATTACHED:-1}" == "1" ]]; then
+      printf 'spark-vikunja  generic  1  0\n'
+    fi ;;
+  sandbox\ provider\ attach*|policy\ update*)
+    exit "${FAKE_OPENSHELL_POLICY_EXIT:-0}" ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "${dir}/openshell"
 
   # ssh mock for spark setup remote tests. Opening the ControlMaster (-fN) and closing it
   # (-O exit) succeed; otherwise the last arg is the remote command and we answer probes.
@@ -1864,6 +1896,8 @@ test_workspace_lifecycle_commands() {
     workspace_tailscale_services_configured() { return 0; }
     workspace_start_hermes_gateway_proxy() { printf "bridge start\n" >> "$CALLS"; }
     workspace_stop_hermes_gateway_proxy() { printf "bridge stop\n" >> "$CALLS"; }
+    workspace_start_hermes_vikunja_proxy() { printf "tasks bridge start\n" >> "$CALLS"; }
+    workspace_stop_hermes_vikunja_proxy() { printf "tasks bridge stop\n" >> "$CALLS"; }
     workspace_start_hermes_dashboard_proxy() { printf "dashboard proxy start\n" >> "$CALLS"; }
     workspace_stop_hermes_dashboard_proxy() { printf "dashboard proxy stop\n" >> "$CALLS"; }
     workspace_start_hermes_private_proxy() { printf "hermes start\n" >> "$CALLS"; }
@@ -1887,11 +1921,13 @@ test_workspace_lifecycle_commands() {
     [[ "$calls" == *"compose up -d --remove-orphans"* ]] &&
     [[ "$calls" == *"gateway 0 1 Org/Model"* ]] &&
     [[ "$calls" == *"bridge start"* ]] &&
+    [[ "$calls" == *"tasks bridge start"* ]] &&
     [[ "$calls" == *"dashboard proxy start"* ]] &&
     [[ "$calls" == *"hermes start"* ]] &&
     [[ "$calls" == *"nemohermes hermes stop"* ]] &&
     [[ "$calls" == *"gateway stop"* ]] &&
     [[ "$calls" == *"bridge stop"* ]] &&
+    [[ "$calls" == *"tasks bridge stop"* ]] &&
     [[ "$calls" == *"dashboard proxy stop"* ]] &&
     [[ "$calls" == *"model stop Org/Model"* ]] &&
     [[ "$calls" == *"compose stop"* ]] &&
@@ -1978,7 +2014,7 @@ test_workspace_listener_check_allows_only_openshell_gateway_bridge() {
     source "$1"
     workspace_read_env() { [[ "$1" == WORKSPACE_TAILSCALE_MODE ]] && printf "services\n"; }
     workspace_openshell_bridge_ip() { printf "172.19.0.1\n"; }
-    ss() { printf "LISTEN 0 4096 172.19.0.1:4000 0.0.0.0:*\n"; }
+    ss() { printf "LISTEN 0 4096 172.19.0.1:4000 0.0.0.0:*\nLISTEN 0 4096 172.19.0.1:3456 0.0.0.0:*\n"; }
     workspace_host_listeners_loopback_only
   ' _ "$SPARK"
 }
@@ -2202,7 +2238,7 @@ test_workspace_setup_waits_for_model() {
 
 test_workspace_setup_writes_compose_names() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out compose init tailscale_calls nemo_calls curl_calls docker_calls env postgres_env vikunja_env n8n_env workspace_mode compose_mode gateway_mode litellm_mode
+  local tmp fake_bin out compose init tailscale_calls nemo_calls openshell_calls curl_calls docker_calls skill env postgres_env vikunja_env n8n_env workspace_mode compose_mode gateway_mode litellm_mode
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
@@ -2211,6 +2247,9 @@ test_workspace_setup_writes_compose_names() {
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_OPENSHELL_FILE="${tmp}/openshell.log" \
+    FAKE_OPENSHELL_PROVIDERS_V2=false FAKE_OPENSHELL_PROVIDER_EXISTS=0 \
+    FAKE_OPENSHELL_PROVIDER_ATTACHED=0 \
     FAKE_DOCKER_ARGS_FILE="${tmp}/docker.log" \
     FAKE_CURL_FILE="${tmp}/curl.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
@@ -2219,8 +2258,10 @@ test_workspace_setup_writes_compose_names() {
   init=$(cat "${tmp}/home/.config/spark/workspace/init-db.sh" 2>/dev/null || echo "")
   tailscale_calls=$(cat "${tmp}/tailscale.log" 2>/dev/null || echo "")
   nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  openshell_calls=$(cat "${tmp}/openshell.log" 2>/dev/null || echo "")
   curl_calls=$(cat "${tmp}/curl.log" 2>/dev/null || echo "")
   docker_calls=$(cat "${tmp}/docker.log" 2>/dev/null || echo "")
+  skill=$(cat "${tmp}/home/.config/spark/workspace/hermes-skills/vikunja/SKILL.md" 2>/dev/null || echo "")
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
   postgres_env=$(cat "${tmp}/home/.config/spark/workspace/postgres.env" 2>/dev/null || echo "")
   vikunja_env=$(cat "${tmp}/home/.config/spark/workspace/vikunja.env" 2>/dev/null || echo "")
@@ -2261,8 +2302,20 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"NEMOCLAW_SANDBOX_GPU=0"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
+    [[ "$nemo_calls" == *"hermes skill install "*"/hermes-skills/vikunja"* ]] &&
+    [[ "$nemo_calls" == *"hermes gateway restart --quiet"* ]] &&
     [[ "$docker_calls" == *"--name spark-hermes-litellm-proxy"* ]] &&
     [[ "$docker_calls" == *"172.19.0.1 4000 127.0.0.1 4000"* ]] &&
+    [[ "$docker_calls" == *"--name spark-hermes-vikunja-proxy"* ]] &&
+    [[ "$docker_calls" == *"172.19.0.1 3456 127.0.0.1 3456"* ]] &&
+    [[ "$openshell_calls" == *"settings set --global --key providers_v2_enabled --value true --yes"* ]] &&
+    [[ "$openshell_calls" == *"provider create --name spark-vikunja --type generic --credential VIKUNJA_API_TOKEN"* ]] &&
+    [[ "$openshell_calls" == *"sandbox provider attach hermes spark-vikunja"* ]] &&
+    [[ "$openshell_calls" == *"policy update hermes --add-endpoint host.openshell.internal:3456:read-write:rest:enforce --binary /usr/bin/curl --rule-name spark-vikunja-api --wait"* ]] &&
+    [[ "$openshell_calls" != *"vk_auto_hermes"* ]] &&
+    [[ "$skill" == *"env_vars: [VIKUNJA_API_TOKEN]"* ]] &&
+    [[ "$skill" == *"Use Vikunja's REST API directly"* ]] &&
+    [[ "$skill" == *"Do not use Electron or an MCP server"* ]] &&
     [[ "$curl_calls" == *'"expires_at":"2099-12-31T23:59:59Z"'* ]] &&
     [[ "$curl_calls" == *'"owner_id":3'* ]] &&
     [[ "$curl_calls" == *'/api/v2/tokens'* ]] &&
@@ -3111,6 +3164,26 @@ test_workspace_setup_creates_hermes_bot() {
     [[ "$env" != *"VIKUNJA_HERMES_PASSWORD="* ]]
 }
 
+test_workspace_setup_requires_hermes_vikunja_api_access() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 SPARK_WORKSPACE_HERMES_API_ATTEMPTS=1 \
+    FAKE_HERMES_VIKUNJA_API_EXIT=1 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Could not give Hermes verified Vikunja API access"* ]]
+}
+
 test_workspace_setup_resolves_unicode_vikunja_user_id() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin env user_list
@@ -3625,7 +3698,7 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"59/59 checks passed"* ]] &&
+    [[ "$out" == *"60/60 checks passed"* ]] &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
@@ -3667,6 +3740,7 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Hermes local API is reachable"* ]] &&
     [[ "$out" == *"[x] NemoHermes sandbox doctor passes"* ]] &&
     [[ "$out" == *"[x] NemoHermes inference route uses selected LiteLLM model"* ]] &&
+    [[ "$out" == *"[x] Hermes reaches Vikunja as bot-hermes"* ]] &&
     [[ "$out" == *"[x] Hermes dashboard URL is reachable"* ]]
 }
 
@@ -3715,7 +3789,7 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"60/60 checks passed"* ]] &&
+  [[ "$out" == *"61/61 checks passed"* ]] &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -3766,17 +3840,18 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 59 and
+    .passed == 60 and
     .failed == 0 and
-    .total == 59 and
+    .total == 60 and
     .model == "Org/Alpha" and
     ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Identity & recovery" and .passed == 13 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Inference & agent" and .passed == 11 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Inference & agent" and .passed == 12 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM Hermes route completes smoke request" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "NemoHermes inference route uses selected LiteLLM model" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "Hermes reaches Vikunja as bot-hermes" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Tailscale workspace URLs respond" and .ok == true)] | length == 1)
   ' >/dev/null
 }
@@ -4982,7 +5057,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"59/59 checks passed"* ]] &&
+  [[ "$out" == *"60/60 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -5004,7 +5079,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"59/59 checks passed"* ]] &&
+  [[ "$out" == *"60/60 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -6791,6 +6866,7 @@ run_test "workspace setup repairs shared Postgres runtime" test_workspace_setup_
 run_test "workspace setup falls back to manual Vikunja token" test_workspace_setup_manual_token_fallback
 run_test "workspace setup waits for Vikunja CLI" test_workspace_setup_waits_for_vikunja_cli
 run_test "workspace setup creates Hermes bot" test_workspace_setup_creates_hermes_bot
+run_test "workspace setup requires Hermes Vikunja API access" test_workspace_setup_requires_hermes_vikunja_api_access
 run_test "workspace setup resolves Unicode Vikunja user ID" test_workspace_setup_resolves_unicode_vikunja_user_id
 run_test "workspace setup shares projects with Hermes bot" test_workspace_setup_shares_projects_with_hermes_bot
 run_test "workspace rejects regular-user token for Hermes" test_workspace_rejects_regular_user_token_for_hermes
