@@ -249,7 +249,7 @@ stdin_payload=""
 args="$*
 ${stdin_payload}"
 case "$args" in
-  *https://vikunja.test-tailnet.ts.net/api/v1/info*) exit "${FAKE_TAILSCALE_VIKUNJA_EXIT:-0}" ;;
+  *https://tasks.test-tailnet.ts.net/api/v1/info*) exit "${FAKE_TAILSCALE_VIKUNJA_EXIT:-0}" ;;
   *https://n8n.test-tailnet.ts.net/healthz*) exit "${FAKE_TAILSCALE_N8N_EXIT:-0}" ;;
   *https://hermes.test-tailnet.ts.net/*) exit "${FAKE_TAILSCALE_HERMES_EXIT:-0}" ;;
   *http://sparkbox.test-tailnet.ts.net:3456/api/v1/info*) exit "${FAKE_TAILSCALE_VIKUNJA_EXIT:-0}" ;;
@@ -614,7 +614,7 @@ case "${1:-}" in
     exit "${FAKE_TAILSCALE_STATUS_EXIT:-1}" ;;
   serve)
     if [[ "${2:-}" == "get-config" && "${3:-}" == "--all" ]]; then
-      echo "${FAKE_TAILSCALE_SERVE_CONFIG:-svc:vikunja 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790}"
+      echo "${FAKE_TAILSCALE_SERVE_CONFIG:-svc:tasks 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790}"
       exit "${FAKE_TAILSCALE_GET_CONFIG_EXIT:-0}"
     fi
     [[ "${2:-}" == "status" ]] && exit 0
@@ -2119,7 +2119,7 @@ test_workspace_check_existing_config_no_mutation() {
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\nopenshell-hermes-test\n' \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"CapMap":{"services/tasks":[{"Name":"svc:tasks","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_VIKUNJA_USER_EXIT=1 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
@@ -2230,8 +2230,10 @@ test_workspace_setup_writes_compose_names() {
   gateway_mode=$(stat -c '%a' "${tmp}/home/.config/spark/gateway.json" 2>/dev/null || stat -f '%Lp' "${tmp}/home/.config/spark/gateway.json" 2>/dev/null || echo "")
   litellm_mode=$(stat -c '%a' "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || stat -f '%Lp' "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$out" == *"Workspace complete"* ]] && [[ "$compose" == *"  vikunja:"* ]] &&
-    [[ "$compose" == *"  postgres:"* ]] && [[ "$compose" == *"  n8n:"* ]] &&
+  [[ "$out" == *"Workspace complete"* ]] &&
+    [[ "$(sed -n '1p' <<< "$compose")" == "services:" ]] &&
+    [[ "$(sed -n '2p' <<< "$compose")" == "  postgres:" ]] &&
+    [[ "$(grep -c '^  \(postgres\|vikunja\|n8n\):$' <<< "$compose")" -eq 3 ]] &&
     [[ "$compose" == *"postgres.env"* ]] && [[ "$compose" == *"vikunja.env"* ]] &&
     [[ "$compose" == *"n8n.env"* ]] && [[ "$compose" != *"secrets.env"* ]] &&
     [[ "$compose" == *"image: postgres:18"* ]] &&
@@ -2249,7 +2251,7 @@ test_workspace_setup_writes_compose_names() {
     [[ "$(grep -c 'stop_grace_period: 30s' <<< "$compose")" -ge 3 ]] &&
     [[ "$(grep -c 'max-size: "10m"' <<< "$compose")" -ge 3 ]] &&
     [[ "$(grep -c 'max-file: "5"' <<< "$compose")" -ge 3 ]] &&
-    [[ "$tailscale_calls" == *"serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456"* ]] &&
+    [[ "$tailscale_calls" == *"serve --bg --service=svc:tasks --https=443 --yes http://127.0.0.1:3456"* ]] &&
     [[ "$nemo_calls" == *"onboard --non-interactive --yes-i-accept-third-party-software --yes --no-gpu --control-ui-port 18789"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_AGENT=hermes"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_PREFERRED_API=openai-completions"* ]] &&
@@ -2265,6 +2267,7 @@ test_workspace_setup_writes_compose_names() {
     [[ "$curl_calls" == *'"owner_id":3'* ]] &&
     [[ "$curl_calls" == *'/api/v2/tokens'* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
+    [[ "$env" == *"VIKUNJA_URL=https://tasks.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"HERMES_DASHBOARD_PORT=18789"* ]] &&
     [[ "$env" == *"HERMES_LITELLM_MODEL=vllm/Org/Alpha"* ]] &&
     [[ "$env" == *"HERMES_POLICY_TIER=restricted"* ]] &&
@@ -2552,7 +2555,7 @@ test_workspace_tailnet_from_self_dnsname() {
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$env" == *"VIKUNJA_URL=https://vikunja.test-tailnet.ts.net"* ]] &&
+  [[ "$env" == *"VIKUNJA_URL=https://tasks.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"N8N_URL=https://n8n.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"HERMES_URL=https://hermes.test-tailnet.ts.net"* ]]
 }
@@ -2695,7 +2698,7 @@ test_workspace_setup_updates_old_tailscale_for_services() {
     [[ "$out" == *"Tailscale updated"* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$tailscale_calls" == *"update"* ]] &&
-    [[ "$tailscale_calls" == *"serve --bg --service=svc:vikunja"* ]]
+    [[ "$tailscale_calls" == *"serve --bg --service=svc:tasks"* ]]
 }
 
 test_workspace_setup_defaults_to_services_from_ports_workspace() {
@@ -2722,10 +2725,10 @@ test_workspace_setup_defaults_to_services_from_ports_workspace() {
   rm -rf "$tmp"
   [[ "$out" == *"Tailscale Services configured"* || "$out" == *"Workspace drift detected; reconciling"* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
-    [[ "$env" == *"VIKUNJA_URL=https://vikunja.test-tailnet.ts.net"* ]] &&
+    [[ "$env" == *"VIKUNJA_URL=https://tasks.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"N8N_URL=https://n8n.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"HERMES_URL=https://hermes.test-tailnet.ts.net"* ]] &&
-    [[ "$tailscale_calls" == *"serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456"* ]] &&
+    [[ "$tailscale_calls" == *"serve --bg --service=svc:tasks --https=443 --yes http://127.0.0.1:3456"* ]] &&
     [[ "$tailscale_calls" == *"serve --bg --service=svc:n8n --https=443 --yes http://127.0.0.1:5678"* ]] &&
     [[ "$tailscale_calls" == *"serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:18790"* ]]
 }
@@ -2739,7 +2742,7 @@ test_workspace_setup_reports_missing_tailscale_services_hitl() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/tasks":[{"Name":"svc:tasks","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}]}}}' \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
@@ -2793,12 +2796,12 @@ test_workspace_setup_reports_tailscale_service_pending_approval() {
   local tmp fake_bin out status env nemo_calls serve_config
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
-  serve_config='{"version":"0.0.1","services":{"svc:vikunja":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18790"}}}}'
+  serve_config='{"version":"0.0.1","services":{"svc:tasks":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18790"}}}}'
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/tasks":[{"Name":"svc:tasks","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
     FAKE_TAILSCALE_SERVE_CONFIG="$serve_config" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
@@ -2823,8 +2826,8 @@ test_workspace_waits_for_delayed_tailscale_service_approval() {
   mkdir -p "${tmp}/home/.config/spark/workspace"
   printf 'WORKSPACE_TAILSCALE_MODE=services\n' > "${tmp}/home/.config/spark/workspace/secrets.env"
   status_file="${tmp}/tailscale-status.json"
-  initial_json='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}'
-  approved_json='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}],"service-host":[{"Name":"svc:vikunja"},{"Name":"svc:n8n"},{"Name":"svc:hermes"}]}}}'
+  initial_json='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/tasks":[{"Name":"svc:tasks","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}'
+  approved_json='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"Tags":["tag:spark"],"CapMap":{"services/tasks":[{"Name":"svc:tasks","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}],"service-host":[{"Name":"svc:tasks"},{"Name":"svc:n8n"},{"Name":"svc:hermes"}]}}}'
   printf '%s\n' "$initial_json" > "$status_file"
   ( sleep 0.2; printf '%s\n' "$approved_json" > "$status_file" ) &
   updater=$!
@@ -2849,7 +2852,7 @@ test_workspace_setup_reports_missing_tailscale_tag() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/tasks":[{"Name":"svc:tasks","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
@@ -2877,7 +2880,7 @@ test_workspace_setup_reports_missing_tailscale_operator() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_TAILSCALE_SERVE_STDERR="Access denied: serve config denied\nUse 'sudo tailscale serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:3456'.\nTo not require root, use 'sudo tailscale set --operator=\$USER' once." \
+    FAKE_TAILSCALE_SERVE_EXIT=1 FAKE_TAILSCALE_SERVE_STDERR="Access denied: serve config denied\nUse 'sudo tailscale serve --bg --service=svc:tasks --https=443 --yes http://127.0.0.1:3456'.\nTo not require root, use 'sudo tailscale set --operator=\$USER' once." \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1)
@@ -3814,7 +3817,7 @@ test_workspace_status_renders_containers_and_agent_workspace() {
     "$SPARK" ws status 2>&1)
   verbose_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\nopenshell-hermes-test\n' \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"CapMap":{"services/tasks":[{"Name":"svc:tasks","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
     FAKE_COMPOSE_PS=$'NAME STATUS\nworkspace-n8n Up' \
     FAKE_NEMOHERMES_STATUS=$'Sandbox-scoped status for hermes:\n  Model: vllm/Org/Alpha\n  Agent: Hermes Agent\n\nSandbox:\n  Id: abc-123\n  Revision: 1\n\nPolicy:\nprivate policy detail' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
@@ -3830,7 +3833,7 @@ test_workspace_status_renders_containers_and_agent_workspace() {
     [[ "$out" == *"Agent workspace"* ]] &&
     [[ "$out" == *"Hermes model"* && "$out" == *"Org/Alpha"* ]] &&
     [[ "$out" == *"Private access"* && "$out" == *"ready"* ]] &&
-    [[ "$out" == *"https://vikunja.test-tailnet.ts.net"* ]] &&
+    [[ "$out" == *"https://tasks.test-tailnet.ts.net"* ]] &&
     [[ "$out" != *"Workspace health"* ]] &&
     [[ "$out" != *"URLs:"* ]] &&
     [[ "$out" != *"LiteLLM"* ]] &&
@@ -3850,11 +3853,11 @@ test_workspace_status_json_quiet_and_containers() {
   cat > "${tmp}/home/.config/spark/workspace/secrets.env" <<'ENV'
 WORKSPACE_TAILSCALE_MODE=services
 HERMES_MODEL=Org/Alpha
-VIKUNJA_URL=https://vikunja.test-tailnet.ts.net
+VIKUNJA_URL=https://tasks.test-tailnet.ts.net
 N8N_URL=https://n8n.test-tailnet.ts.net
 HERMES_URL=https://hermes.test-tailnet.ts.net
 ENV
-  status_json='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}'
+  status_json='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"CapMap":{"services/tasks":[{"Name":"svc:tasks","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}'
   json=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_TAILSCALE_STATUS_JSON="$status_json" FAKE_NAMES='openshell-hermes-test\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' "$SPARK" ws status --json)
@@ -4742,7 +4745,7 @@ test_workspace_doctor_flags_missing_tailscale_service_registration() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/tasks":[{"Name":"svc:tasks","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}]}}}' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -4795,7 +4798,7 @@ test_workspace_doctor_flags_tailscale_service_host_not_advertised() {
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_TAILSCALE_GET_CONFIG_EXIT=0 FAKE_TAILSCALE_SERVE_CONFIG='{"version":"0.0.1"}' \
-    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/vikunja":[{"Name":"svc:vikunja","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
+    FAKE_TAILSCALE_STATUS_JSON='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"DNSName":"sparkbox.test-tailnet.ts.net.","TailscaleIPs":["100.64.0.10"],"CapMap":{"services/tasks":[{"Name":"svc:tasks","Ports":["tcp:443"]}],"services/n8n":[{"Name":"svc:n8n","Ports":["tcp:443"]}],"services/hermes":[{"Name":"svc:hermes","Ports":["tcp:443"]}]}}}' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -4871,7 +4874,7 @@ test_workspace_doctor_flags_missing_tailscale_service_config() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_TAILSCALE_SERVE_CONFIG='svc:vikunja 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678' \
+    FAKE_TAILSCALE_SERVE_CONFIG='svc:tasks 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -4895,7 +4898,7 @@ test_workspace_doctor_flags_tailscale_funnel_enabled() {
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_STATUS='https://vikunja.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://tasks.example.com\n' \
     FAKE_NAMES='spark-litellm\n' FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
@@ -4921,7 +4924,7 @@ test_workspace_doctor_rejects_public_tailscale_service_target() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_TAILSCALE_SERVE_CONFIG='svc:vikunja 0.0.0.0:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790' \
+    FAKE_TAILSCALE_SERVE_CONFIG='svc:tasks 0.0.0.0:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -4946,7 +4949,7 @@ test_workspace_doctor_rejects_swapped_tailscale_service_ports() {
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
-    FAKE_TAILSCALE_SERVE_CONFIG='svc:vikunja 127.0.0.1:5678\nsvc:n8n 127.0.0.1:3456\nsvc:hermes 127.0.0.1:18790' \
+    FAKE_TAILSCALE_SERVE_CONFIG='svc:tasks 127.0.0.1:5678\nsvc:n8n 127.0.0.1:3456\nsvc:hermes 127.0.0.1:18790' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
   status=$?
@@ -4968,7 +4971,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
   serve_config=$'{
-    "svc:vikunja": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:3456" } } },
+    "svc:tasks": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:3456" } } },
     "svc:n8n": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:5678" } } },
     "svc:hermes": { "Handlers": { "/": { "Proxy": "http://127.0.0.1:18790" } } }
   }'
@@ -4993,7 +4996,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
-  serve_config='{"version":"0.0.1","services":{"svc:vikunja":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18790"}}}}'
+  serve_config='{"version":"0.0.1","services":{"svc:tasks":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18790"}}}}'
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \

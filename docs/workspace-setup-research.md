@@ -45,7 +45,7 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 
 ## Security decisions
 
-- Tailscale Services are preferred for friendly names like `https://vikunja.<tailnet>.ts.net`. They require Tailscale 1.86+, admin approval when needed, and tag-based host identity.
+- Tailscale Services are preferred for stable role-based names like `https://tasks.<tailnet>.ts.net`. They require Tailscale 1.86+, admin approval when needed, and tag-based host identity.
 - If Tailscale is older than 1.86, `spark ws setup` attempts to update Tailscale before failing Services setup.
 - If Services cannot be used, ports mode binds only to the host Tailscale IPv4 address and uses the machine MagicDNS name plus explicit ports.
 - Localhost URLs are not a valid workspace access mode; missing tailnet/MagicDNS evidence marks setup incomplete.
