@@ -10,6 +10,8 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 - Vikunja CLI docs: https://vikunja.io/docs/cli/
 - Vikunja API docs: https://vikunja.io/docs/api-documentation/
 - Vikunja Swagger/OpenAPI: https://try.vikunja.io/api/v1/docs.json
+- Vikunja API v2 docs: https://vikunja.io/docs/api-v2/
+- Vikunja bot users: https://vikunja.io/docs/bot-users/
 - Vikunja n8n docs: https://vikunja.io/docs/n8n/
 - Vikunja webhooks docs: https://vikunja.io/docs/webhooks/
 - n8n Docker install docs: https://docs.n8n.io/hosting/installation/docker/
@@ -27,8 +29,9 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 
 - Vikunja supports binary, source build, Docker, distro packages, FreeBSD, Kubernetes, and Ansible. `spark ws` uses Docker Compose because the requested target is dockerized, repeatable, and easy to bind privately.
 - Vikunja docs state SQLite is fine for personal use and PostgreSQL/MySQL fit multi-user setups. `spark ws` uses PostgreSQL.
-- Vikunja CLI docs show Docker CLI execution as `docker exec ... /app/vikunja/vikunja <subcommand>` and `user create` flags `-u`, `-e`, and `-p`, so setup can create the human and `hermes` users through the running container without enabling public registration.
-- Vikunja API docs recommend API tokens, support self-hosted `/api/v1/login` for JWT, and expose `PUT /api/v1/tokens`; setup logs in as `hermes` and creates the token on behalf of that same user. If token creation fails, setup emits the manual UI token step.
+- Vikunja CLI creates only the human account. Hermes uses a Vikunja 2.4+ bot user named `bot-hermes`, created through `POST /api/v2/user/bots`; no Hermes password or email is stored.
+- Setup authenticates the human through self-hosted `/api/v1/login`, creates a bot-owned token through `POST /api/v2/tokens` with `owner_id` set to the bot ID, and rejects tokens for regular users or bots owned by another human.
+- Bot ownership controls lifecycle, not project access. Setup shares every project the human can administer with `bot-hermes` as read/write, then compares the projects visible to the human and bot. Projects the human cannot share remain a manual action.
 - Vikunja n8n docs document a community node, but `spark ws` keeps community packages disabled by default and uses the generic HTTP/webhook path for the inactive scaffold.
 - Vikunja webhooks docs document project/user webhook endpoints plus HMAC-SHA256 signatures with `X-Vikunja-Signature`; the future workflow scaffold stores a shared mention secret for that verification contract.
 - n8n runs in Docker with PostgreSQL. `spark ws` uses the same Postgres service as Vikunja, but creates separate DBs/users to keep data ownership separate.
@@ -60,7 +63,7 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 ## Integration decision
 
 - Vikunja remains the source of truth for tasks.
-- Hermes should act as the Vikunja user `hermes` through the Vikunja API token.
+- Hermes should act as `bot-hermes` through its Vikunja API token. Activity is attributed to the bot, while project access is granted explicitly.
 - n8n should only detect events/mentions and notify Hermes with IDs. It should not become the task source of truth.
 - Current implementation stops at an inactive workflow scaffold. Real workflows are intentionally deferred.
 

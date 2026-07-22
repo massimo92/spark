@@ -256,10 +256,34 @@ case "$args" in
   *http://sparkbox.test-tailnet.ts.net:5678/healthz*) exit "${FAKE_TAILSCALE_N8N_EXIT:-0}" ;;
   *http://sparkbox.test-tailnet.ts.net:18789/*) exit "${FAKE_TAILSCALE_HERMES_EXIT:-0}" ;;
   *:3456/api/v1/info*) exit "${FAKE_VIKUNJA_INFO_EXIT:-0}" ;;
-  *:3456/api/v1/login*) echo '{"token":"jwt_hermes"}'; exit "${FAKE_VIKUNJA_LOGIN_EXIT:-0}" ;;
+  *:3456/api/v1/login*) echo '{"token":"jwt_human"}'; exit "${FAKE_VIKUNJA_LOGIN_EXIT:-0}" ;;
   *:3456/api/v1/routes*) echo '{"tasks":{"read_all":{},"create":{},"update":{},"delete":{}},"projects":{"read_all":{},"create":{},"update":{},"delete":{}},"comments":{"read_all":{},"create":{},"update":{},"delete":{}},"labels":{"read_all":{},"create":{},"update":{},"delete":{}},"webhooks":{"read_all":{},"create":{},"update":{},"delete":{}}}'; exit "${FAKE_VIKUNJA_ROUTES_EXIT:-0}" ;;
   *:3456/api/v1/tokens*) [[ -n "${FAKE_CURL_FILE:-}" ]] && printf '%s\n' "$*" >> "${FAKE_CURL_FILE}"; echo "{\"token\":\"${FAKE_VIKUNJA_CREATED_TOKEN:-vk_auto_hermes}\"}"; exit "${FAKE_VIKUNJA_TOKEN_CREATE_EXIT:-0}" ;;
-  *:3456/api/v1/user*) echo "${FAKE_VIKUNJA_USER_JSON:-{\"username\":\"hermes\",\"email\":\"hermes@spark.invalid\"}}"; exit "${FAKE_VIKUNJA_USER_EXIT:-0}" ;;
+  *:3456/api/v2/user/bots*)
+    [[ -n "${FAKE_CURL_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_CURL_FILE}"
+    if [[ "$args" == *"-X POST"* ]]; then
+      if [[ -n "${FAKE_VIKUNJA_BOT_CREATE_JSON:-}" ]]; then echo "$FAKE_VIKUNJA_BOT_CREATE_JSON"; else echo '{"id":3,"username":"bot-hermes","name":"Hermes","bot_owner_id":1}'; fi
+      exit "${FAKE_VIKUNJA_BOT_CREATE_EXIT:-0}"
+    fi
+    if [[ -n "${FAKE_VIKUNJA_BOTS_JSON:-}" ]]; then echo "$FAKE_VIKUNJA_BOTS_JSON"; else echo '{"items":[{"id":3,"username":"bot-hermes","name":"Hermes","bot_owner_id":1}]}'; fi
+    exit "${FAKE_VIKUNJA_BOTS_EXIT:-0}" ;;
+  *:3456/api/v2/tokens*)
+    [[ -n "${FAKE_CURL_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_CURL_FILE}"
+    echo "{\"token\":\"${FAKE_VIKUNJA_CREATED_TOKEN:-vk_auto_hermes}\"}"
+    exit "${FAKE_VIKUNJA_TOKEN_CREATE_EXIT:-0}" ;;
+  *:3456/api/v2/projects/*/users*)
+    [[ -n "${FAKE_CURL_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_CURL_FILE}"
+    if [[ "$args" == *"-X GET"* ]]; then
+      if [[ -n "${FAKE_VIKUNJA_PROJECT_USERS_JSON:-}" ]]; then echo "$FAKE_VIKUNJA_PROJECT_USERS_JSON"; else echo '{"items":[{"username":"bot-hermes","permission":1}]}'; fi
+    else
+      echo '{"id":1,"username":"bot-hermes","permission":1}'
+    fi
+    exit "${FAKE_VIKUNJA_PROJECT_SHARE_EXIT:-0}" ;;
+  *:3456/api/v2/projects*)
+    [[ -n "${FAKE_CURL_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_CURL_FILE}"
+    if [[ -n "${FAKE_VIKUNJA_PROJECTS_JSON:-}" ]]; then echo "$FAKE_VIKUNJA_PROJECTS_JSON"; else echo '{"items":[{"id":10,"title":"Inbox","max_permission":2}]}'; fi
+    exit "${FAKE_VIKUNJA_PROJECTS_EXIT:-0}" ;;
+  *:3456/api/v1/user*) echo "${FAKE_VIKUNJA_USER_JSON:-{\"id\":3,\"username\":\"bot-hermes\",\"email\":\"\",\"bot_owner_id\":1}}"; exit "${FAKE_VIKUNJA_USER_EXIT:-0}" ;;
   *:5678/healthz*) exit "${FAKE_N8N_HEALTH_EXIT:-0}" ;;
   *:5678/rest/owner/setup*) [[ -n "${FAKE_N8N_OWNER_MARKER:-}" ]] && : > "$FAKE_N8N_OWNER_MARKER"; echo '{"data":{"id":"owner"}}'; exit "${FAKE_N8N_OWNER_EXIT:-0}" ;;
   *:5678/rest/login*)
@@ -2238,6 +2262,8 @@ test_workspace_setup_writes_compose_names() {
     [[ "$docker_calls" == *"--name spark-hermes-litellm-proxy"* ]] &&
     [[ "$docker_calls" == *"172.19.0.1 4000 127.0.0.1 4000"* ]] &&
     [[ "$curl_calls" == *'"expires_at":"2099-12-31T23:59:59Z"'* ]] &&
+    [[ "$curl_calls" == *'"owner_id":3'* ]] &&
+    [[ "$curl_calls" == *'/api/v2/tokens'* ]] &&
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$env" == *"HERMES_DASHBOARD_PORT=18789"* ]] &&
     [[ "$env" == *"HERMES_LITELLM_MODEL=vllm/Org/Alpha"* ]] &&
@@ -2251,9 +2277,14 @@ test_workspace_setup_writes_compose_names() {
     [[ "$env" == *"WORKSPACE_VIKUNJA_IMAGE=vikunja/vikunja:latest"* ]] &&
     [[ "$env" == *"WORKSPACE_N8N_IMAGE=docker.n8n.io/n8nio/n8n:latest"* ]] &&
     [[ "$env" == *"VIKUNJA_HUMAN_USER_STATUS=exists"* ]] &&
-    [[ "$env" == *"VIKUNJA_HERMES_USER_STATUS=exists"* ]] &&
+    [[ "$env" == *"VIKUNJA_HUMAN_USER_ID=1"* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_BOT_USERNAME=bot-hermes"* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_BOT_ID=3"* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_BOT_STATUS=exists"* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_PROJECT_ACCESS_STATUS=verified"* ]] &&
     [[ "$env" == *"VIKUNJA_HERMES_API_TOKEN=vk_auto_hermes"* ]] &&
     [[ "$env" == *"VIKUNJA_HERMES_API_STATUS=verified"* ]] &&
+    [[ "$env" != *"VIKUNJA_HERMES_PASSWORD="* ]] &&
     [[ "$env" != *"VIKUNJA_HUMAN_PASSWORD=secret123"* ]] &&
     [[ "$postgres_env" == *"VIKUNJA_DATABASE_PASSWORD="* ]] &&
     [[ "$postgres_env" == *"DB_POSTGRESDB_PASSWORD="* ]] &&
@@ -3026,7 +3057,7 @@ test_workspace_setup_manual_token_fallback() {
     "$SPARK" ws setup --yes --model Org/Alpha 2>&1 || true)
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$out" == *"Create a Vikunja API token for user 'hermes' in the UI"* ]] &&
+  [[ "$out" == *"Create a token for bot-hermes under Settings > Bots"* ]] &&
     [[ "$env" == *"VIKUNJA_HERMES_API_STATUS=manual"* ]] &&
     [[ "$env" != *"VIKUNJA_HERMES_API_TOKEN=vk_auto_hermes"* ]]
 }
@@ -3049,26 +3080,109 @@ test_workspace_setup_waits_for_vikunja_cli() {
   rm -rf "$tmp"
   [[ "$count" -ge 2 ]] &&
     [[ "$env" == *"VIKUNJA_HUMAN_USER_STATUS=exists"* ]] &&
-    [[ "$env" == *"VIKUNJA_HERMES_USER_STATUS=exists"* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_BOT_STATUS=exists"* ]] &&
     [[ "$env" != *"VIKUNJA_HUMAN_PASSWORD=secret123"* ]]
 }
 
-test_workspace_setup_creates_hermes_with_valid_email() {
+test_workspace_setup_creates_hermes_bot() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin calls
+  local tmp fake_bin compose_calls curl_calls env
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_COMPOSE_EXEC_FILE="${tmp}/compose-exec.log" \
+    FAKE_CURL_FILE="${tmp}/curl.log" FAKE_VIKUNJA_BOTS_JSON='{"items":[]}' \
     FAKE_VIKUNJA_USER_LIST='| 1 | massimo | m@example.com | active |\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
-  calls=$(cat "${tmp}/compose-exec.log" 2>/dev/null || echo "")
+  compose_calls=$(cat "${tmp}/compose-exec.log" 2>/dev/null || echo "")
+  curl_calls=$(cat "${tmp}/curl.log" 2>/dev/null || echo "")
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$calls" == *"user create -u hermes -e hermes@spark.invalid"* ]] &&
-    [[ "$calls" != *"hermes@local"* ]]
+  [[ "$compose_calls" != *"user create -u hermes"* ]] &&
+    [[ "$curl_calls" == *"-X POST http://127.0.0.1:3456/api/v2/user/bots"* ]] &&
+    [[ "$curl_calls" == *'"username":"bot-hermes"'* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_BOT_STATUS=created"* ]] &&
+    [[ "$env" != *"VIKUNJA_HERMES_PASSWORD="* ]]
+}
+
+test_workspace_setup_resolves_unicode_vikunja_user_id() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env user_list
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  user_list='┌────┬──────────┬─────────────────┬────────┐\n│ ID │ USERNAME │      EMAIL      │ STATUS │\n├────┼──────────┼─────────────────┼────────┤\n│ 7  │ massimo  │ m@example.com   │ Active │\n└────┴──────────┴─────────────────┴────────┘\n'
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_VIKUNJA_USER_LIST="$user_list" \
+    FAKE_VIKUNJA_BOTS_JSON='{"items":[{"id":3,"username":"bot-hermes","name":"Hermes","bot_owner_id":7}]}' \
+    FAKE_VIKUNJA_USER_JSON='{"id":3,"username":"bot-hermes","email":"","bot_owner_id":7}' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$env" == *"VIKUNJA_HUMAN_USER_ID=7"* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_API_STATUS=verified"* ]]
+}
+
+test_workspace_setup_shares_projects_with_hermes_bot() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin curl_calls
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_CURL_FILE="${tmp}/curl.log" FAKE_VIKUNJA_PROJECT_USERS_JSON='{"items":[]}' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  curl_calls=$(cat "${tmp}/curl.log" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$curl_calls" == *"-X POST http://127.0.0.1:3456/api/v2/projects/10/users"* ]] &&
+    [[ "$curl_calls" == *'"username":"bot-hermes","permission":1'* ]]
+}
+
+test_workspace_rejects_regular_user_token_for_hermes() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 SPARK_WORKSPACE_VIKUNJA_TOKEN=vk_regular \
+    FAKE_VIKUNJA_USER_JSON='{"id":2,"username":"hermes","email":"hermes@spark.invalid","bot_owner_id":0}' \
+    FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$env" == *"VIKUNJA_HERMES_API_STATUS=wrong-user"* ]] &&
+    [[ "$env" != *"VIKUNJA_HERMES_PROJECT_ACCESS_STATUS=verified"* ]]
+}
+
+test_workspace_rejects_bot_owned_by_another_user() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 SPARK_WORKSPACE_VIKUNJA_TOKEN=vk_foreign_bot \
+    FAKE_VIKUNJA_USER_JSON='{"id":3,"username":"bot-hermes","email":"","bot_owner_id":9}' \
+    FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$env" == *"VIKUNJA_HUMAN_USER_ID=1"* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_API_STATUS=wrong-user"* ]]
 }
 
 test_workspace_setup_never_persists_human_password_on_vikunja_failure() {
@@ -3156,6 +3270,8 @@ test_workspace_setup_generates_prints_and_forgets_passwords() {
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     FAKE_VIKUNJA_USER_LIST='| 2 | hermes | hermes@spark.invalid | active |\n' \
     FAKE_VIKUNJA_CREATED_USER_FILE="${tmp}/vikunja.user" \
+    FAKE_VIKUNJA_BOTS_JSON='{"items":[{"id":3,"username":"bot-hermes","bot_owner_id":9}]}' \
+    FAKE_VIKUNJA_USER_JSON='{"id":3,"username":"bot-hermes","email":"","bot_owner_id":9}' \
     FAKE_N8N_LOGIN_EXIT=7 FAKE_N8N_LOGIN_AFTER_OWNER=1 FAKE_N8N_OWNER_MARKER="${tmp}/n8n.owner" \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --no-smtp --model Org/Alpha 2>&1 || true)
@@ -3183,6 +3299,8 @@ test_workspace_setup_accepts_password_flags_and_files() {
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     FAKE_VIKUNJA_USER_LIST='| 2 | hermes | hermes@spark.invalid | active |\n' \
     FAKE_VIKUNJA_CREATED_USER_FILE="${tmp}/vikunja.user" \
+    FAKE_VIKUNJA_BOTS_JSON='{"items":[{"id":3,"username":"bot-hermes","bot_owner_id":9}]}' \
+    FAKE_VIKUNJA_USER_JSON='{"id":3,"username":"bot-hermes","email":"","bot_owner_id":9}' \
     FAKE_N8N_LOGIN_EXIT=7 FAKE_N8N_LOGIN_AFTER_OWNER=1 FAKE_N8N_OWNER_MARKER="${tmp}/n8n.owner" \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --yes --no-smtp --model Org/Alpha \
@@ -3381,7 +3499,7 @@ EOF_ENV
   env=$(cat "$env_file")
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"Removed legacy stored human passwords"* ]] &&
+    [[ "$out" == *"Removed legacy stored interactive-user credentials"* ]] &&
     [[ "$out" == *"Workspace username is required"* ]] &&
     [[ "$env" != *"✗"* ]] &&
     [[ "$env" != *"is required"* ]]
@@ -3473,14 +3591,14 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"58/58 checks passed"* ]] &&
+    [[ "$out" == *"59/59 checks passed"* ]] &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
     [[ "$out" == *"Private access"* ]] &&
     [[ "$out" == *"Inference & agent"* ]] &&
     [[ "$out" == *"[x] Compose service running: postgres"* ]] &&
-    [[ "$out" == *"[x] Human service passwords are not stored"* ]] &&
+    [[ "$out" == *"[x] Interactive service passwords are not stored"* ]] &&
     [[ "$out" == *"[x] Scoped service env files exist and are 0600"* ]] &&
     [[ "$out" == *"[x] Docker Compose config is valid"* ]] &&
     [[ "$out" == *"[x] Compose uses scoped env files, not full secrets.env"* ]] &&
@@ -3492,8 +3610,9 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Workspace URLs configured"* ]] &&
     [[ "$out" == *"[x] Workspace technical secrets are unique per service"* ]] &&
     [[ "$out" == *"[x] Vikunja human user exists"* ]] &&
-    [[ "$out" == *"[x] Vikunja hermes user exists"* ]] &&
-    [[ "$out" == *"[x] Vikunja hermes API token works"* ]] &&
+    [[ "$out" == *"[x] Vikunja bot-hermes exists"* ]] &&
+    [[ "$out" == *"[x] Vikunja bot-hermes API token works"* ]] &&
+    [[ "$out" == *"[x] Vikunja projects are shared with bot-hermes"* ]] &&
     [[ "$out" == *"[x] n8n hardened for private agent workflows"* ]] &&
     [[ "$out" == *"[x] n8n owner/admin ready"* ]] &&
     [[ "$out" == *"[x] Tailscale supports selected private access mode"* ]] &&
@@ -3562,7 +3681,7 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"59/59 checks passed"* ]] &&
+  [[ "$out" == *"60/60 checks passed"* ]] &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -3613,12 +3732,12 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 58 and
+    .passed == 59 and
     .failed == 0 and
-    .total == 58 and
+    .total == 59 and
     .model == "Org/Alpha" and
     ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Identity & recovery" and .passed == 12 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Identity & recovery" and .passed == 13 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Inference & agent" and .passed == 11 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
@@ -4008,7 +4127,7 @@ test_workspace_doctor_flags_stale_vikunja_token_status() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Vikunja hermes API token works"* ]]
+    [[ "$out" == *"[ ] Vikunja bot-hermes API token works"* ]]
 }
 
 test_workspace_doctor_requires_vikunja_user_and_email_same_row() {
@@ -4300,7 +4419,7 @@ test_workspace_doctor_flags_stored_human_password() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"[ ] Human service passwords are not stored"* ]]
+    [[ "$out" == *"[ ] Interactive service passwords are not stored"* ]]
 }
 
 test_workspace_doctor_flags_duplicate_credentials() {
@@ -4829,7 +4948,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"58/58 checks passed"* ]] &&
+  [[ "$out" == *"59/59 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -4851,7 +4970,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"58/58 checks passed"* ]] &&
+  [[ "$out" == *"59/59 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -6637,7 +6756,11 @@ run_test "workspace setup --check reports Funnel without reset" test_workspace_s
 run_test "workspace setup repairs shared Postgres runtime" test_workspace_setup_repairs_shared_postgres_runtime
 run_test "workspace setup falls back to manual Vikunja token" test_workspace_setup_manual_token_fallback
 run_test "workspace setup waits for Vikunja CLI" test_workspace_setup_waits_for_vikunja_cli
-run_test "workspace setup creates Hermes with valid email" test_workspace_setup_creates_hermes_with_valid_email
+run_test "workspace setup creates Hermes bot" test_workspace_setup_creates_hermes_bot
+run_test "workspace setup resolves Unicode Vikunja user ID" test_workspace_setup_resolves_unicode_vikunja_user_id
+run_test "workspace setup shares projects with Hermes bot" test_workspace_setup_shares_projects_with_hermes_bot
+run_test "workspace rejects regular-user token for Hermes" test_workspace_rejects_regular_user_token_for_hermes
+run_test "workspace rejects bot owned by another user" test_workspace_rejects_bot_owned_by_another_user
 run_test "workspace setup never persists human password on Vikunja failure" test_workspace_setup_never_persists_human_password_on_vikunja_failure
 run_test "workspace setup preserves existing secrets" test_workspace_setup_preserves_existing_secrets
 run_test "workspace setup missing required values does not pollute env" test_workspace_setup_missing_required_values_do_not_pollute_env
