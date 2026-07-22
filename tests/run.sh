@@ -40,7 +40,7 @@ case "${1:-}" in
       *" up -d"*|*" up"*) exit "${FAKE_COMPOSE_UP_EXIT:-0}" ;;
       *exec*)
         stdin_payload=""
-        if [[ ! -t 0 ]]; then
+        if [[ ! -t 0 && "${FAKE_DOCKER_READ_STDIN:-1}" == "1" ]]; then
           stdin_payload=$(cat || true)
         fi
         match_payload="$*
@@ -3311,6 +3311,37 @@ test_workspace_setup_accepts_password_flags_and_files() {
     [[ "$out" == *"password: N8nFilePassword456"* ]] &&
     [[ "$out" == *"prefer --vikunja-password-file"* ]] &&
     [[ "$env" != *"VikunjaFlagPassword123"* ]] && [[ "$env" != *"N8nFilePassword456"* ]]
+}
+
+test_workspace_setup_prompts_for_existing_vikunja_password() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env_file staged out env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=InitialPassword123 \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com SPARK_WORKSPACE_N8N_PASSWORD=secret456 \
+    FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env_file="${tmp}/home/.config/spark/workspace/secrets.env"
+  staged="${env_file}.staged"
+  grep -v '^VIKUNJA_HERMES_BOT_STATUS=' "$env_file" > "$staged"
+  printf '%s\n' 'VIKUNJA_HERMES_BOT_STATUS=manual' >> "$staged"
+  mv "$staged" "$env_file"
+  out=$(printf '%s\n' 'CurrentPassword123' | \
+    HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_ASSUME_INTERACTIVE=1 FAKE_DOCKER_READ_STDIN=0 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --yes --model Org/Alpha 2>&1 || true)
+  env=$(cat "$env_file")
+  rm -rf "$tmp"
+  [[ "$out" == *"Current Vikunja password for massimo"* ]] &&
+    [[ "$out" != *"CurrentPassword123"* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_BOT_STATUS=exists"* ]] &&
+    [[ "$env" == *"VIKUNJA_HERMES_PROJECT_ACCESS_STATUS=verified"* ]] &&
+    [[ "$env" != *"CurrentPassword123"* ]]
 }
 
 test_workspace_credentials_command_removed() {
@@ -6766,6 +6797,7 @@ run_test "workspace setup preserves existing secrets" test_workspace_setup_prese
 run_test "workspace setup missing required values does not pollute env" test_workspace_setup_missing_required_values_do_not_pollute_env
 run_test "workspace setup generates, prints, and forgets human passwords" test_workspace_setup_generates_prints_and_forgets_passwords
 run_test "workspace setup accepts password flags and files" test_workspace_setup_accepts_password_flags_and_files
+run_test "workspace setup prompts for existing Vikunja password" test_workspace_setup_prompts_for_existing_vikunja_password
 run_test "workspace credentials command is removed" test_workspace_credentials_command_removed
 run_test "workspace setup rejects removed SMTP" test_workspace_setup_rejects_removed_smtp
 run_test "workspace setup removes legacy SMTP" test_workspace_setup_removes_legacy_smtp

@@ -856,6 +856,10 @@ workspace_ensure_vikunja_user() {
     info "Vikunja user exists: ${username}"
     return 0
   fi
+  if [[ -z "$password" ]]; then
+    workspace_set_env_key "$status_key" manual
+    return 1
+  fi
   workspace_vikunja_cli user create -u "$username" -e "$email" -p "$password" >/dev/null 2>&1 || true
   if workspace_vikunja_user_exists "$username" "$email"; then
     workspace_set_env_key "$status_key" created
@@ -868,11 +872,10 @@ workspace_ensure_vikunja_user() {
 }
 
 workspace_create_vikunja_users() {
-  local human_pass="${1:-}" human_user human_email human_id jwt token
+  local human_pass="${1:-}" human_user human_email human_id jwt token bot_id
   workspace_wait_for_vikunja_cli || return 1
   human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME)
   human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL)
-  [[ -n "$human_pass" ]] || { warn "Vikunja user password unavailable; existing user left unchanged"; return 0; }
   workspace_ensure_vikunja_user "$human_user" "$human_email" "$human_pass" VIKUNJA_HUMAN_USER_STATUS || true
   human_id=$(workspace_vikunja_user_id "$human_user" "$human_email" 2>/dev/null || true)
   if [[ "$human_id" =~ ^[1-9][0-9]*$ ]]; then
@@ -884,6 +887,23 @@ workspace_create_vikunja_users() {
   workspace_vikunja_cli user set-admin "$human_user" --admin >/dev/null 2>&1 \
     && { workspace_set_env_key VIKUNJA_HUMAN_ADMIN_STATUS enabled; info "Vikunja admin set: ${human_user}"; } \
     || { workspace_set_env_key VIKUNJA_HUMAN_ADMIN_STATUS manual; warn "Could not promote ${human_user}; set admin manually if needed"; }
+  if [[ -z "$human_pass" ]]; then
+    token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
+    bot_id=$(workspace_read_env VIKUNJA_HERMES_BOT_ID 2>/dev/null || true)
+    if [[ -n "$token" ]] \
+      && workspace_check_vikunja_token "$token" "$bot_id" >/dev/null 2>&1 \
+      && [[ "$(workspace_read_env VIKUNJA_HERMES_BOT_STATUS 2>/dev/null || true)" =~ ^(created|exists)$ ]] \
+      && [[ "$(workspace_read_env VIKUNJA_HERMES_PROJECT_ACCESS_STATUS 2>/dev/null || true)" == "verified" ]]; then
+      info "Vikunja bot-hermes access already configured"
+      return 0
+    fi
+    if ! is_interactive; then
+      warn "Current Vikunja password required; rerun interactively or with --vikunja-password-file"
+      return 0
+    fi
+    human_pass=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_PASSWORD \
+      "Current Vikunja password for ${human_user}" "" 1 text)
+  fi
   jwt=$(workspace_vikunja_login_jwt "$human_user" "$human_pass") || {
     token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
     if [[ -n "$token" ]] && workspace_check_vikunja_token "$token" >/dev/null 2>&1; then
@@ -894,7 +914,7 @@ workspace_create_vikunja_users() {
     fi
     workspace_set_env_key VIKUNJA_HERMES_BOT_STATUS manual
     workspace_set_env_key VIKUNJA_HERMES_API_STATUS manual
-    warn "Could not authenticate the Vikunja human user; rerun with --vikunja-password-file"
+    warn "Could not authenticate the Vikunja human user; rerun interactively or with --vikunja-password-file"
     return 1
   }
   workspace_ensure_vikunja_hermes_bot "$jwt" || {
@@ -2136,13 +2156,19 @@ workspace_setup() {
   human_email=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Workspace email" "$existing_human_email" 0 email)
   n8n_email="$human_email"
   SPARK_WORKSPACE_N8N_EMAIL="$n8n_email"
-  human_pass="${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-$(workspace_random_password)}"
+  vikunja_previous_status=$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)
+  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" ]]; then
+    human_pass="$SPARK_WORKSPACE_VIKUNJA_PASSWORD"
+  elif [[ "$vikunja_previous_status" =~ ^(created|exists)$ ]]; then
+    human_pass=""
+  else
+    human_pass=$(workspace_random_password)
+  fi
   n8n_pass="${SPARK_WORKSPACE_N8N_PASSWORD:-$(workspace_random_password)}"
   [[ "$human_pass" != "$n8n_pass" ]] || die "Vikunja and n8n passwords must be different"
   workspace_require_prompt_value "Vikunja human username" "$human_user" username
   workspace_require_prompt_value "Vikunja human email" "$human_email" email
   workspace_require_prompt_value "n8n admin email" "$n8n_email" email
-  vikunja_previous_status=$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)
   n8n_previous_status=$(workspace_read_env N8N_OWNER_SETUP_STATUS 2>/dev/null || true)
   WORKSPACE_SHOW_VIKUNJA_PASSWORD=0
   WORKSPACE_SHOW_N8N_PASSWORD=0
@@ -4333,7 +4359,7 @@ cmd_workspace_setup_help() {
 
   ${BOLD}Flags:${NC}
     --check                     Read-only validation; no files, containers, or Funnel changes.
-    --yes                       Accept safe defaults. Does not reset Funnel by itself.
+    --yes                       Accept safe defaults. Existing-user passwords still prompt.
     --remote user@host          Run setup on a configured remote host.
     --model MODEL               Hermes model; selected from spark list data when omitted.
     --tailscale-mode services   Prefer HTTPS names: vikunja/n8n/hermes.<tailnet>.ts.net.
@@ -4345,9 +4371,9 @@ cmd_workspace_setup_help() {
     --n8n-image IMAGE           Override n8n image ref.
     --vikunja-username NAME     Human Vikunja username.
     --vikunja-email EMAIL       Human Vikunja email.
-    --vikunja-password PASS     Initial password; visible to shell history/process tools.
+    --vikunja-password PASS     Current/initial password; visible to shell history/process tools.
     --vikunja-password-file FILE
-                                Read initial password from the first line of FILE.
+                                Read current/initial password from the first line of FILE.
     --vikunja-token TOKEN       Store/verify Hermes' Vikunja API token.
     --n8n-email EMAIL           n8n owner/admin email.
     --n8n-password PASS         Initial password; visible to shell history/process tools.
