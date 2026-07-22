@@ -25,6 +25,9 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 - OpenShell providers and credential injection: https://docs.nvidia.com/openshell/sandboxes/manage-providers
 - OpenShell sandbox management: https://docs.nvidia.com/openshell/latest/sandboxes/manage-sandboxes
 - OpenShell network policies: https://docs.nvidia.com/openshell/latest/sandboxes/policies
+- vLLM automatic tool calling: https://docs.vllm.ai/en/stable/features/tool_calling/
+- Qwen3.6 vLLM tool-call launch: https://huggingface.co/Qwen/Qwen3.6-27B
+- Gemma 4 tool parser: https://docs.vllm.ai/en/stable/api/vllm/tool_parsers/gemma4_tool_parser/
 - Tailscale Serve CLI: https://tailscale.com/docs/reference/tailscale-cli/serve
 - Tailscale Services: https://tailscale.com/docs/features/tailscale-services
 
@@ -37,6 +40,10 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 - Bot ownership controls lifecycle, not project access. Setup shares every project the human can administer with `bot-hermes` as read/write, then compares the projects visible to the human and bot. Projects the human cannot share remain a manual action.
 - Spark registers the bot token as a generic OpenShell provider, attaches it to the running `hermes` sandbox, and installs a Vikunja skill that uses direct `curl` calls. No MCP server or Electron client is involved.
 - The sandbox reaches the loopback-only Vikunja service through a Spark-managed TCP bridge on `host.openshell.internal:3456`. OpenShell policy permits only `/usr/bin/curl` to use that REST endpoint.
+- Hermes requires vLLM automatic tool calling. Workspace setup reconciles an existing model that lacks `--enable-auto-tool-choice` or the expected parser; Qwen3.5/3.6 profiles use `qwen3_coder` as documented by Qwen.
+- Hermes rejects contexts below 64K. Spark serves workspace models at 65,536 tokens and caps each local response at 512 tokens; this keeps multi-turn tool calls responsive without reducing the agent loop.
+- Spark keeps Hermes' terminal, file, web, skills, memory, task, cron, and delegation toolsets. Heavy media, browser, and computer-control schemas stay disabled so smaller local models choose the Vikunja HTTP path reliably.
+- Gemma 4 uses its `gemma4` reasoning/tool parsers and automatic attention-backend selection because its partial multimodal attention is incompatible with forced FlashInfer.
 - Vikunja n8n docs document a community node, but `spark ws` keeps community packages disabled by default and uses the generic HTTP/webhook path for the inactive scaffold.
 - Vikunja webhooks docs document project/user webhook endpoints plus HMAC-SHA256 signatures with `X-Vikunja-Signature`; the future workflow scaffold stores a shared mention secret for that verification contract.
 - n8n runs in Docker with PostgreSQL. `spark ws` uses the same Postgres service as Vikunja, but creates separate DBs/users to keep data ownership separate.
@@ -78,5 +85,7 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 - `spark ws setup --check` must not mutate config/data.
 - `spark ws doctor` must pass before considering the base workspace healthy.
 - Doctor calls `/api/v1/user` from inside the Hermes sandbox and requires the response identity to be `bot-hermes`.
+- Doctor rejects a running vLLM model that lacks automatic tool calling or uses the wrong profile parser.
+- Doctor rejects model contexts below 64K and stale Hermes output/reasoning limits.
 - `spark ws doctor --strict` must pass with pinned image refs once the base workspace is production-ready.
 - `spark ws backup` and `spark ws backup --verify DIR` must pass before upgrade or destructive changes.

@@ -94,7 +94,11 @@ The workspace is optional. It installs a private agent environment:
 
 Hermes accesses Vikunja directly through its REST API as the human-owned
 `bot-hermes`. OpenShell injects the bot token as an opaque provider credential;
-the sandbox never receives the raw token.
+the sandbox never receives the raw token. Spark also starts the Hermes model
+with at least 64K context, vLLM automatic tool calling, and the model-specific
+parser. Hermes output and active tool schemas are capped for responsive local
+tool execution while retaining terminal, files, web, skills, memory, tasks,
+cron jobs, and delegation.
 
 ```bash
 spark setup --full

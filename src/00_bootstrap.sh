@@ -56,6 +56,11 @@ WORKSPACE_HERMES_PORT=18789
 WORKSPACE_HERMES_LOCAL_PORT=8642
 WORKSPACE_HERMES_TAILSCALE_PROXY_PORT=18790
 WORKSPACE_HERMES_TAILSCALE_PROXY_CONTAINER="spark-hermes-dashboard-proxy"
+WORKSPACE_HERMES_MIN_CONTEXT=65536
+WORKSPACE_HERMES_MAX_TOKENS_DEFAULT=512
+WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT="none"
+WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT="terminal file web skills memory todo cronjob delegation"
+WORKSPACE_HERMES_CLI_TOOLSETS_DISABLED="browser code_execution vision video image_gen video_gen x_search tts context_engine session_search clarify homeassistant spotify yuanbao computer_use"
 WORKSPACE_POSTGRES_IMAGE_DEFAULT="postgres:18"
 WORKSPACE_VIKUNJA_IMAGE_DEFAULT="vikunja/vikunja:latest"
 WORKSPACE_N8N_IMAGE_DEFAULT="docker.n8n.io/n8nio/n8n:latest"
@@ -207,7 +212,7 @@ SWAPPINESS="${SPARK_SWAPPINESS:-10}"
 # Profile cache schema. Bumped when new fields are added (e.g. is_moe). A cached profile older than
 # this is auto-refreshed on the next `spark run` so new fields (and the decisions that depend on them,
 # like auto enforce-eager) are populated — no user action needed.
-PROFILE_SCHEMA_VERSION=6
+PROFILE_SCHEMA_VERSION=8
 
 # Detect the latest pulled NGC vLLM image
 ngc_vllm_image_blocked() {
@@ -723,8 +728,11 @@ compute_kv_gb() {
 # The fraction is need / total_system_memory — it reflects what the model asks for,
 # NOT the free space. Sets NEED_GB and GPU_MEM_UTIL.
 compute_need_and_fraction() {
-  NEED_GB=$(awk -v w="$WEIGHTS_GB" -v k="$KV_GB" -v h="$MEM_HEADROOM_PCT" \
-    'BEGIN{ printf "%.1f", (w+k)*(1+h/100) }')
+  local mm_extra=0
+  [[ "${IS_MULTIMODAL:-false}" == "true" ]] && mm_extra="${SPARK_MM_ENCODER_OVERHEAD_GB:-8}"
+  awk -v x="$mm_extra" 'BEGIN{exit !(x+0>=0)}' || mm_extra=8
+  NEED_GB=$(awk -v w="$WEIGHTS_GB" -v k="$KV_GB" -v x="$mm_extra" -v h="$MEM_HEADROOM_PCT" \
+    'BEGIN{ printf "%.1f", (w+k+x)*(1+h/100) }')
   GPU_MEM_UTIL=$(awk -v n="$NEED_GB" -v T="$TOTAL_MEM_GB" \
     'BEGIN{ if (T<=0) T=128; u=n/T; if(u>0.95)u=0.95; if(u<0.05)u=0.05; printf "%.2f", u }')
 }
@@ -778,12 +786,15 @@ profile_model() {
 
   REASONING_PARSER=""
   case "$MODEL_FAMILY:$model_type" in
+    gemma:*|*:gemma4) REASONING_PARSER="gemma4" ;;
     qwen:*|*:qwen3*) REASONING_PARSER="qwen3" ;;
     deepseek:*|*:deepseek_v3) REASONING_PARSER="deepseek_r1" ;;
   esac
 
   TOOL_CALL_PARSER=""
   case "$MODEL_FAMILY:$model_type" in
+    gemma:*|*:gemma4) TOOL_CALL_PARSER="gemma4" ;;
+    *:qwen3_5) TOOL_CALL_PARSER="qwen3_coder" ;;
     qwen:*|*:qwen3*) TOOL_CALL_PARSER="qwen3_xml" ;;
   esac
 
