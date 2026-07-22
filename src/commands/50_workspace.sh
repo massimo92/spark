@@ -1,6 +1,7 @@
 # --- Workspace setup: Vikunja + n8n + Hermes/NemoClaw behind Tailscale ---
 
 WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME="${WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME:-bot-hermes}"
+WORKSPACE_TASK_MANAGER_SERVICE="${WORKSPACE_TASK_MANAGER_SERVICE:-tasks}"
 
 workspace_random_secret() {
   if command -v openssl >/dev/null 2>&1; then
@@ -434,7 +435,7 @@ workspace_write_files() {
   else
     if [[ -n "$tailnet" ]]; then
       tailscale_bind_addr=127.0.0.1
-      vikunja_url=$(workspace_url_for vikunja "$tailnet" "$WORKSPACE_VIKUNJA_PORT")
+      vikunja_url=$(workspace_url_for "$WORKSPACE_TASK_MANAGER_SERVICE" "$tailnet" "$WORKSPACE_VIKUNJA_PORT")
       n8n_url=$(workspace_url_for n8n "$tailnet" "$WORKSPACE_N8N_PORT")
       hermes_url=$(workspace_url_for hermes "$tailnet" "$WORKSPACE_HERMES_PORT")
     else
@@ -649,7 +650,7 @@ SQL
 EOF
   umask 022
   workspace_install_file "$WORKSPACE_COMPOSE_FILE" 644 <<EOF
-  services:
+services:
   postgres:
     image: ${postgres_image}
     container_name: ${WORKSPACE_POSTGRES_CONTAINER}
@@ -1446,7 +1447,7 @@ workspace_configure_tailscale() {
   vikunja_log="${status_dir}/vikunja.log"
   n8n_log="${status_dir}/n8n.log"
   hermes_log="${status_dir}/hermes.log"
-  workspace_tailscale_serve_launch_bg "svc:vikunja" "http://127.0.0.1:${WORKSPACE_VIKUNJA_PORT}" "$vikunja_status" "$vikunja_log"
+  workspace_tailscale_serve_launch_bg "svc:${WORKSPACE_TASK_MANAGER_SERVICE}" "http://127.0.0.1:${WORKSPACE_VIKUNJA_PORT}" "$vikunja_status" "$vikunja_log"
   workspace_tailscale_serve_launch_bg "svc:n8n" "http://127.0.0.1:${WORKSPACE_N8N_PORT}" "$n8n_status" "$n8n_log"
   workspace_tailscale_serve_launch_bg "svc:hermes" "http://127.0.0.1:${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT}" "$hermes_status" "$hermes_log"
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
@@ -1506,7 +1507,7 @@ workspace_configure_tailscale() {
         workspace_clear_public_urls
         setup_fail "Could not configure Tailscale Services automatically"
         printf "    Configure manually:\n"
-        printf "    tailscale serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_VIKUNJA_PORT"
+        printf "    tailscale serve --bg --service=svc:%s --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_TASK_MANAGER_SERVICE" "$WORKSPACE_VIKUNJA_PORT"
         printf "    tailscale serve --bg --service=svc:n8n --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_N8N_PORT"
         printf "    tailscale serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_HERMES_TAILSCALE_PROXY_PORT"
         printf "    The host may need tag-based identity and admin approval in Tailscale Services.\n"
@@ -1564,7 +1565,7 @@ workspace_configure_tailscale() {
     workspace_clear_public_urls
     setup_fail "Could not configure Tailscale Services automatically"
     printf "    Configure manually:\n"
-    printf "    tailscale serve --bg --service=svc:vikunja --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_VIKUNJA_PORT"
+    printf "    tailscale serve --bg --service=svc:%s --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_TASK_MANAGER_SERVICE" "$WORKSPACE_VIKUNJA_PORT"
     printf "    tailscale serve --bg --service=svc:n8n --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_N8N_PORT"
     printf "    tailscale serve --bg --service=svc:hermes --https=443 --yes http://127.0.0.1:%s\n" "$WORKSPACE_HERMES_TAILSCALE_PROXY_PORT"
     printf "    The host may need tag-based identity and admin approval in Tailscale Services.\n"
@@ -3152,7 +3153,7 @@ workspace_urls_configured() {
   if [[ "$mode" == "services" ]]; then
     [[ -n "$tailnet" ]] || return 1
     expected_host="${n8n#https://}"
-    [[ "$vikunja" == "https://vikunja.${tailnet}" && "$n8n" == "https://n8n.${tailnet}" && "$hermes" == "https://hermes.${tailnet}" ]] &&
+    [[ "$vikunja" == "https://${WORKSPACE_TASK_MANAGER_SERVICE}.${tailnet}" && "$n8n" == "https://n8n.${tailnet}" && "$hermes" == "https://hermes.${tailnet}" ]] &&
       [[ "$vikunja_public" == "$vikunja" && "$n8n_host" == "$expected_host" ]] &&
       [[ "$n8n_protocol" == "https" && "$n8n_cookie" == "true" ]] &&
       [[ "$n8n_editor" == "$n8n" && "$n8n_webhook" == "$n8n" ]]
@@ -3233,7 +3234,7 @@ workspace_tailscale_https_urls_ready() {
   if [[ "$mode" == "services" ]]; then
     tailnet=$(workspace_tailnet_suffix 2>/dev/null || true)
     [[ -n "$tailnet" ]] || return 1
-    [[ "$vikunja" == "https://vikunja.${tailnet}" && "$n8n" == "https://n8n.${tailnet}" && "$hermes" == "https://hermes.${tailnet}" ]] || return 1
+    [[ "$vikunja" == "https://${WORKSPACE_TASK_MANAGER_SERVICE}.${tailnet}" && "$n8n" == "https://n8n.${tailnet}" && "$hermes" == "https://hermes.${tailnet}" ]] || return 1
   else
     dns=$(workspace_read_env WORKSPACE_TAILSCALE_DNS_NAME 2>/dev/null || true)
     workspace_tailscale_dns_name_ok "$dns" || return 1
@@ -3368,7 +3369,7 @@ workspace_update_tailscale() {
 }
 
 workspace_tailscale_service_specs() {
-  printf 'vikunja 443\n'
+  printf '%s 443\n' "$WORKSPACE_TASK_MANAGER_SERVICE"
   printf 'n8n 443\n'
   printf 'hermes 443\n'
 }
@@ -3684,7 +3685,7 @@ workspace_tailscale_service_host_advertised() {
   json=$(workspace_tailscale_status_json 2>/dev/null || true)
   [[ -n "$json" ]] || {
     out=$(tailscale serve get-config --all 2>/dev/null || tailscale serve status --json 2>/dev/null || tailscale serve status 2>/dev/null || true)
-    [[ "$out" == *"svc:vikunja"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]]
+    [[ "$out" == *"svc:${WORKSPACE_TASK_MANAGER_SERVICE}"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]]
     return $?
   }
   if command -v jq >/dev/null 2>&1; then
@@ -3694,7 +3695,7 @@ workspace_tailscale_service_host_advertised() {
     fi
   fi
   out=$(tailscale serve get-config --all 2>/dev/null || tailscale serve status --json 2>/dev/null || tailscale serve status 2>/dev/null || true)
-  [[ "$out" == *"svc:vikunja"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]]
+  [[ "$out" == *"svc:${WORKSPACE_TASK_MANAGER_SERVICE}"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]]
 }
 
 workspace_tailscale_wait_for_service_host_advertised() {
@@ -3734,8 +3735,8 @@ workspace_tailscale_service_target_private() {
 
 workspace_tailscale_services_local_configured_from_output() {
   local out="$1"
-  [[ "$out" == *"svc:vikunja"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]] &&
-    workspace_tailscale_service_target_private "$out" vikunja "$WORKSPACE_VIKUNJA_PORT" &&
+  [[ "$out" == *"svc:${WORKSPACE_TASK_MANAGER_SERVICE}"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]] &&
+    workspace_tailscale_service_target_private "$out" "$WORKSPACE_TASK_MANAGER_SERVICE" "$WORKSPACE_VIKUNJA_PORT" &&
     workspace_tailscale_service_target_private "$out" n8n "$WORKSPACE_N8N_PORT" &&
     workspace_tailscale_service_target_private "$out" hermes "$WORKSPACE_HERMES_TAILSCALE_PROXY_PORT" &&
     ! printf '%s\n' "$out" | grep -Eq "0[.]0[.]0[.]0:(${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT})|[[]::[]]:(${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT})"
