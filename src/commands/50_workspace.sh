@@ -227,6 +227,39 @@ workspace_model_state() {
   else printf 'downloaded'; fi
 }
 
+workspace_model_tool_calling_ready() {
+  local model="$1" container args parser profile_file expected=""
+  [[ "$BACKEND" == "vllm" ]] || return 0
+  [[ -n "$model" ]] || return 1
+  container=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  args=$(docker inspect -f '{{json .Config.Cmd}}' "$container" 2>/dev/null || true)
+  parser=$(printf '%s\n' "$args" | jq -er '
+    if type == "array" and index("--enable-auto-tool-choice") != null then
+      index("--tool-call-parser") as $i |
+      if $i != null and ($i + 1) < length then .[$i + 1] else empty end
+    else empty end
+  ' 2>/dev/null) || return 1
+  [[ -n "$parser" ]] || return 1
+  profile_file="${PROFILES_DIR}/$(printf '%s' "$model" | sed 's/\//--/g').json"
+  if [[ -f "$profile_file" ]]; then
+    expected=$(jq -r '
+      if .hf.raw.model_type == "qwen3_5" then "qwen3_coder"
+      else (.tool_call_parser // "") end
+    ' "$profile_file" 2>/dev/null || true)
+  fi
+  [[ -z "$expected" || "$parser" == "$expected" ]]
+}
+
+workspace_model_context_ready() {
+  local model="$1" container max_len
+  [[ "$BACKEND" == "vllm" ]] || return 0
+  container=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  max_len=$(docker inspect -f '{{index .Config.Labels "spark.max_model_len"}}' "$container" 2>/dev/null || true)
+  [[ "$max_len" =~ ^[0-9]+$ && "$max_len" -ge "$WORKSPACE_HERMES_MIN_CONTEXT" ]]
+}
+
 workspace_litellm_model_name() {
   local model="$1"
   if [[ "$BACKEND" == "ollama" ]]; then
@@ -277,7 +310,7 @@ workspace_select_model() {
 }
 
 workspace_ensure_gateway() {
-  local check_only="$1" auto_yes="$2" model="$3" prov="vllm"
+  local check_only="$1" auto_yes="$2" model="$3" prov="vllm" model_state=""
   [[ "$BACKEND" == "ollama" ]] && prov="ollama"
   if [[ ! -f "$GATEWAY_CONFIG" ]]; then
     if [[ "$check_only" == "1" ]]; then
@@ -306,15 +339,26 @@ workspace_ensure_gateway() {
   else
     setup_fail "LiteLLM gateway required for Hermes"
   fi
-  if [[ -n "$model" && "$(workspace_model_state "$model")" != *"running"* ]]; then
-    if [[ "$check_only" == "1" ]]; then
-      setup_fail "Model not running for Hermes: $model"
-    elif [[ "$auto_yes" == "1" ]] || confirm "Start ${model} now with spark run?"; then
-      # Workspace recovery favors a reliable full-context launch. MTP can add enough
-      # runtime headroom to exceed unified-memory hosts even when the base model fits.
-      cmd_run "$model" --no-mtp
-    else
-      setup_fail "Hermes model not started: $model"
+  if [[ -n "$model" ]]; then
+    model_state=$(workspace_model_state "$model")
+    if [[ "$model_state" == *"running"* ]] \
+        && { ! workspace_model_tool_calling_ready "$model" || ! workspace_model_context_ready "$model"; }; then
+      if [[ "$check_only" == "1" ]]; then
+        setup_fail "Hermes model needs automatic tool calling and at least ${WORKSPACE_HERMES_MIN_CONTEXT} context: $model"
+      else
+        info "Restarting ${model} with Hermes tool calling and ${WORKSPACE_HERMES_MIN_CONTEXT} context"
+        cmd_run "$model" --no-mtp --tools --max-len "$WORKSPACE_HERMES_MIN_CONTEXT" --force
+      fi
+    elif [[ "$model_state" != *"running"* ]]; then
+      if [[ "$check_only" == "1" ]]; then
+        setup_fail "Model not running for Hermes: $model"
+      elif [[ "$auto_yes" == "1" ]] || confirm "Start ${model} now with spark run?"; then
+        # Workspace recovery favors a reliable full-context launch. MTP can add enough
+        # runtime headroom to exceed unified-memory hosts even when the base model fits.
+        cmd_run "$model" --no-mtp --tools --max-len "$WORKSPACE_HERMES_MIN_CONTEXT"
+      else
+        setup_fail "Hermes model not started: $model"
+      fi
     fi
   fi
 }
@@ -564,6 +608,9 @@ HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
 HERMES_MODEL=${model}
 HERMES_LITELLM_MODEL=${litellm_model}
 HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
+HERMES_CONTEXT_LENGTH=${WORKSPACE_HERMES_MIN_CONTEXT}
+HERMES_MAX_TOKENS=${WORKSPACE_HERMES_MAX_TOKENS_DEFAULT}
+HERMES_REASONING_EFFORT=${WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT}
 HERMES_POLICY_TIER=restricted
 HERMES_ONBOARD_STATUS=$(workspace_env_or_value HERMES_ONBOARD_STATUS pending)
 WORKSPACE_MENTION_SECRET=${mention_secret}
@@ -1585,6 +1632,59 @@ workspace_hermes_config_ready() {
   workspace_hermes_doctor_ready || return 1
   workspace_hermes_inference_route_ready || return 1
   workspace_hermes_dashboard_url_ready || return 1
+  workspace_hermes_runtime_config_ready || return 1
+  workspace_hermes_cli_toolsets_ready || return 1
+}
+
+workspace_hermes_runtime_config_ready() {
+  local max_tokens context reasoning
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  max_tokens=$(workspace_read_env HERMES_MAX_TOKENS 2>/dev/null || true)
+  context=$(workspace_read_env HERMES_CONTEXT_LENGTH 2>/dev/null || true)
+  reasoning=$(workspace_read_env HERMES_REASONING_EFFORT 2>/dev/null || true)
+  [[ "$max_tokens" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$context" =~ ^[0-9]+$ && "$context" -ge "$WORKSPACE_HERMES_MIN_CONTEXT" ]] || return 1
+  [[ "$reasoning" == "none" ]] || return 1
+  nemohermes hermes exec --no-tty --timeout 20 -- sh -lc '
+    file=/sandbox/.hermes/config.yaml max="$1" context="$2" reasoning="$3"
+    grep -Eq "^[[:space:]]+max_tokens: ${max}$" "$file" &&
+      grep -Eq "^[[:space:]]+context_length: ${context}$" "$file" &&
+      grep -Eq "^[[:space:]]+reasoning_effort: ${reasoning}$" "$file"
+  ' spark-hermes-config "$max_tokens" "$context" "$reasoning" >/dev/null 2>&1
+}
+
+workspace_configure_hermes_runtime() {
+  local max_tokens context reasoning
+  max_tokens=$(workspace_read_env HERMES_MAX_TOKENS 2>/dev/null || true)
+  context=$(workspace_read_env HERMES_CONTEXT_LENGTH 2>/dev/null || true)
+  reasoning=$(workspace_read_env HERMES_REASONING_EFFORT 2>/dev/null || true)
+  [[ "$max_tokens" =~ ^[1-9][0-9]*$ ]] || max_tokens="$WORKSPACE_HERMES_MAX_TOKENS_DEFAULT"
+  [[ "$context" =~ ^[0-9]+$ && "$context" -ge "$WORKSPACE_HERMES_MIN_CONTEXT" ]] || context="$WORKSPACE_HERMES_MIN_CONTEXT"
+  [[ "$reasoning" == "none" ]] || reasoning="$WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT"
+  nemohermes hermes exec --no-tty --timeout 30 -- hermes config set model.max_tokens "$max_tokens" >/dev/null 2>&1 &&
+    nemohermes hermes exec --no-tty --timeout 30 -- hermes config set model.context_length "$context" >/dev/null 2>&1 &&
+    nemohermes hermes exec --no-tty --timeout 30 -- hermes config set agent.reasoning_effort "$reasoning" >/dev/null 2>&1 &&
+    workspace_configure_hermes_cli_toolsets
+}
+
+workspace_configure_hermes_cli_toolsets() {
+  local -a enabled disabled
+  read -r -a enabled <<< "$WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT"
+  read -r -a disabled <<< "$WORKSPACE_HERMES_CLI_TOOLSETS_DISABLED"
+  nemohermes hermes exec --no-tty --timeout 30 -- hermes tools enable --platform cli "${enabled[@]}" >/dev/null 2>&1 &&
+    nemohermes hermes exec --no-tty --timeout 30 -- hermes tools disable --platform cli "${disabled[@]}" >/dev/null 2>&1
+}
+
+workspace_hermes_cli_toolsets_ready() {
+  local out tool
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  out=$(nemohermes hermes exec --no-tty --timeout 20 -- env NO_COLOR=1 hermes tools list --platform cli 2>/dev/null) || return 1
+  for tool in $WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT; do
+    grep -Eq "enabled[[:space:]]+${tool}([[:space:]]|$)" <<< "$out" || return 1
+  done
+  for tool in $WORKSPACE_HERMES_CLI_TOOLSETS_DISABLED; do
+    grep -Eq "disabled[[:space:]]+${tool}([[:space:]]|$)" <<< "$out" || return 1
+  done
 }
 
 workspace_nemohermes_update_available() {
@@ -1801,7 +1901,7 @@ Use Vikunja's REST API directly with `curl`. Do not use Electron or an MCP serve
 
 ```bash
 VIKUNJA_API_URL=http://host.openshell.internal:3456/api/v1
-curl -fsS "$VIKUNJA_API_URL/user" \
+curl -fsS --max-time 10 "$VIKUNJA_API_URL/user" \
   -H "Authorization: Bearer $VIKUNJA_API_TOKEN" | jq
 ```
 
@@ -1813,25 +1913,25 @@ Common operations:
 ```bash
 # Projects visible to bot-hermes
 VIKUNJA_API_URL=http://host.openshell.internal:3456/api/v1
-curl -fsS "$VIKUNJA_API_URL/projects?per_page=1000" \
+curl -fsS --max-time 10 "$VIKUNJA_API_URL/projects?per_page=1000" \
   -H "Authorization: Bearer $VIKUNJA_API_TOKEN" | jq
 
 # Tasks in a project
 VIKUNJA_API_URL=http://host.openshell.internal:3456/api/v1
-curl -fsS "$VIKUNJA_API_URL/tasks?per_page=1000" \
+curl -fsS --max-time 10 "$VIKUNJA_API_URL/tasks?per_page=1000" \
   -H "Authorization: Bearer $VIKUNJA_API_TOKEN" \
   | jq --argjson project_id "$PROJECT_ID" '[.[] | select(.project_id == $project_id)]'
 
 # Create a task
 VIKUNJA_API_URL=http://host.openshell.internal:3456/api/v1
-curl -fsS -X PUT "$VIKUNJA_API_URL/projects/$PROJECT_ID/tasks" \
+curl -fsS --max-time 10 -X PUT "$VIKUNJA_API_URL/projects/$PROJECT_ID/tasks" \
   -H "Authorization: Bearer $VIKUNJA_API_TOKEN" \
   -H 'Content-Type: application/json' \
   --data-binary "$(jq -nc --arg title "$TITLE" '{title:$title}')" | jq
 
 # Update or complete a task
 VIKUNJA_API_URL=http://host.openshell.internal:3456/api/v1
-curl -fsS -X POST "$VIKUNJA_API_URL/tasks/$TASK_ID" \
+curl -fsS --max-time 10 -X POST "$VIKUNJA_API_URL/tasks/$TASK_ID" \
   -H "Authorization: Bearer $VIKUNJA_API_TOKEN" \
   -H 'Content-Type: application/json' \
   --data-binary "$(jq -nc --argjson done true '{done:$done}')" | jq
@@ -1919,6 +2019,14 @@ workspace_setup_hermes() {
       setup_fail "NemoHermes update failed; run nemohermes update --yes manually"
       return 0
     fi
+    if workspace_hermes_running; then
+      if ! workspace_hermes_inference_route_ready; then
+        NEMOCLAW_SANDBOX_NAME=hermes nemohermes inference set \
+          --provider compatible-endpoint --model "$litellm_model" \
+          --sandbox hermes --no-verify >/dev/null 2>&1 || true
+      fi
+      workspace_configure_hermes_runtime || true
+    fi
     if workspace_hermes_config_ready "$litellm_model"; then
       workspace_set_env_key HERMES_ONBOARD_STATUS configured
       info "Hermes already configured with ${litellm_model}"
@@ -1948,6 +2056,7 @@ workspace_setup_hermes() {
         --no-gpu \
         --control-ui-port "$WORKSPACE_HERMES_PORT" >/dev/null 2>&1 \
       && workspace_start_hermes_private_proxy \
+      && workspace_configure_hermes_runtime \
       && { workspace_set_env_key HERMES_ONBOARD_STATUS configured; info "Hermes onboarded with ${litellm_model}"; } \
       || { workspace_set_env_key HERMES_ONBOARD_STATUS manual; setup_fail "Hermes onboarding failed; run nemohermes onboard manually"; }
   elif [[ "$check_only" == "1" ]]; then
@@ -4173,6 +4282,7 @@ cmd_workspace_doctor() {
     POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD VIKUNJA_SERVICE_SECRET DB_POSTGRESDB_PASSWORD \
     N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HUMAN_USER_ID N8N_BASIC_AUTH_USER \
     N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
+    HERMES_CONTEXT_LENGTH HERMES_MAX_TOKENS HERMES_REASONING_EFFORT \
     HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
     VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_BOT_USERNAME VIKUNJA_HERMES_BOT_ID \
     VIKUNJA_HERMES_BOT_STATUS VIKUNJA_HERMES_PROJECT_ACCESS_STATUS
@@ -4210,6 +4320,10 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Hermes local API is reachable" workspace_hermes_local_api_ready
   workspace_doctor_check "NemoHermes sandbox doctor passes" workspace_hermes_doctor_ready
   workspace_doctor_check "NemoHermes inference route uses selected LiteLLM model" workspace_hermes_inference_route_ready
+  workspace_doctor_check "Hermes model supports automatic tool calling" workspace_model_tool_calling_ready "$model"
+  workspace_doctor_check "Hermes model context is at least ${WORKSPACE_HERMES_MIN_CONTEXT} tokens" workspace_model_context_ready "$model"
+  workspace_doctor_check "Hermes output and reasoning limits are configured" workspace_hermes_runtime_config_ready
+  workspace_doctor_check "Hermes CLI uses the balanced local-model tool profile" workspace_hermes_cli_toolsets_ready
   workspace_doctor_check "Hermes reaches Vikunja as bot-hermes" workspace_hermes_vikunja_api_ready
   workspace_doctor_check "Hermes dashboard URL is reachable" workspace_hermes_dashboard_url_ready
   if [[ "$strict_mode" == "1" ]]; then

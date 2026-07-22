@@ -142,6 +142,8 @@ ${stdin_payload}"
       *State.OOMKilled*)
         if [[ "${FAKE_RETRY:-}" == "oom" && "${_att}" -le 1 ]]; then echo "true"
         else echo "${FAKE_OOMKILLED:-false}"; fi ;;
+      *spark.max_model_len*) echo "${FAKE_DOCKER_MAX_MODEL_LEN:-65536}" ;;
+      *Config.Cmd*) echo "${FAKE_DOCKER_CMD_JSON:-[\"Org/Model\",\"--enable-auto-tool-choice\",\"--tool-call-parser\",\"qwen3_coder\"]}" ;;
       *) [[ -n "${FAKE_DOCKER_INSPECT:-}" ]] && echo "${FAKE_DOCKER_INSPECT}" ;;
     esac
     ;;
@@ -666,6 +668,31 @@ Update available:         no}"; exit "${FAKE_NEMOHERMES_UPDATE_CHECK_EXIT:-0}" ;
   *"policy-explain --json"*) echo "${FAKE_NEMOHERMES_POLICY_JSON:-{\"tier\":\"restricted\",\"appliedPresets\":[]}}" ;;
   *"policy-explain"*) echo "${FAKE_NEMOHERMES_POLICY_TEXT:-Policy tier: restricted}" ;;
   *"policy-list"*) echo "${FAKE_NEMOHERMES_POLICY_LIST:-restricted}" ;;
+  *"hermes exec"*"hermes tools list --platform cli"*)
+    printf '%b\n' "${FAKE_HERMES_TOOLS_LIST:-Built-in toolsets (cli):
+  enabled  terminal
+  enabled  file
+  enabled  web
+  enabled  skills
+  enabled  memory
+  enabled  todo
+  enabled  cronjob
+  enabled  delegation
+  disabled  browser
+  disabled  code_execution
+  disabled  vision
+  disabled  video
+  disabled  image_gen
+  disabled  video_gen
+  disabled  x_search
+  disabled  tts
+  disabled  context_engine
+  disabled  session_search
+  disabled  clarify
+  disabled  homeassistant
+  disabled  spotify
+  disabled  yuanbao
+  disabled  computer_use}" ;;
   *"channels status --channel whatsapp --json"*) echo "${FAKE_WHATSAPP_STATUS_JSON:-{\"verdict\":\"healthy\"}}" ;;
   *"hermes exec"*"/user"*)
     echo "${FAKE_HERMES_VIKUNJA_USER_JSON:-{\"id\":3,\"username\":\"bot-hermes\",\"bot_owner_id\":1}}"
@@ -2032,7 +2059,57 @@ test_workspace_model_start_disables_mtp_for_reliable_recovery() {
     workspace_ensure_gateway 0 1 Org/Model
   ' _ "$SPARK")
   rm -rf "$tmp"
-  [[ "$out" == *"Org/Model --no-mtp"* ]] && [[ "$out" != *"--no-wait"* ]]
+  [[ "$out" == *"Org/Model --no-mtp --tools --max-len 65536"* ]] && [[ "$out" != *"--no-wait"* ]]
+}
+
+test_workspace_model_restarts_without_tool_calling() {
+  local tmp out
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '{}\n' > "${tmp}/home/.config/spark/gateway.json"
+  out=$(HOME="${tmp}/home" bash -c '
+    source "$1"
+    docker() { [[ "$*" == *"ps --format"* ]] && printf "%s\n" "$GATEWAY_CONTAINER"; }
+    workspace_model_state() { printf "running+routed\n"; }
+    workspace_model_tool_calling_ready() { return 1; }
+    cmd_run() { printf "%s\n" "$*"; }
+    workspace_ensure_gateway 0 1 Org/Model
+  ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$out" == *"Org/Model --no-mtp --tools --max-len 65536 --force"* ]]
+}
+
+test_workspace_model_tool_calling_requires_expected_parser() {
+  local tmp fake_bin wrong=0 right=0 profile
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark/profiles"
+  profile="${tmp}/home/.config/spark/profiles/Org--Model.json"
+  printf '%s\n' '{"tool_call_parser":"qwen3_xml","hf":{"raw":{"model_type":"qwen3_5"}}}' > "$profile"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
+    FAKE_DOCKER_CMD_JSON='["Org/Model","--enable-auto-tool-choice","--tool-call-parser","qwen3_xml"]' \
+    bash -c 'source "$1"; workspace_model_tool_calling_ready Org/Model' _ "$SPARK" || wrong=$?
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
+    FAKE_DOCKER_CMD_JSON='["Org/Model","--enable-auto-tool-choice","--tool-call-parser","qwen3_coder"]' \
+    bash -c 'source "$1"; workspace_model_tool_calling_ready Org/Model' _ "$SPARK" || right=$?
+  rm -rf "$tmp"
+  [[ "$wrong" -ne 0 && "$right" -eq 0 ]]
+}
+
+test_workspace_hermes_toolsets_are_balanced() {
+  local tmp fake_bin calls wrong=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    bash -c 'source "$1"; workspace_configure_hermes_cli_toolsets; workspace_hermes_cli_toolsets_ready' _ "$SPARK"
+  calls=$(cat "${tmp}/nemohermes.log")
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_HERMES_TOOLS_LIST=$'Built-in toolsets (cli):\n  enabled  terminal\n  enabled  browser' \
+    bash -c 'source "$1"; workspace_hermes_cli_toolsets_ready' _ "$SPARK" || wrong=$?
+  rm -rf "$tmp"
+  [[ "$calls" == *"hermes tools enable --platform cli terminal file web skills memory todo cronjob delegation"* ]] &&
+    [[ "$calls" == *"hermes tools disable --platform cli browser code_execution vision video image_gen video_gen x_search tts context_engine session_search clarify homeassistant spotify yuanbao computer_use"* ]] &&
+    [[ "$wrong" -ne 0 ]]
 }
 
 test_workspace_status_uses_tailscale_services_config() {
@@ -2303,6 +2380,9 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
     [[ "$nemo_calls" == *"hermes skill install "*"/hermes-skills/vikunja"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set model.max_tokens 512"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set model.context_length 65536"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set agent.reasoning_effort none"* ]] &&
     [[ "$nemo_calls" == *"hermes gateway restart --quiet"* ]] &&
     [[ "$docker_calls" == *"--name spark-hermes-litellm-proxy"* ]] &&
     [[ "$docker_calls" == *"172.19.0.1 4000 127.0.0.1 4000"* ]] &&
@@ -2316,6 +2396,7 @@ test_workspace_setup_writes_compose_names() {
     [[ "$skill" == *"env_vars: [VIKUNJA_API_TOKEN]"* ]] &&
     [[ "$skill" == *"Use Vikunja's REST API directly"* ]] &&
     [[ "$skill" == *"Do not use Electron or an MCP server"* ]] &&
+    [[ "$skill" == *"curl -fsS --max-time 10"* ]] &&
     [[ "$curl_calls" == *'"expires_at":"2099-12-31T23:59:59Z"'* ]] &&
     [[ "$curl_calls" == *'"owner_id":3'* ]] &&
     [[ "$curl_calls" == *'/api/v2/tokens'* ]] &&
@@ -2323,6 +2404,9 @@ test_workspace_setup_writes_compose_names() {
     [[ "$env" == *"VIKUNJA_URL=https://tasks.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"HERMES_DASHBOARD_PORT=18789"* ]] &&
     [[ "$env" == *"HERMES_LITELLM_MODEL=vllm/Org/Alpha"* ]] &&
+    [[ "$env" == *"HERMES_CONTEXT_LENGTH=65536"* ]] &&
+    [[ "$env" == *"HERMES_MAX_TOKENS=512"* ]] &&
+    [[ "$env" == *"HERMES_REASONING_EFFORT=none"* ]] &&
     [[ "$env" == *"HERMES_POLICY_TIER=restricted"* ]] &&
     [[ "$env" == *"HERMES_ONBOARD_STATUS=configured"* ]] &&
     [[ "$env" == *"N8N_PROTOCOL=https"* ]] &&
@@ -3698,7 +3782,7 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"60/60 checks passed"* ]] &&
+    [[ "$out" == *"64/64 checks passed"* ]] &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
@@ -3740,6 +3824,10 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Hermes local API is reachable"* ]] &&
     [[ "$out" == *"[x] NemoHermes sandbox doctor passes"* ]] &&
     [[ "$out" == *"[x] NemoHermes inference route uses selected LiteLLM model"* ]] &&
+    [[ "$out" == *"[x] Hermes model supports automatic tool calling"* ]] &&
+    [[ "$out" == *"[x] Hermes model context is at least 65536 tokens"* ]] &&
+    [[ "$out" == *"[x] Hermes output and reasoning limits are configured"* ]] &&
+    [[ "$out" == *"[x] Hermes CLI uses the balanced local-model tool profile"* ]] &&
     [[ "$out" == *"[x] Hermes reaches Vikunja as bot-hermes"* ]] &&
     [[ "$out" == *"[x] Hermes dashboard URL is reachable"* ]]
 }
@@ -3789,7 +3877,7 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"61/61 checks passed"* ]] &&
+  [[ "$out" == *"65/65 checks passed"* ]] &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -3840,17 +3928,21 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 60 and
+    .passed == 64 and
     .failed == 0 and
-    .total == 60 and
+    .total == 64 and
     .model == "Org/Alpha" and
     ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Identity & recovery" and .passed == 13 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Inference & agent" and .passed == 12 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Inference & agent" and .passed == 16 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM Hermes route completes smoke request" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "NemoHermes inference route uses selected LiteLLM model" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "Hermes model supports automatic tool calling" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "Hermes model context is at least 65536 tokens" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "Hermes output and reasoning limits are configured" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "Hermes CLI uses the balanced local-model tool profile" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes reaches Vikunja as bot-hermes" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Tailscale workspace URLs respond" and .ok == true)] | length == 1)
   ' >/dev/null
@@ -5057,7 +5149,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"60/60 checks passed"* ]] &&
+  [[ "$out" == *"64/64 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -5079,7 +5171,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"60/60 checks passed"* ]] &&
+  [[ "$out" == *"64/64 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -5952,6 +6044,55 @@ test_hf_inspector_tools_requires_tool_calling_signal() {
   [[ "$generic" == "false" ]] && [[ "$explicit" == "true" ]]
 }
 
+test_qwen35_uses_qwen3_coder_tool_parser() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Qwen35" '{ "model_type":"qwen3_5", "architectures":["Qwen3_5ForConditionalGeneration"], "max_position_embeddings":262144 }'
+  meta=$(hf_inspect_json false false 262144 true dense nvfp4 \
+    "vllm serve Org/Qwen35 --quantization modelopt" "vllm/vllm-openai:nightly" \
+    | jq '.raw.model_type="qwen3_5" | .raw.architectures=["Qwen3_5ForConditionalGeneration"]')
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="vllm/vllm-openai:nightly" \
+    "$SPARK" run Org/Qwen35 --dry-run --tools --no-mtp </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--enable-auto-tool-choice --tool-call-parser qwen3_coder"* ]] &&
+    [[ "$out" != *"--tool-call-parser qwen3_xml"* ]]
+}
+
+test_gemma4_uses_gemma4_tool_and_reasoning_parsers() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Gemma4" '{ "model_type":"gemma4", "architectures":["Gemma4ForConditionalGeneration"], "max_position_embeddings":262144 }'
+  meta=$(hf_inspect_json false true 262144 true moe nvfp4 \
+    "vllm serve Org/Gemma4 --quantization modelopt" "vllm/vllm-openai:nightly" \
+    | jq '.raw.model_type="gemma4" | .raw.architectures=["Gemma4ForConditionalGeneration"] | .features.is_multimodal=true')
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="vllm/vllm-openai:nightly" \
+    "$SPARK" run Org/Gemma4 --dry-run --tools --no-mtp </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--reasoning-parser gemma4"* ]] &&
+    [[ "$out" == *"--enable-auto-tool-choice --tool-call-parser gemma4"* ]] &&
+    [[ "$out" != *"--attention-backend flashinfer"* ]]
+}
+
+test_text_only_uses_vllm_json_multimodal_limit() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Vision" '{ "model_type":"gemma4", "architectures":["Gemma4ForConditionalGeneration"], "max_position_embeddings":262144 }'
+  meta=$(hf_inspect_json false true 262144 true moe nvfp4 \
+    "vllm serve Org/Vision --quantization modelopt" "vllm/vllm-openai:nightly" \
+    | jq '.raw.model_type="gemma4" | .raw.architectures=["Gemma4ForConditionalGeneration"] | .features.is_multimodal=true')
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="vllm/vllm-openai:nightly" \
+    "$SPARK" run Org/Vision --dry-run --text-only --no-mtp --max-len 3072 </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *'--limit-mm-per-prompt \{\"image\":0\}'* ]] &&
+    [[ "$out" == *"--max-num-batched-tokens 3072"* ]]
+}
+
 test_hf_card_context_wins() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out meta
@@ -6221,7 +6362,7 @@ test_profile_schema_autoregen() {
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" "$SPARK" run Qwen/Qwen3-30B --dry-run </dev/null 2>&1 || true)
   sv=$(jq -r '.schema_version // "none"' "$pf" 2>/dev/null || echo none)
   rm -rf "$tmp"
-  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "6" ]]
+  [[ "$out" == *"Refreshing model profile"* ]] && [[ "$sv" == "8" ]]
 }
 
 # CUDA-graph calibration over the two-column peak table: eager peak on record + no graph peak →
@@ -6233,7 +6374,7 @@ _write_cal_profile() {
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
   jq -n --arg m "$2" --arg ep "$3" --arg cp "$4" '{
-    schema_version:6, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    schema_version:8, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
     warmup: {"8192/auto": ({date:"2026-01-01"}
@@ -6248,7 +6389,7 @@ _write_legacy_cal_profile() {
   pf="$1/.config/spark/profiles/$(printf '%s' "$2" | sed 's,/,--,g').json"
   mkdir -p "$(dirname "$pf")"
   jq -n --arg m "$2" --arg p "$3" --arg e "$4" --arg c "$5" '{
-    schema_version:6, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
+    schema_version:8, model:$m, generated:"2026-01-01", reasoning_parser:"", tool_call_parser:"",
     gpu_memory_utilization:"0.2", max_model_len:8192, is_multimodal:false, is_moe:"1",
     model_size_gb:"10", weights_gb:"10", kv_gb:"1", need_gb:"11", kv_cache_dtype:"auto",
     warmup: {"8192/auto": {peak_gb:$p, enforce_eager:$e, cudagraph_oom:$c, date:"2026-01-01"}}
@@ -6500,6 +6641,9 @@ WORKSPACE_VIKUNJA_IMAGE=vikunja/vikunja:latest
 WORKSPACE_N8N_IMAGE=docker.n8n.io/n8nio/n8n:latest
 HERMES_MODEL=Org/Alpha
 HERMES_LITELLM_MODEL=vllm/Org/Alpha
+HERMES_CONTEXT_LENGTH=65536
+HERMES_MAX_TOKENS=512
+HERMES_REASONING_EFFORT=none
 HERMES_LITELLM_BASE_URL=http://127.0.0.1:4000/v1
 HERMES_DASHBOARD_PORT=18789
 HERMES_POLICY_TIER=restricted
@@ -6563,6 +6707,9 @@ test_update_nemohermes_rebuild_uses_stored_compatible_key() {
   mkdir -p "${tmp}/home/.config/spark/workspace"
   cat > "${tmp}/home/.config/spark/workspace/secrets.env" <<ENV
 HERMES_LITELLM_MODEL=vllm/Org/Alpha
+HERMES_CONTEXT_LENGTH=65536
+HERMES_MAX_TOKENS=512
+HERMES_REASONING_EFFORT=none
 HERMES_LITELLM_BASE_URL=http://127.0.0.1:4000/v1
 COMPATIBLE_API_KEY=stored-compatible-key
 ENV
@@ -6774,6 +6921,9 @@ run_test "HF inspector maps compressed-tensors NVFP4" test_hf_inspector_compress
 run_test "HF inspector maps ModelOpt HF quant NVFP4" test_hf_inspector_modelopt_hf_quant_nvfp4_tag
 run_test "HF inspector prefers recommended multiline command" test_hf_inspector_prefers_recommended_multiline_command_from_readme
 run_test "HF inspector tools needs explicit tool-calling signal" test_hf_inspector_tools_requires_tool_calling_signal
+run_test "Qwen3.5 uses qwen3_coder tool parser" test_qwen35_uses_qwen3_coder_tool_parser
+run_test "Gemma4 uses gemma4 reasoning and tool parsers" test_gemma4_uses_gemma4_tool_and_reasoning_parsers
+run_test "text-only uses vLLM JSON multimodal limit" test_text_only_uses_vllm_json_multimodal_limit
 run_test "HF card recommended context wins" test_hf_card_context_wins
 run_test "HF MTP auto-enables when supported" test_hf_mtp_auto_enables_when_supported
 run_test "HF MTP raises memory floor" test_hf_mtp_raises_memory_floor
@@ -6826,6 +6976,9 @@ run_test "workspace bridge waits for delayed readiness" test_workspace_bridge_wa
 run_test "workspace dashboard proxy rewrites Host on loopback" test_workspace_dashboard_proxy_rewrites_host_on_loopback
 run_test "workspace listener check allows OpenShell gateway bridge" test_workspace_listener_check_allows_only_openshell_gateway_bridge
 run_test "workspace model recovery disables MTP" test_workspace_model_start_disables_mtp_for_reliable_recovery
+run_test "workspace model recovery enables tool calling" test_workspace_model_restarts_without_tool_calling
+run_test "workspace model requires expected tool parser" test_workspace_model_tool_calling_requires_expected_parser
+run_test "workspace Hermes uses balanced CLI toolsets" test_workspace_hermes_toolsets_are_balanced
 run_test "workspace status uses Tailscale Services config" test_workspace_status_uses_tailscale_services_config
 run_test "workspace restores OpenShell Hermes container name" test_workspace_restores_openshell_hermes_name
 run_test "workspace setup --check does not write files" test_workspace_check_no_mutation

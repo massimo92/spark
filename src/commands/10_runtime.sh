@@ -656,11 +656,17 @@ build_launch() {
   local quant_lc use_marlin_atomic=0 mtp_spec="" stream_interval=""
   quant_lc=$(printf '%s' "${MODEL_QUANTIZATION:-}" | tr '[:upper:]' '[:lower:]')
   if [[ "$ACCEL" == cuda-* ]]; then
-    add_vllm_flag_once --attention-backend flashinfer
+    # Gemma 4 partial multimodal full attention is incompatible with FlashInfer;
+    # its official vLLM launch leaves backend selection automatic.
+    [[ "${TOOL_CALL_PARSER:-}" == "gemma4" ]] || add_vllm_flag_once --attention-backend flashinfer
     add_vllm_flag_once --enable-chunked-prefill
     add_vllm_flag_once --enable-prefix-caching
     if [[ "${MAX_MODEL_LEN:-0}" -ge 65536 ]]; then
       add_vllm_flag_once --max-num-batched-tokens "$(resolve_batched_tokens SPARK_MAX_NUM_BATCHED_TOKENS 32768)"
+    elif [[ "${IS_MULTIMODAL:-false}" == "true" && "${MAX_MODEL_LEN:-0}" -gt 2048 ]]; then
+      # Some multimodal encoders need more than vLLM's 2048-token batch default,
+      # even when image input is disabled. The fitted context is a safe upper bound.
+      add_vllm_flag_once --max-num-batched-tokens "$MAX_MODEL_LEN"
     fi
   fi
   if [[ "$ACCEL" == cuda-* && "${IS_MOE:-0}" == "1" && "$quant_lc" =~ (nvfp4|fp8|fp4|modelopt) ]]; then
@@ -680,7 +686,7 @@ build_launch() {
       add_vllm_flag_once --stream-interval "$stream_interval"
     fi
   fi
-  [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt image=0)
+  [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt '{"image":0}')
 
   # Captured aliases preserve the effective vLLM command, including flags that
   # Spark normally derives from the hardware/model profile. Docker safety and
