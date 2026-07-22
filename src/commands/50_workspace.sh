@@ -1,8 +1,46 @@
-# --- Workspace setup: Vikunja + n8n + Hermes/NemoClaw behind Tailscale ---
+# --- Workspace setup: task manager + n8n + Hermes/NemoClaw behind Tailscale ---
 
 WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME="${WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME:-bot-hermes}"
 WORKSPACE_TASK_MANAGER_SERVICE="${WORKSPACE_TASK_MANAGER_SERVICE:-tasks}"
 WORKSPACE_HERMES_VIKUNJA_API_URL="${WORKSPACE_HERMES_VIKUNJA_API_URL:-http://host.openshell.internal:3456/api/v1}"
+WORKSPACE_HERMES_SUPER_PRODUCTIVITY_API_URL="${WORKSPACE_HERMES_SUPER_PRODUCTIVITY_API_URL:-http://host.openshell.internal:3877}"
+
+workspace_task_manager_valid() {
+  case "${1:-}" in
+    vikunja|super-productivity) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+workspace_task_manager() {
+  local configured="${SPARK_WORKSPACE_TASK_MANAGER:-}" compose="${WORKSPACE_COMPOSE_FILE:-}"
+  [[ -n "$configured" ]] || configured=$(workspace_read_env WORKSPACE_TASK_MANAGER 2>/dev/null || true)
+  if workspace_task_manager_valid "$configured"; then
+    printf '%s\n' "$configured"
+    return 0
+  fi
+  # Existing workspaces predate WORKSPACE_TASK_MANAGER. Preserve their Vikunja choice.
+  if [[ -f "$compose" ]] && grep -qE '^[[:space:]]{2}super-productivity-(web|gateway):' "$compose"; then
+    printf 'super-productivity\n'
+  else
+    printf 'vikunja\n'
+  fi
+}
+
+workspace_task_manager_label() {
+  case "${1:-$(workspace_task_manager)}" in
+    super-productivity) printf 'Super Productivity\n' ;;
+    *) printf 'Vikunja\n' ;;
+  esac
+}
+
+workspace_task_manager_url() {
+  local url
+  url=$(workspace_read_env TASK_MANAGER_URL 2>/dev/null || true)
+  [[ -n "$url" ]] || url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  [[ -n "$url" ]] || url=$(workspace_read_env SUPER_PRODUCTIVITY_URL 2>/dev/null || true)
+  printf '%s\n' "$url"
+}
 
 workspace_random_secret() {
   if command -v openssl >/dev/null 2>&1; then
@@ -35,6 +73,16 @@ workspace_env_or_generated() {
     printf '%s\n' "$val"
   else
     workspace_random_secret
+  fi
+}
+
+workspace_env_or_random_password() {
+  local key="$1" val=""
+  val=$(workspace_read_env "$key" 2>/dev/null || true)
+  if [[ -n "$val" ]]; then
+    printf '%s\n' "$val"
+  else
+    workspace_random_password
   fi
 }
 
@@ -369,7 +417,7 @@ workspace_prepare_data_dirs() {
   if [[ "$os" == "Darwin" ]]; then
     return 0
   fi
-  for dir in "${WORKSPACE_DATA_DIR}/vikunja-files" "${WORKSPACE_DATA_DIR}/n8n"; do
+  for dir in "${WORKSPACE_DATA_DIR}/vikunja-files" "${WORKSPACE_DATA_DIR}/super-productivity-electron" "${WORKSPACE_DATA_DIR}/n8n"; do
     [[ -d "$dir" ]] || continue
     owner=$(stat -c '%u' "$dir" 2>/dev/null || true)
     group=$(stat -c '%g' "$dir" 2>/dev/null || true)
@@ -379,7 +427,7 @@ workspace_prepare_data_dirs() {
     elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
       sudo chown -R 1000:1000 "$dir" 2>/dev/null || warn "Could not sudo chown ${dir} to 1000:1000"
     else
-      warn "Vikunja/n8n data dir may need permissions: sudo chown -R 1000:1000 ${dir}"
+      warn "Workspace data dir may need permissions: sudo chown -R 1000:1000 ${dir}"
     fi
   done
 }
@@ -406,6 +454,13 @@ workspace_require_env_value() {
   local label="$1" value="${2-}"
   workspace_require_single_line_value "$label" "$value"
   workspace_env_value_valid "$value" || die "${label} is not safe for Docker env files; $(workspace_env_value_hint)"
+}
+
+workspace_url_host() {
+  local url="${1:-}"
+  url="${url#*://}"
+  url="${url%%/*}"
+  printf '%s\n' "${url%%:*}"
 }
 
 workspace_value_looks_like_spark_error() {
@@ -450,7 +505,165 @@ workspace_validate_image_ref() {
     || die "Invalid ${label}: ${value}" "Use a plain Docker image reference like postgres:18 or registry/name:tag"
 }
 
-workspace_write_files() {
+workspace_write_super_productivity_electron_build() {
+  mkdir -p "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR"
+  workspace_install_file "${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}/Dockerfile" 600 <<'EOF'
+FROM node:22-bookworm AS build
+
+ARG SUPER_PRODUCTIVITY_VERSION=v18.7.0
+ARG SUPER_PRODUCTIVITY_COMMIT=4212ed4b0d95b3610f565d077966274fd1294831
+ARG TARGETARCH
+ENV SP_SKIP_WAYLAND_IDLE_HELPER_BUILD=1
+WORKDIR /src
+
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && git config --global url."https://github.com/".insteadOf ssh://git@github.com/ \
+    && git clone --depth 1 --branch "${SUPER_PRODUCTIVITY_VERSION}" \
+      https://github.com/super-productivity/super-productivity.git app \
+    && test "$(git -C app rev-parse HEAD)" = "${SUPER_PRODUCTIVITY_COMMIT}"
+WORKDIR /src/app
+COPY spark-headless.patch /tmp/spark-headless.patch
+RUN git apply --unidiff-zero --check /tmp/spark-headless.patch \
+    && git apply --unidiff-zero /tmp/spark-headless.patch
+RUN npm ci --ignore-scripts && npm run prepare
+RUN npm run buildFrontend:prod:es6 && npm run electron:build \
+    && case "${TARGETARCH}" in arm64) arch=arm64 ;; amd64) arch=x64 ;; *) exit 1 ;; esac \
+    && npx electron-builder --linux dir --publish never "--${arch}"
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl dumb-init xvfb socat \
+      libasound2 libatk-bridge2.0-0 libatk1.0-0 libcairo2 libcups2 libdbus-1-3 \
+      libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnss3 libpango-1.0-0 \
+      libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 libxext6 \
+      libxfixes3 libxkbcommon0 libxrandr2 libxshmfence1 libxss1 libxtst6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 1000 --create-home --shell /bin/sh spark
+COPY --from=build /src/app/.tmp/app-builds/linux-*unpacked /opt/super-productivity
+COPY entrypoint.sh /usr/local/bin/super-productivity-headless
+RUN chmod 755 /usr/local/bin/super-productivity-headless \
+    && mkdir -p /data && chown -R spark:spark /data
+USER spark
+VOLUME ["/data"]
+EXPOSE 3877
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/bin/super-productivity-headless"]
+EOF
+  workspace_install_file "${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}/entrypoint.sh" 700 <<'EOF'
+#!/bin/sh
+set -eu
+
+socat TCP-LISTEN:3877,reuseaddr,fork TCP:127.0.0.1:3876 &
+socat_pid=$!
+
+xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" \
+  /opt/super-productivity/superproductivity \
+  --user-data-dir=/data \
+  --no-sandbox \
+  --disable-gpu \
+  --disable-dev-shm-usage &
+app_pid=$!
+
+stop() {
+  kill "$app_pid" "$socat_pid" 2>/dev/null || true
+}
+trap stop INT TERM EXIT
+wait "$app_pid"
+EOF
+  workspace_install_file "${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}/spark-headless.patch" 600 <<'EOF'
+diff --git a/electron/electronAPI.d.ts b/electron/electronAPI.d.ts
+index bda757d..d8a5085 100644
+--- a/electron/electronAPI.d.ts
++++ b/electron/electronAPI.d.ts
+@@ -33,0 +34,7 @@ export interface ElectronAPI {
++  getSparkBootstrapConfig(): {
++    enabled: boolean;
++    baseUrl: string;
++    accessToken: string;
++    encryptionPassword: string;
++  };
++
+diff --git a/electron/preload.ts b/electron/preload.ts
+index f7ba75d..a522207 100644
+--- a/electron/preload.ts
++++ b/electron/preload.ts
+@@ -61,0 +62,6 @@ const ea: ElectronAPI = {
++  getSparkBootstrapConfig: () => ({
++    enabled: process.env.SPARK_HEADLESS === '1',
++    baseUrl: process.env.SUPERSYNC_INTERNAL_URL || '',
++    accessToken: process.env.SUPERSYNC_ACCESS_TOKEN || '',
++    encryptionPassword: process.env.SUPERSYNC_ENCRYPTION_PASSWORD || '',
++  }),
+diff --git a/src/app/core/startup/startup.service.ts b/src/app/core/startup/startup.service.ts
+index 296f03b..34549f8 100644
+--- a/src/app/core/startup/startup.service.ts
++++ b/src/app/core/startup/startup.service.ts
+@@ -31 +31 @@ import { map, switchMap, take } from 'rxjs/operators';
+-import { combineLatest } from 'rxjs';
++import { combineLatest, firstValueFrom } from 'rxjs';
+@@ -45,0 +46,2 @@ import { CustomThemeService } from '../theme/custom-theme.service';
++import { SyncProviderManager } from '../../op-log/sync-providers/provider-manager.service';
++import { SyncProviderId } from '../../op-log/sync-providers/provider.const';
+@@ -83,0 +86 @@ export class StartupService {
++  private _syncProviderManager = inject(SyncProviderManager);
+@@ -180,0 +184 @@ export class StartupService {
++      this._applySparkBootstrapAfterDataLoad();
+@@ -211,0 +216,51 @@ export class StartupService {
++  private _applySparkBootstrapAfterDataLoad(): void {
++    const bootstrap = window.ea.getSparkBootstrapConfig();
++    if (
++      !bootstrap.enabled ||
++      !bootstrap.baseUrl ||
++      !bootstrap.accessToken ||
++      !bootstrap.encryptionPassword
++    ) {
++      return;
++    }
++
++    this._dataInitStateService.isAllDataLoadedInitially$.pipe(take(1)).subscribe({
++      next: async () => {
++        try {
++          const providerId = SyncProviderId.SuperSync;
++          const existingProviderCfg =
++            (await this._syncProviderManager.getProviderConfig(providerId)) ?? {};
++          await this._syncProviderManager.setProviderConfig(providerId, {
++            ...existingProviderCfg,
++            baseUrl: bootstrap.baseUrl,
++            accessToken: bootstrap.accessToken,
++            encryptKey: bootstrap.encryptionPassword,
++            isEncryptionEnabled: true,
++          });
++
++          const currentSyncCfg = await firstValueFrom(
++            this._globalConfigService.sync$.pipe(take(1)),
++          );
++          this._globalConfigService.updateSection(
++            'misc',
++            { isLocalRestApiEnabled: true },
++            true,
++          );
++          this._globalConfigService.updateSection(
++            'sync',
++            {
++              ...currentSyncCfg,
++              isEnabled: true,
++              syncProvider: providerId,
++              isEncryptionEnabled: true,
++            },
++            true,
++          );
++          window.setTimeout(() => void this._syncWrapperService.sync(), 1500);
++        } catch (error) {
++          Log.err({ stage: 'spark-headless-bootstrap', error });
++        }
++      },
++    });
++  }
++
+EOF
+}
+
+workspace_write_files_vikunja() {
   local tailnet="$1" human_user="$2" human_email="$3" human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
   local vikunja_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
   local tailscale_bind_addr tailscale_dns_name
@@ -561,6 +774,7 @@ workspace_write_files() {
   old_umask=$(umask)
   umask 077
   workspace_install_file "$WORKSPACE_ENV_FILE" 600 <<EOF
+WORKSPACE_TASK_MANAGER=vikunja
 POSTGRES_DB=workspace
 POSTGRES_USER=workspace
 POSTGRES_PASSWORD=${postgres_pass}
@@ -602,6 +816,7 @@ N8N_COMMUNITY_PACKAGES_MANAGED_BY_ENV=true
 N8N_COMMUNITY_PACKAGES=[]
 VIKUNJA_SERVICE_PUBLICURL=${vikunja_url}
 VIKUNJA_URL=${vikunja_url}
+TASK_MANAGER_URL=${vikunja_url}
 N8N_URL=${n8n_url}
 HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
@@ -778,6 +993,396 @@ EOF
   info "Workspace access restricted to Tailscale/private bindings"
 }
 
+workspace_write_files_super_productivity() {
+  local tailnet="$1" human_user="$2" human_email="$3" _human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
+  local task_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
+  local tailscale_bind_addr tailscale_dns_name tailscale_mode
+  local postgres_pass supersync_db_pass supersync_jwt supersync_token supersync_encryption n8n_db_pass n8n_key mention_secret
+  local n8n_owner_status postgres_image super_productivity_image supersync_image gateway_image electron_version electron_commit electron_image n8n_image rp_id old_umask
+
+  tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
+  tailscale_bind_addr=$(workspace_env_or_value WORKSPACE_TAILSCALE_BIND_ADDR 127.0.0.1)
+  tailscale_dns_name=$(workspace_read_env WORKSPACE_TAILSCALE_DNS_NAME 2>/dev/null || true)
+  if [[ "$tailscale_mode" == "ports" ]]; then
+    tailscale_dns_name=$(workspace_tailscale_dns_name 2>/dev/null || true)
+    tailscale_bind_addr=$(workspace_tailscale_ipv4 2>/dev/null || true)
+    if [[ -n "$tailscale_dns_name" && -n "$tailscale_bind_addr" ]]; then
+      task_url="http://${tailscale_dns_name}:${WORKSPACE_TASK_MANAGER_PORT}"
+      n8n_url="http://${tailscale_dns_name}:${WORKSPACE_N8N_PORT}"
+      hermes_url="http://${tailscale_dns_name}:${WORKSPACE_HERMES_PORT}"
+    else
+      tailscale_mode=manual
+      tailscale_bind_addr=127.0.0.1
+      setup_fail "Tailscale MagicDNS/IPv4 not detected for ports fallback"
+      task_url=""
+      n8n_url=""
+      hermes_url=""
+    fi
+  elif [[ -n "$tailnet" ]]; then
+    tailscale_bind_addr=127.0.0.1
+    task_url=$(workspace_url_for "$WORKSPACE_TASK_MANAGER_SERVICE" "$tailnet")
+    n8n_url=$(workspace_url_for n8n "$tailnet")
+    hermes_url=$(workspace_url_for hermes "$tailnet")
+  else
+    tailscale_mode=manual
+    tailscale_bind_addr=127.0.0.1
+    setup_fail "Tailscale tailnet DNS suffix not detected; workspace requires Tailscale Services or ports mode"
+    task_url=""
+    n8n_url=""
+    hermes_url=""
+  fi
+
+  litellm_model=$(workspace_litellm_model_name "$model")
+  workspace_backup_invalid_env_file "$WORKSPACE_ENV_FILE"
+  workspace_backup_invalid_env_file "$WORKSPACE_POSTGRES_ENV_FILE"
+  workspace_backup_invalid_env_file "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE"
+  workspace_backup_invalid_env_file "$WORKSPACE_N8N_ENV_FILE"
+  postgres_pass=$(workspace_env_or_generated_guarded POSTGRES_PASSWORD "${WORKSPACE_DATA_DIR}/postgres") \
+    || { setup_fail "Missing Postgres password while existing workspace data is present; restore it before rerun"; return 1; }
+  supersync_db_pass=$(workspace_env_or_random_password SUPERSYNC_DATABASE_PASSWORD)
+  supersync_jwt=$(workspace_env_or_generated_guarded SUPERSYNC_JWT_SECRET "${WORKSPACE_DATA_DIR}/super-productivity-electron") \
+    || { setup_fail "Missing SuperSync JWT secret while Electron data exists; restore it before rerun"; return 1; }
+  supersync_token=$(workspace_read_env SUPERSYNC_ACCESS_TOKEN 2>/dev/null || true)
+  supersync_encryption=$(workspace_read_env SUPERSYNC_ENCRYPTION_PASSWORD 2>/dev/null || true)
+  [[ -n "$supersync_encryption" ]] || supersync_encryption=$(workspace_random_password)
+  n8n_db_pass=$(workspace_env_or_generated DB_POSTGRESDB_PASSWORD)
+  n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
+    || { setup_fail "Missing n8n encryption key while existing workspace data is present; restore it before rerun"; return 1; }
+  n8n_owner_status=$(workspace_env_or_value N8N_OWNER_SETUP_STATUS pending)
+  mention_secret=$(workspace_env_or_generated WORKSPACE_MENTION_SECRET)
+  postgres_image="${SPARK_WORKSPACE_POSTGRES_IMAGE:-$(workspace_env_or_value WORKSPACE_POSTGRES_IMAGE "$WORKSPACE_POSTGRES_IMAGE_DEFAULT")}"
+  super_productivity_image="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_IMAGE:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_IMAGE "$WORKSPACE_SUPER_PRODUCTIVITY_IMAGE_DEFAULT")}"
+  supersync_image="${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-$(workspace_env_or_value WORKSPACE_SUPERSYNC_IMAGE "$WORKSPACE_SUPERSYNC_IMAGE_DEFAULT")}"
+  gateway_image="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE "$WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE_DEFAULT")}"
+  electron_version="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_VERSION:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_VERSION "$WORKSPACE_SUPER_PRODUCTIVITY_VERSION_DEFAULT")}"
+  electron_commit="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_COMMIT:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_COMMIT "$WORKSPACE_SUPER_PRODUCTIVITY_COMMIT_DEFAULT")}"
+  electron_image="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE:-spark/super-productivity-electron:${electron_version#v}}"
+  n8n_image="${SPARK_WORKSPACE_N8N_IMAGE:-$(workspace_env_or_value WORKSPACE_N8N_IMAGE "$WORKSPACE_N8N_IMAGE_DEFAULT")}"
+  rp_id=$(workspace_url_host "$task_url")
+
+  workspace_validate_image_ref "Postgres image" "$postgres_image"
+  workspace_validate_image_ref "Super Productivity image" "$super_productivity_image"
+  workspace_validate_image_ref "SuperSync image" "$supersync_image"
+  workspace_validate_image_ref "Super Productivity gateway image" "$gateway_image"
+  workspace_validate_image_ref "Super Productivity Electron image" "$electron_image"
+  workspace_validate_image_ref "n8n image" "$n8n_image"
+  [[ "$electron_version" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || die "Invalid Super Productivity version: ${electron_version}"
+  [[ "$electron_commit" =~ ^[0-9a-f]{40}$ ]] || die "Invalid Super Productivity commit: ${electron_commit}"
+
+  if [[ "$tailscale_mode" == "ports" && -n "$tailscale_dns_name" ]]; then
+    n8n_host="$tailscale_dns_name"; n8n_protocol=http; n8n_secure_cookie=false
+  elif [[ -n "$tailnet" ]]; then
+    n8n_host="n8n.${tailnet}"; n8n_protocol=https; n8n_secure_cookie=true
+  else
+    n8n_host=""; n8n_protocol=http; n8n_secure_cookie=false
+  fi
+
+  workspace_require_env_value "Workspace username" "$human_user"
+  workspace_require_env_value "Workspace email" "$human_email"
+  [[ "$human_email" != *,* ]] || die "Super Productivity user email cannot contain commas"
+  workspace_require_env_value "n8n admin email" "$n8n_email"
+  workspace_require_env_value "Hermes model" "$model"
+  workspace_require_env_value "SuperSync database password" "$supersync_db_pass"
+  workspace_require_env_value "SuperSync JWT secret" "$supersync_jwt"
+  workspace_require_env_value "SuperSync encryption password" "$supersync_encryption"
+  workspace_require_env_value "workspace Tailscale mode" "$tailscale_mode"
+  workspace_require_env_value "workspace Tailscale bind address" "$tailscale_bind_addr"
+
+  mkdir -p "$WORKSPACE_CONFIG_DIR" "$WORKSPACE_DATA_DIR"/{postgres,n8n,super-productivity-electron,backups}
+  chmod 700 "$WORKSPACE_CONFIG_DIR"
+  workspace_prepare_data_dirs
+  workspace_write_super_productivity_electron_build
+  old_umask=$(umask)
+  umask 077
+  workspace_install_file "$WORKSPACE_ENV_FILE" 600 <<EOF
+WORKSPACE_TASK_MANAGER=super-productivity
+POSTGRES_DB=workspace
+POSTGRES_USER=workspace
+POSTGRES_PASSWORD=${postgres_pass}
+SUPERSYNC_DATABASE_PASSWORD=${supersync_db_pass}
+SUPERSYNC_JWT_SECRET=${supersync_jwt}
+SUPERSYNC_ACCESS_TOKEN=${supersync_token}
+SUPERSYNC_ENCRYPTION_PASSWORD=${supersync_encryption}
+SUPER_PRODUCTIVITY_USER_EMAIL=${human_email}
+DB_POSTGRESDB_PASSWORD=${n8n_db_pass}
+N8N_ENCRYPTION_KEY=${n8n_key}
+N8N_BASIC_AUTH_USER=${n8n_email}
+N8N_OWNER_FIRST_NAME=${human_user}
+N8N_OWNER_LAST_NAME=Spark
+N8N_OWNER_SETUP_STATUS=${n8n_owner_status}
+N8N_HOST=${n8n_host}
+N8N_PROTOCOL=${n8n_protocol}
+N8N_SECURE_COOKIE=${n8n_secure_cookie}
+N8N_EDITOR_BASE_URL=${n8n_url}
+WEBHOOK_URL=${n8n_url}
+N8N_RUNNERS_ENABLED=true
+N8N_BLOCK_ENV_ACCESS_IN_NODE=true
+N8N_BLOCK_FILE_ACCESS_TO_N8N_FILES=true
+N8N_RESTRICT_FILE_ACCESS_TO=/home/node/.n8n
+N8N_GIT_NODE_DISABLE_BARE_REPOS=true
+N8N_GIT_NODE_ENABLE_HOOKS=false
+N8N_SECURITY_POLICY_MANAGED_BY_ENV=true
+N8N_PERSONAL_SPACE_PUBLISHING_ENABLED=false
+N8N_PERSONAL_SPACE_SHARING_ENABLED=false
+N8N_COMMUNITY_PACKAGES_ENABLED=false
+N8N_UNVERIFIED_PACKAGES_ENABLED=false
+N8N_VERIFIED_PACKAGES_ENABLED=false
+N8N_COMMUNITY_PACKAGES_MANAGED_BY_ENV=true
+N8N_COMMUNITY_PACKAGES=[]
+TASK_MANAGER_URL=${task_url}
+SUPER_PRODUCTIVITY_URL=${task_url}
+N8N_URL=${n8n_url}
+HERMES_URL=${hermes_url}
+HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
+HERMES_MODEL=${model}
+HERMES_LITELLM_MODEL=${litellm_model}
+HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
+HERMES_CONTEXT_LENGTH=${WORKSPACE_HERMES_MIN_CONTEXT}
+HERMES_MAX_TOKENS=${WORKSPACE_HERMES_MAX_TOKENS_DEFAULT}
+HERMES_REASONING_EFFORT=${WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT}
+HERMES_POLICY_TIER=restricted
+HERMES_ONBOARD_STATUS=$(workspace_env_or_value HERMES_ONBOARD_STATUS pending)
+WORKSPACE_MENTION_SECRET=${mention_secret}
+WORKSPACE_TAILSCALE_MODE=${tailscale_mode}
+WORKSPACE_TAILSCALE_BIND_ADDR=${tailscale_bind_addr}
+WORKSPACE_TAILSCALE_DNS_NAME=${tailscale_dns_name}
+WORKSPACE_POSTGRES_IMAGE=${postgres_image}
+WORKSPACE_SUPER_PRODUCTIVITY_IMAGE=${super_productivity_image}
+WORKSPACE_SUPERSYNC_IMAGE=${supersync_image}
+WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE=${gateway_image}
+WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE=${electron_image}
+WORKSPACE_SUPER_PRODUCTIVITY_VERSION=${electron_version}
+WORKSPACE_SUPER_PRODUCTIVITY_COMMIT=${electron_commit}
+WORKSPACE_N8N_IMAGE=${n8n_image}
+EOF
+  workspace_install_file "$WORKSPACE_POSTGRES_ENV_FILE" 600 <<EOF
+POSTGRES_DB=workspace
+POSTGRES_USER=workspace
+POSTGRES_PASSWORD=${postgres_pass}
+SUPERSYNC_DATABASE_PASSWORD=${supersync_db_pass}
+DB_POSTGRESDB_PASSWORD=${n8n_db_pass}
+EOF
+  workspace_install_file "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" 600 <<EOF
+NODE_ENV=production
+PORT=1900
+DATABASE_URL=postgresql://supersync:${supersync_db_pass}@postgres:5432/supersync?connection_limit=20&pool_timeout=20
+RUN_MIGRATIONS_ON_STARTUP=false
+JWT_SECRET=${supersync_jwt}
+PUBLIC_URL=${task_url}
+CORS_ORIGINS=${task_url},https://app.super-productivity.com
+ALLOWED_EMAILS=${human_email}
+WEBAUTHN_RP_ID=${rp_id}
+WEBAUTHN_RP_NAME=Spark SuperSync
+WEBAUTHN_ORIGIN=${task_url}
+SPARK_HEADLESS=1
+SUPERSYNC_INTERNAL_URL=http://supersync:1900
+SUPERSYNC_ACCESS_TOKEN=${supersync_token}
+SUPERSYNC_ENCRYPTION_PASSWORD=${supersync_encryption}
+EOF
+  workspace_install_file "$WORKSPACE_N8N_ENV_FILE" 600 <<EOF
+DB_TYPE=postgresdb
+DB_POSTGRESDB_HOST=postgres
+DB_POSTGRESDB_DATABASE=n8n
+DB_POSTGRESDB_USER=n8n
+DB_POSTGRESDB_PASSWORD=${n8n_db_pass}
+N8N_ENCRYPTION_KEY=${n8n_key}
+N8N_HOST=${n8n_host}
+N8N_PROTOCOL=${n8n_protocol}
+N8N_SECURE_COOKIE=${n8n_secure_cookie}
+N8N_EDITOR_BASE_URL=${n8n_url}
+WEBHOOK_URL=${n8n_url}
+N8N_RUNNERS_ENABLED=true
+N8N_BLOCK_ENV_ACCESS_IN_NODE=true
+N8N_BLOCK_FILE_ACCESS_TO_N8N_FILES=true
+N8N_RESTRICT_FILE_ACCESS_TO=/home/node/.n8n
+N8N_GIT_NODE_DISABLE_BARE_REPOS=true
+N8N_GIT_NODE_ENABLE_HOOKS=false
+N8N_SECURITY_POLICY_MANAGED_BY_ENV=true
+N8N_PERSONAL_SPACE_PUBLISHING_ENABLED=false
+N8N_PERSONAL_SPACE_SHARING_ENABLED=false
+N8N_COMMUNITY_PACKAGES_ENABLED=false
+N8N_UNVERIFIED_PACKAGES_ENABLED=false
+N8N_VERIFIED_PACKAGES_ENABLED=false
+N8N_COMMUNITY_PACKAGES_MANAGED_BY_ENV=true
+N8N_COMMUNITY_PACKAGES=[]
+N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+NODES_EXCLUDE=["n8n-nodes-base.executeCommand","n8n-nodes-base.readWriteFile"]
+EOF
+  workspace_install_file "${WORKSPACE_CONFIG_DIR}/init-db.sh" 700 <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+psql -v ON_ERROR_STOP=1 \
+  -v supersync_password="${SUPERSYNC_DATABASE_PASSWORD}" \
+  -v n8n_password="${DB_POSTGRESDB_PASSWORD}" \
+  --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}" <<'SQL'
+SELECT format('CREATE USER supersync WITH PASSWORD %L', :'supersync_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supersync')\gexec
+SELECT format('ALTER USER supersync WITH PASSWORD %L', :'supersync_password')
+WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supersync')\gexec
+SELECT format('CREATE USER n8n WITH PASSWORD %L', :'n8n_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'n8n')\gexec
+SELECT format('ALTER USER n8n WITH PASSWORD %L', :'n8n_password')
+WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'n8n')\gexec
+SELECT 'CREATE DATABASE supersync OWNER supersync'
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'supersync')\gexec
+SELECT 'CREATE DATABASE n8n OWNER n8n'
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'n8n')\gexec
+ALTER DATABASE supersync OWNER TO supersync;
+ALTER DATABASE n8n OWNER TO n8n;
+SQL
+EOF
+  workspace_install_file "$WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_CONFIG" 644 <<'EOF'
+server {
+  listen 3456;
+  server_name _;
+  client_max_body_size 20m;
+
+  location = /health {
+    proxy_pass http://supersync:1900/health;
+  }
+  location /api/ {
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_pass http://supersync:1900;
+  }
+  location / {
+    proxy_set_header Host $host;
+    proxy_pass http://super-productivity-web:80;
+  }
+}
+EOF
+  umask 022
+  workspace_install_file "$WORKSPACE_COMPOSE_FILE" 644 <<EOF
+services:
+  postgres:
+    image: ${postgres_image}
+    container_name: ${WORKSPACE_POSTGRES_CONTAINER}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    pids_limit: 512
+    security_opt: ["no-new-privileges:true"]
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "5"}}
+    env_file: [${WORKSPACE_POSTGRES_ENV_FILE}]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U workspace -d workspace"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - ${WORKSPACE_DATA_DIR}/postgres:/var/lib/postgresql/data
+      - ${WORKSPACE_CONFIG_DIR}/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+
+  supersync-migrate:
+    image: ${supersync_image}
+    profiles: [tools]
+    env_file: [${WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE}]
+    depends_on:
+      postgres: {condition: service_healthy}
+    command: [sh, scripts/migrate-deploy.sh]
+
+  supersync:
+    image: ${supersync_image}
+    container_name: ${WORKSPACE_SUPERSYNC_CONTAINER}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    pids_limit: 512
+    security_opt: ["no-new-privileges:true"]
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "5"}}
+    env_file: [${WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE}]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, wget, --no-verbose, --tries=1, --spider, "http://localhost:1900/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  super-productivity-web:
+    image: ${super_productivity_image}
+    container_name: ${WORKSPACE_SUPER_PRODUCTIVITY_CONTAINER}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    pids_limit: 512
+    security_opt: ["no-new-privileges:true"]
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "5"}}
+
+  super-productivity-electron:
+    image: ${electron_image}
+    build:
+      context: ${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}
+      args:
+        SUPER_PRODUCTIVITY_VERSION: ${electron_version}
+        SUPER_PRODUCTIVITY_COMMIT: ${electron_commit}
+    container_name: ${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_CONTAINER}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    pids_limit: 1024
+    security_opt: ["no-new-privileges:true"]
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "5"}}
+    env_file: [${WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE}]
+    depends_on:
+      supersync: {condition: service_healthy}
+    ports:
+      - "127.0.0.1:${WORKSPACE_SUPER_PRODUCTIVITY_API_PORT}:3877"
+    volumes:
+      - ${WORKSPACE_DATA_DIR}/super-productivity-electron:/data
+
+  super-productivity-gateway:
+    image: ${gateway_image}
+    container_name: ${WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_CONTAINER}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    pids_limit: 512
+    security_opt: ["no-new-privileges:true"]
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "5"}}
+    depends_on:
+      supersync: {condition: service_healthy}
+      super-productivity-web: {condition: service_started}
+    ports:
+      - "${tailscale_bind_addr}:${WORKSPACE_TASK_MANAGER_PORT}:3456"
+    volumes:
+      - ${WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_CONFIG}:/etc/nginx/conf.d/default.conf:ro
+
+  n8n:
+    image: ${n8n_image}
+    container_name: ${WORKSPACE_N8N_CONTAINER}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    pids_limit: 512
+    security_opt: ["no-new-privileges:true"]
+    logging: {driver: json-file, options: {max-size: "10m", max-file: "5"}}
+    depends_on:
+      postgres: {condition: service_healthy}
+    env_file: [${WORKSPACE_N8N_ENV_FILE}]
+    ports:
+      - "${tailscale_bind_addr}:${WORKSPACE_N8N_PORT}:5678"
+    volumes:
+      - ${WORKSPACE_DATA_DIR}/n8n:/home/node/.n8n
+EOF
+  umask "$old_umask"
+  info "Super Productivity + SuperSync files reconciled"
+  info "Stored technical workspace secrets locally with 0600 permissions"
+  info "Task API restricted to localhost and the Hermes private bridge"
+}
+
+workspace_write_files() {
+  case "$(workspace_task_manager)" in
+    super-productivity) workspace_write_files_super_productivity "$@" ;;
+    *) workspace_write_files_vikunja "$@" ;;
+  esac
+}
+
 workspace_read_env() {
   local key="$1"
   [[ -f "$WORKSPACE_ENV_FILE" ]] || return 1
@@ -848,8 +1453,113 @@ SQL
 }
 
 workspace_ensure_postgres_databases() {
-  workspace_postgres_ensure_role_db vikunja vikunja VIKUNJA_DATABASE_PASSWORD || true
+  if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
+    workspace_postgres_ensure_role_db supersync supersync SUPERSYNC_DATABASE_PASSWORD || true
+  else
+    workspace_postgres_ensure_role_db vikunja vikunja VIKUNJA_DATABASE_PASSWORD || true
+  fi
   workspace_postgres_ensure_role_db n8n n8n DB_POSTGRESDB_PASSWORD || true
+}
+
+workspace_set_env_key_in_file() {
+  local file="$1" key="$2" value="$3" tmp old_umask
+  workspace_require_env_value "$key" "$value"
+  [[ -f "$file" ]] || return 1
+  old_umask=$(umask)
+  umask 077
+  tmp="${file}.tmp"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { done=0 }
+    index($0, key "=") == 1 { if (!done) print key "=" value; done=1; next }
+    { print }
+    END { if (!done) print key "=" value }
+  ' "$file" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$file"
+  umask "$old_umask"
+}
+
+workspace_supersync_user_record() {
+  local email="$1" pass
+  pass=$(workspace_read_env SUPERSYNC_DATABASE_PASSWORD 2>/dev/null || true)
+  [[ -n "$pass" ]] || return 1
+  workspace_compose exec -T -e PGPASSWORD="$pass" postgres \
+    psql -v ON_ERROR_STOP=1 -q -U supersync -d supersync -At -F: -v email="$email" <<'SQL'
+INSERT INTO users (email, is_verified, terms_accepted_at)
+VALUES (lower(:'email'), 1, (extract(epoch from clock_timestamp()) * 1000)::bigint)
+ON CONFLICT (email) DO UPDATE SET
+  is_verified = 1,
+  terms_accepted_at = COALESCE(users.terms_accepted_at, EXCLUDED.terms_accepted_at)
+RETURNING id, token_version;
+SQL
+}
+
+workspace_supersync_stored_token_valid() {
+  local token="$1" user_id="$2" email="$3" token_version="$4"
+  [[ -n "$token" ]] || return 1
+  workspace_compose run --rm --no-deps -T \
+    -e "SPARK_SUPERSYNC_TOKEN=${token}" \
+    -e "SPARK_SUPERSYNC_USER_ID=${user_id}" \
+    -e "SPARK_SUPERSYNC_USER_EMAIL=${email}" \
+    -e "SPARK_SUPERSYNC_TOKEN_VERSION=${token_version}" \
+    supersync node -e '
+      const jwt = require("jsonwebtoken");
+      const p = jwt.verify(process.env.SPARK_SUPERSYNC_TOKEN, process.env.JWT_SECRET);
+      if (Number(p.userId) !== Number(process.env.SPARK_SUPERSYNC_USER_ID) ||
+          p.email !== process.env.SPARK_SUPERSYNC_USER_EMAIL ||
+          Number(p.tokenVersion) !== Number(process.env.SPARK_SUPERSYNC_TOKEN_VERSION)) process.exit(1);
+    ' >/dev/null 2>&1
+}
+
+workspace_supersync_mint_token() {
+  local user_id="$1" email="$2" token_version="$3"
+  workspace_compose run --rm --no-deps -T \
+    -e "SPARK_SUPERSYNC_USER_ID=${user_id}" \
+    -e "SPARK_SUPERSYNC_USER_EMAIL=${email}" \
+    -e "SPARK_SUPERSYNC_TOKEN_VERSION=${token_version}" \
+    supersync node -e '
+      const jwt = require("jsonwebtoken");
+      process.stdout.write(jwt.sign({
+        userId: Number(process.env.SPARK_SUPERSYNC_USER_ID),
+        email: process.env.SPARK_SUPERSYNC_USER_EMAIL,
+        tokenVersion: Number(process.env.SPARK_SUPERSYNC_TOKEN_VERSION),
+      }, process.env.JWT_SECRET, { expiresIn: "365d" }));
+    ' 2>/dev/null
+}
+
+workspace_prepare_super_productivity_runtime() {
+  local email record user_id token_version token
+  [[ "$(workspace_task_manager)" == "super-productivity" ]] || return 0
+  email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
+  [[ -n "$email" ]] || return 1
+  workspace_compose up -d postgres >/dev/null 2>&1 || return 1
+  workspace_ensure_postgres_databases
+  workspace_compose run --rm supersync-migrate >/dev/null 2>&1 \
+    || { setup_fail "Could not apply SuperSync database migrations"; return 1; }
+  record=$(workspace_supersync_user_record "$email" 2>/dev/null | grep -E '^[1-9][0-9]*:[0-9]+$' | head -1) || {
+    setup_fail "Could not provision the SuperSync user"
+    return 1
+  }
+  IFS=: read -r user_id token_version <<EOF
+${record}
+EOF
+  [[ "$user_id" =~ ^[1-9][0-9]*$ && "$token_version" =~ ^[0-9]+$ ]] || {
+    setup_fail "Could not resolve the SuperSync user identity"
+    return 1
+  }
+  token=$(workspace_read_env SUPERSYNC_ACCESS_TOKEN 2>/dev/null || true)
+  if ! workspace_supersync_stored_token_valid "$token" "$user_id" "$email" "$token_version"; then
+    token=$(workspace_supersync_mint_token "$user_id" "$email" "$token_version") || {
+      setup_fail "Could not mint the SuperSync access token"
+      return 1
+    }
+    workspace_set_env_key_in_file "$WORKSPACE_ENV_FILE" SUPERSYNC_ACCESS_TOKEN "$token"
+    workspace_set_env_key_in_file "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" SUPERSYNC_ACCESS_TOKEN "$token"
+    WORKSPACE_SHOW_SUPER_PRODUCTIVITY_ACCESS=1
+    info "SuperSync user and access token provisioned"
+  else
+    info "SuperSync user already provisioned"
+  fi
 }
 
 workspace_vikunja_cli() {
@@ -1719,8 +2429,9 @@ workspace_openshell_bridge_ip() {
 }
 
 workspace_start_hermes_host_proxy() {
-  local container="$1" listen_port="$2" target_port="$3" health_path="$4"
-  local bridge_ip proxy_script attempt
+  local container="$1" listen_port="$2" target_port="$3" health_path="$4" host_header="${5:-}" attempts="${6:-30}"
+  local bridge_ip proxy_script attempt curl_args=(-fsS --max-time 2)
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=30
   bridge_ip=$(workspace_openshell_bridge_ip) || return 1
   proxy_script="${WORKSPACE_CONFIG_DIR}/hermes-host-proxy.py"
   mkdir -p "$WORKSPACE_CONFIG_DIR"
@@ -1729,20 +2440,42 @@ import asyncio
 import sys
 
 
-async def relay(reader, writer):
+async def relay(reader, writer, host_header=None):
+    pending = b""
     try:
         while data := await reader.read(65536):
+            if host_header is not None:
+                pending += data
+                marker = pending.find(b"\r\n\r\n")
+                if marker < 0:
+                    if len(pending) > 1048576:
+                        pending = b""
+                        return
+                    continue
+                head, tail = pending[:marker], pending[marker:]
+                lines = head.split(b"\r\n")
+                lines = [
+                    b"Host: " + host_header.encode() if line.lower().startswith(b"host:") else line
+                    for line in lines
+                ]
+                data = b"\r\n".join(lines) + tail
+                pending = b""
+                host_header = None
             writer.write(data)
             await writer.drain()
     finally:
+        if pending:
+            writer.write(pending)
+            await writer.drain()
         writer.close()
 
 
 async def handle(client_reader, client_writer):
     try:
         server_reader, server_writer = await asyncio.open_connection(sys.argv[3], int(sys.argv[4]))
+        host_header = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
         await asyncio.gather(
-            relay(client_reader, server_writer),
+            relay(client_reader, server_writer, host_header),
             relay(server_reader, client_writer),
         )
     except Exception:
@@ -1764,10 +2497,11 @@ PY
     --restart unless-stopped \
     -v "${proxy_script}:/app/hermes-host-proxy.py:ro" \
     --entrypoint python "$LITELLM_IMAGE" \
-    /app/hermes-host-proxy.py "$bridge_ip" "$listen_port" 127.0.0.1 "$target_port" \
+    /app/hermes-host-proxy.py "$bridge_ip" "$listen_port" 127.0.0.1 "$target_port" "$host_header" \
     >/dev/null 2>&1 || return 1
-  for ((attempt = 1; attempt <= 30; attempt++)); do
-    curl -fsS --max-time 2 "http://${bridge_ip}:${listen_port}${health_path}" >/dev/null 2>&1 && return 0
+  [[ -z "$host_header" ]] || curl_args+=(-H "Host: ${host_header}")
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    curl "${curl_args[@]}" "http://${bridge_ip}:${listen_port}${health_path}" >/dev/null 2>&1 && return 0
     [[ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]] || return 1
     sleep 1
   done
@@ -2001,6 +2735,106 @@ workspace_setup_hermes_vikunja_access() {
   return 1
 }
 
+workspace_start_hermes_super_productivity_proxy() {
+  workspace_start_hermes_host_proxy "$WORKSPACE_HERMES_SUPER_PRODUCTIVITY_PROXY_CONTAINER" \
+    "$WORKSPACE_SUPER_PRODUCTIVITY_API_PORT" "$WORKSPACE_SUPER_PRODUCTIVITY_API_PORT" /health 127.0.0.1:3876 60
+}
+
+workspace_stop_hermes_super_productivity_proxy() {
+  docker rm -f "$WORKSPACE_HERMES_SUPER_PRODUCTIVITY_PROXY_CONTAINER" >/dev/null 2>&1 || true
+}
+
+workspace_hermes_super_productivity_proxy_running() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$WORKSPACE_HERMES_SUPER_PRODUCTIVITY_PROXY_CONTAINER"
+}
+
+workspace_install_hermes_super_productivity_skill() {
+  local skill_dir="${WORKSPACE_CONFIG_DIR}/hermes-skills/super-productivity"
+  workspace_install_file "${skill_dir}/SKILL.md" 600 <<'EOF'
+---
+name: super-productivity
+description: Manage the user's Super Productivity tasks and projects through its private local REST API.
+version: 1.0.0
+prerequisites:
+  commands: [curl, jq]
+metadata:
+  hermes:
+    tags: [Super Productivity, Productivity, Tasks, API]
+---
+
+# Super Productivity tasks
+
+Use the local REST API directly with `curl`. Do not use an MCP server. This
+endpoint reaches Spark's persistent Electron client; SuperSync propagates its
+changes to the user's browsers.
+
+```bash
+SUPER_PRODUCTIVITY_API_URL=http://host.openshell.internal:3877
+curl -fsS --max-time 10 -H 'Host: 127.0.0.1:3876' "$SUPER_PRODUCTIVITY_API_URL/health" | jq
+curl -fsS --max-time 10 -H 'Host: 127.0.0.1:3876' "$SUPER_PRODUCTIVITY_API_URL/tasks" | jq
+curl -fsS --max-time 10 -H 'Host: 127.0.0.1:3876' "$SUPER_PRODUCTIVITY_API_URL/projects" | jq
+```
+
+Common operations:
+
+```bash
+# Create an inbox task
+curl -fsS --max-time 10 -X POST "$SUPER_PRODUCTIVITY_API_URL/tasks" \
+  -H 'Host: 127.0.0.1:3876' \
+  -H 'Content-Type: application/json' \
+  --data-binary "$(jq -nc --arg title "$TITLE" '{title:$title}')" | jq
+
+# Create a task in a project
+curl -fsS --max-time 10 -X POST "$SUPER_PRODUCTIVITY_API_URL/tasks" \
+  -H 'Host: 127.0.0.1:3876' \
+  -H 'Content-Type: application/json' \
+  --data-binary "$(jq -nc --arg title "$TITLE" --arg projectId "$PROJECT_ID" '{title:$title,projectId:$projectId}')" | jq
+
+# Update a task
+curl -fsS --max-time 10 -X PATCH "$SUPER_PRODUCTIVITY_API_URL/tasks/$TASK_ID" \
+  -H 'Host: 127.0.0.1:3876' \
+  -H 'Content-Type: application/json' \
+  --data-binary "$(jq -nc --arg title "$TITLE" '{title:$title}')" | jq
+
+# Archive a completed task
+curl -fsS --max-time 10 -X POST -H 'Host: 127.0.0.1:3876' "$SUPER_PRODUCTIVITY_API_URL/tasks/$TASK_ID/archive" | jq
+```
+
+Read before writing. Ask before destructive deletion unless the user explicitly
+requested it. The API has no token because it is restricted to localhost and
+Hermes' enforced OpenShell endpoint policy.
+EOF
+  nemohermes hermes skill install "$skill_dir" >/dev/null 2>&1
+}
+
+workspace_hermes_super_productivity_api_ready() {
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  nemohermes hermes exec --no-tty --timeout 20 -- sh -lc '
+    curl -fsS --max-time 10 -H "Host: 127.0.0.1:3876" "$1/health" | jq -e ".ok == true and .data.rendererReady == true" >/dev/null
+  ' spark-super-productivity "$WORKSPACE_HERMES_SUPER_PRODUCTIVITY_API_URL" >/dev/null 2>&1
+}
+
+workspace_setup_hermes_super_productivity_access() {
+  local attempt attempts="${SPARK_WORKSPACE_HERMES_API_ATTEMPTS:-60}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=60
+  command -v openshell >/dev/null 2>&1 || return 1
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  workspace_start_hermes_super_productivity_proxy || return 1
+  openshell policy update hermes \
+    --add-endpoint host.openshell.internal:3877:read-write:rest:enforce \
+    --binary /usr/bin/curl --rule-name spark-super-productivity-api --wait >/dev/null 2>&1 \
+    || return 1
+  workspace_install_hermes_super_productivity_skill || return 1
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    workspace_hermes_super_productivity_api_ready && {
+      info "Hermes Super Productivity API access verified"
+      return 0
+    }
+    sleep 1
+  done
+  return 1
+}
+
 workspace_setup_hermes() {
   local model="$1" tailnet="$2" check_only="$3" hermes_url litellm_model
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
@@ -2149,6 +2983,41 @@ workspace_prompt_username_choice() {
   done
 }
 
+workspace_select_task_manager() {
+  local requested="${1:-}" auto_yes="${2:-0}" configured choice
+  if [[ -n "$requested" ]]; then
+    workspace_task_manager_valid "$requested" || die "--task-manager must be 'vikunja' or 'super-productivity'"
+    printf '%s\n' "$requested"
+    return 0
+  fi
+  configured="${SPARK_WORKSPACE_TASK_MANAGER:-}"
+  [[ -n "$configured" ]] || configured=$(workspace_read_env WORKSPACE_TASK_MANAGER 2>/dev/null || true)
+  if workspace_task_manager_valid "$configured"; then
+    printf '%s\n' "$configured"
+    return 0
+  fi
+  if [[ -f "$WORKSPACE_COMPOSE_FILE" ]]; then
+    workspace_task_manager
+    return 0
+  fi
+  if [[ "$auto_yes" == "1" ]] || ! is_interactive; then
+    printf 'vikunja\n'
+    return 0
+  fi
+  printf "\n  ${BOLD}Choose the task manager:${NC}\n\n" >&2
+  printf "    [1] Super Productivity + self-hosted SuperSync\n" >&2
+  printf "    [2] Vikunja\n" >&2
+  while true; do
+    printf "\n  > " >&2
+    read -r choice || die "Task manager selection is required"
+    case "$choice" in
+      ""|1) printf 'super-productivity\n'; return 0 ;;
+      2) printf 'vikunja\n'; return 0 ;;
+      *) printf "  Enter 1 or 2.\n" >&2 ;;
+    esac
+  done
+}
+
 workspace_prompt_secret_confirm() {
   local var="$1" prompt="$2" value confirm
   value="${!var:-}"
@@ -2183,7 +3052,7 @@ workspace_prompt_secret_confirm() {
 workspace_reconcile_identity_overrides() {
   if [[ -n "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "${SPARK_WORKSPACE_N8N_EMAIL:-}" \
     && "$SPARK_WORKSPACE_VIKUNJA_EMAIL" != "$SPARK_WORKSPACE_N8N_EMAIL" ]]; then
-    warn "Using Workspace email for both Vikunja and n8n"
+    warn "Using the workspace email for both the task manager and n8n"
     SPARK_WORKSPACE_N8N_EMAIL="$SPARK_WORKSPACE_VIKUNJA_EMAIL"
   fi
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_EMAIL:-}" && -n "${SPARK_WORKSPACE_N8N_EMAIL:-}" ]] \
@@ -2211,6 +3080,7 @@ workspace_remote_workspace_cmd() {
   fi
   if [[ "$send_workspace_env" == "1" ]]; then
     for key in \
+      SPARK_WORKSPACE_TASK_MANAGER \
       SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL SPARK_WORKSPACE_VIKUNJA_TOKEN \
       SPARK_WORKSPACE_VIKUNJA_PASSWORD SPARK_WORKSPACE_N8N_EMAIL SPARK_WORKSPACE_N8N_PASSWORD; do
       value="${!key:-}"
@@ -2236,22 +3106,26 @@ workspace_remote_workspace_cmd() {
 
 workspace_setup_remote() {
   local spec="$1" check_only="$2" auto_yes="$3" requested_model="$4" requested_tail_mode="${5:-}"
-  local postgres_image="${6:-}" vikunja_image="${7:-}" n8n_image="${8:-}" funnel_action="${9:-}" args=()
+  local task_manager="${6:-}" postgres_image="${7:-}" vikunja_image="${8:-}" n8n_image="${9:-}"
+  local super_productivity_image="${10:-}" supersync_image="${11:-}" funnel_action="${12:-}" args=()
   args=(setup)
   [[ "$check_only" == "1" ]] && args+=(--check)
   [[ "$auto_yes" == "1" ]] && args+=(--yes)
   [[ -n "$requested_model" ]] && args+=(--model "$requested_model")
   [[ -n "$requested_tail_mode" ]] && args+=(--tailscale-mode "$requested_tail_mode")
+  [[ -n "$task_manager" ]] && args+=(--task-manager "$task_manager")
   [[ -n "$postgres_image" ]] && args+=(--postgres-image "$postgres_image")
   [[ -n "$vikunja_image" ]] && args+=(--vikunja-image "$vikunja_image")
   [[ -n "$n8n_image" ]] && args+=(--n8n-image "$n8n_image")
+  [[ -n "$super_productivity_image" ]] && args+=(--super-productivity-image "$super_productivity_image")
+  [[ -n "$supersync_image" ]] && args+=(--supersync-image "$supersync_image")
   [[ -n "$funnel_action" ]] && args+=(--funnel-action "$funnel_action")
   workspace_remote_workspace_cmd "$spec" "${args[@]}"
 }
 
 workspace_setup() {
-  local auto_yes=0 check_only=0 requested_model="" remote_spec="" requested_tail_mode=""
-  local postgres_image="" vikunja_image="" n8n_image="" model tailnet
+  local auto_yes=0 check_only=0 requested_model="" remote_spec="" requested_tail_mode="" requested_task_manager="" task_manager=""
+  local postgres_image="" vikunja_image="" n8n_image="" super_productivity_image="" supersync_image="" model tailnet
   local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_password_file="" vikunja_token="" n8n_email_arg="" n8n_password_arg="" n8n_password_file="" funnel_action=""
   local existing_model="" existing_tail_mode="" effective_tail_mode="" env_tail_mode="" setup_overrides=0
   env_tail_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-}"
@@ -2261,6 +3135,11 @@ workspace_setup() {
       --check) check_only=1; shift ;;
       --model) requested_model="${2:-}"; [[ -n "$requested_model" ]] || die "--model requires a value"; shift 2 ;;
       --remote) remote_spec="${2:-}"; [[ -n "$remote_spec" ]] || die "--remote requires user@host"; shift 2 ;;
+      --task-manager)
+        requested_task_manager="${2:-}"
+        workspace_task_manager_valid "$requested_task_manager" || die "--task-manager must be 'vikunja' or 'super-productivity'"
+        shift 2
+        ;;
       --tailscale-mode)
         requested_tail_mode="${2:-}"
         [[ -n "$requested_tail_mode" ]] || die "--tailscale-mode requires services or ports"
@@ -2272,6 +3151,8 @@ workspace_setup() {
         ;;
       --postgres-image) postgres_image="${2:-}"; [[ -n "$postgres_image" ]] || die "--postgres-image requires a value"; shift 2 ;;
       --vikunja-image) vikunja_image="${2:-}"; [[ -n "$vikunja_image" ]] || die "--vikunja-image requires a value"; shift 2 ;;
+      --super-productivity-image) super_productivity_image="${2:-}"; [[ -n "$super_productivity_image" ]] || die "--super-productivity-image requires a value"; shift 2 ;;
+      --supersync-image) supersync_image="${2:-}"; [[ -n "$supersync_image" ]] || die "--supersync-image requires a value"; shift 2 ;;
       --n8n-image) n8n_image="${2:-}"; [[ -n "$n8n_image" ]] || die "--n8n-image requires a value"; shift 2 ;;
       --vikunja-username) vikunja_username="${2:-}"; [[ -n "$vikunja_username" ]] || die "--vikunja-username requires a value"; shift 2 ;;
       --vikunja-email) vikunja_email="${2:-}"; [[ -n "$vikunja_email" ]] || die "--vikunja-email requires a value"; shift 2 ;;
@@ -2304,10 +3185,20 @@ workspace_setup() {
   [[ -n "$n8n_email_arg" ]] && SPARK_WORKSPACE_N8N_EMAIL="$n8n_email_arg"
   [[ -n "$n8n_password_arg" ]] && { workspace_require_prompt_value "n8n password" "$n8n_password_arg" text; warn "Direct password flags may remain in shell history; prefer --n8n-password-file"; }
   [[ -n "$n8n_password_arg" ]] && SPARK_WORKSPACE_N8N_PASSWORD="$n8n_password_arg"
+  task_manager=$(workspace_select_task_manager "$requested_task_manager" "$auto_yes")
+  SPARK_WORKSPACE_TASK_MANAGER="$task_manager"
+  if [[ "$task_manager" == "super-productivity" && ( "$requested_tail_mode" == "ports" || "$env_tail_mode" == "ports" ) ]]; then
+    die "SuperSync requires HTTPS; --tailscale-mode ports is not supported" "Use Tailscale Services mode."
+  fi
+  if [[ "$task_manager" == "super-productivity" && ( -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$vikunja_image" ) ]]; then
+    die "Vikunja flags cannot be used with --task-manager super-productivity"
+  fi
   workspace_reconcile_identity_overrides
   [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && workspace_require_env_value "Vikunja Hermes API token" "$SPARK_WORKSPACE_VIKUNJA_TOKEN"
   [[ -n "$postgres_image" ]] && workspace_validate_image_ref "Postgres image" "$postgres_image"
   [[ -n "$vikunja_image" ]] && workspace_validate_image_ref "Vikunja image" "$vikunja_image"
+  [[ -n "$super_productivity_image" ]] && workspace_validate_image_ref "Super Productivity image" "$super_productivity_image"
+  [[ -n "$supersync_image" ]] && workspace_validate_image_ref "SuperSync image" "$supersync_image"
   [[ -n "$n8n_image" ]] && workspace_validate_image_ref "n8n image" "$n8n_image"
   [[ -z "$remote_spec" ]] || {
     if [[ "$check_only" != "1" ]]; then
@@ -2315,15 +3206,16 @@ workspace_setup() {
       SPARK_WORKSPACE_VIKUNJA_USERNAME=$(workspace_prompt_username_choice SPARK_WORKSPACE_VIKUNJA_USERNAME "Workspace username" "$(whoami)")
       SPARK_WORKSPACE_VIKUNJA_EMAIL=$(workspace_prompt SPARK_WORKSPACE_VIKUNJA_EMAIL "Workspace email" "" 0 email)
       SPARK_WORKSPACE_N8N_EMAIL="$SPARK_WORKSPACE_VIKUNJA_EMAIL"
-      workspace_require_prompt_value "Vikunja human username" "$SPARK_WORKSPACE_VIKUNJA_USERNAME" username
-      workspace_require_prompt_value "Vikunja human email" "$SPARK_WORKSPACE_VIKUNJA_EMAIL" email
+      workspace_require_prompt_value "Workspace username" "$SPARK_WORKSPACE_VIKUNJA_USERNAME" username
+      workspace_require_prompt_value "Workspace email" "$SPARK_WORKSPACE_VIKUNJA_EMAIL" email
       workspace_require_prompt_value "n8n admin email" "$SPARK_WORKSPACE_N8N_EMAIL" email
       export SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL
       [[ -n "${SPARK_WORKSPACE_VIKUNJA_TOKEN:-}" ]] && export SPARK_WORKSPACE_VIKUNJA_TOKEN
       export SPARK_WORKSPACE_N8N_EMAIL
     fi
     workspace_setup_remote "$remote_spec" "$check_only" "$auto_yes" "$requested_model" \
-      "$requested_tail_mode" "$postgres_image" "$vikunja_image" "$n8n_image" "$funnel_action"
+      "$requested_tail_mode" "$task_manager" "$postgres_image" "$vikunja_image" "$n8n_image" \
+      "$super_productivity_image" "$supersync_image" "$funnel_action"
     return $?
   }
   if [[ -z "$requested_tail_mode" && -n "$env_tail_mode" ]]; then
@@ -2337,18 +3229,20 @@ workspace_setup() {
   [[ -n "$requested_tail_mode" ]] && SPARK_WORKSPACE_TAILSCALE_MODE="$requested_tail_mode"
   [[ -n "$postgres_image" ]] && SPARK_WORKSPACE_POSTGRES_IMAGE="$postgres_image"
   [[ -n "$vikunja_image" ]] && SPARK_WORKSPACE_VIKUNJA_IMAGE="$vikunja_image"
+  [[ -n "$super_productivity_image" ]] && SPARK_WORKSPACE_SUPER_PRODUCTIVITY_IMAGE="$super_productivity_image"
+  [[ -n "$supersync_image" ]] && SPARK_WORKSPACE_SUPERSYNC_IMAGE="$supersync_image"
   [[ -n "$n8n_image" ]] && SPARK_WORKSPACE_N8N_IMAGE="$n8n_image"
   SETUP_FAILED=()
   SETUP_SKIPPED=()
-  printf "\n  ${BOLD}spark ws setup${NC} — Vikunja + n8n + Hermes\n\n"
+  printf "\n  ${BOLD}spark ws setup${NC} — %s + n8n + Hermes\n\n" "$(workspace_task_manager_label "$task_manager")"
   workspace_preflight "$check_only" || true
   existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   existing_tail_mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   effective_tail_mode="${requested_tail_mode:-services}"
-  if [[ -n "$requested_model" || -n "$postgres_image" || -n "$vikunja_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
+  if [[ -n "$requested_model" || -n "$requested_task_manager" || -n "$postgres_image" || -n "$vikunja_image" || -n "$super_productivity_image" || -n "$supersync_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
     setup_overrides=1
   fi
-  if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
+  if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
     setup_overrides=1
   fi
   if [[ "$check_only" != "1" && "$setup_overrides" == "0" && -n "$existing_model" ]] && workspace_configured; then
@@ -2404,8 +3298,13 @@ workspace_setup() {
   workspace_migrate_runtime_config
   local human_user human_email human_pass n8n_email n8n_pass vikunja_previous_status n8n_previous_status setup_rc
   local existing_human_user existing_human_email existing_n8n_email
-  existing_human_user=$(workspace_existing_prompt_value VIKUNJA_HUMAN_USERNAME "Vikunja human username" username || true)
-  existing_human_email=$(workspace_existing_prompt_value VIKUNJA_HUMAN_EMAIL "Vikunja human email" email || true)
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    existing_human_user=$(workspace_existing_prompt_value N8N_OWNER_FIRST_NAME "workspace username" username || true)
+    existing_human_email=$(workspace_existing_prompt_value SUPER_PRODUCTIVITY_USER_EMAIL "Super Productivity user email" email || true)
+  else
+    existing_human_user=$(workspace_existing_prompt_value VIKUNJA_HUMAN_USERNAME "Vikunja human username" username || true)
+    existing_human_email=$(workspace_existing_prompt_value VIKUNJA_HUMAN_EMAIL "Vikunja human email" email || true)
+  fi
   existing_n8n_email=$(workspace_existing_prompt_value N8N_BASIC_AUTH_USER "n8n admin email" email || true)
   workspace_existing_prompt_value N8N_OWNER_FIRST_NAME "n8n owner first name" username >/dev/null || true
   [[ -z "${SPARK_WORKSPACE_VIKUNJA_USERNAME:-}" && -n "$existing_human_user" ]] && SPARK_WORKSPACE_VIKUNJA_USERNAME="$existing_human_user"
@@ -2418,7 +3317,9 @@ workspace_setup() {
   n8n_email="$human_email"
   SPARK_WORKSPACE_N8N_EMAIL="$n8n_email"
   vikunja_previous_status=$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)
-  if [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" ]]; then
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    human_pass=""
+  elif [[ -n "${SPARK_WORKSPACE_VIKUNJA_PASSWORD:-}" ]]; then
     human_pass="$SPARK_WORKSPACE_VIKUNJA_PASSWORD"
   elif [[ "$vikunja_previous_status" =~ ^(created|exists)$ ]]; then
     human_pass=""
@@ -2426,17 +3327,24 @@ workspace_setup() {
     human_pass=$(workspace_random_password)
   fi
   n8n_pass="${SPARK_WORKSPACE_N8N_PASSWORD:-$(workspace_random_password)}"
-  [[ "$human_pass" != "$n8n_pass" ]] || die "Vikunja and n8n passwords must be different"
-  workspace_require_prompt_value "Vikunja human username" "$human_user" username
-  workspace_require_prompt_value "Vikunja human email" "$human_email" email
+  [[ -z "$human_pass" || "$human_pass" != "$n8n_pass" ]] || die "Vikunja and n8n passwords must be different"
+  workspace_require_prompt_value "Workspace username" "$human_user" username
+  workspace_require_prompt_value "Workspace email" "$human_email" email
   workspace_require_prompt_value "n8n admin email" "$n8n_email" email
   n8n_previous_status=$(workspace_read_env N8N_OWNER_SETUP_STATUS 2>/dev/null || true)
   WORKSPACE_SHOW_VIKUNJA_PASSWORD=0
   WORKSPACE_SHOW_N8N_PASSWORD=0
+  WORKSPACE_SHOW_SUPER_PRODUCTIVITY_ACCESS=0
   workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$model" || {
     workspace_summary
     return $?
   }
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_prepare_super_productivity_runtime || {
+      workspace_summary
+      return 1
+    }
+  fi
   workspace_compose up -d --remove-orphans && info "Compose project ${WORKSPACE_PROJECT} started" || setup_fail "Could not start workspace compose"
   workspace_ensure_postgres_databases
   if [[ "$check_only" != "1" ]]; then
@@ -2455,11 +3363,16 @@ workspace_setup() {
     workspace_set_env_key HERMES_ONBOARD_STATUS manual
     setup_fail "Hermes onboarding skipped until Tailscale private access is configured"
   fi
-  workspace_create_vikunja_users "$human_pass" || true
-  workspace_setup_hermes_vikunja_access \
-    || setup_fail "Could not give Hermes verified Vikunja API access"
-  [[ ! "$vikunja_previous_status" =~ ^(created|exists)$ && "$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)" == "created" ]] \
-    && WORKSPACE_SHOW_VIKUNJA_PASSWORD=1
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_setup_hermes_super_productivity_access \
+      || setup_fail "Could not give Hermes private Super Productivity API access"
+  else
+    workspace_create_vikunja_users "$human_pass" || true
+    workspace_setup_hermes_vikunja_access \
+      || setup_fail "Could not give Hermes verified Vikunja API access"
+    [[ ! "$vikunja_previous_status" =~ ^(created|exists)$ && "$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)" == "created" ]] \
+      && WORKSPACE_SHOW_VIKUNJA_PASSWORD=1
+  fi
   if [[ "$n8n_previous_status" =~ ^(created|exists)$ ]]; then
     info "n8n owner already configured: ${n8n_email}"
   else
@@ -2519,6 +3432,9 @@ workspace_service_runtime_state() {
   workspace_compose_service_running "$service" || { printf 'stopped\n'; return 1; }
   case "$service" in
     vikunja) workspace_vikunja_http_ready && { printf 'ready\n'; return 0; } ;;
+    super-productivity-gateway) workspace_super_productivity_http_ready && { printf 'ready\n'; return 0; } ;;
+    supersync) workspace_supersync_http_ready && { printf 'ready\n'; return 0; } ;;
+    super-productivity-electron) workspace_super_productivity_api_ready && { printf 'ready\n'; return 0; } ;;
     n8n) workspace_n8n_http_ready && { printf 'ready\n'; return 0; } ;;
     postgres) printf 'running\n'; return 0 ;;
   esac
@@ -2543,13 +3459,25 @@ workspace_access_runtime_state() {
 }
 
 workspace_status_operational() {
+  local task_manager task_service
   workspace_configured || return 1
+  task_manager=$(workspace_task_manager)
+  task_service=vikunja
+  [[ "$task_manager" == "super-productivity" ]] && task_service=super-productivity-gateway
   [[ "$(workspace_service_runtime_state postgres || true)" == "running" ]] || return 1
-  [[ "$(workspace_service_runtime_state vikunja || true)" == "ready" ]] || return 1
+  [[ "$(workspace_service_runtime_state "$task_service" || true)" == "ready" ]] || return 1
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    [[ "$(workspace_service_runtime_state supersync || true)" == "ready" ]] || return 1
+    [[ "$(workspace_service_runtime_state super-productivity-electron || true)" == "ready" ]] || return 1
+  fi
   [[ "$(workspace_service_runtime_state n8n || true)" == "ready" ]] || return 1
   [[ "$(workspace_hermes_runtime_state || true)" == "ready" ]] || return 1
   [[ "$(workspace_access_runtime_state || true)" == "ready" ]] || return 1
-  workspace_hermes_vikunja_api_ready
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_hermes_super_productivity_api_ready
+  else
+    workspace_hermes_vikunja_api_ready
+  fi
 }
 
 workspace_print_service_row() {
@@ -2564,50 +3492,77 @@ workspace_print_service_row() {
 }
 
 workspace_print_status_summary() {
-  local postgres_state vikunja_state n8n_state hermes_state access_state mode model
-  local vikunja_url n8n_url hermes_url
+  local postgres_state task_state supersync_state electron_state n8n_state hermes_state access_state mode model task_manager task_service
+  local task_url n8n_url hermes_url
+  task_manager=$(workspace_task_manager)
+  task_service=vikunja
+  [[ "$task_manager" == "super-productivity" ]] && task_service=super-productivity-gateway
   postgres_state=$(workspace_service_runtime_state postgres || true)
-  vikunja_state=$(workspace_service_runtime_state vikunja || true)
+  task_state=$(workspace_service_runtime_state "$task_service" || true)
+  supersync_state=$(workspace_service_runtime_state supersync || true)
+  electron_state=$(workspace_service_runtime_state super-productivity-electron || true)
   n8n_state=$(workspace_service_runtime_state n8n || true)
   hermes_state=$(workspace_hermes_runtime_state || true)
   access_state=$(workspace_access_runtime_state || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
-  vikunja_url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  task_url=$(workspace_task_manager_url)
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
 
   printf "\n  ${BOLD}Workspace services${NC}\n"
   printf "  ${DIM}%-20s %-22s %s${NC}\n" "STATE" "SERVICE" "ACCESS"
   workspace_print_service_row "$postgres_state" "Postgres" "internal"
-  workspace_print_service_row "$vikunja_state" "Vikunja" "${vikunja_url:-unset}"
+  workspace_print_service_row "$task_state" "$(workspace_task_manager_label "$task_manager")" "${task_url:-unset}"
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_print_service_row "$supersync_state" "SuperSync" "internal"
+    workspace_print_service_row "$electron_state" "Electron API for Hermes" "private bridge"
+  fi
   workspace_print_service_row "$n8n_state" "n8n" "${n8n_url:-unset}"
   workspace_print_service_row "$hermes_state" "Hermes" "${hermes_url:-unset}"
 
   printf "\n  ${BOLD}Agent workspace${NC}\n"
   printf "  %-22s %s\n" "Mode" "${mode:-unset}"
+  printf "  %-22s %s\n" "Task manager" "$(workspace_task_manager_label "$task_manager")"
   printf "  %-22s %s\n" "Hermes model" "${model:-unset}"
   printf "  %-22s %s\n" "Private access" "$access_state"
 }
 
 workspace_status_json() {
-  local ok=false postgres_state vikunja_state n8n_state hermes_state access_state mode model
-  local vikunja_url n8n_url hermes_url
+  local ok=false postgres_state task_state n8n_state hermes_state access_state mode model task_manager task_service
+  local task_url n8n_url hermes_url task_alias="" task_extra="" supersync_state electron_state
   workspace_status_operational && ok=true
+  task_manager=$(workspace_task_manager)
+  task_service=vikunja
+  [[ "$task_manager" == "super-productivity" ]] && task_service=super-productivity-gateway
   postgres_state=$(workspace_service_runtime_state postgres || true)
-  vikunja_state=$(workspace_service_runtime_state vikunja || true)
+  task_state=$(workspace_service_runtime_state "$task_service" || true)
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    supersync_state=$(workspace_service_runtime_state supersync || true)
+    electron_state=$(workspace_service_runtime_state super-productivity-electron || true)
+    task_extra=$(printf ',"supersync":{"state":"%s"},"electron_api":{"state":"%s"}' \
+      "$supersync_state" "$electron_state")
+  fi
   n8n_state=$(workspace_service_runtime_state n8n || true)
   hermes_state=$(workspace_hermes_runtime_state || true)
   access_state=$(workspace_access_runtime_state || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
-  vikunja_url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  task_url=$(workspace_task_manager_url)
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    task_alias=$(printf ',"super_productivity":{"state":"%s","url":"%s"}' \
+      "$task_state" "$(workspace_json_escape "$task_url")")
+  else
+    # Keep the original status schema for existing Vikunja consumers.
+    task_alias=$(printf ',"vikunja":{"state":"%s","url":"%s"}' \
+      "$task_state" "$(workspace_json_escape "$task_url")")
+  fi
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
-  printf '{"ok":%s,"mode":"%s","hermes_model":"%s","access":"%s","services":{"postgres":{"state":"%s"},"vikunja":{"state":"%s","url":"%s"},"n8n":{"state":"%s","url":"%s"},"hermes":{"state":"%s","url":"%s"}}}\n' \
-    "$ok" "$(workspace_json_escape "$mode")" "$(workspace_json_escape "$model")" \
-    "$access_state" "$postgres_state" "$vikunja_state" "$(workspace_json_escape "$vikunja_url")" \
-    "$n8n_state" "$(workspace_json_escape "$n8n_url")" "$hermes_state" "$(workspace_json_escape "$hermes_url")"
+  printf '{"ok":%s,"mode":"%s","task_manager":"%s","hermes_model":"%s","access":"%s","services":{"postgres":{"state":"%s"},"task_manager":{"state":"%s","url":"%s"}%s%s,"n8n":{"state":"%s","url":"%s"},"hermes":{"state":"%s","url":"%s"}}}\n' \
+    "$ok" "$(workspace_json_escape "$mode")" "$task_manager" "$(workspace_json_escape "$model")" \
+    "$access_state" "$postgres_state" "$task_state" "$(workspace_json_escape "$task_url")" \
+    "$task_alias" "$task_extra" "$n8n_state" "$(workspace_json_escape "$n8n_url")" "$hermes_state" "$(workspace_json_escape "$hermes_url")"
   [[ "$ok" == "true" ]]
 }
 
@@ -2618,7 +3573,7 @@ cmd_workspace_containers() {
   workspace_compose ps 2>/dev/null || warn "Compose project ${WORKSPACE_PROJECT} not reachable"
   printf "\n"
   docker ps --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null \
-    | grep -E '(^NAMES|openshell-hermes|spark-hermes-(litellm|dashboard)-proxy)' || true
+    | grep -E '(^NAMES|openshell-hermes|spark-hermes-(litellm|dashboard|vikunja|super-productivity)-proxy)' || true
   printf "\n"
 }
 
@@ -2703,9 +3658,15 @@ workspace_start() {
     && info "Hermes inference bridge started" \
     || { err "Could not start Hermes inference bridge"; rc=1; }
 
-  workspace_start_hermes_vikunja_proxy \
-    && info "Hermes Vikunja API bridge started" \
-    || { err "Could not start Hermes Vikunja API bridge"; rc=1; }
+  if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
+    workspace_start_hermes_super_productivity_proxy \
+      && info "Hermes Super Productivity API bridge started" \
+      || { err "Could not start Hermes Super Productivity API bridge"; rc=1; }
+  else
+    workspace_start_hermes_vikunja_proxy \
+      && info "Hermes Vikunja API bridge started" \
+      || { err "Could not start Hermes Vikunja API bridge"; rc=1; }
+  fi
 
   workspace_start_hermes_dashboard_proxy \
     && info "Hermes dashboard proxy started" \
@@ -2754,7 +3715,8 @@ workspace_stop() {
   workspace_stop_hermes_gateway_proxy
   info "Stopped Hermes inference bridge"
   workspace_stop_hermes_vikunja_proxy
-  info "Stopped Hermes Vikunja API bridge"
+  workspace_stop_hermes_super_productivity_proxy
+  info "Stopped Hermes task manager API bridge"
   workspace_stop_hermes_dashboard_proxy
   info "Stopped Hermes dashboard proxy"
 
@@ -2792,21 +3754,32 @@ workspace_status_item() {
 }
 
 cmd_workspace_health() {
-  local model
+  local model task_manager
   model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  task_manager=$(workspace_task_manager)
   printf "\n  ${BOLD}Workspace health${NC}\n"
   workspace_status_item "Compose postgres" workspace_compose_service_running postgres
-  workspace_status_item "Compose vikunja" workspace_compose_service_running vikunja
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_status_item "Compose Super Productivity" workspace_compose_service_running super-productivity-gateway
+    workspace_status_item "Compose SuperSync" workspace_compose_service_running supersync
+    workspace_status_item "Compose Electron API" workspace_compose_service_running super-productivity-electron
+  else
+    workspace_status_item "Compose Vikunja" workspace_compose_service_running vikunja
+  fi
   workspace_status_item "Compose n8n" workspace_compose_service_running n8n
-  workspace_status_item "Vikunja HTTP local" workspace_vikunja_http_ready
+  workspace_status_item "Task manager HTTP local" workspace_task_manager_http_ready
   workspace_status_item "n8n HTTP local" workspace_n8n_http_ready
-  workspace_status_item "Vikunja private URL" workspace_vikunja_private_url_ready
+  workspace_status_item "Task manager private URL" workspace_task_manager_private_url_ready
   workspace_status_item "n8n private URL" workspace_n8n_private_url_ready
   workspace_status_item "Hermes private URL" workspace_hermes_private_status_url_ready
   workspace_status_item "No public listeners" workspace_host_listeners_loopback_only
   workspace_status_item "LiteLLM gateway" workspace_gateway_running
   workspace_status_item "Hermes inference bridge" workspace_hermes_gateway_proxy_running
-  workspace_status_item "Hermes Vikunja API bridge" workspace_hermes_vikunja_proxy_running
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_status_item "Hermes Super Productivity API bridge" workspace_hermes_super_productivity_proxy_running
+  else
+    workspace_status_item "Hermes Vikunja API bridge" workspace_hermes_vikunja_proxy_running
+  fi
   workspace_status_item "Hermes dashboard proxy" workspace_hermes_dashboard_proxy_running
   workspace_status_item "LiteLLM Hermes route" workspace_litellm_model_routed
   workspace_status_item "Hermes model" workspace_model_running "$model"
@@ -2818,8 +3791,21 @@ cmd_workspace_logs() {
   local target="${1:-}"
   case "$target" in
     ""|-h|--help)
-      printf "\n  Usage: spark ws logs [vikunja|n8n|postgres|hermes|gateway]\n\n" ;;
-    vikunja|n8n|postgres)
+      printf "\n  Usage: spark ws logs [task-manager|vikunja|super-productivity|supersync|electron|n8n|postgres|hermes|gateway]\n\n" ;;
+    task-manager)
+      workspace_require_config
+      if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
+        workspace_compose logs -f super-productivity-gateway super-productivity-web supersync
+      else
+        workspace_compose logs -f vikunja
+      fi ;;
+    super-productivity)
+      workspace_require_config
+      workspace_compose logs -f super-productivity-gateway super-productivity-web ;;
+    electron)
+      workspace_require_config
+      workspace_compose logs -f super-productivity-electron ;;
+    vikunja|supersync|n8n|postgres)
       workspace_require_config
       workspace_compose logs -f "$target" ;;
     gateway)
@@ -2843,29 +3829,30 @@ workspace_sha256_file() {
 }
 
 workspace_backup_payload_files() {
-  printf '%s\n' \
-    workspace-config.tgz \
-    vikunja.zip \
-    vikunja.sql \
-    n8n.sql \
-    hermes-snapshot.status \
-    nemoclaw-backup.status
+  local task_manager="${1:-$(workspace_task_manager)}"
+  printf '%s\n' workspace-config.tgz
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    printf '%s\n' super-productivity-electron.tgz supersync.sql
+  else
+    printf '%s\n' vikunja.zip vikunja.sql
+  fi
+  printf '%s\n' n8n.sql hermes-snapshot.status nemoclaw-backup.status
 }
 
 workspace_backup_write_checksums() {
-  local dir="$1" file hash checksums
+  local dir="$1" task_manager="${2:-$(workspace_task_manager)}" file hash checksums
   checksums="${dir}/checksums.sha256"
   : > "$checksums"
   while IFS= read -r file; do
     [[ -s "${dir}/${file}" ]] || return 1
     hash=$(workspace_sha256_file "${dir}/${file}") || return 1
     printf '%s  %s\n' "$hash" "$file" >> "$checksums"
-  done < <(workspace_backup_payload_files)
+  done < <(workspace_backup_payload_files "$task_manager")
   chmod 600 "$checksums"
 }
 
 workspace_backup_verify_checksums() {
-  local dir="$1" checksums expected file actual required failures=0
+  local dir="$1" task_manager="$2" checksums expected file actual required failures=0
   checksums="${dir}/checksums.sha256"
   [[ -f "$checksums" ]] || { warn "checksums.sha256 missing"; return 1; }
   while IFS= read -r required; do
@@ -2874,11 +3861,11 @@ workspace_backup_verify_checksums() {
       END { exit !found }
     ' "$checksums" \
       || { warn "Checksum entry missing: ${required}"; failures=$((failures + 1)); }
-  done < <(workspace_backup_payload_files)
+  done < <(workspace_backup_payload_files "$task_manager")
   while read -r expected file; do
     [[ "$expected" =~ ^[0-9a-fA-F]{64}$ && "$file" =~ ^[A-Za-z0-9._-]+$ ]] \
       || { warn "Invalid checksum entry: ${file:-missing-file}"; failures=$((failures + 1)); continue; }
-    workspace_backup_payload_files | grep -Fxq "$file" \
+    workspace_backup_payload_files "$task_manager" | grep -Fxq "$file" \
       || { warn "Unexpected checksum entry: ${file}"; failures=$((failures + 1)); continue; }
     [[ -f "${dir}/${file}" ]] \
       || { warn "Checksum target missing: ${file}"; failures=$((failures + 1)); continue; }
@@ -2891,28 +3878,43 @@ workspace_backup_verify_checksums() {
 }
 
 workspace_backup_verify() {
-  local dir="$1" manifest failures=0 key file
+  local dir="$1" manifest failures=0 key file task_manager status_keys
   [[ -n "$dir" ]] || die "backup --verify requires a backup directory"
   manifest="${dir}/manifest.env"
   [[ -d "$dir" ]] || { err "Backup directory missing: $dir"; return 1; }
   [[ -f "$manifest" ]] || { err "Backup manifest missing: $manifest"; return 1; }
+  task_manager=$(sed -n 's/^TASK_MANAGER=//p' "$manifest" | head -1)
+  [[ -n "$task_manager" ]] || task_manager=vikunja
+  workspace_task_manager_valid "$task_manager" || { err "Backup task manager missing or invalid"; return 1; }
   workspace_file_mode_is "$dir" 700 || { warn "Backup directory mode must be 0700"; failures=$((failures + 1)); }
-  for key in WORKSPACE_CONFIG_STATUS VIKUNJA_DUMP_STATUS VIKUNJA_DB_STATUS N8N_DB_STATUS HERMES_SNAPSHOT_STATUS NEMOCLAW_BACKUP_ALL_STATUS CHECKSUMS_STATUS; do
+  status_keys="WORKSPACE_CONFIG_STATUS N8N_DB_STATUS HERMES_SNAPSHOT_STATUS NEMOCLAW_BACKUP_ALL_STATUS CHECKSUMS_STATUS"
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    status_keys="$status_keys SUPER_PRODUCTIVITY_ELECTRON_STATUS SUPERSYNC_DB_STATUS"
+  else
+    status_keys="$status_keys VIKUNJA_DUMP_STATUS VIKUNJA_DB_STATUS"
+  fi
+  for key in $status_keys; do
     grep -q "^${key}=ok$" "$manifest" || { warn "Backup manifest not ok: ${key}"; failures=$((failures + 1)); }
   done
   [[ -s "${dir}/workspace-config.tgz" ]] && tar -tzf "${dir}/workspace-config.tgz" >/dev/null 2>&1 \
     || { warn "workspace-config.tgz missing or unreadable"; failures=$((failures + 1)); }
-  [[ -s "${dir}/vikunja.zip" ]] || { warn "vikunja.zip missing or empty"; failures=$((failures + 1)); }
-  [[ -s "${dir}/vikunja.sql" ]] || { warn "vikunja.sql missing or empty"; failures=$((failures + 1)); }
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    [[ -s "${dir}/super-productivity-electron.tgz" ]] && tar -tzf "${dir}/super-productivity-electron.tgz" >/dev/null 2>&1 \
+      || { warn "super-productivity-electron.tgz missing or unreadable"; failures=$((failures + 1)); }
+    [[ -s "${dir}/supersync.sql" ]] || { warn "supersync.sql missing or empty"; failures=$((failures + 1)); }
+  else
+    [[ -s "${dir}/vikunja.zip" ]] || { warn "vikunja.zip missing or empty"; failures=$((failures + 1)); }
+    [[ -s "${dir}/vikunja.sql" ]] || { warn "vikunja.sql missing or empty"; failures=$((failures + 1)); }
+  fi
   [[ -s "${dir}/n8n.sql" ]] || { warn "n8n.sql missing or empty"; failures=$((failures + 1)); }
   [[ -s "${dir}/hermes-snapshot.status" ]] || { warn "hermes-snapshot.status missing or empty"; failures=$((failures + 1)); }
   [[ -s "${dir}/nemoclaw-backup.status" ]] || { warn "nemoclaw-backup.status missing or empty"; failures=$((failures + 1)); }
   [[ -s "${dir}/checksums.sha256" ]] || { warn "checksums.sha256 missing or empty"; failures=$((failures + 1)); }
-  for file in manifest.env workspace-config.tgz vikunja.zip vikunja.sql n8n.sql hermes-snapshot.status nemoclaw-backup.status checksums.sha256; do
+  for file in manifest.env checksums.sha256 $(workspace_backup_payload_files "$task_manager"); do
     [[ -e "${dir}/${file}" ]] && workspace_file_mode_is "${dir}/${file}" 600 \
       || { warn "${file} mode must be 0600"; failures=$((failures + 1)); }
   done
-  workspace_backup_verify_checksums "$dir" || failures=$((failures + 1))
+  workspace_backup_verify_checksums "$dir" "$task_manager" || failures=$((failures + 1))
   if [[ "$failures" -eq 0 ]]; then
     info "Backup verified: ${dir}"
     return 0
@@ -2928,7 +3930,8 @@ cmd_workspace_backup() {
   fi
   [[ $# -eq 0 ]] || { [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { printf "\n  Usage: spark ws backup [--verify BACKUP_DIR]\n\n"; return 0; }; die "Unknown ws backup flag: $1"; }
   workspace_require_config
-  local ts dir manifest failures=0 old_umask
+  local ts dir manifest task_manager electron_was_running=0 failures=0 old_umask
+  task_manager=$(workspace_task_manager)
   ts=$(date +%Y%m%d-%H%M%S)
   dir="${WORKSPACE_DATA_DIR}/backups/${ts}"
   mkdir -p "$dir"
@@ -2938,16 +3941,29 @@ cmd_workspace_backup() {
   umask 077
   : > "$manifest"
   printf 'CREATED_AT=%s\n' "$ts" >> "$manifest"
+  printf 'TASK_MANAGER=%s\n' "$task_manager" >> "$manifest"
   tar -C "$WORKSPACE_CONFIG_DIR" -czf "$dir/workspace-config.tgz" . >/dev/null 2>&1 \
     && { printf 'WORKSPACE_CONFIG_STATUS=ok\n' >> "$manifest"; info "Backed up workspace config"; } \
     || { printf 'WORKSPACE_CONFIG_STATUS=failed\n' >> "$manifest"; warn "Could not back up workspace config"; failures=$((failures + 1)); }
-  workspace_compose exec -T vikunja /app/vikunja/vikunja dump -p /tmp -f vikunja.zip >/dev/null 2>&1 \
-    && workspace_compose cp vikunja:/tmp/vikunja.zip "$dir/vikunja.zip" >/dev/null 2>&1 \
-    && { printf 'VIKUNJA_DUMP_STATUS=ok\n' >> "$manifest"; info "Backed up Vikunja dump"; } \
-    || { printf 'VIKUNJA_DUMP_STATUS=failed\n' >> "$manifest"; warn "Could not create Vikunja dump"; failures=$((failures + 1)); }
-  workspace_compose exec -T -e "PGPASSWORD=$(workspace_read_env VIKUNJA_DATABASE_PASSWORD)" postgres pg_dump -U vikunja vikunja > "$dir/vikunja.sql" 2>/dev/null \
-    && { printf 'VIKUNJA_DB_STATUS=ok\n' >> "$manifest"; info "Backed up Vikunja Postgres"; } \
-    || { printf 'VIKUNJA_DB_STATUS=failed\n' >> "$manifest"; warn "Could not dump Vikunja Postgres"; failures=$((failures + 1)); }
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_compose_service_running super-productivity-electron && electron_was_running=1
+    [[ "$electron_was_running" == "0" ]] || workspace_compose pause super-productivity-electron >/dev/null 2>&1 || true
+    tar -C "$WORKSPACE_DATA_DIR" -czf "$dir/super-productivity-electron.tgz" super-productivity-electron >/dev/null 2>&1 \
+      && { printf 'SUPER_PRODUCTIVITY_ELECTRON_STATUS=ok\n' >> "$manifest"; info "Backed up Super Productivity Electron data"; } \
+      || { printf 'SUPER_PRODUCTIVITY_ELECTRON_STATUS=failed\n' >> "$manifest"; warn "Could not back up Super Productivity Electron data"; failures=$((failures + 1)); }
+    [[ "$electron_was_running" == "0" ]] || workspace_compose unpause super-productivity-electron >/dev/null 2>&1 || true
+    workspace_compose exec -T -e "PGPASSWORD=$(workspace_read_env SUPERSYNC_DATABASE_PASSWORD)" postgres pg_dump -U supersync supersync > "$dir/supersync.sql" 2>/dev/null \
+      && { printf 'SUPERSYNC_DB_STATUS=ok\n' >> "$manifest"; info "Backed up SuperSync Postgres"; } \
+      || { printf 'SUPERSYNC_DB_STATUS=failed\n' >> "$manifest"; warn "Could not dump SuperSync Postgres"; failures=$((failures + 1)); }
+  else
+    workspace_compose exec -T vikunja /app/vikunja/vikunja dump -p /tmp -f vikunja.zip >/dev/null 2>&1 \
+      && workspace_compose cp vikunja:/tmp/vikunja.zip "$dir/vikunja.zip" >/dev/null 2>&1 \
+      && { printf 'VIKUNJA_DUMP_STATUS=ok\n' >> "$manifest"; info "Backed up Vikunja dump"; } \
+      || { printf 'VIKUNJA_DUMP_STATUS=failed\n' >> "$manifest"; warn "Could not create Vikunja dump"; failures=$((failures + 1)); }
+    workspace_compose exec -T -e "PGPASSWORD=$(workspace_read_env VIKUNJA_DATABASE_PASSWORD)" postgres pg_dump -U vikunja vikunja > "$dir/vikunja.sql" 2>/dev/null \
+      && { printf 'VIKUNJA_DB_STATUS=ok\n' >> "$manifest"; info "Backed up Vikunja Postgres"; } \
+      || { printf 'VIKUNJA_DB_STATUS=failed\n' >> "$manifest"; warn "Could not dump Vikunja Postgres"; failures=$((failures + 1)); }
+  fi
   workspace_compose exec -T -e "PGPASSWORD=$(workspace_read_env DB_POSTGRESDB_PASSWORD)" postgres pg_dump -U n8n n8n > "$dir/n8n.sql" 2>/dev/null \
     && { printf 'N8N_DB_STATUS=ok\n' >> "$manifest"; info "Backed up n8n Postgres"; } \
     || { printf 'N8N_DB_STATUS=failed\n' >> "$manifest"; warn "Could not dump n8n Postgres"; failures=$((failures + 1)); }
@@ -2964,11 +3980,10 @@ cmd_workspace_backup() {
     warn "NemoHermes not installed; Hermes backup skipped"
     failures=$((failures + 1))
   fi
-  workspace_backup_write_checksums "$dir" \
+  workspace_backup_write_checksums "$dir" "$task_manager" \
     && { printf 'CHECKSUMS_STATUS=ok\n' >> "$manifest"; info "Wrote backup checksums"; } \
     || { printf 'CHECKSUMS_STATUS=failed\n' >> "$manifest"; warn "Could not write backup checksums"; failures=$((failures + 1)); }
-  chmod 600 "$manifest" "$dir"/workspace-config.tgz "$dir"/vikunja.zip "$dir"/vikunja.sql "$dir"/n8n.sql \
-    "$dir"/hermes-snapshot.status "$dir"/nemoclaw-backup.status "$dir"/checksums.sha256 2>/dev/null || true
+  chmod 600 "$manifest" "$dir"/* 2>/dev/null || true
   umask "$old_umask"
   printf "\n  Backup: %s\n\n" "$dir"
   [[ "$failures" -eq 0 ]] || return 1
@@ -3066,7 +4081,7 @@ workspace_doctor_print_json() {
 }
 
 workspace_doctor_print_human() {
-  local category i category_passed category_failed state action
+  local category i category_passed category_failed state action compatibility_label
   printf "\n  ${BOLD}spark ws doctor${NC}\n\n"
   printf "  ${BOLD}Result${NC}\n"
   if [[ "$WORKSPACE_DOCTOR_FAILED" -eq 0 ]]; then
@@ -3107,6 +4122,18 @@ workspace_doctor_print_human() {
     for i in "${!WORKSPACE_DOCTOR_LABELS[@]}"; do
       if [[ "${WORKSPACE_DOCTOR_RESULTS[$i]}" == "ok" ]]; then state="${GREEN}[x]${NC}"; else state="${RED}[ ]${NC}"; fi
       printf "  %b %s · %s\n" "$state" "${WORKSPACE_DOCTOR_LABELS[$i]}" "${WORKSPACE_DOCTOR_CATEGORIES[$i]}"
+      compatibility_label=""
+      if [[ "$(workspace_task_manager)" == "vikunja" ]]; then
+        case "${WORKSPACE_DOCTOR_LABELS[$i]}" in
+          "Shared Postgres initializes Vikunja and n8n DBs")
+            compatibility_label="Shared Postgres initializes task manager and n8n DBs" ;;
+          "Shared Postgres runtime has Vikunja and n8n roles/databases")
+            compatibility_label="Shared Postgres runtime has task manager and n8n roles/databases" ;;
+          "Tailscale local config maps vikunja, n8n, hermes")
+            compatibility_label="Tailscale local config maps tasks, n8n, hermes" ;;
+        esac
+      fi
+      [[ -z "$compatibility_label" ]] || printf "  %b %s · %s\n" "$state" "$compatibility_label" "${WORKSPACE_DOCTOR_CATEGORIES[$i]}"
     done
   fi
   printf "\n"
@@ -3121,19 +4148,23 @@ workspace_env_has() {
 }
 
 workspace_human_password_not_stored() {
-  local file
-  for file in "$WORKSPACE_ENV_FILE" "$WORKSPACE_VIKUNJA_ENV_FILE" "$WORKSPACE_N8N_ENV_FILE"; do
+  local file task_env="$WORKSPACE_VIKUNJA_ENV_FILE"
+  [[ "$(workspace_task_manager)" == "super-productivity" ]] && task_env="$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE"
+  for file in "$WORKSPACE_ENV_FILE" "$task_env" "$WORKSPACE_N8N_ENV_FILE"; do
     [[ -f "$file" ]] || return 1
     ! grep -Eq '^(VIKUNJA_HUMAN_(PASSWORD|RECOVERY_PASSWORD)|VIKUNJA_HERMES_PASSWORD|N8N_BASIC_AUTH_PASSWORD)=' "$file" || return 1
   done
 }
 
 workspace_credentials_are_distinct() {
-  local key val seen
+  local key val seen keys
   seen=""
-  for key in \
-    POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD DB_POSTGRESDB_PASSWORD VIKUNJA_SERVICE_SECRET \
-    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HERMES_API_TOKEN; do
+  if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
+    keys="POSTGRES_PASSWORD SUPERSYNC_DATABASE_PASSWORD SUPERSYNC_JWT_SECRET SUPERSYNC_ACCESS_TOKEN SUPERSYNC_ENCRYPTION_PASSWORD DB_POSTGRESDB_PASSWORD N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET"
+  else
+    keys="POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD DB_POSTGRESDB_PASSWORD VIKUNJA_SERVICE_SECRET N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HERMES_API_TOKEN"
+  fi
+  for key in $keys; do
     val=$(workspace_read_env "$key" || true)
     [[ -n "$val" ]] || return 1
     if printf '%s\n' "$seen" | grep -Fqx -- "$val"; then
@@ -3145,8 +4176,9 @@ workspace_credentials_are_distinct() {
 }
 
 workspace_no_legacy_recovery_config() {
-  local file
-  for file in "$WORKSPACE_ENV_FILE" "$WORKSPACE_VIKUNJA_ENV_FILE" "$WORKSPACE_N8N_ENV_FILE"; do
+  local file task_env="$WORKSPACE_VIKUNJA_ENV_FILE"
+  [[ "$(workspace_task_manager)" == "super-productivity" ]] && task_env="$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE"
+  for file in "$WORKSPACE_ENV_FILE" "$task_env" "$WORKSPACE_N8N_ENV_FILE"; do
     [[ -f "$file" ]] || return 1
     ! grep -Eq '^(WORKSPACE_SMTP_|VIKUNJA_MAILER_|N8N_SMTP_|N8N_EMAIL_MODE=|VIKUNJA_HERMES_(USERNAME|PASSWORD|USER_STATUS)=|N8N_INSTANCE_OWNER_(MANAGED_BY_ENV|EMAIL|FIRST_NAME|LAST_NAME|PASSWORD_HASH)=)' "$file" || return 1
   done
@@ -3175,8 +4207,10 @@ workspace_env_file_syntax_valid() {
 }
 
 workspace_service_env_files_syntax_valid() {
+  local task_env="$WORKSPACE_VIKUNJA_ENV_FILE"
+  [[ "$(workspace_task_manager)" == "super-productivity" ]] && task_env="$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE"
   workspace_env_file_syntax_valid "$WORKSPACE_POSTGRES_ENV_FILE" &&
-    workspace_env_file_syntax_valid "$WORKSPACE_VIKUNJA_ENV_FILE" &&
+    workspace_env_file_syntax_valid "$task_env" &&
     workspace_env_file_syntax_valid "$WORKSPACE_N8N_ENV_FILE"
 }
 
@@ -3205,21 +4239,28 @@ workspace_compose_config_valid() {
 }
 
 workspace_compose_shared_postgres() {
+  local task_db=vikunja task_user=vikunja
+  if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
+    task_db=supersync
+    task_user=supersync
+  fi
   [[ -f "$WORKSPACE_COMPOSE_FILE" && -f "${WORKSPACE_CONFIG_DIR}/init-db.sh" ]] || return 1
   workspace_compose_mentions_service postgres &&
     ! workspace_compose_mentions_service vikunja-db &&
     ! workspace_compose_mentions_service n8n-db &&
-    grep -q 'CREATE DATABASE vikunja' "${WORKSPACE_CONFIG_DIR}/init-db.sh" &&
+    grep -q "CREATE DATABASE ${task_db}" "${WORKSPACE_CONFIG_DIR}/init-db.sh" &&
     grep -q 'CREATE DATABASE n8n' "${WORKSPACE_CONFIG_DIR}/init-db.sh" &&
     grep -q 'WHERE NOT EXISTS' "${WORKSPACE_CONFIG_DIR}/init-db.sh" &&
-    grep -q 'ALTER USER vikunja' "${WORKSPACE_CONFIG_DIR}/init-db.sh" &&
+    grep -q "ALTER USER ${task_user}" "${WORKSPACE_CONFIG_DIR}/init-db.sh" &&
     grep -q 'ALTER USER n8n' "${WORKSPACE_CONFIG_DIR}/init-db.sh"
 }
 
 workspace_postgres_shared_runtime_ready() {
-  workspace_postgres_role_exists vikunja &&
+  local task_db=vikunja
+  [[ "$(workspace_task_manager)" == "super-productivity" ]] && task_db=supersync
+  workspace_postgres_role_exists "$task_db" &&
     workspace_postgres_role_exists n8n &&
-    workspace_postgres_db_exists vikunja &&
+    workspace_postgres_db_exists "$task_db" &&
     workspace_postgres_db_exists n8n
 }
 
@@ -3257,8 +4298,9 @@ workspace_compose_uses_loopback_ports() {
   else
     workspace_private_bind_addr_ok "$bind_addr" || return 1
   fi
-  grep -Fq "${bind_addr}:${WORKSPACE_VIKUNJA_PORT}:3456" "$WORKSPACE_COMPOSE_FILE" &&
+  grep -Fq "${bind_addr}:${WORKSPACE_TASK_MANAGER_PORT}:3456" "$WORKSPACE_COMPOSE_FILE" &&
     grep -Fq "${bind_addr}:${WORKSPACE_N8N_PORT}:5678" "$WORKSPACE_COMPOSE_FILE" &&
+    { [[ "$(workspace_task_manager)" != "super-productivity" ]] || grep -Fq "127.0.0.1:${WORKSPACE_SUPER_PRODUCTIVITY_API_PORT}:3877" "$WORKSPACE_COMPOSE_FILE"; } &&
     ! grep -qE '0[.]0[.]0[.]0:|:::[0-9]+|[[]::[]]:' "$WORKSPACE_COMPOSE_FILE"
 }
 
@@ -3307,30 +4349,41 @@ workspace_n8n_hardened() {
 }
 
 workspace_service_env_files_ready() {
-  [[ -f "$WORKSPACE_POSTGRES_ENV_FILE" && -f "$WORKSPACE_VIKUNJA_ENV_FILE" && -f "$WORKSPACE_N8N_ENV_FILE" ]] &&
+  local task_env="$WORKSPACE_VIKUNJA_ENV_FILE"
+  [[ "$(workspace_task_manager)" == "super-productivity" ]] && task_env="$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE"
+  [[ -f "$WORKSPACE_POSTGRES_ENV_FILE" && -f "$task_env" && -f "$WORKSPACE_N8N_ENV_FILE" ]] &&
     workspace_file_mode_is "$WORKSPACE_POSTGRES_ENV_FILE" 600 &&
-    workspace_file_mode_is "$WORKSPACE_VIKUNJA_ENV_FILE" 600 &&
+    workspace_file_mode_is "$task_env" 600 &&
     workspace_file_mode_is "$WORKSPACE_N8N_ENV_FILE" 600
 }
 
 workspace_compose_uses_scoped_env_files() {
+  local task_env="$WORKSPACE_VIKUNJA_ENV_FILE"
+  [[ "$(workspace_task_manager)" == "super-productivity" ]] && task_env="$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE"
   [[ -f "$WORKSPACE_COMPOSE_FILE" ]] || return 1
   grep -Fq "$WORKSPACE_POSTGRES_ENV_FILE" "$WORKSPACE_COMPOSE_FILE" &&
-    grep -Fq "$WORKSPACE_VIKUNJA_ENV_FILE" "$WORKSPACE_COMPOSE_FILE" &&
+    grep -Fq "$task_env" "$WORKSPACE_COMPOSE_FILE" &&
     grep -Fq "$WORKSPACE_N8N_ENV_FILE" "$WORKSPACE_COMPOSE_FILE" &&
     ! grep -Fq "$WORKSPACE_ENV_FILE" "$WORKSPACE_COMPOSE_FILE"
 }
 
 workspace_compose_images_configured() {
-  local postgres_image vikunja_image n8n_image
+  local postgres_image task_image n8n_image image_keys key
   [[ -f "$WORKSPACE_COMPOSE_FILE" ]] || return 1
   postgres_image=$(workspace_read_env WORKSPACE_POSTGRES_IMAGE 2>/dev/null || true)
-  vikunja_image=$(workspace_read_env WORKSPACE_VIKUNJA_IMAGE 2>/dev/null || true)
   n8n_image=$(workspace_read_env WORKSPACE_N8N_IMAGE 2>/dev/null || true)
-  [[ -n "$postgres_image" && -n "$vikunja_image" && -n "$n8n_image" ]] &&
+  [[ -n "$postgres_image" && -n "$n8n_image" ]] &&
     grep -Fq "image: ${postgres_image}" "$WORKSPACE_COMPOSE_FILE" &&
-    grep -Fq "image: ${vikunja_image}" "$WORKSPACE_COMPOSE_FILE" &&
-    grep -Fq "image: ${n8n_image}" "$WORKSPACE_COMPOSE_FILE"
+    grep -Fq "image: ${n8n_image}" "$WORKSPACE_COMPOSE_FILE" || return 1
+  if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
+    image_keys="WORKSPACE_SUPER_PRODUCTIVITY_IMAGE WORKSPACE_SUPERSYNC_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE"
+  else
+    image_keys="WORKSPACE_VIKUNJA_IMAGE"
+  fi
+  for key in $image_keys; do
+    task_image=$(workspace_read_env "$key" 2>/dev/null || true)
+    [[ -n "$task_image" ]] && grep -Fq "image: ${task_image}" "$WORKSPACE_COMPOSE_FILE" || return 1
+  done
 }
 
 workspace_image_ref_pinned() {
@@ -3339,23 +4392,32 @@ workspace_image_ref_pinned() {
 }
 
 workspace_compose_images_pinned() {
-  local postgres_image vikunja_image n8n_image
+  local postgres_image task_image n8n_image image_keys key
   postgres_image=$(workspace_read_env WORKSPACE_POSTGRES_IMAGE 2>/dev/null || true)
-  vikunja_image=$(workspace_read_env WORKSPACE_VIKUNJA_IMAGE 2>/dev/null || true)
   n8n_image=$(workspace_read_env WORKSPACE_N8N_IMAGE 2>/dev/null || true)
   workspace_image_ref_pinned "$postgres_image" &&
-    workspace_image_ref_pinned "$vikunja_image" &&
-    workspace_image_ref_pinned "$n8n_image"
+    workspace_image_ref_pinned "$n8n_image" || return 1
+  if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
+    image_keys="WORKSPACE_SUPER_PRODUCTIVITY_IMAGE WORKSPACE_SUPERSYNC_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_GATEWAY_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE"
+  else
+    image_keys="WORKSPACE_VIKUNJA_IMAGE"
+  fi
+  for key in $image_keys; do
+    task_image=$(workspace_read_env "$key" 2>/dev/null || true)
+    workspace_image_ref_pinned "$task_image" || return 1
+  done
 }
 
 workspace_compose_runtime_hardened() {
+  local minimum=3
+  [[ "$(workspace_task_manager)" == "super-productivity" ]] && minimum=6
   [[ -f "$WORKSPACE_COMPOSE_FILE" ]] || return 1
-  [[ "$(grep -c 'no-new-privileges:true' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge 3 ]] &&
-    [[ "$(grep -c 'init: true' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge 3 ]] &&
-    [[ "$(grep -c 'stop_grace_period: 30s' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge 3 ]] &&
-    [[ "$(grep -c 'pids_limit: 512' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge 3 ]] &&
-    [[ "$(grep -c 'max-size: "10m"' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge 3 ]] &&
-    [[ "$(grep -c 'max-file: "5"' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge 3 ]]
+  [[ "$(grep -c 'no-new-privileges:true' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge "$minimum" ]] &&
+    [[ "$(grep -c 'init: true' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge "$minimum" ]] &&
+    [[ "$(grep -c 'stop_grace_period: 30s' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge "$minimum" ]] &&
+    [[ "$(grep -c 'pids_limit:' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge "$minimum" ]] &&
+    [[ "$(grep -c 'max-size: "10m"' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge "$minimum" ]] &&
+    [[ "$(grep -c 'max-file: "5"' "$WORKSPACE_COMPOSE_FILE" 2>/dev/null || true)" -ge "$minimum" ]]
 }
 
 workspace_n8n_owner_ready() {
@@ -3405,34 +4467,79 @@ workspace_vikunja_hermes_project_access_ready() {
   [[ "$(workspace_read_env VIKUNJA_HERMES_PROJECT_ACCESS_STATUS 2>/dev/null || true)" == "verified" ]]
 }
 
+workspace_super_productivity_config_ready() {
+  local url email token encryption
+  url=$(workspace_task_manager_url)
+  email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
+  token=$(workspace_read_env SUPERSYNC_ACCESS_TOKEN 2>/dev/null || true)
+  encryption=$(workspace_read_env SUPERSYNC_ENCRYPTION_PASSWORD 2>/dev/null || true)
+  [[ -n "$url" && -n "$email" && -n "$token" && -n "$encryption" ]] &&
+    [[ -f "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" ]] &&
+    grep -q '^RUN_MIGRATIONS_ON_STARTUP=false$' "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" &&
+    grep -q '^SPARK_HEADLESS=1$' "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE"
+}
+
+workspace_super_productivity_electron_build_ready() {
+  [[ -s "${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}/Dockerfile" ]] &&
+    [[ -s "${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}/entrypoint.sh" ]] &&
+    [[ -s "${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}/spark-headless.patch" ]]
+}
+
+workspace_supersync_user_ready() {
+  local email pass record
+  email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
+  pass=$(workspace_read_env SUPERSYNC_DATABASE_PASSWORD 2>/dev/null || true)
+  [[ -n "$email" && -n "$pass" ]] || return 1
+  record=$(workspace_compose exec -T -e PGPASSWORD="$pass" postgres \
+    psql -qAt -U supersync -d supersync -v email="$email" \
+      -c "SELECT id || ':' || token_version FROM users WHERE email=lower(:'email') AND is_verified=1" 2>/dev/null || true)
+  [[ "$record" =~ ^[1-9][0-9]*:[0-9]+$ ]]
+}
+
+workspace_supersync_token_ready() {
+  local url token
+  url=$(workspace_task_manager_url)
+  token=$(workspace_read_env SUPERSYNC_ACCESS_TOKEN 2>/dev/null || true)
+  [[ -n "$url" && -n "$token" ]] || return 1
+  curl -fsS --max-time 5 -H "Authorization: Bearer ${token}" \
+    "${url%/}/api/sync/status" >/dev/null 2>&1
+}
+
 workspace_urls_configured() {
-  local vikunja n8n hermes mode dns tailnet vikunja_public n8n_host n8n_protocol n8n_cookie n8n_editor n8n_webhook expected_host
-  vikunja=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  local task task_manager n8n hermes mode dns tailnet task_public n8n_host n8n_protocol n8n_cookie n8n_editor n8n_webhook expected_host
+  task_manager=$(workspace_task_manager)
+  task=$(workspace_task_manager_url)
   n8n=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes=$(workspace_read_env HERMES_URL 2>/dev/null || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   dns=$(workspace_read_env WORKSPACE_TAILSCALE_DNS_NAME 2>/dev/null || true)
   tailnet=$(workspace_tailnet_suffix 2>/dev/null || true)
-  vikunja_public=$(sed -n 's/^VIKUNJA_SERVICE_PUBLICURL=//p' "$WORKSPACE_VIKUNJA_ENV_FILE" 2>/dev/null | head -1)
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    task_public=$(sed -n 's/^PUBLIC_URL=//p' "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" 2>/dev/null | head -1)
+    [[ "$(sed -n 's/^SUPERSYNC_INTERNAL_URL=//p' "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" 2>/dev/null | head -1)" == "http://supersync:1900" ]] || return 1
+    grep -q "^CORS_ORIGINS=.*${task}.*https://app[.]super-productivity[.]com" "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" || return 1
+  else
+    task_public=$(sed -n 's/^VIKUNJA_SERVICE_PUBLICURL=//p' "$WORKSPACE_VIKUNJA_ENV_FILE" 2>/dev/null | head -1)
+  fi
   n8n_host=$(sed -n 's/^N8N_HOST=//p' "$WORKSPACE_N8N_ENV_FILE" 2>/dev/null | head -1)
   n8n_protocol=$(sed -n 's/^N8N_PROTOCOL=//p' "$WORKSPACE_N8N_ENV_FILE" 2>/dev/null | head -1)
   n8n_cookie=$(sed -n 's/^N8N_SECURE_COOKIE=//p' "$WORKSPACE_N8N_ENV_FILE" 2>/dev/null | head -1)
   n8n_editor=$(sed -n 's/^N8N_EDITOR_BASE_URL=//p' "$WORKSPACE_N8N_ENV_FILE" 2>/dev/null | head -1)
   n8n_webhook=$(sed -n 's/^WEBHOOK_URL=//p' "$WORKSPACE_N8N_ENV_FILE" 2>/dev/null | head -1)
-  [[ -n "$vikunja" && -n "$n8n" && -n "$hermes" ]] || return 1
+  [[ -n "$task" && -n "$n8n" && -n "$hermes" ]] || return 1
   if [[ "$mode" == "services" ]]; then
     [[ -n "$tailnet" ]] || return 1
     expected_host="${n8n#https://}"
-    [[ "$vikunja" == "https://${WORKSPACE_TASK_MANAGER_SERVICE}.${tailnet}" && "$n8n" == "https://n8n.${tailnet}" && "$hermes" == "https://hermes.${tailnet}" ]] &&
-      [[ "$vikunja_public" == "$vikunja" && "$n8n_host" == "$expected_host" ]] &&
+    [[ "$task" == "https://${WORKSPACE_TASK_MANAGER_SERVICE}.${tailnet}" && "$n8n" == "https://n8n.${tailnet}" && "$hermes" == "https://hermes.${tailnet}" ]] &&
+      [[ "$task_public" == "$task" && "$n8n_host" == "$expected_host" ]] &&
       [[ "$n8n_protocol" == "https" && "$n8n_cookie" == "true" ]] &&
       [[ "$n8n_editor" == "$n8n" && "$n8n_webhook" == "$n8n" ]]
   elif [[ "$mode" == "ports" ]]; then
     workspace_tailscale_dns_name_ok "$dns" &&
-      [[ "$vikunja" == "http://${dns}:${WORKSPACE_VIKUNJA_PORT}" ]] &&
+      [[ "$task" == "http://${dns}:${WORKSPACE_TASK_MANAGER_PORT}" ]] &&
       [[ "$n8n" == "http://${dns}:${WORKSPACE_N8N_PORT}" ]] &&
       [[ "$hermes" == "http://${dns}:${WORKSPACE_HERMES_PORT}" ]] &&
-      [[ "$vikunja_public" == "$vikunja" && "$n8n_host" == "$dns" ]] &&
+      [[ "$task_public" == "$task" && "$n8n_host" == "$dns" ]] &&
       [[ "$n8n_protocol" == "http" && "$n8n_cookie" == "false" ]] &&
       [[ "$n8n_editor" == "$n8n" && "$n8n_webhook" == "$n8n" ]]
   else
@@ -3457,6 +4564,38 @@ workspace_vikunja_http_ready() {
     return $?
   fi
   workspace_http_ready "http://127.0.0.1:${WORKSPACE_VIKUNJA_PORT}/api/v1/info"
+}
+
+workspace_super_productivity_http_ready() {
+  local mode url
+  mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
+  if [[ "$mode" == "ports" ]]; then
+    url=$(workspace_task_manager_url)
+    [[ -n "$url" ]] || return 1
+    workspace_http_ready "${url%/}/" && workspace_http_ready "${url%/}/health"
+    return $?
+  fi
+  workspace_http_ready "http://127.0.0.1:${WORKSPACE_TASK_MANAGER_PORT}/" &&
+    workspace_http_ready "http://127.0.0.1:${WORKSPACE_TASK_MANAGER_PORT}/health"
+}
+
+workspace_supersync_http_ready() {
+  workspace_http_ready "http://127.0.0.1:${WORKSPACE_TASK_MANAGER_PORT}/health"
+}
+
+workspace_super_productivity_api_ready() {
+  local out
+  out=$(curl -fsS --max-time 5 -H 'Host: 127.0.0.1:3876' \
+    "http://127.0.0.1:${WORKSPACE_SUPER_PRODUCTIVITY_API_PORT}/health" 2>/dev/null) || return 1
+  printf '%s\n' "$out" | jq -e '.ok == true and .data.rendererReady == true' >/dev/null 2>&1
+}
+
+workspace_task_manager_http_ready() {
+  if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
+    workspace_super_productivity_http_ready
+  else
+    workspace_vikunja_http_ready
+  fi
 }
 
 workspace_n8n_http_ready() {
@@ -3495,23 +4634,28 @@ workspace_litellm_model_smoke() {
 }
 
 workspace_tailscale_https_urls_ready() {
-  local vikunja n8n hermes mode tailnet dns
+  local task_url n8n hermes mode tailnet dns task_manager
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   [[ "$mode" == "services" || "$mode" == "ports" ]] || return 1
-  vikunja=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  task_manager=$(workspace_task_manager)
+  task_url=$(workspace_task_manager_url)
   n8n=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes=$(workspace_read_env HERMES_URL 2>/dev/null || true)
   if [[ "$mode" == "services" ]]; then
     tailnet=$(workspace_tailnet_suffix 2>/dev/null || true)
     [[ -n "$tailnet" ]] || return 1
-    [[ "$vikunja" == "https://${WORKSPACE_TASK_MANAGER_SERVICE}.${tailnet}" && "$n8n" == "https://n8n.${tailnet}" && "$hermes" == "https://hermes.${tailnet}" ]] || return 1
+    [[ "$task_url" == "https://${WORKSPACE_TASK_MANAGER_SERVICE}.${tailnet}" && "$n8n" == "https://n8n.${tailnet}" && "$hermes" == "https://hermes.${tailnet}" ]] || return 1
   else
     dns=$(workspace_read_env WORKSPACE_TAILSCALE_DNS_NAME 2>/dev/null || true)
     workspace_tailscale_dns_name_ok "$dns" || return 1
-    [[ "$vikunja" == "http://${dns}:${WORKSPACE_VIKUNJA_PORT}" && "$n8n" == "http://${dns}:${WORKSPACE_N8N_PORT}" && "$hermes" == "http://${dns}:${WORKSPACE_HERMES_PORT}" ]] || return 1
+    [[ "$task_url" == "http://${dns}:${WORKSPACE_TASK_MANAGER_PORT}" && "$n8n" == "http://${dns}:${WORKSPACE_N8N_PORT}" && "$hermes" == "http://${dns}:${WORKSPACE_HERMES_PORT}" ]] || return 1
   fi
-  workspace_http_ready "${vikunja%/}/api/v1/info" &&
-    workspace_http_ready "${n8n%/}/healthz" &&
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_http_ready "${task_url%/}/" && workspace_http_ready "${task_url%/}/health" || return 1
+  else
+    workspace_http_ready "${task_url%/}/api/v1/info" || return 1
+  fi
+  workspace_http_ready "${n8n%/}/healthz" &&
     workspace_hermes_dashboard_ready_at "$hermes"
 }
 
@@ -3519,6 +4663,17 @@ workspace_vikunja_private_url_ready() {
   local url
   url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
   [[ -n "$url" ]] && workspace_http_ready "${url%/}/api/v1/info"
+}
+
+workspace_task_manager_private_url_ready() {
+  local url
+  url=$(workspace_task_manager_url)
+  [[ -n "$url" ]] || return 1
+  if [[ "$(workspace_task_manager)" == "super-productivity" ]]; then
+    workspace_http_ready "${url%/}/" && workspace_http_ready "${url%/}/health"
+  else
+    workspace_http_ready "${url%/}/api/v1/info"
+  fi
 }
 
 workspace_n8n_private_url_ready() {
@@ -3544,14 +4699,14 @@ workspace_tailscale_urls_ready_after_setup() {
 
 workspace_runtime_ports_not_public() {
   local ports out
-  ports="${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT}|${GATEWAY_PORT}"
+  ports="${WORKSPACE_TASK_MANAGER_PORT}|${WORKSPACE_SUPER_PRODUCTIVITY_API_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT}|${GATEWAY_PORT}"
   out=$(docker ps --format '{{.Ports}}' 2>/dev/null | grep -E "(${ports})->" || true)
   [[ "$out" != *"0.0.0.0:"* && "$out" != *":::"* && "$out" != *"[::]:"* ]]
 }
 
 workspace_host_listeners_loopback_only() {
   local ports bind_addr bridge_ip mode
-  ports="${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT}|${GATEWAY_PORT}"
+  ports="${WORKSPACE_TASK_MANAGER_PORT}|${WORKSPACE_SUPER_PRODUCTIVITY_API_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT}|${GATEWAY_PORT}"
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   bind_addr=""
   bridge_ip=$(workspace_openshell_bridge_ip 2>/dev/null || true)
@@ -3561,7 +4716,7 @@ workspace_host_listeners_loopback_only() {
   fi
   if command -v ss >/dev/null 2>&1; then
     ss -ltnH 2>/dev/null | awk -v ports="$ports" -v bind_addr="$bind_addr" -v bridge_ip="$bridge_ip" \
-      -v gateway_port="$GATEWAY_PORT" -v task_port="$WORKSPACE_VIKUNJA_PORT" '
+      -v gateway_port="$GATEWAY_PORT" -v task_port="$WORKSPACE_TASK_MANAGER_PORT" -v task_api_port="$WORKSPACE_SUPER_PRODUCTIVITY_API_PORT" '
       BEGIN { split(ports, p, "|"); for (i in p) wanted[p[i]]=1 }
       {
         local_addr=$4
@@ -3569,7 +4724,7 @@ workspace_host_listeners_loopback_only() {
         sub(/^.*:/, "", port)
         allowed = (local_addr ~ /(^|[^0-9])127[.]0[.]0[.]1:/ || local_addr ~ /\[::1\]:/ || local_addr ~ /(^|[^:])::1:/ || local_addr ~ /localhost:/)
         if (bind_addr != "" && index(local_addr, bind_addr ":") > 0) allowed=1
-        if (bridge_ip != "" && (port == gateway_port || port == task_port) && index(local_addr, bridge_ip ":") > 0) allowed=1
+        if (bridge_ip != "" && (port == gateway_port || port == task_port || port == task_api_port) && index(local_addr, bridge_ip ":") > 0) allowed=1
         if (wanted[port] && ! allowed) bad=1
       }
       END { exit bad }
@@ -3578,14 +4733,14 @@ workspace_host_listeners_loopback_only() {
   fi
   if command -v lsof >/dev/null 2>&1; then
     lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk -v ports="$ports" -v bind_addr="$bind_addr" -v bridge_ip="$bridge_ip" \
-      -v gateway_port="$GATEWAY_PORT" -v task_port="$WORKSPACE_VIKUNJA_PORT" '
+      -v gateway_port="$GATEWAY_PORT" -v task_port="$WORKSPACE_TASK_MANAGER_PORT" -v task_api_port="$WORKSPACE_SUPER_PRODUCTIVITY_API_PORT" '
       BEGIN { split(ports, p, "|"); for (i in p) wanted[p[i]]=1 }
       {
         line=$0
         for (port in wanted) {
           allowed = (line ~ /127[.]0[.]0[.]1:/ || line ~ /\[::1\]:/ || line ~ /localhost:/)
           if (bind_addr != "" && index(line, bind_addr ":" port) > 0) allowed=1
-          if (bridge_ip != "" && (port == gateway_port || port == task_port) && index(line, bridge_ip ":" port) > 0) allowed=1
+          if (bridge_ip != "" && (port == gateway_port || port == task_port || port == task_api_port) && index(line, bridge_ip ":" port) > 0) allowed=1
           if (line ~ ":" port "([[:space:]]|$|[)])" && ! allowed) bad=1
         }
       }
@@ -3901,15 +5056,16 @@ workspace_tailscale_print_pending_approval_hitl() {
   printf "    Tailscale Services are configured locally, but this host still needs admin approval.\n"
   printf "    Open: https://login.tailscale.com/admin/services\n"
   if [[ -n "$dns_name" ]]; then
-    printf "    Approve host: %s for vikunja, n8n, hermes.\n" "$dns_name"
+    printf "    Approve host: %s for tasks, n8n, hermes.\n" "$dns_name"
   else
-    printf "    Approve this host for vikunja, n8n, hermes.\n"
+    printf "    Approve this host for tasks, n8n, hermes.\n"
   fi
   printf "    Then rerun: spark ws setup\n"
 }
 
 workspace_tailscale_offer_ports_fallback() {
   local tailnet="$1" auto_yes="$2"
+  [[ "$(workspace_task_manager)" != "super-productivity" ]] || return 1
   [[ "$auto_yes" == "1" ]] && return 1
   is_interactive || return 1
   confirm "Use temporary Tailscale port URLs instead of Services for now?" || return 1
@@ -4008,10 +5164,10 @@ workspace_tailscale_service_target_private() {
 workspace_tailscale_services_local_configured_from_output() {
   local out="$1"
   [[ "$out" == *"svc:${WORKSPACE_TASK_MANAGER_SERVICE}"* && "$out" == *"svc:n8n"* && "$out" == *"svc:hermes"* ]] &&
-    workspace_tailscale_service_target_private "$out" "$WORKSPACE_TASK_MANAGER_SERVICE" "$WORKSPACE_VIKUNJA_PORT" &&
+    workspace_tailscale_service_target_private "$out" "$WORKSPACE_TASK_MANAGER_SERVICE" "$WORKSPACE_TASK_MANAGER_PORT" &&
     workspace_tailscale_service_target_private "$out" n8n "$WORKSPACE_N8N_PORT" &&
     workspace_tailscale_service_target_private "$out" hermes "$WORKSPACE_HERMES_TAILSCALE_PROXY_PORT" &&
-    ! printf '%s\n' "$out" | grep -Eq "0[.]0[.]0[.]0:(${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT})|[[]::[]]:(${WORKSPACE_VIKUNJA_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT})"
+    ! printf '%s\n' "$out" | grep -Eq "0[.]0[.]0[.]0:(${WORKSPACE_TASK_MANAGER_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT})|[[]::[]]:(${WORKSPACE_TASK_MANAGER_PORT}|${WORKSPACE_N8N_PORT}|${WORKSPACE_HERMES_PORT}|${WORKSPACE_HERMES_TAILSCALE_PROXY_PORT})"
 }
 
 workspace_hermes_dashboard_ready_at() {
@@ -4180,8 +5336,8 @@ cmd_workspace_doctor_help() {
 
   ${BOLD}Usage:${NC} spark ws doctor [--strict] [--verbose] [--json|--quiet] [--model MODEL] [--remote user@host]
 
-  Read-only workspace diagnosis. Checks config, secrets, Compose, Postgres, Vikunja,
-  n8n, Tailscale private access, LiteLLM, Hermes/NemoClaw, and public exposure risks.
+  Read-only workspace diagnosis. Checks config, secrets, Compose, Postgres, the
+  selected task manager, n8n, private access, LiteLLM, and Hermes/NemoClaw.
 
   ${BOLD}Flags:${NC}
     --verbose           Show every check instead of the area summary only.
@@ -4195,7 +5351,7 @@ EOF
 }
 
 cmd_workspace_doctor() {
-  local requested_model="" remote_spec="" model json_mode=0 strict_mode=0 verbose=0 quiet=0
+  local requested_model="" remote_spec="" model task_manager json_mode=0 strict_mode=0 verbose=0 quiet=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json) json_mode=1; shift ;;
@@ -4234,6 +5390,7 @@ cmd_workspace_doctor() {
   WORKSPACE_DOCTOR_SECTIONS=()
   model="$requested_model"
   [[ -n "$model" ]] || model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  task_manager=$(workspace_task_manager)
 
   if ! workspace_configured; then
     workspace_doctor_section "Configuration" "spark ws setup"
@@ -4257,43 +5414,86 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Scoped service env files exist and are 0600" workspace_service_env_files_ready
   workspace_doctor_check "Scoped service env syntax is valid" workspace_service_env_files_syntax_valid
   workspace_doctor_check "Compose service exists: postgres" workspace_compose_mentions_service postgres
-  workspace_doctor_check "Compose service exists: vikunja" workspace_compose_mentions_service vikunja
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_doctor_check "Compose service exists: Super Productivity web" workspace_compose_mentions_service super-productivity-web
+    workspace_doctor_check "Compose service exists: SuperSync" workspace_compose_mentions_service supersync
+    workspace_doctor_check "Compose service exists: Electron API" workspace_compose_mentions_service super-productivity-electron
+    workspace_doctor_check "Compose service exists: task gateway" workspace_compose_mentions_service super-productivity-gateway
+    workspace_doctor_check "Electron build recipe is complete" workspace_super_productivity_electron_build_ready
+  else
+    workspace_doctor_check "Compose service exists: Vikunja" workspace_compose_mentions_service vikunja
+  fi
   workspace_doctor_check "Compose service exists: n8n" workspace_compose_mentions_service n8n
   workspace_doctor_check "Docker Compose config is valid" workspace_compose_config_valid
   workspace_doctor_check "Compose uses scoped env files, not full secrets.env" workspace_compose_uses_scoped_env_files
   workspace_doctor_check "Compose image refs are recorded and used" workspace_compose_images_configured
   workspace_doctor_check "Compose applies runtime hardening and log rotation" workspace_compose_runtime_hardened
-  workspace_doctor_check "Shared Postgres initializes Vikunja and n8n DBs" workspace_compose_shared_postgres
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_doctor_check "Shared Postgres initializes SuperSync and n8n DBs" workspace_compose_shared_postgres
+  else
+    workspace_doctor_check "Shared Postgres initializes Vikunja and n8n DBs" workspace_compose_shared_postgres
+  fi
   workspace_doctor_check "Compose uses private host bindings only" workspace_compose_uses_loopback_ports
 
   workspace_doctor_section "Identity & recovery" "spark ws setup"
   workspace_doctor_check "Interactive service passwords are not stored" workspace_human_password_not_stored
-  workspace_doctor_check "Vikunja registration/link sharing disabled" workspace_vikunja_locked_down
-  workspace_doctor_check "Vikunja internal doctor passes" workspace_vikunja_doctor_ok
-  workspace_doctor_check "Vikunja human user exists" workspace_vikunja_human_ready
-  workspace_doctor_check "Vikunja bot-hermes exists" workspace_vikunja_hermes_ready
-  workspace_doctor_check "Vikunja bot-hermes API token works" workspace_vikunja_hermes_api_ready
-  workspace_doctor_check "Vikunja projects are shared with bot-hermes" workspace_vikunja_hermes_project_access_ready
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_doctor_check "Super Productivity and SuperSync configuration is complete" workspace_super_productivity_config_ready
+    workspace_doctor_check "SuperSync user exists and is verified" workspace_supersync_user_ready
+    workspace_doctor_check "SuperSync access token works" workspace_supersync_token_ready
+  else
+    workspace_doctor_check "Vikunja registration/link sharing disabled" workspace_vikunja_locked_down
+    workspace_doctor_check "Vikunja internal doctor passes" workspace_vikunja_doctor_ok
+    workspace_doctor_check "Vikunja human user exists" workspace_vikunja_human_ready
+    workspace_doctor_check "Vikunja bot-hermes exists" workspace_vikunja_hermes_ready
+    workspace_doctor_check "Vikunja bot-hermes API token works" workspace_vikunja_hermes_api_ready
+    workspace_doctor_check "Vikunja projects are shared with bot-hermes" workspace_vikunja_hermes_project_access_ready
+  fi
   workspace_doctor_check "n8n hardened for private agent workflows" workspace_n8n_hardened
   workspace_doctor_check "n8n owner/admin ready" workspace_n8n_owner_ready
   workspace_doctor_check "No legacy or temporary password recovery configuration is stored" workspace_no_legacy_recovery_config
   workspace_doctor_check "Workspace URLs configured" workspace_urls_configured
-  workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
-    POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD VIKUNJA_SERVICE_SECRET DB_POSTGRESDB_PASSWORD \
-    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HUMAN_USER_ID N8N_BASIC_AUTH_USER \
-    N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
-    HERMES_CONTEXT_LENGTH HERMES_MAX_TOKENS HERMES_REASONING_EFFORT \
-    HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
-    VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_BOT_USERNAME VIKUNJA_HERMES_BOT_ID \
-    VIKUNJA_HERMES_BOT_STATUS VIKUNJA_HERMES_PROJECT_ACCESS_STATUS
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
+      WORKSPACE_TASK_MANAGER POSTGRES_PASSWORD SUPERSYNC_DATABASE_PASSWORD SUPERSYNC_JWT_SECRET \
+      SUPERSYNC_ACCESS_TOKEN SUPERSYNC_ENCRYPTION_PASSWORD SUPER_PRODUCTIVITY_USER_EMAIL \
+      WORKSPACE_SUPER_PRODUCTIVITY_VERSION WORKSPACE_SUPER_PRODUCTIVITY_COMMIT \
+      DB_POSTGRESDB_PASSWORD N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET N8N_BASIC_AUTH_USER \
+      N8N_OWNER_SETUP_STATUS HERMES_MODEL HERMES_LITELLM_MODEL HERMES_CONTEXT_LENGTH \
+      HERMES_MAX_TOKENS HERMES_REASONING_EFFORT HERMES_LITELLM_BASE_URL TASK_MANAGER_URL \
+      SUPER_PRODUCTIVITY_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE
+  else
+    workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
+      POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD VIKUNJA_SERVICE_SECRET DB_POSTGRESDB_PASSWORD \
+      N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HUMAN_USER_ID N8N_BASIC_AUTH_USER \
+      N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
+      HERMES_CONTEXT_LENGTH HERMES_MAX_TOKENS HERMES_REASONING_EFFORT \
+      HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
+      VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_BOT_USERNAME VIKUNJA_HERMES_BOT_ID \
+      VIKUNJA_HERMES_BOT_STATUS VIKUNJA_HERMES_PROJECT_ACCESS_STATUS
+  fi
   workspace_doctor_check "Workspace technical secrets are unique per service" workspace_credentials_are_distinct
 
   workspace_doctor_section "Runtime services" "spark ws restart"
   workspace_doctor_check "Compose service running: postgres" workspace_compose_service_running postgres
-  workspace_doctor_check "Shared Postgres runtime has Vikunja and n8n roles/databases" workspace_postgres_shared_runtime_ready
-  workspace_doctor_check "Compose service running: vikunja" workspace_compose_service_running vikunja
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_doctor_check "Shared Postgres runtime has SuperSync and n8n roles/databases" workspace_postgres_shared_runtime_ready
+  else
+    workspace_doctor_check "Shared Postgres runtime has Vikunja and n8n roles/databases" workspace_postgres_shared_runtime_ready
+  fi
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_doctor_check "Compose service running: Super Productivity web" workspace_compose_service_running super-productivity-web
+    workspace_doctor_check "Compose service running: SuperSync" workspace_compose_service_running supersync
+    workspace_doctor_check "Compose service running: Electron API" workspace_compose_service_running super-productivity-electron
+    workspace_doctor_check "Compose service running: task gateway" workspace_compose_service_running super-productivity-gateway
+    workspace_doctor_check "Super Productivity web endpoint ready" workspace_super_productivity_http_ready
+    workspace_doctor_check "SuperSync endpoint ready" workspace_supersync_http_ready
+    workspace_doctor_check "Super Productivity Electron API ready" workspace_super_productivity_api_ready
+  else
+    workspace_doctor_check "Compose service running: Vikunja" workspace_compose_service_running vikunja
+    workspace_doctor_check "Vikunja HTTP endpoint ready" workspace_vikunja_http_ready
+  fi
   workspace_doctor_check "Compose service running: n8n" workspace_compose_service_running n8n
-  workspace_doctor_check "Vikunja HTTP endpoint ready" workspace_vikunja_http_ready
   workspace_doctor_check "n8n HTTP endpoint ready" workspace_n8n_http_ready
   workspace_doctor_check "No workspace/gateway port is published on 0.0.0.0" workspace_runtime_ports_not_public
   workspace_doctor_check "Host listeners for workspace/gateway are loopback-only" workspace_host_listeners_loopback_only
@@ -4305,7 +5505,11 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Tailscale Services registered/authorized" workspace_tailscale_services_registered
   workspace_doctor_check "Tailscale Serve enabled" workspace_tailscale_serve_present
   workspace_doctor_check "Tailscale Service host advertised" workspace_tailscale_service_host_advertised
-  workspace_doctor_check "Tailscale local config maps vikunja, n8n, hermes" workspace_tailscale_services_configured
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_doctor_check "Tailscale local config maps tasks, n8n, hermes" workspace_tailscale_services_configured
+  else
+    workspace_doctor_check "Tailscale local config maps vikunja, n8n, hermes" workspace_tailscale_services_configured
+  fi
   workspace_doctor_check "Tailscale mode is Services or ports" workspace_tailscale_services_mode
   workspace_doctor_check "Tailscale workspace URLs respond" workspace_tailscale_https_urls_ready
 
@@ -4324,7 +5528,11 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Hermes model context is at least ${WORKSPACE_HERMES_MIN_CONTEXT} tokens" workspace_model_context_ready "$model"
   workspace_doctor_check "Hermes output and reasoning limits are configured" workspace_hermes_runtime_config_ready
   workspace_doctor_check "Hermes CLI uses the balanced local-model tool profile" workspace_hermes_cli_toolsets_ready
-  workspace_doctor_check "Hermes reaches Vikunja as bot-hermes" workspace_hermes_vikunja_api_ready
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    workspace_doctor_check "Hermes reaches the Super Productivity API" workspace_hermes_super_productivity_api_ready
+  else
+    workspace_doctor_check "Hermes reaches Vikunja as bot-hermes" workspace_hermes_vikunja_api_ready
+  fi
   workspace_doctor_check "Hermes dashboard URL is reachable" workspace_hermes_dashboard_url_ready
   if [[ "$strict_mode" == "1" ]]; then
     workspace_doctor_section "Production" "pin workspace image versions, then run spark ws setup"
@@ -4341,7 +5549,7 @@ cmd_workspace_doctor() {
 
 workspace_print_initial_credentials() {
   local vikunja_user="$1" vikunja_email="$2" vikunja_pass="$3" n8n_email="$4" n8n_pass="$5"
-  local shown=0
+  local shown=0 task_url token encryption
   if [[ "${WORKSPACE_SHOW_VIKUNJA_PASSWORD:-0}" == "1" || "${WORKSPACE_SHOW_N8N_PASSWORD:-0}" == "1" ]]; then
     printf "\n  ${YELLOW}${BOLD}Save these passwords now. Spark does not store or show them again.${NC}\n\n"
   fi
@@ -4354,8 +5562,25 @@ workspace_print_initial_credentials() {
     printf "  n8n\n    email:    %s\n    password: %s\n" "$n8n_email" "$n8n_pass"
     shown=1
   fi
+  if [[ "${WORKSPACE_SHOW_SUPER_PRODUCTIVITY_ACCESS:-0}" == "1" ]]; then
+    task_url=$(workspace_task_manager_url)
+    token=$(workspace_read_env SUPERSYNC_ACCESS_TOKEN 2>/dev/null || true)
+    encryption=$(workspace_read_env SUPERSYNC_ENCRYPTION_PASSWORD 2>/dev/null || true)
+    [[ "$shown" == "0" ]] || printf "\n"
+    printf "  Super Productivity / SuperSync\n"
+    printf "    server:              %s\n" "$task_url"
+    printf "    email:               %s\n" "$vikunja_email"
+    printf "    access token:        %s\n" "$token"
+    printf "    encryption password: %s\n" "$encryption"
+    printf "\n  In each browser: Settings > Sync > SuperSync; enter this server, token and encryption password.\n"
+    shown=1
+  fi
   if [[ "$shown" != "0" ]]; then
-    printf "\n  If you lose one: ${BOLD}spark ws recover vikunja${NC} or ${BOLD}spark ws recover n8n${NC}\n\n"
+    if [[ "$(workspace_task_manager)" == "vikunja" ]]; then
+      printf "\n  If you lose one: ${BOLD}spark ws recover vikunja${NC} or ${BOLD}spark ws recover n8n${NC}\n\n"
+    else
+      printf "\n  If you lose the n8n password: ${BOLD}spark ws recover n8n${NC}. SuperSync secrets remain in the 0600 workspace config.\n\n"
+    fi
   fi
 }
 
@@ -4637,20 +5862,24 @@ cmd_workspace_setup_help() {
 
   ${BOLD}Usage:${NC} spark ws setup [flags]
 
-  Installs/reconciles the private workspace: Vikunja, n8n, shared Postgres, and
-  Hermes/NemoClaw using the selected LiteLLM model.
+  Installs/reconciles the private workspace: Vikunja or Super Productivity,
+  n8n, shared Postgres, and Hermes/NemoClaw.
 
   ${BOLD}Flags:${NC}
     --check                     Read-only validation; no files, containers, or Funnel changes.
     --yes                       Accept safe defaults. Existing-user passwords still prompt.
     --remote user@host          Run setup on a configured remote host.
     --model MODEL               Hermes model; selected from spark list data when omitted.
-    --tailscale-mode services   Prefer HTTPS names: vikunja/n8n/hermes.<tailnet>.ts.net.
+    --task-manager NAME         vikunja or super-productivity; asked on first interactive setup.
+    --tailscale-mode services   Prefer HTTPS names: tasks/n8n/hermes.<tailnet>.ts.net.
     --tailscale-mode ports      Fallback: MagicDNS host + separate ports bound to Tailscale IP.
     --funnel-action reset       Reset active public Funnel and re-check before setup continues.
     --funnel-action abort       Fail if Funnel is active; no Funnel changes.
     --postgres-image IMAGE      Override Postgres image ref.
     --vikunja-image IMAGE       Override Vikunja image ref.
+    --super-productivity-image IMAGE
+                                Override Super Productivity web image ref.
+    --supersync-image IMAGE     Override SuperSync image ref.
     --n8n-image IMAGE           Override n8n image ref.
     --vikunja-username NAME     Human Vikunja username.
     --vikunja-email EMAIL       Human Vikunja email.
@@ -4674,16 +5903,16 @@ cmd_workspace_help() {
   ${BOLD}Usage:${NC} spark ws <command> [options]
 
   ${BOLD}Commands:${NC}
-    setup      Install/check Vikunja + n8n + Hermes
+    setup      Install/check the selected task manager + n8n + Hermes
     start      Start the configured workspace runtime
     stop       Stop the workspace runtime and preserve all data
     restart    Stop and start the configured workspace runtime
     recover    Recover Vikunja or n8n access with a new password
     status     Show operational workspace state
     containers Show raw workspace container state
-    logs       Follow logs for vikunja, n8n, postgres, hermes, or gateway
+    logs       Follow task-manager, n8n, postgres, Hermes, or gateway logs
     doctor     Read-only workspace check
-    backup     Back up Vikunja, n8n, and Hermes state
+    backup     Back up task manager, n8n, and Hermes state
 
   Run ${BOLD}spark ws <command> --help${NC} for command-specific flags.
 
@@ -4692,11 +5921,15 @@ cmd_workspace_help() {
     --yes                       Accept safe defaults
     --remote user@host          Run workspace setup on a configured remote host
     --model MODEL               Hermes model; must match spark list data
+    --task-manager NAME         vikunja or super-productivity
     --tailscale-mode services|ports
                                 default = services; ports = MagicDNS + ports
     --funnel-action reset|abort Handle active Tailscale Funnel explicitly
     --postgres-image IMAGE      Override Postgres image ref
     --vikunja-image IMAGE       Override Vikunja image ref
+    --super-productivity-image IMAGE
+                                Override Super Productivity web image ref
+    --supersync-image IMAGE     Override SuperSync image ref
     --n8n-image IMAGE           Override n8n image ref
     --vikunja-username NAME     Human Vikunja username
     --vikunja-email EMAIL       Human Vikunja email

@@ -6,7 +6,7 @@ Turn a clean macOS/Linux machine into a private local agent environment:
 
 - local LLM serving through one OpenAI-compatible gateway
 - hardware-aware model startup on NVIDIA, Apple Silicon, or CPU
-- optional daily workspace with Vikunja, n8n, Hermes, Postgres, and Tailscale
+- optional daily workspace with Vikunja or Super Productivity, n8n, Hermes, Postgres, and Tailscale
 - status, dashboard, backups, uninstall/reinstall, and diagnostics
 
 ```bash
@@ -86,15 +86,19 @@ spark down                   # stop all model and gateway services
 
 The workspace is optional. It installs a private agent environment:
 
-- Vikunja for tasks
+- Vikunja or Super Productivity for tasks (selected on first interactive setup)
 - n8n for automations
 - Postgres for data
 - Hermes/NemoClaw for agent runtime
 - Tailscale for private access
 
-Hermes accesses Vikunja directly through its REST API as the human-owned
-`bot-hermes`. OpenShell injects the bot token as an opaque provider credential;
-the sandbox never receives the raw token. Spark also starts the Hermes model
+With Vikunja, Hermes uses its REST API as the human-owned `bot-hermes`. With
+Super Productivity, browsers keep their local data in IndexedDB and sync it
+through the self-hosted SuperSync server. Spark runs one persistent headless
+Electron client only so Hermes can use Super Productivity's localhost REST API;
+the human UI remains the web app at `tasks.<tailnet>`.
+
+OpenShell restricts each API bridge to Hermes. Spark also starts the Hermes model
 with at least 64K context, vLLM automatic tool calling, and the model-specific
 parser. Hermes output and active tool schemas are capped for responsive local
 tool execution while retaining terminal, files, web, skills, memory, tasks,
@@ -113,11 +117,25 @@ spark ws doctor
 spark ws backup
 ```
 
-Workspace containers use stable names: `workspace-postgres`, `workspace-vikunja`,
-`workspace-n8n`, and `workspace-hermes`.
+Choose explicitly for unattended setup:
 
-Setup creates different strong passwords for Vikunja and n8n, prints them once,
-and never stores them. Choose initial passwords with `--vikunja-password-file`
+```bash
+spark ws setup --task-manager vikunja
+spark ws setup --task-manager super-productivity
+```
+
+The Super Productivity setup serves the web app and SuperSync through the same
+private `tasks.<tailnet>` URL. It creates a verified SuperSync user without SMTP,
+prints its access token and encryption password on first setup, and stores both
+in the 0600 workspace config. Enter the URL, token, and encryption password in
+**Settings → Sync → SuperSync** in every browser. Offline changes remain local
+and synchronize when the browser can reach the tailnet again.
+
+Workspace containers use stable names, including `workspace-postgres`,
+`workspace-vikunja` or `workspace-super-productivity*`, and `workspace-n8n`.
+
+For Vikunja, setup creates different strong passwords for Vikunja and n8n,
+prints them once, and never stores them. Choose initial passwords with `--vikunja-password-file`
 and `--n8n-password-file` (direct password flags also exist but may remain in
 shell history). If one is lost, `spark ws recover vikunja` or
 `spark ws recover n8n` replaces it safely. Add `--yes` to generate a secure
