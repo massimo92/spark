@@ -2,6 +2,7 @@
 
 WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME="${WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME:-bot-hermes}"
 WORKSPACE_TASK_MANAGER_SERVICE="${WORKSPACE_TASK_MANAGER_SERVICE:-tasks}"
+WORKSPACE_HERMES_VIKUNJA_API_URL="${WORKSPACE_HERMES_VIKUNJA_API_URL:-http://host.openshell.internal:3456/api/v1}"
 
 workspace_random_secret() {
   if command -v openssl >/dev/null 2>&1; then
@@ -1617,10 +1618,11 @@ workspace_openshell_bridge_ip() {
   printf '%s\n' "$bridge_ip"
 }
 
-workspace_start_hermes_gateway_proxy() {
+workspace_start_hermes_host_proxy() {
+  local container="$1" listen_port="$2" target_port="$3" health_path="$4"
   local bridge_ip proxy_script attempt
   bridge_ip=$(workspace_openshell_bridge_ip) || return 1
-  proxy_script="${WORKSPACE_CONFIG_DIR}/hermes-litellm-proxy.py"
+  proxy_script="${WORKSPACE_CONFIG_DIR}/hermes-host-proxy.py"
   mkdir -p "$WORKSPACE_CONFIG_DIR"
   cat > "$proxy_script" <<'PY'
 import asyncio
@@ -1656,23 +1658,30 @@ async def main():
 asyncio.run(main())
 PY
   chmod 600 "$proxy_script"
-  docker rm -f "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" >/dev/null 2>&1 || true
+  docker rm -f "$container" >/dev/null 2>&1 || true
   docker run -d --network host \
-    --name "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" \
+    --name "$container" \
     --restart unless-stopped \
-    -v "${proxy_script}:/app/hermes-litellm-proxy.py:ro" \
+    -v "${proxy_script}:/app/hermes-host-proxy.py:ro" \
     --entrypoint python "$LITELLM_IMAGE" \
-    /app/hermes-litellm-proxy.py "$bridge_ip" "$GATEWAY_PORT" 127.0.0.1 "$GATEWAY_PORT" \
+    /app/hermes-host-proxy.py "$bridge_ip" "$listen_port" 127.0.0.1 "$target_port" \
     >/dev/null 2>&1 || return 1
-  # The proxy can be scheduled before the freshly restarted LiteLLM gateway is
-  # ready. Give both processes enough time to become reachable before Hermes
-  # recovery probes the route.
   for ((attempt = 1; attempt <= 30; attempt++)); do
-    curl -fsS --max-time 2 "http://${bridge_ip}:${GATEWAY_PORT}/v1/models" >/dev/null 2>&1 && return 0
-    [[ "$(docker inspect --format '{{.State.Running}}' "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" 2>/dev/null)" == "true" ]] || return 1
+    curl -fsS --max-time 2 "http://${bridge_ip}:${listen_port}${health_path}" >/dev/null 2>&1 && return 0
+    [[ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]] || return 1
     sleep 1
   done
   return 1
+}
+
+workspace_start_hermes_gateway_proxy() {
+  workspace_start_hermes_host_proxy "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" \
+    "$GATEWAY_PORT" "$GATEWAY_PORT" /v1/models
+}
+
+workspace_start_hermes_vikunja_proxy() {
+  workspace_start_hermes_host_proxy "$WORKSPACE_HERMES_VIKUNJA_PROXY_CONTAINER" \
+    "$WORKSPACE_VIKUNJA_PORT" "$WORKSPACE_VIKUNJA_PORT" /api/v1/info
 }
 
 workspace_start_hermes_dashboard_proxy() {
@@ -1748,6 +1757,148 @@ workspace_hermes_dashboard_proxy_running() {
 
 workspace_stop_hermes_gateway_proxy() {
   docker rm -f "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" >/dev/null 2>&1 || true
+}
+
+workspace_stop_hermes_vikunja_proxy() {
+  docker rm -f "$WORKSPACE_HERMES_VIKUNJA_PROXY_CONTAINER" >/dev/null 2>&1 || true
+}
+
+workspace_openshell_providers_v2_enabled() {
+  command -v openshell >/dev/null 2>&1 || return 1
+  openshell settings get --global --json 2>/dev/null \
+    | jq -e '((.settings.providers_v2_enabled // .providers_v2_enabled) | tostring) == "true"' >/dev/null 2>&1
+}
+
+workspace_hermes_vikunja_provider_exists() {
+  openshell provider list -o json 2>/dev/null \
+    | jq -e --arg name "$WORKSPACE_HERMES_VIKUNJA_PROVIDER" \
+      'any(.[]?; .name == $name)' >/dev/null 2>&1
+}
+
+workspace_hermes_vikunja_provider_attached() {
+  openshell sandbox provider list hermes 2>/dev/null \
+    | grep -Eq "^${WORKSPACE_HERMES_VIKUNJA_PROVIDER}[[:space:]]"
+}
+
+workspace_install_hermes_vikunja_skill() {
+  local skill_dir="${WORKSPACE_CONFIG_DIR}/hermes-skills/vikunja"
+  workspace_install_file "${skill_dir}/SKILL.md" 600 <<'EOF'
+---
+name: vikunja
+description: Manage the user's Vikunja projects and tasks through its REST API with curl.
+version: 1.0.0
+prerequisites:
+  env_vars: [VIKUNJA_API_TOKEN]
+  commands: [curl, jq]
+metadata:
+  hermes:
+    tags: [Vikunja, Productivity, Tasks, API]
+---
+
+# Vikunja tasks
+
+Use Vikunja's REST API directly with `curl`. Do not use Electron or an MCP server.
+
+```bash
+VIKUNJA_API_URL=http://host.openshell.internal:3456/api/v1
+curl -fsS "$VIKUNJA_API_URL/user" \
+  -H "Authorization: Bearer $VIKUNJA_API_TOKEN" | jq
+```
+
+Never print `VIKUNJA_API_TOKEN`. It is an OpenShell-managed placeholder and is
+resolved only when sent to the approved Vikunja endpoint.
+
+Common operations:
+
+```bash
+# Projects visible to bot-hermes
+VIKUNJA_API_URL=http://host.openshell.internal:3456/api/v1
+curl -fsS "$VIKUNJA_API_URL/projects?per_page=1000" \
+  -H "Authorization: Bearer $VIKUNJA_API_TOKEN" | jq
+
+# Tasks in a project
+VIKUNJA_API_URL=http://host.openshell.internal:3456/api/v1
+curl -fsS "$VIKUNJA_API_URL/tasks?per_page=1000" \
+  -H "Authorization: Bearer $VIKUNJA_API_TOKEN" \
+  | jq --argjson project_id "$PROJECT_ID" '[.[] | select(.project_id == $project_id)]'
+
+# Create a task
+VIKUNJA_API_URL=http://host.openshell.internal:3456/api/v1
+curl -fsS -X PUT "$VIKUNJA_API_URL/projects/$PROJECT_ID/tasks" \
+  -H "Authorization: Bearer $VIKUNJA_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary "$(jq -nc --arg title "$TITLE" '{title:$title}')" | jq
+
+# Update or complete a task
+VIKUNJA_API_URL=http://host.openshell.internal:3456/api/v1
+curl -fsS -X POST "$VIKUNJA_API_URL/tasks/$TASK_ID" \
+  -H "Authorization: Bearer $VIKUNJA_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary "$(jq -nc --argjson done true '{done:$done}')" | jq
+```
+
+Read before writing. Ask before destructive deletion unless the user explicitly
+requested it. Attribute all API activity to `bot-hermes`.
+EOF
+  nemohermes hermes skill install "$skill_dir" >/dev/null 2>&1
+}
+
+workspace_hermes_vikunja_api_ready() {
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  nemohermes hermes exec --no-tty --timeout 20 -- sh -lc '
+    url="$1" expected="$2"
+    test -n "${VIKUNJA_API_TOKEN:-}" || exit 1
+    curl -fsS --max-time 10 "$url/user" \
+      -H "Authorization: Bearer ${VIKUNJA_API_TOKEN}" \
+      | jq -e --arg expected "$expected" ".username == \$expected and (.bot_owner_id > 0)" >/dev/null
+  ' spark-vikunja "$WORKSPACE_HERMES_VIKUNJA_API_URL" "$WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME" \
+    >/dev/null 2>&1
+}
+
+workspace_setup_hermes_vikunja_access() {
+  local token attached=0 attempt attempts="${SPARK_WORKSPACE_HERMES_API_ATTEMPTS:-10}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=10
+  command -v jq >/dev/null 2>&1 || return 1
+  command -v openshell >/dev/null 2>&1 || return 1
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
+  [[ -n "$token" ]] || return 1
+  [[ "$(workspace_read_env VIKUNJA_HERMES_API_STATUS 2>/dev/null || true)" == "verified" ]] || return 1
+  [[ "$(workspace_read_env VIKUNJA_HERMES_PROJECT_ACCESS_STATUS 2>/dev/null || true)" == "verified" ]] || return 1
+  workspace_start_hermes_vikunja_proxy || return 1
+  workspace_openshell_providers_v2_enabled \
+    || openshell settings set --global --key providers_v2_enabled --value true --yes >/dev/null 2>&1 \
+    || return 1
+  if workspace_hermes_vikunja_provider_exists; then
+    VIKUNJA_API_TOKEN="$token" openshell provider update "$WORKSPACE_HERMES_VIKUNJA_PROVIDER" \
+      --credential VIKUNJA_API_TOKEN >/dev/null 2>&1 || return 1
+  else
+    VIKUNJA_API_TOKEN="$token" openshell provider create \
+      --name "$WORKSPACE_HERMES_VIKUNJA_PROVIDER" --type generic \
+      --credential VIKUNJA_API_TOKEN >/dev/null 2>&1 || return 1
+  fi
+  if workspace_hermes_vikunja_provider_attached; then
+    attached=1
+  else
+    openshell sandbox provider attach hermes "$WORKSPACE_HERMES_VIKUNJA_PROVIDER" >/dev/null 2>&1 \
+      || return 1
+  fi
+  openshell policy update hermes \
+    --add-endpoint host.openshell.internal:3456:read-write:rest:enforce \
+    --binary /usr/bin/curl --rule-name spark-vikunja-api --wait >/dev/null 2>&1 \
+    || return 1
+  workspace_install_hermes_vikunja_skill || return 1
+  [[ "$attached" == "1" ]] \
+    || nemohermes hermes gateway restart --quiet >/dev/null 2>&1 \
+    || return 1
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    workspace_hermes_vikunja_api_ready && {
+      info "Hermes Vikunja API access verified as ${WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME}"
+      return 0
+    }
+    sleep 1
+  done
+  return 1
 }
 
 workspace_setup_hermes() {
@@ -2196,6 +2347,8 @@ workspace_setup() {
     setup_fail "Hermes onboarding skipped until Tailscale private access is configured"
   fi
   workspace_create_vikunja_users "$human_pass" || true
+  workspace_setup_hermes_vikunja_access \
+    || setup_fail "Could not give Hermes verified Vikunja API access"
   [[ ! "$vikunja_previous_status" =~ ^(created|exists)$ && "$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)" == "created" ]] \
     && WORKSPACE_SHOW_VIKUNJA_PASSWORD=1
   if [[ "$n8n_previous_status" =~ ^(created|exists)$ ]]; then
@@ -2286,7 +2439,8 @@ workspace_status_operational() {
   [[ "$(workspace_service_runtime_state vikunja || true)" == "ready" ]] || return 1
   [[ "$(workspace_service_runtime_state n8n || true)" == "ready" ]] || return 1
   [[ "$(workspace_hermes_runtime_state || true)" == "ready" ]] || return 1
-  [[ "$(workspace_access_runtime_state || true)" == "ready" ]]
+  [[ "$(workspace_access_runtime_state || true)" == "ready" ]] || return 1
+  workspace_hermes_vikunja_api_ready
 }
 
 workspace_print_service_row() {
@@ -2440,6 +2594,10 @@ workspace_start() {
     && info "Hermes inference bridge started" \
     || { err "Could not start Hermes inference bridge"; rc=1; }
 
+  workspace_start_hermes_vikunja_proxy \
+    && info "Hermes Vikunja API bridge started" \
+    || { err "Could not start Hermes Vikunja API bridge"; rc=1; }
+
   workspace_start_hermes_dashboard_proxy \
     && info "Hermes dashboard proxy started" \
     || { err "Could not start Hermes dashboard proxy"; rc=1; }
@@ -2486,6 +2644,8 @@ workspace_stop() {
 
   workspace_stop_hermes_gateway_proxy
   info "Stopped Hermes inference bridge"
+  workspace_stop_hermes_vikunja_proxy
+  info "Stopped Hermes Vikunja API bridge"
   workspace_stop_hermes_dashboard_proxy
   info "Stopped Hermes dashboard proxy"
 
@@ -2537,6 +2697,7 @@ cmd_workspace_health() {
   workspace_status_item "No public listeners" workspace_host_listeners_loopback_only
   workspace_status_item "LiteLLM gateway" workspace_gateway_running
   workspace_status_item "Hermes inference bridge" workspace_hermes_gateway_proxy_running
+  workspace_status_item "Hermes Vikunja API bridge" workspace_hermes_vikunja_proxy_running
   workspace_status_item "Hermes dashboard proxy" workspace_hermes_dashboard_proxy_running
   workspace_status_item "LiteLLM Hermes route" workspace_litellm_model_routed
   workspace_status_item "Hermes model" workspace_model_running "$model"
@@ -3290,7 +3451,8 @@ workspace_host_listeners_loopback_only() {
     workspace_tailscale_bind_addr_ok "$bind_addr" || bind_addr=""
   fi
   if command -v ss >/dev/null 2>&1; then
-    ss -ltnH 2>/dev/null | awk -v ports="$ports" -v bind_addr="$bind_addr" -v bridge_ip="$bridge_ip" -v gateway_port="$GATEWAY_PORT" '
+    ss -ltnH 2>/dev/null | awk -v ports="$ports" -v bind_addr="$bind_addr" -v bridge_ip="$bridge_ip" \
+      -v gateway_port="$GATEWAY_PORT" -v task_port="$WORKSPACE_VIKUNJA_PORT" '
       BEGIN { split(ports, p, "|"); for (i in p) wanted[p[i]]=1 }
       {
         local_addr=$4
@@ -3298,7 +3460,7 @@ workspace_host_listeners_loopback_only() {
         sub(/^.*:/, "", port)
         allowed = (local_addr ~ /(^|[^0-9])127[.]0[.]0[.]1:/ || local_addr ~ /\[::1\]:/ || local_addr ~ /(^|[^:])::1:/ || local_addr ~ /localhost:/)
         if (bind_addr != "" && index(local_addr, bind_addr ":") > 0) allowed=1
-        if (bridge_ip != "" && port == gateway_port && index(local_addr, bridge_ip ":") > 0) allowed=1
+        if (bridge_ip != "" && (port == gateway_port || port == task_port) && index(local_addr, bridge_ip ":") > 0) allowed=1
         if (wanted[port] && ! allowed) bad=1
       }
       END { exit bad }
@@ -3306,14 +3468,15 @@ workspace_host_listeners_loopback_only() {
     return $?
   fi
   if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk -v ports="$ports" -v bind_addr="$bind_addr" -v bridge_ip="$bridge_ip" -v gateway_port="$GATEWAY_PORT" '
+    lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | awk -v ports="$ports" -v bind_addr="$bind_addr" -v bridge_ip="$bridge_ip" \
+      -v gateway_port="$GATEWAY_PORT" -v task_port="$WORKSPACE_VIKUNJA_PORT" '
       BEGIN { split(ports, p, "|"); for (i in p) wanted[p[i]]=1 }
       {
         line=$0
         for (port in wanted) {
           allowed = (line ~ /127[.]0[.]0[.]1:/ || line ~ /\[::1\]:/ || line ~ /localhost:/)
           if (bind_addr != "" && index(line, bind_addr ":" port) > 0) allowed=1
-          if (bridge_ip != "" && port == gateway_port && index(line, bridge_ip ":" port) > 0) allowed=1
+          if (bridge_ip != "" && (port == gateway_port || port == task_port) && index(line, bridge_ip ":" port) > 0) allowed=1
           if (line ~ ":" port "([[:space:]]|$|[)])" && ! allowed) bad=1
         }
       }
@@ -3850,6 +4013,10 @@ workspace_hermes_gateway_proxy_running() {
   docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER"
 }
 
+workspace_hermes_vikunja_proxy_running() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$WORKSPACE_HERMES_VIKUNJA_PROXY_CONTAINER"
+}
+
 workspace_model_running() {
   local model="$1"
   [[ -n "$model" ]] || return 1
@@ -4043,6 +4210,7 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Hermes local API is reachable" workspace_hermes_local_api_ready
   workspace_doctor_check "NemoHermes sandbox doctor passes" workspace_hermes_doctor_ready
   workspace_doctor_check "NemoHermes inference route uses selected LiteLLM model" workspace_hermes_inference_route_ready
+  workspace_doctor_check "Hermes reaches Vikunja as bot-hermes" workspace_hermes_vikunja_api_ready
   workspace_doctor_check "Hermes dashboard URL is reachable" workspace_hermes_dashboard_url_ready
   if [[ "$strict_mode" == "1" ]]; then
     workspace_doctor_section "Production" "pin workspace image versions, then run spark ws setup"

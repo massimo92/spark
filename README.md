@@ -92,6 +92,10 @@ The workspace is optional. It installs a private agent environment:
 - Hermes/NemoClaw for agent runtime
 - Tailscale for private access
 
+Hermes accesses Vikunja directly through its REST API as the human-owned
+`bot-hermes`. OpenShell injects the bot token as an opaque provider credential;
+the sandbox never receives the raw token.
+
 ```bash
 spark setup --full
 spark ws setup
