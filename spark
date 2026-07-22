@@ -5419,7 +5419,7 @@ setup_manual_step() {
 }
 # --- Workspace setup: Vikunja + n8n + Hermes/NemoClaw behind Tailscale ---
 
-WORKSPACE_VIKUNJA_HERMES_EMAIL="${WORKSPACE_VIKUNJA_HERMES_EMAIL:-hermes@spark.invalid}"
+WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME="${WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME:-bot-hermes}"
 
 workspace_random_secret() {
   if command -v openssl >/dev/null 2>&1; then
@@ -5824,13 +5824,13 @@ workspace_validate_image_ref() {
 }
 
 workspace_write_files() {
-  local tailnet="$1" human_user="$2" human_email="$3" human_pass="$4" n8n_email="$5" n8n_pass="$6" hermes_pass="$7" model="$8"
+  local tailnet="$1" human_user="$2" human_email="$3" human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
   local vikunja_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
   local tailscale_bind_addr tailscale_dns_name
   local postgres_pass vikunja_db_pass vikunja_secret n8n_db_pass n8n_key mention_secret
   local n8n_owner_status vikunja_token tailscale_mode
-  local vikunja_api_status
-  local vikunja_human_status vikunja_hermes_status vikunja_human_admin_status
+  local vikunja_api_status vikunja_human_id vikunja_bot_id vikunja_project_access_status
+  local vikunja_human_status vikunja_bot_status vikunja_human_admin_status
   local postgres_image vikunja_image n8n_image old_umask
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
   tailscale_bind_addr=$(workspace_env_or_value WORKSPACE_TAILSCALE_BIND_ADDR 127.0.0.1)
@@ -5875,7 +5875,6 @@ workspace_write_files() {
   vikunja_db_pass=$(workspace_env_or_generated VIKUNJA_DATABASE_PASSWORD)
   vikunja_secret=$(workspace_env_or_generated_guarded VIKUNJA_SERVICE_SECRET "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/vikunja-files") \
     || { setup_fail "Missing Vikunja service secret (VIKUNJA_SERVICE_SECRET) while existing workspace data is present; restore it before rerun"; return 1; }
-  hermes_pass=$(workspace_env_or_value VIKUNJA_HERMES_PASSWORD "$hermes_pass")
   n8n_db_pass=$(workspace_env_or_generated DB_POSTGRESDB_PASSWORD)
   n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
     || { setup_fail "Missing n8n encryption key (N8N_ENCRYPTION_KEY) while existing workspace data is present; restore it before rerun"; return 1; }
@@ -5887,8 +5886,11 @@ workspace_write_files() {
     vikunja_token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
   fi
   vikunja_api_status=$(workspace_env_or_value VIKUNJA_HERMES_API_STATUS pending)
+  vikunja_human_id=$(workspace_read_env VIKUNJA_HUMAN_USER_ID 2>/dev/null || true)
+  vikunja_bot_id=$(workspace_read_env VIKUNJA_HERMES_BOT_ID 2>/dev/null || true)
+  vikunja_project_access_status=$(workspace_env_or_value VIKUNJA_HERMES_PROJECT_ACCESS_STATUS pending)
   vikunja_human_status=$(workspace_env_or_value VIKUNJA_HUMAN_USER_STATUS pending)
-  vikunja_hermes_status=$(workspace_env_or_value VIKUNJA_HERMES_USER_STATUS pending)
+  vikunja_bot_status=$(workspace_env_or_value VIKUNJA_HERMES_BOT_STATUS pending)
   vikunja_human_admin_status=$(workspace_env_or_value VIKUNJA_HUMAN_ADMIN_STATUS pending)
   postgres_image="${SPARK_WORKSPACE_POSTGRES_IMAGE:-$(workspace_env_or_value WORKSPACE_POSTGRES_IMAGE "$WORKSPACE_POSTGRES_IMAGE_DEFAULT")}"
   vikunja_image="${SPARK_WORKSPACE_VIKUNJA_IMAGE:-$(workspace_env_or_value WORKSPACE_VIKUNJA_IMAGE "$WORKSPACE_VIKUNJA_IMAGE_DEFAULT")}"
@@ -5911,7 +5913,6 @@ workspace_write_files() {
   fi
   workspace_require_env_value "Vikunja human username" "$human_user"
   workspace_require_env_value "Vikunja human email" "$human_email"
-  workspace_require_env_value "Vikunja Hermes password" "$hermes_pass"
   workspace_require_env_value "n8n admin email" "$n8n_email"
   workspace_require_env_value "Hermes model" "$model"
   workspace_require_env_value "Postgres password" "$postgres_pass"
@@ -5940,11 +5941,13 @@ VIKUNJA_DATABASE_PASSWORD=${vikunja_db_pass}
 VIKUNJA_SERVICE_SECRET=${vikunja_secret}
 VIKUNJA_HUMAN_USERNAME=${human_user}
 VIKUNJA_HUMAN_EMAIL=${human_email}
+VIKUNJA_HUMAN_USER_ID=${vikunja_human_id}
 VIKUNJA_HUMAN_USER_STATUS=${vikunja_human_status}
 VIKUNJA_HUMAN_ADMIN_STATUS=${vikunja_human_admin_status}
-VIKUNJA_HERMES_USERNAME=hermes
-VIKUNJA_HERMES_PASSWORD=${hermes_pass}
-VIKUNJA_HERMES_USER_STATUS=${vikunja_hermes_status}
+VIKUNJA_HERMES_BOT_USERNAME=${WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME}
+VIKUNJA_HERMES_BOT_ID=${vikunja_bot_id}
+VIKUNJA_HERMES_BOT_STATUS=${vikunja_bot_status}
+VIKUNJA_HERMES_PROJECT_ACCESS_STATUS=${vikunja_project_access_status}
 DB_POSTGRESDB_PASSWORD=${n8n_db_pass}
 N8N_ENCRYPTION_KEY=${n8n_key}
 N8N_BASIC_AUTH_USER=${n8n_email}
@@ -6248,6 +6251,23 @@ workspace_vikunja_user_exists() {
   '
 }
 
+workspace_vikunja_user_id() {
+  local username="$1" email="$2" out user_id
+  out=$(workspace_vikunja_cli user list 2>/dev/null) || return 2
+  user_id=$(printf '%s\n' "$out" | sed 's/│/|/g' | awk -v username="$username" -v email="$email" '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    /\|/ {
+      n = split($0, cols, "|")
+      if (n >= 5 && trim(cols[3]) == username && trim(cols[4]) == email) {
+        id = trim(cols[2])
+        if (id ~ /^[0-9]+$/) { print id; exit }
+      }
+    }
+  ')
+  [[ "$user_id" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$user_id"
+}
+
 workspace_ensure_vikunja_user() {
   local username="$1" email="$2" password="$3" status_key="$4"
   if workspace_vikunja_user_exists "$username" "$email"; then
@@ -6267,19 +6287,46 @@ workspace_ensure_vikunja_user() {
 }
 
 workspace_create_vikunja_users() {
-  local human_pass="${1:-}" human_user human_email hermes_pass
+  local human_pass="${1:-}" human_user human_email human_id jwt token
   workspace_wait_for_vikunja_cli || return 1
   human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME)
   human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL)
-  hermes_pass=$(workspace_read_env VIKUNJA_HERMES_PASSWORD)
   [[ -n "$human_pass" ]] || { warn "Vikunja user password unavailable; existing user left unchanged"; return 0; }
   workspace_ensure_vikunja_user "$human_user" "$human_email" "$human_pass" VIKUNJA_HUMAN_USER_STATUS || true
+  human_id=$(workspace_vikunja_user_id "$human_user" "$human_email" 2>/dev/null || true)
+  if [[ "$human_id" =~ ^[1-9][0-9]*$ ]]; then
+    workspace_set_env_key VIKUNJA_HUMAN_USER_ID "$human_id"
+  else
+    setup_fail "Could not resolve Vikunja human user ID for ${human_user}"
+    return 1
+  fi
   workspace_vikunja_cli user set-admin "$human_user" --admin >/dev/null 2>&1 \
     && { workspace_set_env_key VIKUNJA_HUMAN_ADMIN_STATUS enabled; info "Vikunja admin set: ${human_user}"; } \
     || { workspace_set_env_key VIKUNJA_HUMAN_ADMIN_STATUS manual; warn "Could not promote ${human_user}; set admin manually if needed"; }
-  workspace_ensure_vikunja_user hermes "$WORKSPACE_VIKUNJA_HERMES_EMAIL" "$hermes_pass" VIKUNJA_HERMES_USER_STATUS || true
-  workspace_create_vikunja_hermes_token \
-    || warn "Create a Vikunja API token for user 'hermes' in the UI, then rerun spark ws setup"
+  jwt=$(workspace_vikunja_login_jwt "$human_user" "$human_pass") || {
+    token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
+    if [[ -n "$token" ]] && workspace_check_vikunja_token "$token" >/dev/null 2>&1; then
+      workspace_set_env_key VIKUNJA_HERMES_BOT_STATUS exists
+      workspace_set_env_key VIKUNJA_HERMES_PROJECT_ACCESS_STATUS manual
+      warn "Hermes bot token works, but the human password is needed to sync project access"
+      return 0
+    fi
+    workspace_set_env_key VIKUNJA_HERMES_BOT_STATUS manual
+    workspace_set_env_key VIKUNJA_HERMES_API_STATUS manual
+    warn "Could not authenticate the Vikunja human user; rerun with --vikunja-password-file"
+    return 1
+  }
+  workspace_ensure_vikunja_hermes_bot "$jwt" || {
+    warn "Could not create bot-hermes; Vikunja 2.4.0 or newer is required"
+    return 1
+  }
+  workspace_create_vikunja_hermes_token "$jwt" "$WORKSPACE_VIKUNJA_HERMES_BOT_ID_RESULT" || {
+    warn "Create a token for bot-hermes under Settings > Bots, then rerun with --vikunja-token"
+    return 1
+  }
+  token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
+  workspace_sync_vikunja_hermes_project_access "$jwt" "$token" \
+    || warn "Some Vikunja projects could not be shared with bot-hermes"
 }
 
 workspace_set_env_key() {
@@ -6330,14 +6377,16 @@ workspace_remove_legacy_human_passwords() {
   local file key removed=0
   for file in "$WORKSPACE_ENV_FILE" "$WORKSPACE_VIKUNJA_ENV_FILE" "$WORKSPACE_N8N_ENV_FILE"; do
     [[ -f "$file" ]] || continue
-    for key in VIKUNJA_HUMAN_PASSWORD VIKUNJA_HUMAN_RECOVERY_PASSWORD N8N_BASIC_AUTH_PASSWORD; do
+    for key in VIKUNJA_HUMAN_PASSWORD VIKUNJA_HUMAN_RECOVERY_PASSWORD \
+      VIKUNJA_HERMES_USERNAME VIKUNJA_HERMES_PASSWORD VIKUNJA_HERMES_USER_STATUS \
+      N8N_BASIC_AUTH_PASSWORD; do
       if grep -q "^${key}=" "$file" 2>/dev/null; then
         workspace_remove_env_file_key "$file" "$key"
         removed=1
       fi
     done
   done
-  [[ "$removed" == "0" ]] || info "Removed legacy stored human passwords"
+  [[ "$removed" == "0" ]] || info "Removed legacy stored interactive-user credentials"
 }
 
 workspace_remove_legacy_smtp() {
@@ -6452,27 +6501,66 @@ workspace_vikunja_api_permissions_json() {
   printf '%s\n' '{"tasks":["read_all","create","update","delete"],"projects":["read_all","create","update","delete"],"comments":["read_all","create","update","delete"],"labels":["read_all","create","update","delete"],"webhooks":["read_all","create","update","delete"]}'
 }
 
-workspace_create_vikunja_hermes_token() {
-  local existing hermes_pass jwt perms payload out token base_url
-  existing=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
-  if [[ -n "$existing" ]] && workspace_check_vikunja_token "$existing" >/dev/null 2>&1; then
-    info "Vikunja API token already works for hermes"
-    return 0
+workspace_vikunja_api_json() {
+  local bearer="$1" method="$2" path="$3" payload="${4:-}" base_url
+  [[ -n "$bearer" && -n "$method" && -n "$path" ]] || return 1
+  base_url=$(workspace_vikunja_api_base_url) || return 1
+  if [[ -n "$payload" ]]; then
+    printf '%s' "$payload" | curl -fsS --max-time 10 \
+      -H "Authorization: Bearer ${bearer}" \
+      -H 'Content-Type: application/json' \
+      -H 'Accept: application/json' \
+      -X "$method" "${base_url}${path}" \
+      --data-binary @- 2>/dev/null
+  else
+    curl -fsS --max-time 10 \
+      -H "Authorization: Bearer ${bearer}" \
+      -H 'Accept: application/json' \
+      -X "$method" "${base_url}${path}" 2>/dev/null
   fi
-  hermes_pass=$(workspace_read_env VIKUNJA_HERMES_PASSWORD 2>/dev/null || true)
-  jwt=$(workspace_vikunja_login_jwt hermes "$hermes_pass") || {
-    workspace_set_env_key VIKUNJA_HERMES_API_STATUS manual
+}
+
+workspace_ensure_vikunja_hermes_bot() {
+  local jwt="$1" out bot_id payload created=0
+  command -v jq >/dev/null 2>&1 || return 1
+  out=$(workspace_vikunja_api_json "$jwt" GET '/api/v2/user/bots?per_page=1000') || {
+    workspace_set_env_key VIKUNJA_HERMES_BOT_STATUS manual
     return 1
   }
+  bot_id=$(printf '%s\n' "$out" | jq -r --arg username "$WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME" \
+    '.items[]? | select(.username == $username) | .id' 2>/dev/null | head -1)
+  if [[ ! "$bot_id" =~ ^[1-9][0-9]*$ ]]; then
+    payload=$(printf '{"username":"%s","name":"Hermes"}' \
+      "$(workspace_json_escape "$WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME")")
+    out=$(workspace_vikunja_api_json "$jwt" POST '/api/v2/user/bots' "$payload") || {
+      workspace_set_env_key VIKUNJA_HERMES_BOT_STATUS manual
+      return 1
+    }
+    bot_id=$(printf '%s\n' "$out" | jq -r '.id // empty' 2>/dev/null | head -1)
+    [[ "$bot_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    created=1
+  fi
+  workspace_set_env_key VIKUNJA_HERMES_BOT_ID "$bot_id"
+  if [[ "$created" == "1" ]]; then
+    workspace_set_env_key VIKUNJA_HERMES_BOT_STATUS created
+    info "Vikunja bot created: ${WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME}"
+  else
+    workspace_set_env_key VIKUNJA_HERMES_BOT_STATUS exists
+    info "Vikunja bot exists: ${WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME}"
+  fi
+  WORKSPACE_VIKUNJA_HERMES_BOT_ID_RESULT="$bot_id"
+}
+
+workspace_create_vikunja_hermes_token() {
+  local jwt="$1" bot_id="$2" existing perms payload out token
+  existing=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
+  if [[ -n "$existing" ]] && workspace_check_vikunja_token "$existing" "$bot_id" >/dev/null 2>&1; then
+    info "Vikunja API token already works for bot-hermes"
+    return 0
+  fi
   perms=$(workspace_vikunja_api_permissions_json "$jwt")
-  base_url=$(workspace_vikunja_api_base_url) || return 1
-  payload=$(printf '{"title":"spark-hermes","expires_at":"2099-12-31T23:59:59Z","permissions":%s}' "$perms")
-  out=$(curl -fsS --max-time 10 \
-    -H "Authorization: Bearer ${jwt}" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json' \
-    -X PUT "${base_url}/api/v1/tokens" \
-    --data "$payload" 2>/dev/null) || {
+  payload=$(printf '{"title":"spark-hermes","expires_at":"2099-12-31T23:59:59Z","owner_id":%s,"permissions":%s}' "$bot_id" "$perms")
+  out=$(workspace_vikunja_api_json "$jwt" POST '/api/v2/tokens' "$payload") || {
       workspace_set_env_key VIKUNJA_HERMES_API_STATUS manual
       return 1
     }
@@ -6482,12 +6570,12 @@ workspace_create_vikunja_hermes_token() {
     return 1
   fi
   workspace_store_vikunja_token "$token"
-  workspace_check_vikunja_token "$token" >/dev/null 2>&1 || return 1
-  info "Vikunja API token created for hermes"
+  workspace_check_vikunja_token "$token" "$bot_id" >/dev/null 2>&1 || return 1
+  info "Vikunja API token created for bot-hermes"
 }
 
 workspace_check_vikunja_token() {
-  local token="${1:-}" out base_url
+  local token="${1:-}" expected_id="${2:-}" expected_owner_id out base_url username user_id owner_id
   [[ -n "$token" ]] || token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
   [[ -n "$token" ]] || die "No Vikunja Hermes API token stored" "Create it in Vikunja UI, then rerun spark ws setup"
   command -v curl >/dev/null 2>&1 || die "curl missing"
@@ -6499,13 +6587,71 @@ workspace_check_vikunja_token() {
       workspace_set_env_key VIKUNJA_HERMES_API_STATUS failed
       return 1
     }
-  if printf '%s\n' "$out" | grep -Eq '"username"[[:space:]]*:[[:space:]]*"hermes"'; then
+  if command -v jq >/dev/null 2>&1; then
+    username=$(printf '%s\n' "$out" | jq -r '.username // empty' 2>/dev/null)
+    user_id=$(printf '%s\n' "$out" | jq -r '.id // empty' 2>/dev/null)
+    owner_id=$(printf '%s\n' "$out" | jq -r '.bot_owner_id // empty' 2>/dev/null)
+  else
+    username=$(printf '%s\n' "$out" | workspace_json_string_field username)
+    user_id=$(printf '%s\n' "$out" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+    owner_id=$(printf '%s\n' "$out" | sed -n 's/.*"bot_owner_id"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+  fi
+  expected_owner_id=$(workspace_read_env VIKUNJA_HUMAN_USER_ID 2>/dev/null || true)
+  if [[ "$username" == "$WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME" && "$user_id" =~ ^[1-9][0-9]*$ && "$owner_id" =~ ^[1-9][0-9]*$ ]] \
+    && { [[ -z "$expected_id" ]] || [[ "$user_id" == "$expected_id" ]]; } \
+    && { [[ -z "$expected_owner_id" ]] || [[ "$owner_id" == "$expected_owner_id" ]]; }; then
+    workspace_set_env_key VIKUNJA_HERMES_BOT_ID "$user_id"
     workspace_set_env_key VIKUNJA_HERMES_API_STATUS verified
-    info "Vikunja API token verified for hermes"
+    info "Vikunja API token verified for bot-hermes"
     return 0
   fi
   workspace_set_env_key VIKUNJA_HERMES_API_STATUS wrong-user
-  warn "Vikunja API token works, but does not appear to belong to user 'hermes'"
+  warn "Vikunja API token works, but does not belong to bot-hermes"
+  return 1
+}
+
+workspace_share_vikunja_project_with_hermes() {
+  local jwt="$1" project_id="$2" out permission payload path
+  path="/api/v2/projects/${project_id}/users"
+  out=$(workspace_vikunja_api_json "$jwt" GET "${path}?per_page=1000") || return 1
+  permission=$(printf '%s\n' "$out" | jq -r --arg username "$WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME" \
+    '.items[]? | select(.username == $username) | .permission' 2>/dev/null | head -1)
+  payload=$(printf '{"username":"%s","permission":1}' \
+    "$(workspace_json_escape "$WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME")")
+  if [[ "$permission" =~ ^[0-9]+$ ]]; then
+    [[ "$permission" -ge 1 ]] && return 0
+    workspace_vikunja_api_json "$jwt" PUT "${path}/${WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME}" "$payload" >/dev/null
+    return $?
+  fi
+  workspace_vikunja_api_json "$jwt" POST "$path" "$payload" >/dev/null
+}
+
+workspace_vikunja_accessible_project_ids() {
+  local bearer="$1" out
+  out=$(workspace_vikunja_api_json "$bearer" GET '/api/v2/projects?per_page=1000&expand=permissions&is_archived=true') || return 1
+  printf '%s\n' "$out" | jq -r '.items[]?.id' 2>/dev/null | sort -u
+}
+
+workspace_sync_vikunja_hermes_project_access() {
+  local jwt="$1" token="$2" out project_id failed=0 human_ids bot_ids missing
+  command -v jq >/dev/null 2>&1 || return 1
+  out=$(workspace_vikunja_api_json "$jwt" GET '/api/v2/projects?per_page=1000&expand=permissions&is_archived=true') || {
+    workspace_set_env_key VIKUNJA_HERMES_PROJECT_ACCESS_STATUS manual
+    return 1
+  }
+  while IFS= read -r project_id; do
+    [[ "$project_id" =~ ^[1-9][0-9]*$ ]] || continue
+    workspace_share_vikunja_project_with_hermes "$jwt" "$project_id" || failed=1
+  done < <(printf '%s\n' "$out" | jq -r '.items[]? | select(.max_permission == 2) | .id' 2>/dev/null)
+  human_ids=$(printf '%s\n' "$out" | jq -r '.items[]?.id' 2>/dev/null | sort -u)
+  bot_ids=$(workspace_vikunja_accessible_project_ids "$token") || failed=1
+  missing=$(comm -23 <(printf '%s\n' "$human_ids") <(printf '%s\n' "$bot_ids") | sed '/^$/d')
+  if [[ "$failed" == "0" && -z "$missing" ]]; then
+    workspace_set_env_key VIKUNJA_HERMES_PROJECT_ACCESS_STATUS verified
+    info "Vikunja project access synchronized for bot-hermes"
+    return 0
+  fi
+  workspace_set_env_key VIKUNJA_HERMES_PROJECT_ACCESS_STATUS partial
   return 1
 }
 
@@ -7394,7 +7540,7 @@ workspace_setup() {
     return $?
   fi
   workspace_migrate_runtime_config
-  local human_user human_email human_pass n8n_email n8n_pass hermes_pass vikunja_previous_status n8n_previous_status setup_rc
+  local human_user human_email human_pass n8n_email n8n_pass vikunja_previous_status n8n_previous_status setup_rc
   local existing_human_user existing_human_email existing_n8n_email
   existing_human_user=$(workspace_existing_prompt_value VIKUNJA_HUMAN_USERNAME "Vikunja human username" username || true)
   existing_human_email=$(workspace_existing_prompt_value VIKUNJA_HUMAN_EMAIL "Vikunja human email" email || true)
@@ -7415,12 +7561,11 @@ workspace_setup() {
   workspace_require_prompt_value "Vikunja human username" "$human_user" username
   workspace_require_prompt_value "Vikunja human email" "$human_email" email
   workspace_require_prompt_value "n8n admin email" "$n8n_email" email
-  hermes_pass=$(workspace_random_secret)
   vikunja_previous_status=$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)
   n8n_previous_status=$(workspace_read_env N8N_OWNER_SETUP_STATUS 2>/dev/null || true)
   WORKSPACE_SHOW_VIKUNJA_PASSWORD=0
   WORKSPACE_SHOW_N8N_PASSWORD=0
-  workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$hermes_pass" "$model" || {
+  workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$model" || {
     workspace_summary
     return $?
   }
@@ -7442,7 +7587,7 @@ workspace_setup() {
     workspace_set_env_key HERMES_ONBOARD_STATUS manual
     setup_fail "Hermes onboarding skipped until Tailscale private access is configured"
   fi
-  workspace_create_vikunja_users "$human_pass"
+  workspace_create_vikunja_users "$human_pass" || true
   [[ ! "$vikunja_previous_status" =~ ^(created|exists)$ && "$(workspace_read_env VIKUNJA_HUMAN_USER_STATUS 2>/dev/null || true)" == "created" ]] \
     && WORKSPACE_SHOW_VIKUNJA_PASSWORD=1
   if [[ "$n8n_previous_status" =~ ^(created|exists)$ ]]; then
@@ -8101,7 +8246,7 @@ workspace_human_password_not_stored() {
   local file
   for file in "$WORKSPACE_ENV_FILE" "$WORKSPACE_VIKUNJA_ENV_FILE" "$WORKSPACE_N8N_ENV_FILE"; do
     [[ -f "$file" ]] || return 1
-    ! grep -Eq '^(VIKUNJA_HUMAN_(PASSWORD|RECOVERY_PASSWORD)|N8N_BASIC_AUTH_PASSWORD)=' "$file" || return 1
+    ! grep -Eq '^(VIKUNJA_HUMAN_(PASSWORD|RECOVERY_PASSWORD)|VIKUNJA_HERMES_PASSWORD|N8N_BASIC_AUTH_PASSWORD)=' "$file" || return 1
   done
 }
 
@@ -8110,7 +8255,7 @@ workspace_credentials_are_distinct() {
   seen=""
   for key in \
     POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD DB_POSTGRESDB_PASSWORD VIKUNJA_SERVICE_SECRET \
-    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HERMES_PASSWORD VIKUNJA_HERMES_API_TOKEN; do
+    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HERMES_API_TOKEN; do
     val=$(workspace_read_env "$key" || true)
     [[ -n "$val" ]] || return 1
     if printf '%s\n' "$seen" | grep -Fqx -- "$val"; then
@@ -8125,7 +8270,7 @@ workspace_no_legacy_recovery_config() {
   local file
   for file in "$WORKSPACE_ENV_FILE" "$WORKSPACE_VIKUNJA_ENV_FILE" "$WORKSPACE_N8N_ENV_FILE"; do
     [[ -f "$file" ]] || return 1
-    ! grep -Eq '^(WORKSPACE_SMTP_|VIKUNJA_MAILER_|N8N_SMTP_|N8N_EMAIL_MODE=|N8N_INSTANCE_OWNER_(MANAGED_BY_ENV|EMAIL|FIRST_NAME|LAST_NAME|PASSWORD_HASH)=)' "$file" || return 1
+    ! grep -Eq '^(WORKSPACE_SMTP_|VIKUNJA_MAILER_|N8N_SMTP_|N8N_EMAIL_MODE=|VIKUNJA_HERMES_(USERNAME|PASSWORD|USER_STATUS)=|N8N_INSTANCE_OWNER_(MANAGED_BY_ENV|EMAIL|FIRST_NAME|LAST_NAME|PASSWORD_HASH)=)' "$file" || return 1
   done
 }
 
@@ -8351,15 +8496,24 @@ workspace_vikunja_user_ready() {
 }
 
 workspace_vikunja_human_ready() {
-  local username email
+  local username email expected_id actual_id
   username=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
   email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
-  [[ -n "$username" && -n "$email" ]] || return 1
+  expected_id=$(workspace_read_env VIKUNJA_HUMAN_USER_ID 2>/dev/null || true)
+  [[ -n "$username" && -n "$email" && "$expected_id" =~ ^[1-9][0-9]*$ ]] || return 1
+  actual_id=$(workspace_vikunja_user_id "$username" "$email" 2>/dev/null || true)
+  [[ "$actual_id" == "$expected_id" ]] || return 1
   workspace_vikunja_user_ready "$username" "$email" VIKUNJA_HUMAN_USER_STATUS
 }
 
 workspace_vikunja_hermes_ready() {
-  workspace_vikunja_user_ready hermes "$WORKSPACE_VIKUNJA_HERMES_EMAIL" VIKUNJA_HERMES_USER_STATUS
+  local username bot_id status
+  username=$(workspace_read_env VIKUNJA_HERMES_BOT_USERNAME 2>/dev/null || true)
+  bot_id=$(workspace_read_env VIKUNJA_HERMES_BOT_ID 2>/dev/null || true)
+  status=$(workspace_read_env VIKUNJA_HERMES_BOT_STATUS 2>/dev/null || true)
+  [[ "$username" == "$WORKSPACE_VIKUNJA_HERMES_BOT_USERNAME" ]] &&
+    [[ "$bot_id" =~ ^[1-9][0-9]*$ ]] &&
+    [[ "$status" == "created" || "$status" == "exists" ]]
 }
 
 workspace_vikunja_hermes_api_ready() {
@@ -8367,6 +8521,10 @@ workspace_vikunja_hermes_api_ready() {
   token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
   [[ -n "$token" ]] || return 1
   workspace_check_vikunja_token "$token" >/dev/null 2>&1
+}
+
+workspace_vikunja_hermes_project_access_ready() {
+  [[ "$(workspace_read_env VIKUNJA_HERMES_PROJECT_ACCESS_STATUS 2>/dev/null || true)" == "verified" ]]
 }
 
 workspace_urls_configured() {
@@ -8881,18 +9039,17 @@ workspace_tailscale_offer_ports_fallback() {
 }
 
 workspace_tailscale_ports_fallback() {
-  local tailnet="$1" human_user="" human_email="" n8n_email="" hermes_pass="" model="" bind_addr="" dns_name=""
+  local tailnet="$1" human_user="" human_email="" n8n_email="" model="" bind_addr="" dns_name=""
   human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
   human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
   n8n_email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
-  hermes_pass=$(workspace_read_env VIKUNJA_HERMES_PASSWORD 2>/dev/null || true)
   model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   bind_addr=$(workspace_tailscale_ipv4 2>/dev/null || true)
   dns_name=$(workspace_tailscale_dns_name 2>/dev/null || true)
-  [[ -n "$human_user" && -n "$human_email" && -n "$n8n_email" && -n "$hermes_pass" && -n "$model" ]] || return 1
+  [[ -n "$human_user" && -n "$human_email" && -n "$n8n_email" && -n "$model" ]] || return 1
   [[ -n "$bind_addr" && -n "$dns_name" ]] || return 1
   SPARK_WORKSPACE_TAILSCALE_MODE=ports \
-    workspace_write_files "$tailnet" "$human_user" "$human_email" unused "$n8n_email" unused "$hermes_pass" "$model" || return 1
+    workspace_write_files "$tailnet" "$human_user" "$human_email" unused "$n8n_email" unused "$model" || return 1
   workspace_compose up -d --remove-orphans >/dev/null 2>&1 || return 1
   info "Tailscale Serve is not enabled on this tailnet; using ports fallback"
   return 0
@@ -9226,22 +9383,24 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Compose uses private host bindings only" workspace_compose_uses_loopback_ports
 
   workspace_doctor_section "Identity & recovery" "spark ws setup"
-  workspace_doctor_check "Human service passwords are not stored" workspace_human_password_not_stored
+  workspace_doctor_check "Interactive service passwords are not stored" workspace_human_password_not_stored
   workspace_doctor_check "Vikunja registration/link sharing disabled" workspace_vikunja_locked_down
   workspace_doctor_check "Vikunja internal doctor passes" workspace_vikunja_doctor_ok
   workspace_doctor_check "Vikunja human user exists" workspace_vikunja_human_ready
-  workspace_doctor_check "Vikunja hermes user exists" workspace_vikunja_hermes_ready
-  workspace_doctor_check "Vikunja hermes API token works" workspace_vikunja_hermes_api_ready
+  workspace_doctor_check "Vikunja bot-hermes exists" workspace_vikunja_hermes_ready
+  workspace_doctor_check "Vikunja bot-hermes API token works" workspace_vikunja_hermes_api_ready
+  workspace_doctor_check "Vikunja projects are shared with bot-hermes" workspace_vikunja_hermes_project_access_ready
   workspace_doctor_check "n8n hardened for private agent workflows" workspace_n8n_hardened
   workspace_doctor_check "n8n owner/admin ready" workspace_n8n_owner_ready
   workspace_doctor_check "No legacy or temporary password recovery configuration is stored" workspace_no_legacy_recovery_config
   workspace_doctor_check "Workspace URLs configured" workspace_urls_configured
   workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
     POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD VIKUNJA_SERVICE_SECRET DB_POSTGRESDB_PASSWORD \
-    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HERMES_PASSWORD N8N_BASIC_AUTH_USER \
+    N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HUMAN_USER_ID N8N_BASIC_AUTH_USER \
     N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
     HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
-    VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_USER_STATUS
+    VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_BOT_USERNAME VIKUNJA_HERMES_BOT_ID \
+    VIKUNJA_HERMES_BOT_STATUS VIKUNJA_HERMES_PROJECT_ACCESS_STATUS
   workspace_doctor_check "Workspace technical secrets are unique per service" workspace_credentials_are_distinct
 
   workspace_doctor_section "Runtime services" "spark ws restart"
