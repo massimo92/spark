@@ -946,6 +946,101 @@ EOF
 }
 
 
+test_supersync_reconciles_pre_baseline_migration_history() {
+  local tmp log status calls
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  set +e
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      workspace_supersync_schema_exists() { return 0; }
+      workspace_read_env() {
+        [[ "$1" == SUPERSYNC_DATABASE_PASSWORD ]] || return 1
+        printf "%s\n" secret
+      }
+      workspace_compose() {
+        case " $* " in
+          *" test -d prisma/migrations/0_init "*) return 0 ;;
+          *" psql "*)
+            payload=$(cat)
+            [[ "$payload" == *"migration_name = '\''0_init'\''"* ]] || return 1
+            [[ "$payload" == *"migration_name <> '\''0_init'\''"* ]] || return 1
+            printf "%s\n" legacy
+            ;;
+          *" migrate resolve --rolled-back 0_init "*) printf "%s\n" rolled-back >> "$SPARK_TEST_LOG" ;;
+          *" migrate resolve --applied 0_init "*) printf "%s\n" applied >> "$SPARK_TEST_LOG" ;;
+          *) return 1 ;;
+        esac
+      }
+      workspace_supersync_reconcile_baseline_migration
+    ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  set -e
+  calls=$(cat "$log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ "$calls" == $'rolled-back\napplied' ]]
+}
+
+
+test_supersync_baseline_reconciliation_is_idempotent() {
+  local tmp log status
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  set +e
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      workspace_supersync_schema_exists() { return 0; }
+      workspace_read_env() { printf "%s\n" secret; }
+      workspace_compose() {
+        case " $* " in
+          *" test -d prisma/migrations/0_init "*) return 0 ;;
+          *" psql "*) cat >/dev/null; printf "%s\n" applied ;;
+          *" migrate resolve "*) printf "%s\n" unexpected >> "$SPARK_TEST_LOG"; return 1 ;;
+          *) return 1 ;;
+        esac
+      }
+      workspace_supersync_reconcile_baseline_migration
+    ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ ! -e "$log" ]] || [[ ! -s "$log" ]]
+  local no_calls=$?
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ "$no_calls" -eq 0 ]]
+}
+
+
+test_supersync_baseline_reconciliation_fails_closed_without_history() {
+  local tmp log status
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  set +e
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      workspace_supersync_schema_exists() { return 0; }
+      workspace_read_env() { printf "%s\n" secret; }
+      workspace_compose() {
+        case " $* " in
+          *" test -d prisma/migrations/0_init "*) return 0 ;;
+          *" psql "*) cat >/dev/null; printf "%s\n" unknown ;;
+          *" migrate resolve "*) printf "%s\n" unsafe >> "$SPARK_TEST_LOG"; return 0 ;;
+          *) return 1 ;;
+        esac
+      }
+      workspace_supersync_reconcile_baseline_migration
+    ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ ! -e "$log" ]] || [[ ! -s "$log" ]]
+  local no_calls=$?
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] && [[ "$no_calls" -eq 0 ]]
+}
+
+
 test_supersync_user_ready_uses_stdin_query() {
   local tmp status
   tmp=$(mktemp -d)
@@ -7023,6 +7118,9 @@ run_test "single-file build matches modules" test_single_file_build_matches_modu
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "workspace generates Super Productivity alternative" test_super_productivity_workspace_files
 run_test "workspace preserves custom Super Productivity pins" test_super_productivity_custom_pins_are_preserved
+run_test "workspace reconciles pre-baseline SuperSync migrations" test_supersync_reconciles_pre_baseline_migration_history
+run_test "workspace baseline reconciliation is idempotent" test_supersync_baseline_reconciliation_is_idempotent
+run_test "workspace baseline reconciliation fails closed without history" test_supersync_baseline_reconciliation_fails_closed_without_history
 run_test "workspace checks SuperSync user through stdin SQL" test_supersync_user_ready_uses_stdin_query
 run_test "SuperSync setup creates initial passkey enrollment URL" test_supersync_initial_passkey_enrollment_url
 run_test "workspace preserves legacy Postgres mount" test_workspace_preserves_legacy_postgres_mount
