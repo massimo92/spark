@@ -141,8 +141,9 @@ cmd_update() {
   local spark_update=0 spark_remote_version=""
   local ngc_update=0 current_ngc="" current_tag="" latest_tag=""
   local gateway_update=0 gateway_config=""
-  local postgres_update=0 vikunja_update=0 n8n_update=0
-  local postgres_image="" vikunja_image="" n8n_image=""
+  local postgres_update=0 task_update=0 n8n_update=0 task_manager="" task_label=""
+  local postgres_image="" task_image="" n8n_image="" sp_sync_image=""
+  local task_services=()
   local nemohermes_update=0 nemohermes_status="" nemohermes_update_line=""
   local update_count=0
 
@@ -197,10 +198,19 @@ cmd_update() {
   # --- Workspace Compose images ---
   if [[ -f "$WORKSPACE_ENV_FILE" && -f "$WORKSPACE_COMPOSE_FILE" ]] && command -v docker >/dev/null 2>&1; then
     postgres_image=$(workspace_read_env WORKSPACE_POSTGRES_IMAGE 2>/dev/null || true)
-    vikunja_image=$(workspace_read_env WORKSPACE_VIKUNJA_IMAGE 2>/dev/null || true)
+    task_manager=$(workspace_task_manager)
+    task_label=$(workspace_task_manager_label "$task_manager")
+    if [[ "$task_manager" == "super-productivity" ]]; then
+      sp_sync_image=$(workspace_read_env WORKSPACE_SUPERSYNC_IMAGE 2>/dev/null || true)
+      task_image="$sp_sync_image"
+      task_services=(supersync)
+    else
+      task_image=$(workspace_read_env WORKSPACE_VIKUNJA_IMAGE 2>/dev/null || true)
+      task_services=(vikunja)
+    fi
     n8n_image=$(workspace_read_env WORKSPACE_N8N_IMAGE 2>/dev/null || true)
     [[ -n "$postgres_image" ]] && postgres_update=1
-    [[ -n "$vikunja_image" ]] && vikunja_update=1
+    [[ -n "$task_image" ]] && task_update=1
     [[ -n "$n8n_image" ]] && n8n_update=1
   fi
 
@@ -212,7 +222,7 @@ cmd_update() {
     [[ -n "$nemohermes_update_line" ]] && nemohermes_update=1
   fi
 
-  update_count=$(( spark_update + ngc_update + gateway_update + postgres_update + vikunja_update + n8n_update + nemohermes_update ))
+  update_count=$(( spark_update + ngc_update + gateway_update + postgres_update + task_update + n8n_update + nemohermes_update ))
 
   printf "\n  Available update actions:\n"
   if [[ "$update_count" -eq 0 ]]; then
@@ -230,7 +240,13 @@ cmd_update() {
   fi
   [[ "$gateway_update" -eq 1 ]] && printf "    - LiteLLM gateway image: %s\n" "$LITELLM_IMAGE"
   [[ "$postgres_update" -eq 1 ]] && printf "    - Postgres image: %s\n" "$postgres_image"
-  [[ "$vikunja_update" -eq 1 ]] && printf "    - Vikunja image: %s\n" "$vikunja_image"
+  if [[ "$task_update" -eq 1 ]]; then
+    if [[ "$task_manager" == "super-productivity" ]]; then
+      printf "    - %s images: %s\n" "$task_label" "$task_image"
+    else
+      printf "    - Vikunja image: %s\n" "$task_image"
+    fi
+  fi
   [[ "$n8n_update" -eq 1 ]] && printf "    - n8n image: %s\n" "$n8n_image"
   [[ "$nemohermes_update" -eq 1 ]] && printf "    - NemoHermes: %s\n" "$(workspace_trim "$nemohermes_update_line")"
   printf "\n"
@@ -276,8 +292,8 @@ cmd_update() {
   if [[ "$postgres_update" -eq 1 ]] && confirm "Update Postgres image (${postgres_image})?"; then
     workspace_compose pull postgres && workspace_images_updated=1 && did_update=1 || err "Failed to pull Postgres image"
   fi
-  if [[ "$vikunja_update" -eq 1 ]] && confirm "Update Vikunja image (${vikunja_image})?"; then
-    workspace_compose pull vikunja && workspace_images_updated=1 && did_update=1 || err "Failed to pull Vikunja image"
+  if [[ "$task_update" -eq 1 ]] && confirm "Update ${task_label} images (${task_image})?"; then
+    workspace_compose pull "${task_services[@]}" && workspace_images_updated=1 && did_update=1 || err "Failed to pull ${task_label} images"
   fi
   if [[ "$n8n_update" -eq 1 ]] && confirm "Update n8n image (${n8n_image})?"; then
     workspace_compose pull n8n && workspace_images_updated=1 && did_update=1 || err "Failed to pull n8n image"
@@ -476,7 +492,7 @@ cmd_architecture() {
     vllm          Docker launch, capacity admission, startup supervision
     ollama        native Ollama launch/pull/status path
     setup         local/remote install through ctx_* target abstraction
-    workspace     Vikunja+n8n+Postgres+Hermes compose lifecycle and doctor
+    workspace     Task manager+n8n+Postgres+Hermes lifecycle and doctor
     gateway       LiteLLM provider config, YAML generation, container runtime
     product       dashboard, status, recommendations, uninstall/reinstall
     cli           command parsing, help, config, update, dispatch
@@ -514,7 +530,7 @@ cmd_help() {
     setup            Set up a model server — this machine or a remote one over SSH
     dashboard        Terminal UI for setup, services, models, gateway, workspace
     status           Excellent one-shot health and runtime snapshot
-    ws               Set up a private agent workspace (Vikunja + n8n + Hermes)
+    ws               Set up a private agent workspace (task manager + n8n + Hermes)
     doctor           Check all prerequisites (read-only)
     models           Recommend models for this hardware
     run <model>      Start serving a model (can run several at once)
@@ -569,7 +585,7 @@ cmd_help() {
     spark setup                                            # interactive: this machine or a remote one
     spark dashboard --watch                                # observe the whole environment
     spark models recommend                                 # pick a model for this machine
-    spark ws setup                                         # private Vikunja + n8n + Hermes workspace
+    spark ws setup                                         # choose task manager + n8n + Hermes
     spark setup --check                                    # just report what's missing
     spark pull RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4

@@ -10,6 +10,7 @@ SPARK_VERSION="$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$SPARK" | head -1)"
 # SPARK_BACKEND/SPARK_ACCEL inline, or clear them per-invocation with `env -u`.
 export SPARK_BACKEND="${SPARK_BACKEND:-vllm}"
 export SPARK_ACCEL="${SPARK_ACCEL:-cuda-unified}"
+export SPARK_WORKSPACE_TASK_MANAGER="${SPARK_WORKSPACE_TASK_MANAGER:-vikunja}"
 
 passed=0
 failed=0
@@ -767,9 +768,9 @@ case "$cmd" in
   *"export SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo"*\
 *"export SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com"*\
 *"export SPARK_WORKSPACE_N8N_EMAIL=m@example.com"*\
-*"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --yes --model Org/Alpha --tailscale-mode ports --postgres-image postgres:18.1 --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0"*) echo "remote workspace with creds ok" ;;
-  *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --check --model Org/Alpha --tailscale-mode ports --postgres-image postgres:18.1 --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0"*) echo "remote workspace with opts ok" ;;
-  *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --check --model Org/Alpha"*) echo "remote workspace ok" ;;
+*"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --yes --model Org/Alpha --tailscale-mode ports --task-manager vikunja --postgres-image postgres:18.1 --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0"*) echo "remote workspace with creds ok" ;;
+  *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --check --model Org/Alpha --tailscale-mode ports --task-manager vikunja --postgres-image postgres:18.1 --vikunja-image vikunja/vikunja:1.2.3 --n8n-image docker.n8n.io/n8nio/n8n:1.100.0"*) echo "remote workspace with opts ok" ;;
+  *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws setup --check --model Org/Alpha --task-manager vikunja"*) echo "remote workspace ok" ;;
   *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws doctor --strict --model Org/Alpha"*) echo "remote strict doctor ok" ;;
   *"export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH; spark ws doctor --model Org/Alpha"*) echo "remote doctor ok" ;;
   *)                       exit 1 ;;
@@ -852,6 +853,162 @@ test_source_guard_loads_without_dispatch() {
   rm -rf "$tmp"
 
   [[ "$status" -eq 0 ]] && [[ "$output" == loaded:*:ollama ]]
+}
+
+test_super_productivity_workspace_files() {
+  local tmp compose env sync_env dockerfile supersync_dockerfile supersync_patch headless_patch gateway_absent mode init_mode
+  tmp=$(mktemp -d)
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_WORKSPACE_TASK_MANAGER=super-productivity \
+    SPARK_WORKSPACE_TAILSCALE_MODE=services bash -c '
+      source "$1"
+      workspace_write_files_super_productivity robin-triceratops.ts.net massimo m@example.com unused m@example.com unused Org/Alpha
+    ' _ "$SPARK" >/dev/null 2>&1
+  compose=$(cat "${tmp}/home/.config/spark/workspace/docker-compose.yml")
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  sync_env=$(cat "${tmp}/home/.config/spark/workspace/super-productivity.env")
+  dockerfile=$(cat "${tmp}/home/.config/spark/workspace/super-productivity-electron/Dockerfile")
+  supersync_dockerfile=$(cat "${tmp}/home/.config/spark/workspace/supersync/Dockerfile")
+  supersync_patch=$(cat "${tmp}/home/.config/spark/workspace/supersync/spark-initial-passkey.patch")
+  headless_patch=$(cat "${tmp}/home/.config/spark/workspace/super-productivity-electron/spark-headless.patch")
+  [[ ! -e "${tmp}/home/.config/spark/workspace/super-productivity-gateway.conf" ]] && gateway_absent=1 || gateway_absent=0
+  mode=$(stat -c '%a' "${tmp}/home/.config/spark/workspace/super-productivity.env" 2>/dev/null || stat -f '%Lp' "${tmp}/home/.config/spark/workspace/super-productivity.env")
+  init_mode=$(stat -c '%a' "${tmp}/home/.config/spark/workspace/init-db.sh" 2>/dev/null || stat -f '%Lp' "${tmp}/home/.config/spark/workspace/init-db.sh")
+  rm -rf "$tmp"
+  [[ "$env" == *"WORKSPACE_TASK_MANAGER=super-productivity"* ]] &&
+    [[ "$env" == *"TASK_MANAGER_URL=https://tasks.robin-triceratops.ts.net"* ]] &&
+    [[ "$compose" == *$'  supersync:\n'* ]] &&
+    [[ "$compose" == *$'  super-productivity-electron:\n'* ]] &&
+    [[ "$compose" != *$'  super-productivity-web:\n'* ]] &&
+    [[ "$compose" != *$'  super-productivity-gateway:\n'* ]] &&
+    [[ "$compose" != *$'  vikunja:\n'* ]] &&
+    [[ "$compose" == *'127.0.0.1:3456:1900'* ]] &&
+    [[ "$compose" == *":/var/lib/postgresql"$'\n'* ]] &&
+    [[ "$compose" == *"context: ${tmp}/home/.config/spark/workspace/supersync"* ]] &&
+    [[ "$compose" != *'super-productivity/super-productivity:latest'* ]] &&
+    [[ "$sync_env" == *"PUBLIC_URL=https://tasks.robin-triceratops.ts.net"* ]] &&
+    [[ "$sync_env" == *"CORS_ORIGINS=https://tasks.robin-triceratops.ts.net,https://app.super-productivity.com"* ]] &&
+    [[ "$sync_env" == *"SUPERSYNC_INTERNAL_URL=http://supersync:1900"* ]] &&
+    [[ "$sync_env" == *"SPARK_HEADLESS=1"* ]] &&
+    [[ "$dockerfile" == *"TARGETARCH"* ]] &&
+    [[ "$dockerfile" == *"git apply --unidiff-zero"* ]] &&
+    [[ "$dockerfile" == *"npm ci --ignore-scripts || npm install --ignore-scripts"* ]] &&
+    [[ "$dockerfile" == *"xvfb xauth socat"* ]] &&
+    [[ "$supersync_dockerfile" == *"packages/super-sync-server"* ]] &&
+    [[ "$dockerfile" == *"SUPER_PRODUCTIVITY_VERSION=v18.15.1"* ]] &&
+    [[ "$dockerfile" == *"SUPER_PRODUCTIVITY_COMMIT=014b789c22c9bf75fd7202845639569b61e7cd8e"* ]] &&
+    [[ "$supersync_dockerfile" == *"SUPER_PRODUCTIVITY_VERSION=v18.15.1"* ]] &&
+    [[ "$supersync_dockerfile" == *"SUPER_PRODUCTIVITY_COMMIT=014b789c22c9bf75fd7202845639569b61e7cd8e"* ]] &&
+    [[ "$supersync_dockerfile" == *"COPY spark-initial-passkey.patch"* ]] &&
+    [[ "$supersync_dockerfile" == *"git apply --check --unidiff-zero /tmp/spark-initial-passkey.patch"* ]] &&
+    [[ "$supersync_patch" == *"existingPasskeyCount === 0"* ]] &&
+    [[ "$supersync_patch" == *": { tokenVersion: { increment: 1 } })"* ]] &&
+    [[ "$headless_patch" != *$'+import { SyncProviderId '* ]] &&
+    [[ "$gateway_absent" -eq 1 ]] &&
+    [[ "$mode" == "600" ]] &&
+    [[ "$init_mode" == "644" ]]
+}
+
+
+test_supersync_user_ready_uses_stdin_query() {
+  local tmp status
+  tmp=$(mktemp -d)
+  set +e
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      workspace_read_env() {
+        case "$1" in
+          SUPER_PRODUCTIVITY_USER_EMAIL) printf "%s\n" m@example.com ;;
+          SUPERSYNC_DATABASE_PASSWORD) printf "%s\n" secret ;;
+          *) return 1 ;;
+        esac
+      }
+      workspace_compose() {
+        [[ " $* " != *" -c "* ]] || return 1
+        payload=$(cat)
+        [[ "$payload" == *"FROM users"* ]] || return 1
+        [[ "$payload" == *"lower(:'\''email'\'')"* ]] || return 1
+        printf "%s\n" 1:0
+      }
+      workspace_supersync_user_ready
+    ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]]
+}
+
+test_supersync_initial_passkey_enrollment_url() {
+  local tmp out
+  tmp=$(mktemp -d)
+  out=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      workspace_read_env() {
+        [[ "$1" == SUPERSYNC_DATABASE_PASSWORD ]] || return 1
+        printf "%s\n" secret
+      }
+      workspace_random_hex_token() {
+        printf "%064d\n" 0
+      }
+      workspace_task_manager_url() {
+        printf "%s\n" https://tasks.example.ts.net
+      }
+      workspace_compose() {
+        payload=$(cat)
+        [[ "$payload" == *"NOT EXISTS (SELECT 1 FROM passkeys"* ]] || return 1
+        [[ "$payload" == *"+ 900000"* ]] || return 1
+        [[ "$payload" != *"token_version"* ]] || return 1
+        printf "%s\n" 1
+      }
+      workspace_supersync_create_passkey_enrollment_url m@example.com
+    ' _ "$SPARK" 2>/dev/null)
+  rm -rf "$tmp"
+  [[ "$out" == "https://tasks.example.ts.net/recover-passkey?token=$(printf '%064d' 0)" ]]
+}
+
+test_workspace_preserves_legacy_postgres_mount() {
+  local tmp target
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.local/share/spark/workspace/postgres"
+  printf '17\n' > "${tmp}/home/.local/share/spark/workspace/postgres/PG_VERSION"
+  target=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      workspace_postgres_volume_target
+    ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$target" == "/var/lib/postgresql/data" ]]
+}
+
+test_super_productivity_rejects_http_ports_mode() {
+  local tmp out status
+  tmp=$(mktemp -d)
+  set +e
+  out=$(HOME="${tmp}/home" SPARK_WORKSPACE_TASK_MANAGER=vikunja "$SPARK" ws setup \
+    --task-manager super-productivity --tailscale-mode ports --yes 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] && [[ "$out" == *"SuperSync requires HTTPS"* ]]
+}
+
+test_workspace_interactive_task_manager_selector() {
+  local tmp super_productivity vikunja
+  tmp=$(mktemp -d)
+  super_productivity=$(printf '1\n' | env -u SPARK_WORKSPACE_TASK_MANAGER HOME="${tmp}/home" bash -c '
+    source "$1"
+    is_interactive() { return 0; }
+    workspace_select_task_manager "" 0
+  ' _ "$SPARK" 2>/dev/null)
+  vikunja=$(printf '2\n' | env -u SPARK_WORKSPACE_TASK_MANAGER HOME="${tmp}/home" bash -c '
+    source "$1"
+    is_interactive() { return 0; }
+    workspace_select_task_manager "" 0
+  ' _ "$SPARK" 2>/dev/null)
+  rm -rf "$tmp"
+  [[ "$super_productivity" == "super-productivity" && "$vikunja" == "vikunja" ]]
 }
 
 test_doctor_reports_no_ngc_image() {
@@ -3795,7 +3952,7 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Compose uses scoped env files, not full secrets.env"* ]] &&
     [[ "$out" == *"[x] Compose image refs are recorded and used"* ]] &&
     [[ "$out" == *"[x] Compose applies runtime hardening and log rotation"* ]] &&
-    [[ "$out" == *"[x] Shared Postgres initializes Vikunja and n8n DBs"* ]] &&
+    [[ "$out" == *"[x] Shared Postgres initializes task manager and n8n DBs"* ]] &&
     [[ "$out" == *"[x] Vikunja HTTP endpoint ready"* ]] &&
     [[ "$out" == *"[x] n8n HTTP endpoint ready"* ]] &&
     [[ "$out" == *"[x] Workspace URLs configured"* ]] &&
@@ -3810,12 +3967,12 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Tailscale Services registered/authorized"* ]] &&
     [[ "$out" == *"[x] Tailscale Serve enabled"* ]] &&
     [[ "$out" == *"[x] Tailscale Service host advertised"* ]] &&
-    [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]] &&
+    [[ "$out" == *"[x] Tailscale local config maps tasks, n8n, hermes"* ]] &&
     [[ "$out" == *"[x] Tailscale mode is Services or ports"* ]] &&
     [[ "$out" == *"[x] Tailscale workspace URLs respond"* ]] &&
     [[ "$out" == *"[x] No workspace/gateway port is published on 0.0.0.0"* ]] &&
     [[ "$out" == *"[x] Host listeners for workspace/gateway are loopback-only"* ]] &&
-    [[ "$out" == *"[x] Shared Postgres runtime has Vikunja and n8n roles/databases"* ]] &&
+    [[ "$out" == *"[x] Shared Postgres runtime has task manager and n8n roles/databases"* ]] &&
     [[ "$out" == *"[x] LiteLLM exposes Hermes model route"* ]] &&
     [[ "$out" == *"[x] LiteLLM Hermes route completes smoke request"* ]] &&
     [[ "$out" == *"[x] Vikunja internal doctor passes"* ]] &&
@@ -6828,6 +6985,12 @@ test_stop_ollama_unloads() {
 run_test "architecture command maps core boundaries" test_architecture_command_maps_core_boundaries
 run_test "single-file build matches modules" test_single_file_build_matches_modules
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
+run_test "workspace generates Super Productivity alternative" test_super_productivity_workspace_files
+run_test "workspace checks SuperSync user through stdin SQL" test_supersync_user_ready_uses_stdin_query
+run_test "SuperSync setup creates initial passkey enrollment URL" test_supersync_initial_passkey_enrollment_url
+run_test "workspace preserves legacy Postgres mount" test_workspace_preserves_legacy_postgres_mount
+run_test "Super Productivity rejects insecure ports mode" test_super_productivity_rejects_http_ports_mode
+run_test "workspace asks which task manager to install" test_workspace_interactive_task_manager_selector
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vllm_image
 run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wins

@@ -153,21 +153,23 @@ dashboard_models_html() {
 }
 
 dashboard_workspace_html() {
-  local vikunja_url="" n8n_url="" hermes_url="" mode="" model=""
+  local task_url="" task_manager="" task_label="" n8n_url="" hermes_url="" mode="" model=""
   dashboard_panel_open "Agent workspace" "daily tools"
   if ! workspace_configured; then
     dashboard_row_html missing "Workspace" "not configured"
     dashboard_panel_close
     return 0
   fi
-  vikunja_url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  task_manager=$(workspace_task_manager)
+  task_label=$(workspace_task_manager_label "$task_manager")
+  task_url=$(workspace_task_manager_url)
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   dashboard_row_html ok "Workspace" "configured (${mode:-unknown} mode)"
   dashboard_row_html ok "Hermes model" "${model:-unset}"
-  dashboard_row_html ok "Vikunja" "${vikunja_url:-unset}"
+  dashboard_row_html ok "$task_label" "${task_url:-unset}"
   dashboard_row_html ok "n8n" "${n8n_url:-unset}"
   dashboard_row_html ok "Hermes" "${hermes_url:-unset}"
   dashboard_panel_close
