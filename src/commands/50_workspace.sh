@@ -4585,9 +4585,14 @@ workspace_supersync_user_ready() {
   email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
   pass=$(workspace_read_env SUPERSYNC_DATABASE_PASSWORD 2>/dev/null || true)
   [[ -n "$email" && -n "$pass" ]] || return 1
-  record=$(workspace_compose exec -T -e PGPASSWORD="$pass" postgres \
-    psql -qAt -U supersync -d supersync -v email="$email" \
-      -c "SELECT id || ':' || token_version FROM users WHERE email=lower(:'email') AND is_verified=1" 2>/dev/null || true)
+  record=$(
+    workspace_compose exec -T -e PGPASSWORD="$pass" postgres \
+      psql -qAt -U supersync -d supersync -v email="$email" 2>/dev/null <<'SQL' || true
+SELECT id || ':' || token_version
+FROM users
+WHERE email=lower(:'email') AND is_verified=1;
+SQL
+  )
   [[ "$record" =~ ^[1-9][0-9]*:[0-9]+$ ]]
 }
 

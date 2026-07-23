@@ -901,6 +901,36 @@ test_super_productivity_workspace_files() {
     [[ "$init_mode" == "644" ]]
 }
 
+
+test_supersync_user_ready_uses_stdin_query() {
+  local tmp status
+  tmp=$(mktemp -d)
+  set +e
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      workspace_read_env() {
+        case "$1" in
+          SUPER_PRODUCTIVITY_USER_EMAIL) printf "%s\n" m@example.com ;;
+          SUPERSYNC_DATABASE_PASSWORD) printf "%s\n" secret ;;
+          *) return 1 ;;
+        esac
+      }
+      workspace_compose() {
+        [[ " $* " != *" -c "* ]] || return 1
+        payload=$(cat)
+        [[ "$payload" == *"FROM users"* ]] || return 1
+        [[ "$payload" == *"lower(:'\''email'\'')"* ]] || return 1
+        printf "%s\n" 1:0
+      }
+      workspace_supersync_user_ready
+    ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]]
+}
+
 test_workspace_preserves_legacy_postgres_mount() {
   local tmp target
   tmp=$(mktemp -d)
@@ -6919,6 +6949,7 @@ run_test "architecture command maps core boundaries" test_architecture_command_m
 run_test "single-file build matches modules" test_single_file_build_matches_modules
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "workspace generates Super Productivity alternative" test_super_productivity_workspace_files
+run_test "workspace checks SuperSync user through stdin SQL" test_supersync_user_ready_uses_stdin_query
 run_test "workspace preserves legacy Postgres mount" test_workspace_preserves_legacy_postgres_mount
 run_test "Super Productivity rejects insecure ports mode" test_super_productivity_rejects_http_ports_mode
 run_test "workspace asks which task manager to install" test_workspace_interactive_task_manager_selector
