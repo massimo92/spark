@@ -519,14 +519,15 @@ workspace_write_supersync_build() {
 diff --git a/packages/super-sync-server/src/passkey.ts b/packages/super-sync-server/src/passkey.ts
 --- a/packages/super-sync-server/src/passkey.ts
 +++ b/packages/super-sync-server/src/passkey.ts
-@@ -599,0 +600,3 @@ export const completePasskeyRecovery = async (
+@@ -591,0 +592,3 @@ export const completePasskeyRecovery = async (
 +    const existingPasskeyCount = await tx.passkey.count({
 +      where: { userId: user.id },
 +    });
-@@ -619 +622,5 @@ export const completePasskeyRecovery = async (
--        tokenVersion: { increment: 1 }, // Invalidate all existing JWT tokens
+@@ -604 +607,6 @@ export const completePasskeyRecovery = async (
+-        tokenVersion: { increment: 1 },
 +        // Spark provisions the first access token before passkey enrollment.
-+        // Preserve it only for the initial zero-passkey enrollment; real recovery still revokes sessions.
++        // Preserve it only for the initial zero-passkey enrollment; real recovery
++        // still invalidates every existing session.
 +        ...(existingPasskeyCount === 0
 +          ? {}
 +          : { tokenVersion: { increment: 1 } }),
@@ -534,8 +535,8 @@ PATCH
   workspace_install_file "${WORKSPACE_SUPERSYNC_DIR}/Dockerfile" 600 <<'EOF'
 FROM node:24-alpine AS builder
 
-ARG SUPER_PRODUCTIVITY_VERSION=v18.7.0
-ARG SUPER_PRODUCTIVITY_COMMIT=4212ed4b0d95b3610f565d077966274fd1294831
+ARG SUPER_PRODUCTIVITY_VERSION=v18.15.1
+ARG SUPER_PRODUCTIVITY_COMMIT=014b789c22c9bf75fd7202845639569b61e7cd8e
 WORKDIR /repo
 RUN apk add --no-cache git openssl libc6-compat \
     && git config --global url."https://github.com/".insteadOf ssh://git@github.com/ \
@@ -554,7 +555,7 @@ WORKDIR /repo/packages/super-sync-server
 RUN npx prisma generate && rm -rf dist && npm run build
 
 FROM node:24-alpine
-ARG SUPER_PRODUCTIVITY_COMMIT=4212ed4b0d95b3610f565d077966274fd1294831
+ARG SUPER_PRODUCTIVITY_COMMIT=014b789c22c9bf75fd7202845639569b61e7cd8e
 LABEL org.opencontainers.image.revision="${SUPER_PRODUCTIVITY_COMMIT}"
 RUN apk add --no-cache openssl libc6-compat wget \
     && addgroup -g 1001 -S nodejs \
@@ -590,8 +591,8 @@ workspace_write_super_productivity_electron_build() {
   workspace_install_file "${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}/Dockerfile" 600 <<'EOF'
 FROM node:22-bookworm AS build
 
-ARG SUPER_PRODUCTIVITY_VERSION=v18.7.0
-ARG SUPER_PRODUCTIVITY_COMMIT=4212ed4b0d95b3610f565d077966274fd1294831
+ARG SUPER_PRODUCTIVITY_VERSION=v18.15.1
+ARG SUPER_PRODUCTIVITY_COMMIT=014b789c22c9bf75fd7202845639569b61e7cd8e
 ARG TARGETARCH
 ENV SP_SKIP_WAYLAND_IDLE_HELPER_BUILD=1
 WORKDIR /src
@@ -653,11 +654,9 @@ wait "$app_pid"
 EOF
   workspace_install_file "${WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR}/spark-headless.patch" 600 <<'EOF'
 diff --git a/electron/electronAPI.d.ts b/electron/electronAPI.d.ts
-index bda757d..fc98291 100644
 --- a/electron/electronAPI.d.ts
 +++ b/electron/electronAPI.d.ts
-@@ -24,4 +24,11 @@
- export interface ElectronAPI {
+@@ -27,0 +28,7 @@ export interface ElectronAPI {
 +  getSparkBootstrapConfig(): {
 +    enabled: boolean;
 +    baseUrl: string;
@@ -665,65 +664,29 @@ index bda757d..fc98291 100644
 +    encryptionPassword: string;
 +  };
 +
-   on(
-     channel: string,
-     listener: (event: IpcRendererEvent, ...args: unknown[]) => void,
 diff --git a/electron/preload.ts b/electron/preload.ts
-index f7ba75d..499430c 100644
 --- a/electron/preload.ts
 +++ b/electron/preload.ts
-@@ -51,4 +51,10 @@
- const ea: ElectronAPI = {
+@@ -34,0 +35,6 @@ const ea: ElectronAPI = {
 +  getSparkBootstrapConfig: () => ({
 +    enabled: process.env.SPARK_HEADLESS === '1',
 +    baseUrl: process.env.SUPERSYNC_INTERNAL_URL || '',
 +    accessToken: process.env.SUPERSYNC_ACCESS_TOKEN || '',
 +    encryptionPassword: process.env.SUPERSYNC_ENCRYPTION_PASSWORD || '',
 +  }),
-   on: (
-     channel: string,
-     listener: (event: IpcRendererEvent, ...args: unknown[]) => void,
 diff --git a/src/app/core/startup/startup.service.ts b/src/app/core/startup/startup.service.ts
-index 296f03b..1bfe35e 100644
 --- a/src/app/core/startup/startup.service.ts
 +++ b/src/app/core/startup/startup.service.ts
-@@ -28,7 +28,7 @@ import {
-   shouldShowRateDialog,
- } from '../../features/dialog-please-rate/rate-dialog-state';
- import { map, switchMap, take } from 'rxjs/operators';
+@@ -24 +24 @@ import { LS } from '../persistence/storage-keys.const';
 -import { combineLatest } from 'rxjs';
 +import { combineLatest, firstValueFrom } from 'rxjs';
- import { Store } from '@ngrx/store';
- import { selectSyncConfig } from '../../features/config/store/global-config.reducer';
- import { selectEnabledIssueProviders } from '../../features/issue/store/issue-provider.selectors';
-@@ -43,6 +43,7 @@ import { DataInitStateService } from '../data-init/data-init-state.service';
- import { OnboardingHintService } from '../../features/onboarding/onboarding-hint.service';
- import { LocalRestApiHandlerService } from '../electron/local-rest-api-handler.service';
- import { CustomThemeService } from '../theme/custom-theme.service';
+@@ -39,0 +40 @@ import { JiraElectronBridgeService } from '../../features/issue/providers/jira/jira-electron-bridge.service';
 +import { SyncProviderManager } from '../../op-log/sync-providers/provider-manager.service';
-
- const w = window as Window & { productivityTips?: string[][]; randomIndex?: number };
-
-@@ -81,6 +82,7 @@ export class StartupService {
-   private _dataInitStateService = inject(DataInitStateService);
-   private _injector = inject(Injector);
-   private _customThemeService = inject(CustomThemeService);
+@@ -80,0 +82 @@ export class StartupService {
 +  private _syncProviderManager = inject(SyncProviderManager);
-
-   constructor() {
-     // Initialize electron error handler in an effect
-@@ -178,6 +180,7 @@ export class StartupService {
-
-     if (IS_ELECTRON) {
-       this._injector.get(LocalRestApiHandlerService).init();
+@@ -188,0 +191 @@ export class StartupService {
 +      this._applySparkBootstrapAfterDataLoad();
-
-       window.ea.on(IPC.TRANSFER_SETTINGS_REQUESTED, () =>
-         this._sendCurrentSettingsToElectronAfterDataLoad(),
-@@ -209,6 +212,57 @@ export class StartupService {
-     }
-   }
-
+@@ -219,0 +223,51 @@ export class StartupService {
 +  private _applySparkBootstrapAfterDataLoad(): void {
 +    const bootstrap = window.ea.getSparkBootstrapConfig();
 +    if (
@@ -775,9 +738,6 @@ index 296f03b..1bfe35e 100644
 +    });
 +  }
 +
-   private _sendCurrentSettingsToElectronAfterDataLoad(): void {
-     this._dataInitStateService.isAllDataLoadedInitially$
-       .pipe(
 EOF
 }
 

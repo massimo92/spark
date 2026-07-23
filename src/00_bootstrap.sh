@@ -71,9 +71,9 @@ WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT="terminal file web skills memory todo cron
 WORKSPACE_HERMES_CLI_TOOLSETS_DISABLED="browser code_execution vision video image_gen video_gen x_search tts context_engine session_search clarify homeassistant spotify yuanbao computer_use"
 WORKSPACE_POSTGRES_IMAGE_DEFAULT="postgres:18"
 WORKSPACE_VIKUNJA_IMAGE_DEFAULT="vikunja/vikunja:latest"
-WORKSPACE_SUPERSYNC_IMAGE_DEFAULT="spark/supersync:18.7.0"
-WORKSPACE_SUPER_PRODUCTIVITY_VERSION_DEFAULT="v18.7.0"
-WORKSPACE_SUPER_PRODUCTIVITY_COMMIT_DEFAULT="4212ed4b0d95b3610f565d077966274fd1294831"
+WORKSPACE_SUPERSYNC_IMAGE_DEFAULT="spark/supersync:18.15.1"
+WORKSPACE_SUPER_PRODUCTIVITY_VERSION_DEFAULT="v18.15.1"
+WORKSPACE_SUPER_PRODUCTIVITY_COMMIT_DEFAULT="014b789c22c9bf75fd7202845639569b61e7cd8e"
 WORKSPACE_N8N_IMAGE_DEFAULT="docker.n8n.io/n8nio/n8n:latest"
 
 # Detect total system memory in GiB. On the GB10 (unified memory) nvidia-smi reports

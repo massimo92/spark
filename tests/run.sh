@@ -895,7 +895,10 @@ test_super_productivity_workspace_files() {
     [[ "$dockerfile" == *"npm ci --ignore-scripts || npm install --ignore-scripts"* ]] &&
     [[ "$dockerfile" == *"xvfb xauth socat"* ]] &&
     [[ "$supersync_dockerfile" == *"packages/super-sync-server"* ]] &&
-    [[ "$supersync_dockerfile" == *"SUPER_PRODUCTIVITY_COMMIT=4212ed4b0d95b3610f565d077966274fd1294831"* ]] &&
+    [[ "$dockerfile" == *"SUPER_PRODUCTIVITY_VERSION=v18.15.1"* ]] &&
+    [[ "$dockerfile" == *"SUPER_PRODUCTIVITY_COMMIT=014b789c22c9bf75fd7202845639569b61e7cd8e"* ]] &&
+    [[ "$supersync_dockerfile" == *"SUPER_PRODUCTIVITY_VERSION=v18.15.1"* ]] &&
+    [[ "$supersync_dockerfile" == *"SUPER_PRODUCTIVITY_COMMIT=014b789c22c9bf75fd7202845639569b61e7cd8e"* ]] &&
     [[ "$supersync_dockerfile" == *"COPY spark-initial-passkey.patch"* ]] &&
     [[ "$supersync_dockerfile" == *"git apply --check --unidiff-zero /tmp/spark-initial-passkey.patch"* ]] &&
     [[ "$supersync_patch" == *"existingPasskeyCount === 0"* ]] &&
