@@ -1141,7 +1141,21 @@ workspace_write_files_super_productivity() {
   supersync_image="${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-$(workspace_env_or_value WORKSPACE_SUPERSYNC_IMAGE "$WORKSPACE_SUPERSYNC_IMAGE_DEFAULT")}"
   electron_version="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_VERSION:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_VERSION "$WORKSPACE_SUPER_PRODUCTIVITY_VERSION_DEFAULT")}"
   electron_commit="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_COMMIT:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_COMMIT "$WORKSPACE_SUPER_PRODUCTIVITY_COMMIT_DEFAULT")}"
-  electron_image="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE:-spark/super-productivity-electron:${electron_version#v}}"
+  electron_image="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE:-$(workspace_env_or_value WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE "spark/super-productivity-electron:${electron_version#v}")}"
+  if [[ -z "${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-}" &&
+        -z "${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE:-}" &&
+        -z "${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_VERSION:-}" &&
+        -z "${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_COMMIT:-}" &&
+        "$supersync_image" == "spark/supersync:18.7.0" &&
+        "$electron_image" == "spark/super-productivity-electron:18.7.0" &&
+        "$electron_version" == "v18.7.0" &&
+        "$electron_commit" == "4212ed4b0d95b3610f565d077966274fd1294831" ]]; then
+    supersync_image="$WORKSPACE_SUPERSYNC_IMAGE_DEFAULT"
+    electron_version="$WORKSPACE_SUPER_PRODUCTIVITY_VERSION_DEFAULT"
+    electron_commit="$WORKSPACE_SUPER_PRODUCTIVITY_COMMIT_DEFAULT"
+    electron_image="spark/super-productivity-electron:${electron_version#v}"
+    info "Upgraded Spark-managed Super Productivity pins to ${electron_version}"
+  fi
   n8n_image="${SPARK_WORKSPACE_N8N_IMAGE:-$(workspace_env_or_value WORKSPACE_N8N_IMAGE "$WORKSPACE_N8N_IMAGE_DEFAULT")}"
   rp_id=$(workspace_url_host "$task_url")
 

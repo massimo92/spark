@@ -862,6 +862,13 @@ test_super_productivity_workspace_files() {
     SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_WORKSPACE_TASK_MANAGER=super-productivity \
     SPARK_WORKSPACE_TAILSCALE_MODE=services bash -c '
       source "$1"
+      mkdir -p "$WORKSPACE_CONFIG_DIR"
+      workspace_install_file "$WORKSPACE_ENV_FILE" 600 <<EOF
+WORKSPACE_SUPERSYNC_IMAGE=spark/supersync:18.7.0
+WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE=spark/super-productivity-electron:18.7.0
+WORKSPACE_SUPER_PRODUCTIVITY_VERSION=v18.7.0
+WORKSPACE_SUPER_PRODUCTIVITY_COMMIT=4212ed4b0d95b3610f565d077966274fd1294831
+EOF
       workspace_write_files_super_productivity robin-triceratops.ts.net massimo m@example.com unused m@example.com unused Org/Alpha
     ' _ "$SPARK" >/dev/null 2>&1
   compose=$(cat "${tmp}/home/.config/spark/workspace/docker-compose.yml")
@@ -876,6 +883,10 @@ test_super_productivity_workspace_files() {
   init_mode=$(stat -c '%a' "${tmp}/home/.config/spark/workspace/init-db.sh" 2>/dev/null || stat -f '%Lp' "${tmp}/home/.config/spark/workspace/init-db.sh")
   rm -rf "$tmp"
   [[ "$env" == *"WORKSPACE_TASK_MANAGER=super-productivity"* ]] &&
+    [[ "$env" == *"WORKSPACE_SUPERSYNC_IMAGE=spark/supersync:18.15.1"* ]] &&
+    [[ "$env" == *"WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE=spark/super-productivity-electron:18.15.1"* ]] &&
+    [[ "$env" == *"WORKSPACE_SUPER_PRODUCTIVITY_VERSION=v18.15.1"* ]] &&
+    [[ "$env" == *"WORKSPACE_SUPER_PRODUCTIVITY_COMMIT=014b789c22c9bf75fd7202845639569b61e7cd8e"* ]] &&
     [[ "$env" == *"TASK_MANAGER_URL=https://tasks.robin-triceratops.ts.net"* ]] &&
     [[ "$compose" == *$'  supersync:\n'* ]] &&
     [[ "$compose" == *$'  super-productivity-electron:\n'* ]] &&
@@ -907,6 +918,31 @@ test_super_productivity_workspace_files() {
     [[ "$gateway_absent" -eq 1 ]] &&
     [[ "$mode" == "600" ]] &&
     [[ "$init_mode" == "644" ]]
+}
+
+
+test_super_productivity_custom_pins_are_preserved() {
+  local tmp env
+  tmp=$(mktemp -d)
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_WORKSPACE_TASK_MANAGER=super-productivity \
+    SPARK_WORKSPACE_TAILSCALE_MODE=services bash -c '
+      source "$1"
+      mkdir -p "$WORKSPACE_CONFIG_DIR"
+      workspace_install_file "$WORKSPACE_ENV_FILE" 600 <<EOF
+WORKSPACE_SUPERSYNC_IMAGE=registry.example/supersync:custom
+WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE=registry.example/electron:custom
+WORKSPACE_SUPER_PRODUCTIVITY_VERSION=v18.14.0
+WORKSPACE_SUPER_PRODUCTIVITY_COMMIT=2222222222222222222222222222222222222222
+EOF
+      workspace_write_files_super_productivity robin-triceratops.ts.net massimo m@example.com unused m@example.com unused Org/Alpha
+    ' _ "$SPARK" >/dev/null 2>&1
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  rm -rf "$tmp"
+  [[ "$env" == *"WORKSPACE_SUPERSYNC_IMAGE=registry.example/supersync:custom"* ]] &&
+    [[ "$env" == *"WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE=registry.example/electron:custom"* ]] &&
+    [[ "$env" == *"WORKSPACE_SUPER_PRODUCTIVITY_VERSION=v18.14.0"* ]] &&
+    [[ "$env" == *"WORKSPACE_SUPER_PRODUCTIVITY_COMMIT=2222222222222222222222222222222222222222"* ]]
 }
 
 
@@ -6986,6 +7022,7 @@ run_test "architecture command maps core boundaries" test_architecture_command_m
 run_test "single-file build matches modules" test_single_file_build_matches_modules
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "workspace generates Super Productivity alternative" test_super_productivity_workspace_files
+run_test "workspace preserves custom Super Productivity pins" test_super_productivity_custom_pins_are_preserved
 run_test "workspace checks SuperSync user through stdin SQL" test_supersync_user_ready_uses_stdin_query
 run_test "SuperSync setup creates initial passkey enrollment URL" test_supersync_initial_passkey_enrollment_url
 run_test "workspace preserves legacy Postgres mount" test_workspace_preserves_legacy_postgres_mount
