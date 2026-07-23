@@ -856,7 +856,7 @@ test_source_guard_loads_without_dispatch() {
 }
 
 test_super_productivity_workspace_files() {
-  local tmp compose env sync_env dockerfile supersync_dockerfile headless_patch gateway_absent mode init_mode
+  local tmp compose env sync_env dockerfile supersync_dockerfile supersync_patch headless_patch gateway_absent mode init_mode
   tmp=$(mktemp -d)
   HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
     SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_WORKSPACE_TASK_MANAGER=super-productivity \
@@ -869,6 +869,7 @@ test_super_productivity_workspace_files() {
   sync_env=$(cat "${tmp}/home/.config/spark/workspace/super-productivity.env")
   dockerfile=$(cat "${tmp}/home/.config/spark/workspace/super-productivity-electron/Dockerfile")
   supersync_dockerfile=$(cat "${tmp}/home/.config/spark/workspace/supersync/Dockerfile")
+  supersync_patch=$(cat "${tmp}/home/.config/spark/workspace/supersync/spark-initial-passkey.patch")
   headless_patch=$(cat "${tmp}/home/.config/spark/workspace/super-productivity-electron/spark-headless.patch")
   [[ ! -e "${tmp}/home/.config/spark/workspace/super-productivity-gateway.conf" ]] && gateway_absent=1 || gateway_absent=0
   mode=$(stat -c '%a' "${tmp}/home/.config/spark/workspace/super-productivity.env" 2>/dev/null || stat -f '%Lp' "${tmp}/home/.config/spark/workspace/super-productivity.env")
@@ -895,6 +896,10 @@ test_super_productivity_workspace_files() {
     [[ "$dockerfile" == *"xvfb xauth socat"* ]] &&
     [[ "$supersync_dockerfile" == *"packages/super-sync-server"* ]] &&
     [[ "$supersync_dockerfile" == *"SUPER_PRODUCTIVITY_COMMIT=4212ed4b0d95b3610f565d077966274fd1294831"* ]] &&
+    [[ "$supersync_dockerfile" == *"COPY spark-initial-passkey.patch"* ]] &&
+    [[ "$supersync_dockerfile" == *"git apply --check --unidiff-zero /tmp/spark-initial-passkey.patch"* ]] &&
+    [[ "$supersync_patch" == *"existingPasskeyCount === 0"* ]] &&
+    [[ "$supersync_patch" == *": { tokenVersion: { increment: 1 } })"* ]] &&
     [[ "$headless_patch" != *$'+import { SyncProviderId '* ]] &&
     [[ "$gateway_absent" -eq 1 ]] &&
     [[ "$mode" == "600" ]] &&
@@ -929,6 +934,35 @@ test_supersync_user_ready_uses_stdin_query() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -eq 0 ]]
+}
+
+test_supersync_initial_passkey_enrollment_url() {
+  local tmp out
+  tmp=$(mktemp -d)
+  out=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      workspace_read_env() {
+        [[ "$1" == SUPERSYNC_DATABASE_PASSWORD ]] || return 1
+        printf "%s\n" secret
+      }
+      workspace_random_hex_token() {
+        printf "%064d\n" 0
+      }
+      workspace_task_manager_url() {
+        printf "%s\n" https://tasks.example.ts.net
+      }
+      workspace_compose() {
+        payload=$(cat)
+        [[ "$payload" == *"NOT EXISTS (SELECT 1 FROM passkeys"* ]] || return 1
+        [[ "$payload" == *"+ 900000"* ]] || return 1
+        [[ "$payload" != *"token_version"* ]] || return 1
+        printf "%s\n" 1
+      }
+      workspace_supersync_create_passkey_enrollment_url m@example.com
+    ' _ "$SPARK" 2>/dev/null)
+  rm -rf "$tmp"
+  [[ "$out" == "https://tasks.example.ts.net/recover-passkey?token=$(printf '%064d' 0)" ]]
 }
 
 test_workspace_preserves_legacy_postgres_mount() {
@@ -6950,6 +6984,7 @@ run_test "single-file build matches modules" test_single_file_build_matches_modu
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "workspace generates Super Productivity alternative" test_super_productivity_workspace_files
 run_test "workspace checks SuperSync user through stdin SQL" test_supersync_user_ready_uses_stdin_query
+run_test "SuperSync setup creates initial passkey enrollment URL" test_supersync_initial_passkey_enrollment_url
 run_test "workspace preserves legacy Postgres mount" test_workspace_preserves_legacy_postgres_mount
 run_test "Super Productivity rejects insecure ports mode" test_super_productivity_rejects_http_ports_mode
 run_test "workspace asks which task manager to install" test_workspace_interactive_task_manager_selector

@@ -5501,6 +5501,14 @@ workspace_random_secret() {
   fi
 }
 
+workspace_random_hex_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  else
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+  fi
+}
+
 workspace_random_password() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -hex 24
@@ -5958,6 +5966,22 @@ workspace_validate_image_ref() {
 
 workspace_write_supersync_build() {
   mkdir -p "$WORKSPACE_SUPERSYNC_DIR"
+  workspace_install_file "${WORKSPACE_SUPERSYNC_DIR}/spark-initial-passkey.patch" 600 <<'PATCH'
+diff --git a/packages/super-sync-server/src/passkey.ts b/packages/super-sync-server/src/passkey.ts
+--- a/packages/super-sync-server/src/passkey.ts
++++ b/packages/super-sync-server/src/passkey.ts
+@@ -599,0 +600,3 @@ export const completePasskeyRecovery = async (
++    const existingPasskeyCount = await tx.passkey.count({
++      where: { userId: user.id },
++    });
+@@ -619 +622,5 @@ export const completePasskeyRecovery = async (
+-        tokenVersion: { increment: 1 }, // Invalidate all existing JWT tokens
++        // Spark provisions the first access token before passkey enrollment.
++        // Preserve it only for the initial zero-passkey enrollment; real recovery still revokes sessions.
++        ...(existingPasskeyCount === 0
++          ? {}
++          : { tokenVersion: { increment: 1 } }),
+PATCH
   workspace_install_file "${WORKSPACE_SUPERSYNC_DIR}/Dockerfile" 600 <<'EOF'
 FROM node:24-alpine AS builder
 
@@ -5969,6 +5993,9 @@ RUN apk add --no-cache git openssl libc6-compat \
     && git clone --depth 1 --branch "${SUPER_PRODUCTIVITY_VERSION}" \
       https://github.com/super-productivity/super-productivity.git . \
     && test "$(git rev-parse HEAD)" = "${SUPER_PRODUCTIVITY_COMMIT}"
+COPY spark-initial-passkey.patch /tmp/spark-initial-passkey.patch
+RUN git apply --check --unidiff-zero /tmp/spark-initial-passkey.patch \
+    && git apply --unidiff-zero /tmp/spark-initial-passkey.patch
 RUN (npm ci --ignore-scripts || npm install --ignore-scripts)
 WORKDIR /repo/packages/sync-core
 RUN npm run build && npm pack
@@ -7012,6 +7039,56 @@ RETURNING id, token_version;
 SQL
 }
 
+workspace_supersync_passkey_count() {
+  local email="$1" pass
+  pass=$(workspace_read_env SUPERSYNC_DATABASE_PASSWORD 2>/dev/null || true)
+  [[ -n "$email" && -n "$pass" ]] || return 1
+  workspace_compose exec -T -e PGPASSWORD="$pass" postgres \
+    psql -v ON_ERROR_STOP=1 -q -U supersync -d supersync -At -v email="$email" <<'SQL'
+SELECT count(*)
+FROM passkeys
+WHERE user_id = (
+  SELECT id FROM users WHERE email=lower(:'email') AND is_verified=1
+);
+SQL
+}
+
+workspace_supersync_passkey_ready() {
+  local email count
+  email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
+  [[ -n "$email" ]] || return 1
+  count=$(workspace_supersync_passkey_count "$email" 2>/dev/null || true)
+  [[ "$count" =~ ^[1-9][0-9]*$ ]]
+}
+
+workspace_supersync_create_passkey_enrollment_url() {
+  local email="$1" pass token claimed url
+  pass=$(workspace_read_env SUPERSYNC_DATABASE_PASSWORD 2>/dev/null || true)
+  [[ -n "$email" && -n "$pass" ]] || return 1
+  token=$(workspace_random_hex_token) || return 1
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || return 1
+  claimed=$(
+    workspace_compose exec -T -e PGPASSWORD="$pass" postgres \
+      psql -v ON_ERROR_STOP=1 -q -U supersync -d supersync -At \
+      -v email="$email" -v token="$token" <<'SQL'
+WITH claimed AS (
+  UPDATE users
+  SET passkey_recovery_token=:'token',
+      passkey_recovery_token_expires_at=(extract(epoch from clock_timestamp()) * 1000)::bigint + 900000
+  WHERE email=lower(:'email')
+    AND is_verified=1
+    AND NOT EXISTS (SELECT 1 FROM passkeys WHERE user_id=users.id)
+  RETURNING id
+)
+SELECT count(*) FROM claimed;
+SQL
+  ) || return 1
+  [[ "$claimed" == "1" ]] || return 1
+  url=$(workspace_task_manager_url)
+  [[ "$url" == https://* ]] || return 1
+  printf '%s/recover-passkey?token=%s\n' "${url%/}" "$token"
+}
+
 workspace_supersync_stored_token_valid() {
   local token="$1" user_id="$2" email="$3" token_version="$4"
   [[ -n "$token" ]] || return 1
@@ -7107,6 +7184,15 @@ EOF
     info "SuperSync user and access token provisioned"
   else
     info "SuperSync user already provisioned"
+  fi
+  if workspace_supersync_passkey_ready; then
+    info "SuperSync passkey already enrolled"
+  else
+    WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=$(workspace_supersync_create_passkey_enrollment_url "$email") || {
+      setup_fail "Could not create the initial SuperSync passkey enrollment link"
+      return 1
+    }
+    info "SuperSync passkey enrollment link prepared (valid for 15 minutes)"
   fi
 }
 
@@ -8883,6 +8969,7 @@ workspace_setup() {
   WORKSPACE_SHOW_VIKUNJA_PASSWORD=0
   WORKSPACE_SHOW_N8N_PASSWORD=0
   WORKSPACE_SHOW_SUPER_PRODUCTIVITY_ACCESS=0
+  WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=""
   workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$model" || {
     workspace_summary
     return $?
@@ -10988,6 +11075,7 @@ cmd_workspace_doctor() {
   if [[ "$task_manager" == "super-productivity" ]]; then
     workspace_doctor_check "Super Productivity and SuperSync configuration is complete" workspace_super_productivity_config_ready
     workspace_doctor_check "SuperSync user exists and is verified" workspace_supersync_user_ready
+    workspace_doctor_check "SuperSync passkey is enrolled" workspace_supersync_passkey_ready
     workspace_doctor_check "SuperSync access token works" workspace_supersync_token_ready
   else
     workspace_doctor_check "Vikunja registration/link sharing disabled" workspace_vikunja_locked_down
@@ -11118,6 +11206,14 @@ workspace_print_initial_credentials() {
     printf "    access token:        %s\n" "$token"
     printf "    encryption password: %s\n" "$encryption"
     printf "\n  In each browser: Settings > Sync > SuperSync; enter this server, token and encryption password.\n"
+    shown=1
+  fi
+  if [[ -n "${WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL:-}" ]]; then
+    [[ "$shown" == "0" ]] || printf "\n"
+    printf "  SuperSync passkey enrollment\n"
+    printf "    email: %s\n" "$vikunja_email"
+    printf "    link:  %s\n" "$WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL"
+    printf "\n  Open this one-time link within 15 minutes and create the passkey on your device.\n"
     shown=1
   fi
   if [[ "$shown" != "0" ]]; then
