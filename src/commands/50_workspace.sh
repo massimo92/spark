@@ -12,19 +12,32 @@ workspace_task_manager_valid() {
   esac
 }
 
-workspace_task_manager() {
-  local configured="${SPARK_WORKSPACE_TASK_MANAGER:-}" compose="${WORKSPACE_COMPOSE_FILE:-}"
-  [[ -n "$configured" ]] || configured=$(workspace_read_env WORKSPACE_TASK_MANAGER 2>/dev/null || true)
+workspace_persisted_task_manager() {
+  local configured compose="${WORKSPACE_COMPOSE_FILE:-}"
+  configured=$(workspace_read_env WORKSPACE_TASK_MANAGER 2>/dev/null || true)
   if workspace_task_manager_valid "$configured"; then
     printf '%s\n' "$configured"
     return 0
   fi
-  # Existing workspaces predate WORKSPACE_TASK_MANAGER. Preserve their Vikunja choice.
-  if [[ -f "$compose" ]] && grep -qE '^[[:space:]]{2}(supersync|super-productivity-electron):' "$compose"; then
+  [[ -f "$compose" ]] || return 1
+  if grep -qE '^[[:space:]]{2}(supersync|super-productivity-electron):' "$compose"; then
     printf 'super-productivity\n'
-  else
-    printf 'vikunja\n'
+    return 0
   fi
+  if grep -qE '^[[:space:]]{2}vikunja:' "$compose"; then
+    printf 'vikunja\n'
+    return 0
+  fi
+  return 1
+}
+
+workspace_task_manager() {
+  local configured="${SPARK_WORKSPACE_TASK_MANAGER:-}"
+  if workspace_task_manager_valid "$configured"; then
+    printf '%s\n' "$configured"
+    return 0
+  fi
+  workspace_persisted_task_manager 2>/dev/null || printf 'vikunja\n'
 }
 
 workspace_task_manager_label() {
@@ -148,6 +161,29 @@ workspace_env_or_generated_guarded() {
   if workspace_data_dir_has_content "$@"; then
     return 1
   fi
+  workspace_random_secret
+}
+
+workspace_vikunja_service_secret() {
+  local val="" persisted=""
+
+  val=$(workspace_read_env VIKUNJA_SERVICE_SECRET 2>/dev/null || true)
+  if [[ -z "$val" && -f "$WORKSPACE_VIKUNJA_ENV_FILE" ]]; then
+    val=$(sed -n 's/^VIKUNJA_SERVICE_SECRET=//p' "$WORKSPACE_VIKUNJA_ENV_FILE" | head -1)
+  fi
+  if [[ -n "$val" ]]; then
+    printf '%s\n' "$val"
+    return 0
+  fi
+
+  if workspace_data_dir_has_content "${WORKSPACE_DATA_DIR}/vikunja-files"; then
+    return 1
+  fi
+  persisted=$(workspace_persisted_task_manager 2>/dev/null || true)
+  if [[ "$persisted" == "vikunja" ]] && workspace_data_dir_has_content "${WORKSPACE_DATA_DIR}/postgres"; then
+    return 1
+  fi
+
   workspace_random_secret
 }
 
@@ -799,7 +835,7 @@ workspace_write_files_vikunja() {
   postgres_pass=$(workspace_env_or_generated_guarded POSTGRES_PASSWORD "${WORKSPACE_DATA_DIR}/postgres") \
     || { setup_fail "Missing Postgres password (POSTGRES_PASSWORD) while existing workspace data is present; restore it before rerun"; return 1; }
   vikunja_db_pass=$(workspace_env_or_generated VIKUNJA_DATABASE_PASSWORD)
-  vikunja_secret=$(workspace_env_or_generated_guarded VIKUNJA_SERVICE_SECRET "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/vikunja-files") \
+  vikunja_secret=$(workspace_vikunja_service_secret) \
     || { setup_fail "Missing Vikunja service secret (VIKUNJA_SERVICE_SECRET) while existing workspace data is present; restore it before rerun"; return 1; }
   n8n_db_pass=$(workspace_env_or_generated DB_POSTGRESDB_PASSWORD)
   n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
@@ -3034,6 +3070,154 @@ workspace_setup_hermes_super_productivity_access() {
   return 1
 }
 
+workspace_task_manager_artifacts_exist() {
+  case "${1:-}" in
+    vikunja)
+      [[ -e "$WORKSPACE_VIKUNJA_ENV_FILE" ||
+         -e "${WORKSPACE_DATA_DIR}/vikunja-files" ||
+         -e "${WORKSPACE_CONFIG_DIR}/hermes-skills/vikunja" ]]
+      ;;
+    super-productivity)
+      [[ -e "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" ||
+         -e "${WORKSPACE_DATA_DIR}/super-productivity-electron" ||
+         -e "$WORKSPACE_SUPERSYNC_DIR" ||
+         -e "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR" ||
+         -e "${WORKSPACE_CONFIG_DIR}/hermes-skills/super-productivity" ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+workspace_teardown_task_manager_candidate() {
+  local previous="$1" pending="$2" current="$3"
+  workspace_task_manager_valid "$current" || return 1
+  if workspace_task_manager_valid "$previous" && [[ "$previous" != "$current" ]]; then
+    printf '%s\n' "$previous"
+    return 0
+  fi
+  if workspace_task_manager_valid "$pending" && [[ "$pending" != "$current" ]]; then
+    printf '%s\n' "$pending"
+    return 0
+  fi
+  if [[ "$current" == "vikunja" ]] && workspace_task_manager_artifacts_exist super-productivity; then
+    printf 'super-productivity\n'
+    return 0
+  fi
+  if [[ "$current" == "super-productivity" ]] && workspace_task_manager_artifacts_exist vikunja; then
+    printf 'vikunja\n'
+    return 0
+  fi
+  return 1
+}
+
+workspace_remove_managed_path() {
+  local path="$1"
+  [[ -n "$path" && -n "$WORKSPACE_CONFIG_DIR" && -n "$WORKSPACE_DATA_DIR" ]] || return 1
+  case "$path" in
+    "$WORKSPACE_CONFIG_DIR"/*|"$WORKSPACE_DATA_DIR"/*) ;;
+    *) return 1 ;;
+  esac
+  rm -rf -- "$path"
+}
+
+workspace_drop_task_manager_database() {
+  local manager="$1" db role
+  case "$manager" in
+    vikunja) db=vikunja; role=vikunja ;;
+    super-productivity) db=supersync; role=supersync ;;
+    *) return 1 ;;
+  esac
+  workspace_postgres_psql <<SQL
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = '${db}' AND pid <> pg_backend_pid();
+DROP DATABASE IF EXISTS "${db}";
+DROP ROLE IF EXISTS "${role}";
+SQL
+}
+
+workspace_cleanup_abandoned_hermes_access() {
+  local manager="$1" rule skill skill_dir skill_out="" failed=0
+  command -v openshell >/dev/null 2>&1 || return 1
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  case "$manager" in
+    vikunja)
+      rule=spark-vikunja-api
+      skill=vikunja
+      skill_dir="${WORKSPACE_CONFIG_DIR}/hermes-skills/vikunja"
+      workspace_stop_hermes_vikunja_proxy
+      openshell policy update hermes --remove-rule "$rule" --wait >/dev/null 2>&1 || failed=1
+      if workspace_hermes_vikunja_provider_attached; then
+        openshell sandbox provider detach hermes "$WORKSPACE_HERMES_VIKUNJA_PROVIDER" >/dev/null 2>&1 || failed=1
+      fi
+      if workspace_hermes_vikunja_provider_exists; then
+        openshell provider delete "$WORKSPACE_HERMES_VIKUNJA_PROVIDER" >/dev/null 2>&1 || failed=1
+      fi
+      ;;
+    super-productivity)
+      rule=spark-super-productivity-api
+      skill=super-productivity
+      skill_dir="${WORKSPACE_CONFIG_DIR}/hermes-skills/super-productivity"
+      workspace_stop_hermes_super_productivity_proxy
+      openshell policy update hermes --remove-rule "$rule" --wait >/dev/null 2>&1 || failed=1
+      ;;
+    *) return 1 ;;
+  esac
+  if ! skill_out=$(nemohermes hermes skill remove "$skill" 2>&1); then
+    [[ "$skill_out" == *"is not installed"* ]] || failed=1
+  fi
+  if [[ "$failed" == "0" ]]; then
+    workspace_remove_managed_path "$skill_dir" || return 1
+  fi
+  nemohermes hermes gateway restart --quiet >/dev/null 2>&1 || failed=1
+  [[ "$failed" == "0" ]]
+}
+
+workspace_cleanup_abandoned_task_manager() {
+  local manager="$1" failed=0
+  workspace_cleanup_abandoned_hermes_access "$manager" || failed=1
+  case "$manager" in
+    vikunja)
+      docker rm -f "$WORKSPACE_VIKUNJA_CONTAINER" >/dev/null 2>&1 || true
+      workspace_drop_task_manager_database "$manager" || failed=1
+      workspace_remove_managed_path "${WORKSPACE_DATA_DIR}/vikunja-files" || failed=1
+      workspace_remove_managed_path "$WORKSPACE_VIKUNJA_ENV_FILE" || failed=1
+      ;;
+    super-productivity)
+      docker rm -f "$WORKSPACE_SUPERSYNC_CONTAINER" "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_CONTAINER" >/dev/null 2>&1 || true
+      workspace_drop_task_manager_database "$manager" || failed=1
+      workspace_remove_managed_path "${WORKSPACE_DATA_DIR}/super-productivity-electron" || failed=1
+      workspace_remove_managed_path "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" || failed=1
+      workspace_remove_managed_path "$WORKSPACE_SUPERSYNC_DIR" || failed=1
+      workspace_remove_managed_path "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR" || failed=1
+      ;;
+    *) return 1 ;;
+  esac
+  [[ "$failed" == "0" ]]
+}
+
+workspace_finalize_task_manager_teardown() {
+  local abandoned="$1" current="$2" attempt ready=0
+  workspace_task_manager_valid "$abandoned" || return 0
+  [[ "$abandoned" != "$current" ]] || return 0
+  if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
+    info "Preserved $(workspace_task_manager_label "$abandoned") data because the new workspace is incomplete"
+    return 0
+  fi
+  workspace_cleanup_abandoned_task_manager "$abandoned" || return 1
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    case "$current" in
+      vikunja) workspace_hermes_vikunja_api_ready && ready=1 ;;
+      super-productivity) workspace_hermes_super_productivity_api_ready && ready=1 ;;
+    esac
+    [[ "$ready" == "1" ]] && break
+    sleep 1
+  done
+  [[ "$ready" == "1" ]] || return 1
+  workspace_remove_env_file_key "$WORKSPACE_ENV_FILE" WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING
+  info "Removed abandoned $(workspace_task_manager_label "$abandoned") services and data"
+}
+
 workspace_setup_hermes() {
   local model="$1" tailnet="$2" check_only="$3" hermes_url litellm_model
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
@@ -3324,6 +3508,7 @@ workspace_setup_remote() {
 
 workspace_setup() {
   local auto_yes=0 check_only=0 requested_model="" remote_spec="" requested_tail_mode="" requested_task_manager="" task_manager=""
+  local previous_task_manager="" pending_task_manager="" teardown_task_manager=""
   local postgres_image="" vikunja_image="" n8n_image="" super_productivity_image="" supersync_image="" model tailnet
   local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_password_file="" vikunja_token="" n8n_email_arg="" n8n_password_arg="" n8n_password_file="" funnel_action=""
   local existing_model="" existing_tail_mode="" effective_tail_mode="" env_tail_mode="" setup_overrides=0
@@ -3384,8 +3569,12 @@ workspace_setup() {
   [[ -n "$n8n_email_arg" ]] && SPARK_WORKSPACE_N8N_EMAIL="$n8n_email_arg"
   [[ -n "$n8n_password_arg" ]] && { workspace_require_prompt_value "n8n password" "$n8n_password_arg" text; warn "Direct password flags may remain in shell history; prefer --n8n-password-file"; }
   [[ -n "$n8n_password_arg" ]] && SPARK_WORKSPACE_N8N_PASSWORD="$n8n_password_arg"
+  previous_task_manager=$(workspace_persisted_task_manager 2>/dev/null || true)
+  pending_task_manager=$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING 2>/dev/null || true)
   task_manager=$(workspace_select_task_manager "$requested_task_manager" "$auto_yes")
   SPARK_WORKSPACE_TASK_MANAGER="$task_manager"
+  teardown_task_manager=$(workspace_teardown_task_manager_candidate \
+    "$previous_task_manager" "$pending_task_manager" "$task_manager" 2>/dev/null || true)
   if [[ "$task_manager" == "super-productivity" && ( "$requested_tail_mode" == "ports" || "$env_tail_mode" == "ports" ) ]]; then
     die "SuperSync requires HTTPS; --tailscale-mode ports is not supported" "Use Tailscale Services mode."
   fi
@@ -3438,7 +3627,7 @@ workspace_setup() {
   existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   existing_tail_mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   effective_tail_mode="${requested_tail_mode:-services}"
-  if [[ -n "$requested_model" || -n "$requested_task_manager" || -n "$postgres_image" || -n "$vikunja_image" || -n "$super_productivity_image" || -n "$supersync_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
+  if [[ -n "$teardown_task_manager" || -n "$requested_model" || -n "$requested_task_manager" || -n "$postgres_image" || -n "$vikunja_image" || -n "$super_productivity_image" || -n "$supersync_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
     setup_overrides=1
   fi
   if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
@@ -3539,6 +3728,9 @@ workspace_setup() {
     workspace_summary
     return $?
   }
+  if workspace_task_manager_valid "$teardown_task_manager" && [[ "$teardown_task_manager" != "$task_manager" ]]; then
+    workspace_set_env_key WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING "$teardown_task_manager"
+  fi
   if [[ "$task_manager" == "super-productivity" ]]; then
     workspace_prepare_super_productivity_runtime || {
       workspace_summary
@@ -3588,6 +3780,8 @@ workspace_setup() {
       setup_fail "Tailscale workspace URLs are not reachable yet"
     fi
   fi
+  workspace_finalize_task_manager_teardown "$teardown_task_manager" "$task_manager" \
+    || setup_fail "Could not remove the abandoned $(workspace_task_manager_label "$teardown_task_manager") services and data"
   setup_rc=0
   workspace_summary || setup_rc=$?
   workspace_print_initial_credentials "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass"
