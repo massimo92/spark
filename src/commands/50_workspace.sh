@@ -1670,6 +1670,46 @@ workspace_supersync_bootstrap_schema() {
   ' >/dev/null 2>&1
 }
 
+workspace_supersync_reconcile_baseline_migration() {
+  local pass state
+  workspace_supersync_schema_exists || return 0
+  workspace_compose run --rm --no-deps -T supersync \
+    test -d prisma/migrations/0_init >/dev/null 2>&1 || return 0
+  pass=$(workspace_read_env SUPERSYNC_DATABASE_PASSWORD 2>/dev/null || true)
+  [[ -n "$pass" ]] || return 1
+  state=$(
+    workspace_compose exec -T -e PGPASSWORD="$pass" postgres \
+      psql -v ON_ERROR_STOP=1 -qAt -U supersync -d supersync <<'SQL'
+SELECT CASE
+  WHEN EXISTS (
+    SELECT 1 FROM _prisma_migrations
+    WHERE migration_name = '0_init'
+      AND finished_at IS NOT NULL
+      AND rolled_back_at IS NULL
+  ) THEN 'applied'
+  WHEN EXISTS (
+    SELECT 1 FROM _prisma_migrations
+    WHERE migration_name <> '0_init'
+      AND finished_at IS NOT NULL
+      AND rolled_back_at IS NULL
+  ) THEN 'legacy'
+  ELSE 'unknown'
+END;
+SQL
+  ) || return 1
+  case "$state" in
+    applied) return 0 ;;
+    legacy)
+      workspace_compose run --rm --no-deps -T supersync \
+        npx prisma migrate resolve --rolled-back 0_init >/dev/null 2>&1 || true
+      workspace_compose run --rm --no-deps -T supersync \
+        npx prisma migrate resolve --applied 0_init >/dev/null 2>&1 || return 1
+      info "Registered the existing SuperSync schema against the 0_init baseline"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 workspace_prepare_super_productivity_runtime() {
   local email record user_id token_version token
   [[ "$(workspace_task_manager)" == "super-productivity" ]] || return 0
@@ -1682,6 +1722,8 @@ workspace_prepare_super_productivity_runtime() {
     || { setup_fail "Could not build the pinned SuperSync image"; return 1; }
   workspace_supersync_bootstrap_schema \
     || { setup_fail "Could not initialize the SuperSync database schema"; return 1; }
+  workspace_supersync_reconcile_baseline_migration \
+    || { setup_fail "Could not reconcile the SuperSync migration baseline"; return 1; }
   workspace_compose run --rm supersync-migrate >/dev/null 2>&1 \
     || { setup_fail "Could not apply SuperSync database migrations"; return 1; }
   record=$(workspace_supersync_user_record "$email" 2>/dev/null | grep -E '^[1-9][0-9]*:[0-9]+$' | head -1) || {
