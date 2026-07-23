@@ -1142,6 +1142,211 @@ test_workspace_interactive_task_manager_selector() {
   [[ "$super_productivity" == "super-productivity" && "$vikunja" == "vikunja" ]]
 }
 
+
+test_workspace_persisted_task_manager_ignores_runtime_override() {
+  local tmp out
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf '%s\n' 'WORKSPACE_TASK_MANAGER=super-productivity' \
+    > "${tmp}/home/.config/spark/workspace/secrets.env"
+  out=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      printf "persisted=%s\n" "$(workspace_persisted_task_manager)"
+      SPARK_WORKSPACE_TASK_MANAGER=vikunja
+      printf "effective=%s\n" "$(workspace_task_manager)"
+    ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$out" == $'persisted=super-productivity\neffective=vikunja' ]]
+}
+
+test_workspace_vikunja_secret_is_manager_scoped() {
+  local tmp out
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.config/spark/workspace" "${tmp}/home/.local/share/spark/workspace/postgres"
+  printf '%s\n' 'WORKSPACE_TASK_MANAGER=super-productivity' \
+    > "${tmp}/home/.config/spark/workspace/secrets.env"
+  printf '%s\n' '18' > "${tmp}/home/.local/share/spark/workspace/postgres/PG_VERSION"
+  out=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      workspace_random_secret() { printf "generated-secret\n"; }
+      printf "generated=%s\n" "$(workspace_vikunja_service_secret)"
+      printf "%s\n" "WORKSPACE_TASK_MANAGER=vikunja" > "$WORKSPACE_ENV_FILE"
+      if workspace_vikunja_service_secret >/dev/null; then
+        printf "unguarded\n"
+      else
+        printf "guarded\n"
+      fi
+      printf "%s\n" "VIKUNJA_SERVICE_SECRET=old-secret" > "$WORKSPACE_VIKUNJA_ENV_FILE"
+      printf "restored=%s\n" "$(workspace_vikunja_service_secret)"
+    ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$out" == $'generated=generated-secret\nguarded\nrestored=old-secret' ]]
+}
+
+
+test_workspace_selects_abandoned_task_manager_for_teardown() {
+  local tmp out
+  tmp=$(mktemp -d)
+  out=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      printf "switch=%s\n" "$(workspace_teardown_task_manager_candidate super-productivity "" vikunja)"
+      printf "pending=%s\n" "$(workspace_teardown_task_manager_candidate vikunja super-productivity vikunja)"
+      workspace_task_manager_artifacts_exist() { [[ "$1" == vikunja ]]; }
+      printf "legacy=%s\n" "$(workspace_teardown_task_manager_candidate "" "" super-productivity)"
+    ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$out" == $'switch=super-productivity\npending=super-productivity\nlegacy=vikunja' ]]
+}
+
+
+test_workspace_task_manager_teardown_covers_services_and_data() {
+  local tmp log calls
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      workspace_cleanup_abandoned_hermes_access() { printf "hermes:%s\n" "$1" >> "$SPARK_TEST_LOG"; }
+      workspace_drop_task_manager_database() { printf "database:%s\n" "$1" >> "$SPARK_TEST_LOG"; }
+      workspace_remove_managed_path() { printf "remove:%s\n" "$1" >> "$SPARK_TEST_LOG"; }
+      docker() { printf "docker:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+      workspace_cleanup_abandoned_task_manager super-productivity
+      workspace_cleanup_abandoned_task_manager vikunja
+    ' _ "$SPARK" >/dev/null 2>&1
+  calls=$(cat "$log")
+  rm -rf "$tmp"
+  [[ "$calls" == *"hermes:super-productivity"* ]] &&
+    [[ "$calls" == *"database:super-productivity"* ]] &&
+    [[ "$calls" == *"docker:rm -f workspace-supersync workspace-super-productivity-electron"* ]] &&
+    [[ "$calls" == *"remove:${tmp}/home/.local/share/spark/workspace/super-productivity-electron"* ]] &&
+    [[ "$calls" == *"remove:${tmp}/home/.config/spark/workspace/super-productivity.env"* ]] &&
+    [[ "$calls" == *"remove:${tmp}/home/.config/spark/workspace/supersync"* ]] &&
+    [[ "$calls" == *"remove:${tmp}/home/.config/spark/workspace/super-productivity-electron"* ]] &&
+    [[ "$calls" == *"hermes:vikunja"* ]] &&
+    [[ "$calls" == *"database:vikunja"* ]] &&
+    [[ "$calls" == *"docker:rm -f workspace-vikunja"* ]] &&
+    [[ "$calls" == *"remove:${tmp}/home/.local/share/spark/workspace/vikunja-files"* ]] &&
+    [[ "$calls" == *"remove:${tmp}/home/.config/spark/workspace/vikunja.env"* ]]
+}
+
+
+test_workspace_task_manager_teardown_removes_hermes_access() {
+  local tmp log calls
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      openshell() { printf "openshell:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+      nemohermes() { printf "nemohermes:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+      workspace_stop_hermes_vikunja_proxy() { printf "%s\n" stop-vikunja-proxy >> "$SPARK_TEST_LOG"; }
+      workspace_stop_hermes_super_productivity_proxy() { printf "%s\n" stop-super-productivity-proxy >> "$SPARK_TEST_LOG"; }
+      workspace_hermes_vikunja_provider_attached() { return 0; }
+      workspace_hermes_vikunja_provider_exists() { return 0; }
+      workspace_remove_managed_path() { printf "remove:%s\n" "$1" >> "$SPARK_TEST_LOG"; }
+      workspace_cleanup_abandoned_hermes_access vikunja
+      workspace_cleanup_abandoned_hermes_access super-productivity
+    ' _ "$SPARK" >/dev/null 2>&1
+  calls=$(cat "$log")
+  rm -rf "$tmp"
+  [[ "$calls" == *"stop-vikunja-proxy"* ]] &&
+    [[ "$calls" == *"openshell:policy update hermes --remove-rule spark-vikunja-api --wait"* ]] &&
+    [[ "$calls" == *"openshell:sandbox provider detach hermes spark-vikunja"* ]] &&
+    [[ "$calls" == *"openshell:provider delete spark-vikunja"* ]] &&
+    [[ "$calls" == *"nemohermes:hermes skill remove vikunja"* ]] &&
+    [[ "$calls" == *"remove:${tmp}/home/.config/spark/workspace/hermes-skills/vikunja"* ]] &&
+    [[ "$calls" == *"stop-super-productivity-proxy"* ]] &&
+    [[ "$calls" == *"openshell:policy update hermes --remove-rule spark-super-productivity-api --wait"* ]] &&
+    [[ "$calls" == *"nemohermes:hermes skill remove super-productivity"* ]] &&
+    [[ "$calls" == *"remove:${tmp}/home/.config/spark/workspace/hermes-skills/super-productivity"* ]] &&
+    [[ "$(grep -c '^nemohermes:hermes gateway restart --quiet$' <<<"$calls")" == 2 ]]
+}
+
+
+test_workspace_task_manager_teardown_drops_database_and_role() {
+  local tmp vikunja_sql supersync_sql
+  tmp=$(mktemp -d)
+  vikunja_sql=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      workspace_postgres_psql() { cat; }
+      workspace_drop_task_manager_database vikunja
+    ' _ "$SPARK")
+  supersync_sql=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      workspace_postgres_psql() { cat; }
+      workspace_drop_task_manager_database super-productivity
+    ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$vikunja_sql" == *"datname = 'vikunja'"* ]] &&
+    [[ "$vikunja_sql" == *'DROP DATABASE IF EXISTS "vikunja";'* ]] &&
+    [[ "$vikunja_sql" == *'DROP ROLE IF EXISTS "vikunja";'* ]] &&
+    [[ "$supersync_sql" == *"datname = 'supersync'"* ]] &&
+    [[ "$supersync_sql" == *'DROP DATABASE IF EXISTS "supersync";'* ]] &&
+    [[ "$supersync_sql" == *'DROP ROLE IF EXISTS "supersync";'* ]]
+}
+
+
+test_workspace_task_manager_teardown_waits_and_retries() {
+  local tmp log status calls env
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf '%s\n' 'WORKSPACE_TASK_MANAGER=super-productivity' \
+    'WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING=vikunja' \
+    > "${tmp}/home/.config/spark/workspace/secrets.env"
+  log="${tmp}/calls"
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      workspace_cleanup_abandoned_task_manager() {
+        printf "cleanup:%s\n" "$1" >> "$SPARK_TEST_LOG"
+        [[ "${SPARK_TEST_CLEANUP_FAIL:-0}" != 1 ]]
+      }
+      workspace_hermes_super_productivity_api_ready() { return 0; }
+      SETUP_FAILED=(new-manager-failed)
+      workspace_finalize_task_manager_teardown vikunja super-productivity
+      [[ ! -e "$SPARK_TEST_LOG" ]]
+      [[ "$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING)" == vikunja ]]
+      SETUP_FAILED=()
+      SPARK_TEST_CLEANUP_FAIL=1
+      ! workspace_finalize_task_manager_teardown vikunja super-productivity
+      [[ "$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING)" == vikunja ]]
+      SPARK_TEST_CLEANUP_FAIL=0
+      workspace_finalize_task_manager_teardown vikunja super-productivity
+      [[ -z "$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING)" ]]
+    ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  calls=$(cat "$log" 2>/dev/null || true)
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$calls" == $'cleanup:vikunja\ncleanup:vikunja' ]] &&
+    [[ "$env" != *"WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING="* ]]
+}
+
+
+test_workspace_remove_managed_path_rejects_broad_targets() {
+  local tmp status
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.config/spark/workspace/allowed" "${tmp}/outside"
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama bash -c '
+      source "$1"
+      workspace_remove_managed_path "$WORKSPACE_CONFIG_DIR/allowed"
+      [[ ! -e "$WORKSPACE_CONFIG_DIR/allowed" ]]
+      ! workspace_remove_managed_path "$WORKSPACE_CONFIG_DIR"
+      ! workspace_remove_managed_path "$2/outside"
+      [[ -d "$2/outside" ]]
+    ' _ "$SPARK" "$tmp"
+  status=$?
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]]
+}
+
 test_doctor_reports_no_ngc_image() {
   local tmp fake_bin output
   tmp=$(mktemp -d)
@@ -7126,6 +7331,14 @@ run_test "SuperSync setup creates initial passkey enrollment URL" test_supersync
 run_test "workspace preserves legacy Postgres mount" test_workspace_preserves_legacy_postgres_mount
 run_test "Super Productivity rejects insecure ports mode" test_super_productivity_rejects_http_ports_mode
 run_test "workspace asks which task manager to install" test_workspace_interactive_task_manager_selector
+run_test "workspace distinguishes persisted and requested task managers" test_workspace_persisted_task_manager_ignores_runtime_override
+run_test "workspace scopes Vikunja secret guard to Vikunja data" test_workspace_vikunja_secret_is_manager_scoped
+run_test "workspace selects abandoned task manager for teardown" test_workspace_selects_abandoned_task_manager_for_teardown
+run_test "workspace task manager teardown covers services and data" test_workspace_task_manager_teardown_covers_services_and_data
+run_test "workspace task manager teardown removes Hermes access" test_workspace_task_manager_teardown_removes_hermes_access
+run_test "workspace task manager teardown drops database and role" test_workspace_task_manager_teardown_drops_database_and_role
+run_test "workspace task manager teardown waits and retries" test_workspace_task_manager_teardown_waits_and_retries
+run_test "workspace task manager teardown rejects broad paths" test_workspace_remove_managed_path_rejects_broad_targets
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vllm_image
 run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wins
