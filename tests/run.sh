@@ -1201,6 +1201,66 @@ test_workspace_selects_abandoned_task_manager_for_teardown() {
   [[ "$out" == $'switch=super-productivity\npending=super-productivity\nlegacy=vikunja' ]]
 }
 
+test_workspace_task_manager_teardown_removes_images() {
+  local tmp log out calls
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  out=$(HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      workspace_read_env() {
+        case "$1" in
+          WORKSPACE_VIKUNJA_IMAGE) printf "custom/vikunja:7\n" ;;
+          WORKSPACE_SUPERSYNC_IMAGE) printf "custom/supersync:7\n" ;;
+          WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE) printf "custom/electron:7\n" ;;
+          *) return 1 ;;
+        esac
+      }
+      docker() {
+        case "$*" in
+          "image ls --format {{.Repository}}:{{.Tag}}")
+            printf "vikunja/vikunja:0.24.6\nspark/supersync:18.7.0\nspark/super-productivity-electron:18.7.0\nunrelated/image:1\n"
+            ;;
+          "inspect --format {{.Config.Image}} workspace-vikunja") printf "container/vikunja:7\n" ;;
+          "inspect --format {{.Image}} workspace-vikunja") printf "sha256:vikunja\n" ;;
+          "inspect --format {{.Config.Image}} workspace-supersync") printf "container/supersync:7\n" ;;
+          "inspect --format {{.Image}} workspace-supersync") printf "sha256:supersync\n" ;;
+          "inspect --format {{.Config.Image}} workspace-super-productivity-electron") printf "container/electron:7\n" ;;
+          "inspect --format {{.Image}} workspace-super-productivity-electron") printf "sha256:electron\n" ;;
+          image\ inspect\ *) return 0 ;;
+          image\ rm\ -f\ *) printf "%s\n" "$*" >> "$SPARK_TEST_LOG" ;;
+          *) return 1 ;;
+        esac
+      }
+      vikunja=$(workspace_task_manager_teardown_images vikunja)
+      super_productivity=$(workspace_task_manager_teardown_images super-productivity)
+      printf "vikunja=%s\n" "$vikunja"
+      printf "super-productivity=%s\n" "$super_productivity"
+      workspace_remove_task_manager_images "$vikunja"
+      workspace_remove_task_manager_images "$super_productivity"
+      workspace_read_env() {
+        case "$1" in
+          WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING) printf "vikunja\n" ;;
+          WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES) printf "stored:image\n" ;;
+          *) return 1 ;;
+        esac
+      }
+      printf "stored=%s\n" "$(workspace_task_manager_teardown_images vikunja)"
+      printf "mismatch=%s\n" "$(workspace_task_manager_teardown_images super-productivity)"
+    ' _ "$SPARK")
+  calls=$(cat "$log")
+  rm -rf "$tmp"
+  [[ "$out" == *"vikunja=custom/vikunja:7,container/vikunja:7,sha256:vikunja,vikunja/vikunja:0.24.6,vikunja/vikunja:latest"* ]] &&
+    [[ "$out" == *"super-productivity=custom/supersync:7,custom/electron:7,container/supersync:7,sha256:supersync,container/electron:7,sha256:electron,spark/supersync:18.7.0,spark/super-productivity-electron:18.7.0,spark/supersync:18.15.1,spark/super-productivity-electron:18.15.1"* ]] &&
+    [[ "$out" == *"stored=stored:image"* ]] &&
+    [[ "$out" == *"mismatch=container/supersync:7,sha256:supersync,container/electron:7,sha256:electron"* ]] &&
+    [[ "$calls" == *"image rm -f sha256:vikunja"* ]] &&
+    [[ "$calls" == *"image rm -f sha256:supersync"* ]] &&
+    [[ "$calls" == *"image rm -f sha256:electron"* ]] &&
+    [[ "$calls" == *"image rm -f spark/supersync:18.7.0"* ]] &&
+    [[ "$calls" == *"image rm -f spark/super-productivity-electron:18.7.0"* ]]
+}
+
 
 test_workspace_task_manager_teardown_covers_services_and_data() {
   local tmp log calls
@@ -1297,13 +1357,14 @@ test_workspace_task_manager_teardown_waits_and_retries() {
   mkdir -p "${tmp}/home/.config/spark/workspace"
   printf '%s\n' 'WORKSPACE_TASK_MANAGER=super-productivity' \
     'WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING=vikunja' \
+    'WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES=vikunja/vikunja:1,sha256:old' \
     > "${tmp}/home/.config/spark/workspace/secrets.env"
   log="${tmp}/calls"
   HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
     SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
       source "$1"
       workspace_cleanup_abandoned_task_manager() {
-        printf "cleanup:%s\n" "$1" >> "$SPARK_TEST_LOG"
+        printf "cleanup:%s:%s\n" "$1" "$2" >> "$SPARK_TEST_LOG"
         [[ "${SPARK_TEST_CLEANUP_FAIL:-0}" != 1 ]]
       }
       workspace_hermes_super_productivity_api_ready() { return 0; }
@@ -1311,21 +1372,25 @@ test_workspace_task_manager_teardown_waits_and_retries() {
       workspace_finalize_task_manager_teardown vikunja super-productivity
       [[ ! -e "$SPARK_TEST_LOG" ]]
       [[ "$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING)" == vikunja ]]
+      [[ "$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES)" == "vikunja/vikunja:1,sha256:old" ]]
       SETUP_FAILED=()
       SPARK_TEST_CLEANUP_FAIL=1
       ! workspace_finalize_task_manager_teardown vikunja super-productivity
       [[ "$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING)" == vikunja ]]
+      [[ "$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES)" == "vikunja/vikunja:1,sha256:old" ]]
       SPARK_TEST_CLEANUP_FAIL=0
       workspace_finalize_task_manager_teardown vikunja super-productivity
       [[ -z "$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING)" ]]
+      [[ -z "$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES)" ]]
     ' _ "$SPARK" >/dev/null 2>&1
   status=$?
   calls=$(cat "$log" 2>/dev/null || true)
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
   rm -rf "$tmp"
   [[ "$status" -eq 0 ]] &&
-    [[ "$calls" == $'cleanup:vikunja\ncleanup:vikunja' ]] &&
-    [[ "$env" != *"WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING="* ]]
+    [[ "$calls" == $'cleanup:vikunja:vikunja/vikunja:1,sha256:old\ncleanup:vikunja:vikunja/vikunja:1,sha256:old' ]] &&
+    [[ "$env" != *"WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING="* ]] &&
+    [[ "$env" != *"WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES="* ]]
 }
 
 
@@ -7334,6 +7399,7 @@ run_test "workspace asks which task manager to install" test_workspace_interacti
 run_test "workspace distinguishes persisted and requested task managers" test_workspace_persisted_task_manager_ignores_runtime_override
 run_test "workspace scopes Vikunja secret guard to Vikunja data" test_workspace_vikunja_secret_is_manager_scoped
 run_test "workspace selects abandoned task manager for teardown" test_workspace_selects_abandoned_task_manager_for_teardown
+run_test "workspace task manager teardown removes images" test_workspace_task_manager_teardown_removes_images
 run_test "workspace task manager teardown covers services and data" test_workspace_task_manager_teardown_covers_services_and_data
 run_test "workspace task manager teardown removes Hermes access" test_workspace_task_manager_teardown_removes_hermes_access
 run_test "workspace task manager teardown drops database and role" test_workspace_task_manager_teardown_drops_database_and_role

@@ -3110,6 +3110,72 @@ workspace_teardown_task_manager_candidate() {
   return 1
 }
 
+workspace_task_manager_managed_image_refs() {
+  local manager="$1" refs ref
+  refs=$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true)
+  while IFS= read -r ref; do
+    case "${manager}:${ref}" in
+      vikunja:vikunja/vikunja:*) printf '%s\n' "$ref" ;;
+      super-productivity:spark/supersync:*|super-productivity:spark/super-productivity-electron:*) printf '%s\n' "$ref" ;;
+    esac
+  done <<< "$refs"
+}
+
+workspace_task_manager_image_refs() {
+  local manager="$1" key container ref image_id
+  local -a keys=() containers=() defaults=()
+  case "$manager" in
+    vikunja)
+      keys=(WORKSPACE_VIKUNJA_IMAGE)
+      containers=("$WORKSPACE_VIKUNJA_CONTAINER")
+      defaults=("$WORKSPACE_VIKUNJA_IMAGE_DEFAULT")
+      ;;
+    super-productivity)
+      keys=(WORKSPACE_SUPERSYNC_IMAGE WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE)
+      containers=("$WORKSPACE_SUPERSYNC_CONTAINER" "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_CONTAINER")
+      defaults=("$WORKSPACE_SUPERSYNC_IMAGE_DEFAULT" "spark/super-productivity-electron:${WORKSPACE_SUPER_PRODUCTIVITY_VERSION_DEFAULT#v}")
+      ;;
+    *) return 1 ;;
+  esac
+  for key in "${keys[@]}"; do
+    ref=$(workspace_read_env "$key" 2>/dev/null || true)
+    [[ -n "$ref" ]] && printf '%s\n' "$ref"
+  done
+  for container in "${containers[@]}"; do
+    ref=$(docker inspect --format '{{.Config.Image}}' "$container" 2>/dev/null || true)
+    image_id=$(docker inspect --format '{{.Image}}' "$container" 2>/dev/null || true)
+    [[ -n "$ref" ]] && printf '%s\n' "$ref"
+    [[ -n "$image_id" ]] && printf '%s\n' "$image_id"
+  done
+  workspace_task_manager_managed_image_refs "$manager"
+  printf '%s\n' "${defaults[@]}"
+}
+
+workspace_task_manager_teardown_images() {
+  local manager="$1" pending stored
+  pending=$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING 2>/dev/null || true)
+  stored=$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES 2>/dev/null || true)
+  if [[ "$pending" == "$manager" && -n "$stored" ]]; then
+    printf '%s\n' "$stored"
+    return 0
+  fi
+  workspace_task_manager_image_refs "$manager" | awk 'NF && !seen[$0]++' | paste -sd, -
+}
+
+workspace_remove_task_manager_images() {
+  local csv="$1" image_ref failed=0
+  local -a image_refs=()
+  [[ -n "$csv" ]] || return 0
+  IFS=',' read -r -a image_refs <<< "$csv"
+  for image_ref in "${image_refs[@]}"; do
+    [[ -n "$image_ref" ]] || continue
+    if docker image inspect "$image_ref" >/dev/null 2>&1; then
+      docker image rm -f "$image_ref" >/dev/null 2>&1 || failed=1
+    fi
+  done
+  [[ "$failed" == "0" ]]
+}
+
 workspace_remove_managed_path() {
   local path="$1"
   [[ -n "$path" && -n "$WORKSPACE_CONFIG_DIR" && -n "$WORKSPACE_DATA_DIR" ]] || return 1
@@ -3174,17 +3240,19 @@ workspace_cleanup_abandoned_hermes_access() {
 }
 
 workspace_cleanup_abandoned_task_manager() {
-  local manager="$1" failed=0
+  local manager="$1" image_refs_csv="${2:-}" failed=0
   workspace_cleanup_abandoned_hermes_access "$manager" || failed=1
   case "$manager" in
     vikunja)
       docker rm -f "$WORKSPACE_VIKUNJA_CONTAINER" >/dev/null 2>&1 || true
+      workspace_remove_task_manager_images "$image_refs_csv" || failed=1
       workspace_drop_task_manager_database "$manager" || failed=1
       workspace_remove_managed_path "${WORKSPACE_DATA_DIR}/vikunja-files" || failed=1
       workspace_remove_managed_path "$WORKSPACE_VIKUNJA_ENV_FILE" || failed=1
       ;;
     super-productivity)
       docker rm -f "$WORKSPACE_SUPERSYNC_CONTAINER" "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_CONTAINER" >/dev/null 2>&1 || true
+      workspace_remove_task_manager_images "$image_refs_csv" || failed=1
       workspace_drop_task_manager_database "$manager" || failed=1
       workspace_remove_managed_path "${WORKSPACE_DATA_DIR}/super-productivity-electron" || failed=1
       workspace_remove_managed_path "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" || failed=1
@@ -3197,14 +3265,15 @@ workspace_cleanup_abandoned_task_manager() {
 }
 
 workspace_finalize_task_manager_teardown() {
-  local abandoned="$1" current="$2" attempt ready=0
+  local abandoned="$1" current="$2" teardown_images_csv attempt ready=0
+  teardown_images_csv=$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES 2>/dev/null || true)
   workspace_task_manager_valid "$abandoned" || return 0
   [[ "$abandoned" != "$current" ]] || return 0
   if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
     info "Preserved $(workspace_task_manager_label "$abandoned") data because the new workspace is incomplete"
     return 0
   fi
-  workspace_cleanup_abandoned_task_manager "$abandoned" || return 1
+  workspace_cleanup_abandoned_task_manager "$abandoned" "$teardown_images_csv" || return 1
   for ((attempt = 1; attempt <= 30; attempt++)); do
     case "$current" in
       vikunja) workspace_hermes_vikunja_api_ready && ready=1 ;;
@@ -3215,7 +3284,8 @@ workspace_finalize_task_manager_teardown() {
   done
   [[ "$ready" == "1" ]] || return 1
   workspace_remove_env_file_key "$WORKSPACE_ENV_FILE" WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING
-  info "Removed abandoned $(workspace_task_manager_label "$abandoned") services and data"
+  workspace_remove_env_file_key "$WORKSPACE_ENV_FILE" WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES
+  info "Removed abandoned $(workspace_task_manager_label "$abandoned") services, images and data"
 }
 
 workspace_setup_hermes() {
@@ -3508,7 +3578,7 @@ workspace_setup_remote() {
 
 workspace_setup() {
   local auto_yes=0 check_only=0 requested_model="" remote_spec="" requested_tail_mode="" requested_task_manager="" task_manager=""
-  local previous_task_manager="" pending_task_manager="" teardown_task_manager=""
+  local previous_task_manager="" pending_task_manager="" teardown_task_manager="" teardown_task_manager_images=""
   local postgres_image="" vikunja_image="" n8n_image="" super_productivity_image="" supersync_image="" model tailnet
   local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_password_file="" vikunja_token="" n8n_email_arg="" n8n_password_arg="" n8n_password_file="" funnel_action=""
   local existing_model="" existing_tail_mode="" effective_tail_mode="" env_tail_mode="" setup_overrides=0
@@ -3575,6 +3645,9 @@ workspace_setup() {
   SPARK_WORKSPACE_TASK_MANAGER="$task_manager"
   teardown_task_manager=$(workspace_teardown_task_manager_candidate \
     "$previous_task_manager" "$pending_task_manager" "$task_manager" 2>/dev/null || true)
+  if workspace_task_manager_valid "$teardown_task_manager"; then
+    teardown_task_manager_images=$(workspace_task_manager_teardown_images "$teardown_task_manager" 2>/dev/null || true)
+  fi
   if [[ "$task_manager" == "super-productivity" && ( "$requested_tail_mode" == "ports" || "$env_tail_mode" == "ports" ) ]]; then
     die "SuperSync requires HTTPS; --tailscale-mode ports is not supported" "Use Tailscale Services mode."
   fi
@@ -3730,6 +3803,8 @@ workspace_setup() {
   }
   if workspace_task_manager_valid "$teardown_task_manager" && [[ "$teardown_task_manager" != "$task_manager" ]]; then
     workspace_set_env_key WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING "$teardown_task_manager"
+    [[ -n "$teardown_task_manager_images" ]] && \
+      workspace_set_env_key WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES "$teardown_task_manager_images"
   fi
   if [[ "$task_manager" == "super-productivity" ]]; then
     workspace_prepare_super_productivity_runtime || {
@@ -3781,7 +3856,7 @@ workspace_setup() {
     fi
   fi
   workspace_finalize_task_manager_teardown "$teardown_task_manager" "$task_manager" \
-    || setup_fail "Could not remove the abandoned $(workspace_task_manager_label "$teardown_task_manager") services and data"
+    || setup_fail "Could not remove the abandoned $(workspace_task_manager_label "$teardown_task_manager") services, images and data"
   setup_rc=0
   workspace_summary || setup_rc=$?
   workspace_print_initial_credentials "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass"
