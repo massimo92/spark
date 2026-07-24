@@ -86,7 +86,7 @@ spark down                   # stop all model and gateway services
 
 The workspace is optional. It installs a private agent environment:
 
-- Vikunja or Super Productivity for tasks (selected on first interactive setup)
+- Vikunja or Super Productivity for tasks (selected on every interactive setup; changing it fully removes the previous manager after verification)
 - n8n for automations
 - Postgres for data
 - Hermes/NemoClaw for agent runtime
