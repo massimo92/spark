@@ -3436,37 +3436,74 @@ workspace_prompt_username_choice() {
   done
 }
 
+workspace_confirm_task_manager_migration() {
+  local current="$1" target="$2" confirmation
+  printf "\n  ${RED}${BOLD}WARNING: destructive task-manager migration${NC}\n\n" >&2
+  printf "  %s -> %s\n" \
+    "$(workspace_task_manager_label "$current")" "$(workspace_task_manager_label "$target")" >&2
+  printf "  After the new task manager is verified, Spark will permanently remove the old one:\n" >&2
+  printf "    containers, Docker images, database and role, files, configuration,\n" >&2
+  printf "    and Hermes access/proxy integration. No backup will be created.\n\n" >&2
+  printf "  Type MIGRATE to continue: " >&2
+  read -r confirmation || die "Task manager migration cancelled"
+  [[ "$confirmation" == "MIGRATE" ]] || die "Task manager migration cancelled"
+}
+
 workspace_select_task_manager() {
-  local requested="${1:-}" auto_yes="${2:-0}" configured choice
+  local requested="${1:-}" current="${2:-}" check_only="${3:-0}"
+  local choice target
+  workspace_task_manager_valid "$current" || current=""
   if [[ -n "$requested" ]]; then
     workspace_task_manager_valid "$requested" || die "--task-manager must be 'vikunja' or 'super-productivity'"
+    if [[ -n "$current" && "$requested" != "$current" && "$check_only" != "1" ]]; then
+      if is_interactive; then
+        workspace_confirm_task_manager_migration "$current" "$requested"
+      else
+        printf "  WARNING: migrating from %s to %s will permanently remove the old task manager and its data; no backup will be created.\n" \
+          "$(workspace_task_manager_label "$current")" "$(workspace_task_manager_label "$requested")" >&2
+      fi
+    fi
     printf '%s\n' "$requested"
     return 0
   fi
-  configured="${SPARK_WORKSPACE_TASK_MANAGER:-}"
-  [[ -n "$configured" ]] || configured=$(workspace_read_env WORKSPACE_TASK_MANAGER 2>/dev/null || true)
-  if workspace_task_manager_valid "$configured"; then
-    printf '%s\n' "$configured"
-    return 0
+  if ! is_interactive; then
+    die "Task manager selection is required" \
+      "Use --task-manager vikunja or --task-manager super-productivity."
   fi
-  if [[ -f "$WORKSPACE_COMPOSE_FILE" ]]; then
-    workspace_task_manager
-    return 0
+  if [[ -z "$current" ]]; then
+    printf "\n  ${BOLD}Choose the task manager:${NC}\n\n" >&2
+    printf "    [1] Super Productivity + self-hosted SuperSync\n" >&2
+    printf "    [2] Vikunja\n" >&2
+    while true; do
+      printf "\n  > " >&2
+      read -r choice || die "Task manager selection is required"
+      case "$choice" in
+        1) printf 'super-productivity\n'; return 0 ;;
+        2) printf 'vikunja\n'; return 0 ;;
+        *) printf "  Enter 1 or 2. There is no default.\n" >&2 ;;
+      esac
+    done
   fi
-  if [[ "$auto_yes" == "1" ]] || ! is_interactive; then
-    printf 'vikunja\n'
-    return 0
+  if [[ "$current" == "vikunja" ]]; then
+    target=super-productivity
+  else
+    target=vikunja
   fi
-  printf "\n  ${BOLD}Choose the task manager:${NC}\n\n" >&2
-  printf "    [1] Super Productivity + self-hosted SuperSync\n" >&2
-  printf "    [2] Vikunja\n" >&2
+  printf "\n  ${BOLD}Task manager detected: %s${NC}\n\n" "$(workspace_task_manager_label "$current")" >&2
+  printf "    [1] Keep and reconcile %s\n" "$(workspace_task_manager_label "$current")" >&2
+  printf "    [2] Migrate to %s (complete teardown of the current task manager)\n" \
+    "$(workspace_task_manager_label "$target")" >&2
   while true; do
     printf "\n  > " >&2
     read -r choice || die "Task manager selection is required"
     case "$choice" in
-      ""|1) printf 'super-productivity\n'; return 0 ;;
-      2) printf 'vikunja\n'; return 0 ;;
-      *) printf "  Enter 1 or 2.\n" >&2 ;;
+      1) printf '%s\n' "$current"; return 0 ;;
+      2)
+        [[ "$check_only" == "1" ]] || workspace_confirm_task_manager_migration "$current" "$target"
+        printf '%s\n' "$target"
+        return 0
+        ;;
+      *) printf "  Enter 1 or 2. There is no default.\n" >&2 ;;
     esac
   done
 }
@@ -3557,6 +3594,24 @@ workspace_remote_workspace_cmd() {
   return "$rc"
 }
 
+workspace_remote_persisted_task_manager() {
+  local spec="$1" status manager
+  [[ "$spec" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9._:-]+$ ]] || return 1
+  REMOTE_USER="${spec%@*}"
+  REMOTE_HOST="${spec#*@}"
+  open_remote "$REMOTE_USER" "$REMOTE_HOST" >/dev/null || return 1
+  set +e
+  status=$(printf '%s\n' \
+    "${TGT_PATH} source \"\$(command -v spark)\"; workspace_persisted_task_manager" \
+    | remote_in "bash -s" 2>/dev/null)
+  set -e
+  close_remote >/dev/null 2>&1 || true
+  manager=$(printf '%s\n' "$status" | \
+    sed -n -e '/^vikunja$/p' -e '/^super-productivity$/p' | tail -n 1)
+  workspace_task_manager_valid "$manager" || return 1
+  printf '%s\n' "$manager"
+}
+
 workspace_setup_remote() {
   local spec="$1" check_only="$2" auto_yes="$3" requested_model="$4" requested_tail_mode="${5:-}"
   local task_manager="${6:-}" postgres_image="${7:-}" vikunja_image="${8:-}" n8n_image="${9:-}"
@@ -3639,9 +3694,14 @@ workspace_setup() {
   [[ -n "$n8n_email_arg" ]] && SPARK_WORKSPACE_N8N_EMAIL="$n8n_email_arg"
   [[ -n "$n8n_password_arg" ]] && { workspace_require_prompt_value "n8n password" "$n8n_password_arg" text; warn "Direct password flags may remain in shell history; prefer --n8n-password-file"; }
   [[ -n "$n8n_password_arg" ]] && SPARK_WORKSPACE_N8N_PASSWORD="$n8n_password_arg"
-  previous_task_manager=$(workspace_persisted_task_manager 2>/dev/null || true)
-  pending_task_manager=$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING 2>/dev/null || true)
-  task_manager=$(workspace_select_task_manager "$requested_task_manager" "$auto_yes")
+  if [[ -n "$remote_spec" ]]; then
+    previous_task_manager=$(workspace_remote_persisted_task_manager "$remote_spec" 2>/dev/null || true)
+  else
+    previous_task_manager=$(workspace_persisted_task_manager 2>/dev/null || true)
+    pending_task_manager=$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING 2>/dev/null || true)
+  fi
+  task_manager=$(workspace_select_task_manager \
+    "$requested_task_manager" "$previous_task_manager" "$check_only")
   SPARK_WORKSPACE_TASK_MANAGER="$task_manager"
   teardown_task_manager=$(workspace_teardown_task_manager_candidate \
     "$previous_task_manager" "$pending_task_manager" "$task_manager" 2>/dev/null || true)
@@ -3700,7 +3760,7 @@ workspace_setup() {
   existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   existing_tail_mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   effective_tail_mode="${requested_tail_mode:-services}"
-  if [[ -n "$teardown_task_manager" || -n "$requested_model" || -n "$requested_task_manager" || -n "$postgres_image" || -n "$vikunja_image" || -n "$super_productivity_image" || -n "$supersync_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
+  if [[ -n "$teardown_task_manager" || -n "$requested_model" || -n "$postgres_image" || -n "$vikunja_image" || -n "$super_productivity_image" || -n "$supersync_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$vikunja_token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
     setup_overrides=1
   fi
   if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
@@ -6342,10 +6402,10 @@ cmd_workspace_setup_help() {
 
   ${BOLD}Flags:${NC}
     --check                     Read-only validation; no files, containers, or Funnel changes.
-    --yes                       Accept safe defaults. Existing-user passwords still prompt.
+    --yes                       Accept other safe defaults; task-manager selection is still required.
     --remote user@host          Run setup on a configured remote host.
     --model MODEL               Hermes model; selected from spark list data when omitted.
-    --task-manager NAME         vikunja or super-productivity; asked on first interactive setup.
+    --task-manager NAME         vikunja or super-productivity; required when non-interactive.
     --tailscale-mode services   Prefer HTTPS names: tasks/n8n/hermes.<tailnet>.ts.net.
     --tailscale-mode ports      Fallback: MagicDNS host + separate ports bound to Tailscale IP.
     --funnel-action reset       Reset active public Funnel and re-check before setup continues.
