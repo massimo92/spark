@@ -6572,7 +6572,7 @@ workspace_write_files_super_productivity() {
   local task_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
   local postgres_pass postgres_volume_target supersync_db_pass supersync_jwt supersync_token supersync_encryption n8n_db_pass n8n_key mention_secret
-  local n8n_owner_status postgres_image supersync_image electron_version electron_commit electron_image n8n_image rp_id old_umask
+  local n8n_owner_status browser_sync_status browser_sync_url postgres_image supersync_image electron_version electron_commit electron_image n8n_image rp_id old_umask
 
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
   tailscale_bind_addr=$(workspace_env_or_value WORKSPACE_TAILSCALE_BIND_ADDR 127.0.0.1)
@@ -6623,6 +6623,8 @@ workspace_write_files_super_productivity() {
   n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
     || { setup_fail "Missing n8n encryption key while existing workspace data is present; restore it before rerun"; return 1; }
   n8n_owner_status=$(workspace_env_or_value N8N_OWNER_SETUP_STATUS pending)
+  browser_sync_status=$(workspace_env_or_value SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS pending)
+  browser_sync_url=$(workspace_env_or_value SUPER_PRODUCTIVITY_BROWSER_SYNC_URL "")
   mention_secret=$(workspace_env_or_generated WORKSPACE_MENTION_SECRET)
   postgres_image="${SPARK_WORKSPACE_POSTGRES_IMAGE:-$(workspace_env_or_value WORKSPACE_POSTGRES_IMAGE "$WORKSPACE_POSTGRES_IMAGE_DEFAULT")}"
   supersync_image="${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-$(workspace_env_or_value WORKSPACE_SUPERSYNC_IMAGE "$WORKSPACE_SUPERSYNC_IMAGE_DEFAULT")}"
@@ -6689,6 +6691,8 @@ SUPERSYNC_DATABASE_PASSWORD=${supersync_db_pass}
 SUPERSYNC_JWT_SECRET=${supersync_jwt}
 SUPERSYNC_ACCESS_TOKEN=${supersync_token}
 SUPERSYNC_ENCRYPTION_PASSWORD=${supersync_encryption}
+SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS=${browser_sync_status}
+SUPER_PRODUCTIVITY_BROWSER_SYNC_URL=${browser_sync_url}
 SUPER_PRODUCTIVITY_USER_EMAIL=${human_email}
 DB_POSTGRESDB_PASSWORD=${n8n_db_pass}
 N8N_ENCRYPTION_KEY=${n8n_key}
@@ -7232,7 +7236,8 @@ EOF
     }
     workspace_set_env_key_in_file "$WORKSPACE_ENV_FILE" SUPERSYNC_ACCESS_TOKEN "$token"
     workspace_set_env_key_in_file "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" SUPERSYNC_ACCESS_TOKEN "$token"
-    WORKSPACE_SHOW_SUPER_PRODUCTIVITY_ACCESS=1
+    workspace_set_env_key_in_file "$WORKSPACE_ENV_FILE" SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS pending
+    workspace_set_env_key_in_file "$WORKSPACE_ENV_FILE" SUPER_PRODUCTIVITY_BROWSER_SYNC_URL ""
     info "SuperSync user and access token provisioned"
   else
     info "SuperSync user already provisioned"
@@ -7246,6 +7251,163 @@ EOF
     }
     info "SuperSync passkey enrollment link prepared (valid for 15 minutes)"
   fi
+}
+
+workspace_super_productivity_browser_sync_ready() {
+  local status verified_url current_url
+  status=$(workspace_read_env SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS 2>/dev/null || true)
+  verified_url=$(workspace_read_env SUPER_PRODUCTIVITY_BROWSER_SYNC_URL 2>/dev/null || true)
+  current_url=$(workspace_task_manager_url)
+  [[ "$status" == "verified" && -n "$current_url" && "$verified_url" == "$current_url" ]]
+}
+
+workspace_super_productivity_local_api() {
+  local method="$1" path="$2"
+  curl -fsS --max-time 15 -X "$method" \
+    -H 'Host: 127.0.0.1:3876' \
+    "http://127.0.0.1:${WORKSPACE_SUPER_PRODUCTIVITY_API_PORT}${path}"
+}
+
+workspace_super_productivity_sync_task_id() {
+  local title="$1" response
+  response=$(workspace_super_productivity_local_api GET '/tasks?includeDone=true&source=all') || return 1
+  jq -r --arg title "$title" '.data[]? | select(.title == $title) | .id' <<< "$response" | head -n 1
+}
+
+workspace_wait_for_super_productivity_sync_task() {
+  local title="$1" attempt task_id
+  for ((attempt = 0; attempt < 15; attempt++)); do
+    task_id=$(workspace_super_productivity_sync_task_id "$title" 2>/dev/null || true)
+    if [[ -n "$task_id" ]]; then
+      printf '%s\n' "$task_id"
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+workspace_delete_super_productivity_sync_task() {
+  local task_id="$1"
+  workspace_super_productivity_local_api DELETE "/tasks/${task_id}" \
+    | jq -e '.ok == true' >/dev/null
+}
+
+workspace_wait_for_supersync_passkey() {
+  local attempt
+  for ((attempt = 0; attempt < 15; attempt++)); do
+    workspace_supersync_passkey_ready && return 0
+    sleep 2
+  done
+  return 1
+}
+
+workspace_show_super_productivity_sync_access() {
+  local task_url email token encryption link output
+  task_url=$(workspace_task_manager_url)
+  email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
+  token=$(workspace_read_env SUPERSYNC_ACCESS_TOKEN 2>/dev/null || true)
+  encryption=$(workspace_read_env SUPERSYNC_ENCRYPTION_PASSWORD 2>/dev/null || true)
+  link="${WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL:-}"
+  [[ -n "$task_url" && -n "$email" && -n "$token" && -n "$encryption" ]] || return 1
+  command -v less >/dev/null 2>&1 || {
+    warn "less is required to show SuperSync secrets without leaving them in terminal history"
+    return 1
+  }
+  output=$(printf "\n  ${YELLOW}${BOLD}Temporary Super Productivity sync access${NC}\n\n  Copy these values now. Press q to close and remove them from the terminal.\n\n  SuperSync\n    server URL:         %s\n    email:              %s\n    access token:       %s\n    encryption key:     %s\n" \
+    "$task_url" "$email" "$token" "$encryption")
+  if [[ -n "$link" ]]; then
+    output+=$(printf "\n  Passkey enrollment link (valid for 15 minutes):\n    %s\n" "$link")
+  fi
+  output+=$'\n  Use this access token. Do not replace it with a token from a later SuperSync login.\n'
+  LESS='' LESSOPEN='' LESSHISTFILE=- less -R <<< "$output"
+  unset output token encryption link
+}
+
+workspace_complete_super_productivity_browser_sync() {
+  local task_url email marker task_id confirmation needs_passkey=0 needs_sync=0
+  [[ "$(workspace_task_manager)" == "super-productivity" ]] || return 0
+  workspace_supersync_passkey_ready || needs_passkey=1
+  workspace_super_productivity_browser_sync_ready || needs_sync=1
+  if [[ "$needs_passkey" == "0" && "$needs_sync" == "0" ]]; then
+    info "Super Productivity browser sync already verified"
+    return 0
+  fi
+  if ! is_interactive; then
+    setup_fail "Super Productivity browser sync onboarding requires an interactive terminal"
+    return 1
+  fi
+  task_url=$(workspace_task_manager_url)
+  email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
+  if [[ "$needs_passkey" == "1" ]]; then
+    WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=$(workspace_supersync_create_passkey_enrollment_url "$email") || {
+      setup_fail "Could not refresh the SuperSync passkey enrollment link"
+      return 1
+    }
+  else
+    WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=""
+  fi
+  workspace_show_super_productivity_sync_access || {
+    setup_fail "Could not show temporary SuperSync access securely"
+    return 1
+  }
+  if [[ "$needs_passkey" == "1" ]]; then
+    printf "\n  Open the passkey enrollment link from the temporary page and create the passkey.\n"
+    printf "  Press Enter after SuperSync confirms that the passkey was created: "
+    read -r confirmation || {
+      setup_fail "SuperSync passkey enrollment was not confirmed"
+      return 1
+    }
+    workspace_wait_for_supersync_passkey || {
+      setup_fail "SuperSync passkey was not detected"
+      return 1
+    }
+    info "SuperSync passkey enrolled"
+  fi
+  if [[ "$needs_sync" == "0" ]]; then
+    WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=""
+    return 0
+  fi
+  marker="spark-sync-check-$(workspace_random_hex_token | cut -c1-10)"
+  printf "\n  ${BOLD}Connect the browser app to this workspace${NC}\n\n"
+  printf "    1. Keep Tailscale connected and open https://app.super-productivity.com.\n"
+  printf "    2. Open Settings > Sync and enable syncing.\n"
+  printf "    3. Select SuperSync; under Advanced set server URL to:\n       %s\n" "$task_url"
+  printf "    4. Paste the access token from the temporary page and save.\n"
+  printf "    5. Enter the same encryption key when the mandatory encryption dialog opens.\n"
+  printf "    6. If asked which data to keep, choose the browser/local copy only when it contains\n"
+  printf "       the tasks you want to upload; otherwise choose the remote copy.\n"
+  printf "    7. Run Sync Now, then create this temporary Inbox task exactly:\n\n"
+  printf "       ${BOLD}%s${NC}\n\n" "$marker"
+  printf "  Press Enter after the browser reports a successful sync: "
+  read -r confirmation || {
+    setup_fail "Super Productivity browser sync was not confirmed"
+    return 1
+  }
+  task_id=$(workspace_wait_for_super_productivity_sync_task "$marker" 2>/dev/null || true)
+  if [[ -z "$task_id" ]]; then
+    setup_fail "The browser verification task did not reach Electron through SuperSync"
+    return 1
+  fi
+  info "Browser-to-Electron SuperSync verified"
+  workspace_delete_super_productivity_sync_task "$task_id" || {
+    setup_fail "Could not remove the temporary sync verification task through Electron"
+    return 1
+  }
+  printf "\n  Spark deleted the verification task through Electron. Wait for it to disappear\n"
+  printf "  from the browser, then type SYNCED: "
+  read -r confirmation || {
+    setup_fail "Electron-to-browser SuperSync was not confirmed"
+    return 1
+  }
+  if [[ "$confirmation" != "SYNCED" ]]; then
+    setup_fail "Electron-to-browser SuperSync was not confirmed"
+    return 1
+  fi
+  workspace_set_env_key SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS verified
+  workspace_set_env_key SUPER_PRODUCTIVITY_BROWSER_SYNC_URL "$task_url"
+  WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=""
+  info "Super Productivity browser sync verified in both directions"
 }
 
 workspace_vikunja_cli() {
@@ -9306,7 +9468,6 @@ workspace_setup() {
   n8n_previous_status=$(workspace_read_env N8N_OWNER_SETUP_STATUS 2>/dev/null || true)
   WORKSPACE_SHOW_VIKUNJA_PASSWORD=0
   WORKSPACE_SHOW_N8N_PASSWORD=0
-  WORKSPACE_SHOW_SUPER_PRODUCTIVITY_ACCESS=0
   WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=""
   workspace_write_files "$tailnet" "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass" "$model" || {
     workspace_summary
@@ -9368,6 +9529,13 @@ workspace_setup() {
   fi
   workspace_finalize_task_manager_teardown "$teardown_task_manager" "$task_manager" \
     || setup_fail "Could not remove the abandoned $(workspace_task_manager_label "$teardown_task_manager") services, images and data"
+  if [[ "$task_manager" == "super-productivity" ]]; then
+    if [[ "${#SETUP_FAILED[@]}" -eq 0 ]]; then
+      workspace_complete_super_productivity_browser_sync || true
+    else
+      warn "Super Productivity browser onboarding deferred until infrastructure issues are fixed"
+    fi
+  fi
   setup_rc=0
   workspace_summary || setup_rc=$?
   workspace_print_initial_credentials "$human_user" "$human_email" "$human_pass" "$n8n_email" "$n8n_pass"
@@ -11422,6 +11590,7 @@ cmd_workspace_doctor() {
     workspace_doctor_check "SuperSync user exists and is verified" workspace_supersync_user_ready
     workspace_doctor_check "SuperSync passkey is enrolled" workspace_supersync_passkey_ready
     workspace_doctor_check "SuperSync access token works" workspace_supersync_token_ready
+    workspace_doctor_check "Browser and Electron SuperSync is verified" workspace_super_productivity_browser_sync_ready
   else
     workspace_doctor_check "Vikunja registration/link sharing disabled" workspace_vikunja_locked_down
     workspace_doctor_check "Vikunja internal doctor passes" workspace_vikunja_doctor_ok
@@ -11438,6 +11607,7 @@ cmd_workspace_doctor() {
     workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
       WORKSPACE_TASK_MANAGER POSTGRES_PASSWORD SUPERSYNC_DATABASE_PASSWORD SUPERSYNC_JWT_SECRET \
       SUPERSYNC_ACCESS_TOKEN SUPERSYNC_ENCRYPTION_PASSWORD SUPER_PRODUCTIVITY_USER_EMAIL \
+      SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS SUPER_PRODUCTIVITY_BROWSER_SYNC_URL \
       WORKSPACE_SUPER_PRODUCTIVITY_VERSION WORKSPACE_SUPER_PRODUCTIVITY_COMMIT \
       DB_POSTGRESDB_PASSWORD N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET N8N_BASIC_AUTH_USER \
       N8N_OWNER_SETUP_STATUS HERMES_MODEL HERMES_LITELLM_MODEL HERMES_CONTEXT_LENGTH \
@@ -11527,7 +11697,7 @@ cmd_workspace_doctor() {
 
 workspace_print_initial_credentials() {
   local vikunja_user="$1" vikunja_email="$2" vikunja_pass="$3" n8n_email="$4" n8n_pass="$5"
-  local shown=0 task_url token encryption
+  local shown=0
   if [[ "${WORKSPACE_SHOW_VIKUNJA_PASSWORD:-0}" == "1" || "${WORKSPACE_SHOW_N8N_PASSWORD:-0}" == "1" ]]; then
     printf "\n  ${YELLOW}${BOLD}Save these passwords now. Spark does not store or show them again.${NC}\n\n"
   fi
@@ -11540,32 +11710,11 @@ workspace_print_initial_credentials() {
     printf "  n8n\n    email:    %s\n    password: %s\n" "$n8n_email" "$n8n_pass"
     shown=1
   fi
-  if [[ "${WORKSPACE_SHOW_SUPER_PRODUCTIVITY_ACCESS:-0}" == "1" ]]; then
-    task_url=$(workspace_task_manager_url)
-    token=$(workspace_read_env SUPERSYNC_ACCESS_TOKEN 2>/dev/null || true)
-    encryption=$(workspace_read_env SUPERSYNC_ENCRYPTION_PASSWORD 2>/dev/null || true)
-    [[ "$shown" == "0" ]] || printf "\n"
-    printf "  Super Productivity / SuperSync\n"
-    printf "    server:              %s\n" "$task_url"
-    printf "    email:               %s\n" "$vikunja_email"
-    printf "    access token:        %s\n" "$token"
-    printf "    encryption password: %s\n" "$encryption"
-    printf "\n  In each browser: Settings > Sync > SuperSync; enter this server, token and encryption password.\n"
-    shown=1
-  fi
-  if [[ -n "${WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL:-}" ]]; then
-    [[ "$shown" == "0" ]] || printf "\n"
-    printf "  SuperSync passkey enrollment\n"
-    printf "    email: %s\n" "$vikunja_email"
-    printf "    link:  %s\n" "$WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL"
-    printf "\n  Open this one-time link within 15 minutes and create the passkey on your device.\n"
-    shown=1
-  fi
   if [[ "$shown" != "0" ]]; then
     if [[ "$(workspace_task_manager)" == "vikunja" ]]; then
       printf "\n  If you lose one: ${BOLD}spark ws recover vikunja${NC} or ${BOLD}spark ws recover n8n${NC}\n\n"
     else
-      printf "\n  If you lose the n8n password: ${BOLD}spark ws recover n8n${NC}. SuperSync secrets remain in the 0600 workspace config.\n\n"
+      printf "\n  If you lose the n8n password: ${BOLD}spark ws recover n8n${NC}.\n\n"
     fi
   fi
 }
@@ -11772,7 +11921,7 @@ workspace_show_recovery_password() {
 
   if command -v less >/dev/null 2>&1 && \
     { [[ -t 0 && -t 1 && -t 2 ]] || [[ "${SPARK_WORKSPACE_FORCE_PAGER:-0}" == "1" ]]; }; then
-    LESS='' LESSOPEN='' less -R <<< "$output"
+    LESS='' LESSOPEN='' LESSHISTFILE=- less -R <<< "$output"
     return 0
   fi
 
