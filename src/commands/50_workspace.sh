@@ -774,6 +774,30 @@ diff --git a/src/app/core/startup/startup.service.ts b/src/app/core/startup/star
 +    });
 +  }
 +
+diff --git a/src/app/core/electron/local-rest-api-handler.service.ts b/src/app/core/electron/local-rest-api-handler.service.ts
+--- a/src/app/core/electron/local-rest-api-handler.service.ts
++++ b/src/app/core/electron/local-rest-api-handler.service.ts
+@@ -10,0 +11 @@ import { DateService } from '../date/date.service';
++import { SyncWrapperService } from '../../imex/sync/sync-wrapper.service';
+@@ -180,0 +182 @@ export class LocalRestApiHandlerService {
++  private readonly _syncWrapperService = inject(SyncWrapperService);
+@@ -219,0 +222,4 @@ export class LocalRestApiHandlerService {
++
++    if (method === 'POST' && path === '/sync') {
++      return this._handleSync(requestId);
++    }
+@@ -269,0 +276,10 @@ export class LocalRestApiHandlerService {
++
++  private async _handleSync(
++    requestId: string,
++  ): Promise<LocalRestApiResponsePayload> {
++    const syncResult = await this._syncWrapperService.sync(true);
++    return createSuccessResponse(requestId, 200, {
++      synced: syncResult !== 'HANDLED_ERROR',
++      result: syncResult,
++    });
++  }
+
 EOF
 }
 
@@ -1842,10 +1866,18 @@ workspace_delete_super_productivity_sync_task() {
     | jq -e '.ok == true' >/dev/null
 }
 
-workspace_wait_for_super_productivity_sync_settle() {
-  local seconds="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_SYNC_SETTLE_SECONDS:-4}"
-  [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=4
-  ((seconds > 0)) && sleep "$seconds"
+workspace_trigger_super_productivity_sync() {
+  workspace_super_productivity_local_api POST "/sync" \
+    | jq -e '.ok == true and .data.synced == true' >/dev/null
+}
+
+workspace_wait_for_super_productivity_sync_ready() {
+  local attempt
+  for ((attempt = 0; attempt < 15; attempt++)); do
+    workspace_trigger_super_productivity_sync && return 0
+    sleep 2
+  done
+  return 1
 }
 
 workspace_supersync_task_delete_recorded() {
@@ -1862,6 +1894,8 @@ workspace_supersync_task_delete_recorded() {
 workspace_wait_for_supersync_task_delete() {
   local task_id="$1" attempt
   for ((attempt = 0; attempt < 15; attempt++)); do
+    workspace_supersync_task_delete_recorded "$task_id" && return 0
+    workspace_trigger_super_productivity_sync || return 1
     workspace_supersync_task_delete_recorded "$task_id" && return 0
     sleep 2
   done
@@ -1967,8 +2001,9 @@ workspace_complete_super_productivity_browser_sync() {
         failure="The browser verification task did not reach Electron through SuperSync"
       else
         info "Browser-to-Electron SuperSync verified"
-        workspace_wait_for_super_productivity_sync_settle
-        if ! workspace_delete_super_productivity_sync_task "$task_id"; then
+        if ! workspace_wait_for_super_productivity_sync_ready; then
+          failure="Electron did not finish the inbound SuperSync cycle before verification"
+        elif ! workspace_delete_super_productivity_sync_task "$task_id"; then
           failure="Could not remove the temporary sync verification task through Electron"
         elif ! workspace_wait_for_supersync_task_delete "$task_id"; then
           failure="Electron deleted the verification task locally but did not publish the deletion to SuperSync"

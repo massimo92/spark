@@ -130,8 +130,9 @@ verified SuperSync user without SMTP and stores its access token and encryption
 key in the 0600 workspace config. Interactive setup shows them only in a
 temporary pager, guides passkey enrollment and browser configuration, then
 verifies browser → SuperSync → Electron sync and the reverse path before setup
-can complete. The reverse check waits for the inbound sync to settle, verifies
-that Electron published the marker deletion to SuperSync, and can be retried
+can complete. The reverse check confirms a full Electron sync before deleting
+the marker, forces another sync afterward, verifies that the deletion reached
+SuperSync, and can be retried
 inside the same setup without reconciling the workspace again. Humans use
 `https://app.super-productivity.com` while connected to the tailnet.
 Offline changes remain local and synchronize when the browser can reach the
