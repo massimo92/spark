@@ -126,10 +126,12 @@ spark ws setup --task-manager super-productivity
 
 The Super Productivity setup publishes only SuperSync at the private
 `tasks.<tailnet>` URL; it does not host another copy of the web app. It creates a
-verified SuperSync user without SMTP, prints its access token and encryption
-password on first setup, and stores both in the 0600 workspace config. Open
-`https://app.super-productivity.com` and enter the private URL, token, and
-encryption password under **Settings → Sync → SuperSync** in every browser.
+verified SuperSync user without SMTP and stores its access token and encryption
+key in the 0600 workspace config. Interactive setup shows them only in a
+temporary pager, guides passkey enrollment and browser configuration, then
+verifies browser → SuperSync → Electron sync and the reverse path before setup
+can complete. Humans use `https://app.super-productivity.com` while connected to
+the tailnet.
 Offline changes remain local and synchronize when the browser can reach the
 tailnet again.
 

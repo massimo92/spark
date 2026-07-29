@@ -887,6 +887,8 @@ EOF
     [[ "$env" == *"WORKSPACE_SUPER_PRODUCTIVITY_VERSION=v18.15.1"* ]] &&
     [[ "$env" == *"WORKSPACE_SUPER_PRODUCTIVITY_COMMIT=014b789c22c9bf75fd7202845639569b61e7cd8e"* ]] &&
     [[ "$env" == *"TASK_MANAGER_URL=https://tasks.robin-triceratops.ts.net"* ]] &&
+    [[ "$env" == *"SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS=pending"* ]] &&
+    [[ "$env" == *$'SUPER_PRODUCTIVITY_BROWSER_SYNC_URL=\n'* ]] &&
     [[ "$compose" == *$'  supersync:\n'* ]] &&
     [[ "$compose" == *$'  super-productivity-electron:\n'* ]] &&
     [[ "$compose" != *$'  super-productivity-web:\n'* ]] &&
@@ -1096,6 +1098,91 @@ test_supersync_initial_passkey_enrollment_url() {
     ' _ "$SPARK" 2>/dev/null)
   rm -rf "$tmp"
   [[ "$out" == "https://tasks.example.ts.net/recover-passkey?token=$(printf '%064d' 0)" ]]
+}
+
+test_super_productivity_sync_access_uses_temporary_pager() {
+  local tmp out page token encryption
+  tmp=$(mktemp -d)
+  token=super-secret-access-token
+  encryption=super-secret-encryption-key
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  cat > "${tmp}/home/.config/spark/workspace/secrets.env" <<EOF
+WORKSPACE_TASK_MANAGER=super-productivity
+TASK_MANAGER_URL=https://tasks.example.ts.net
+SUPER_PRODUCTIVITY_USER_EMAIL=m@example.com
+SUPERSYNC_ACCESS_TOKEN=${token}
+SUPERSYNC_ENCRYPTION_PASSWORD=${encryption}
+EOF
+  out=$(HOME="${tmp}/home" PAGER_CAPTURE="${tmp}/pager" bash -c '
+    source "$1"
+    less() { [[ "$LESSHISTFILE" == "-" ]] && cat > "$PAGER_CAPTURE"; }
+    WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=https://tasks.example.ts.net/recover-passkey?token=temporary
+    workspace_show_super_productivity_sync_access
+  ' _ "$SPARK" 2>&1)
+  page=$(cat "${tmp}/pager")
+  rm -rf "$tmp"
+  [[ "$out" != *"$token"* && "$out" != *"$encryption"* ]]
+  [[ "$page" == *"$token"* && "$page" == *"$encryption"* ]]
+  [[ "$page" == *"https://tasks.example.ts.net"* ]]
+  [[ "$page" == *"recover-passkey?token=temporary"* ]]
+}
+
+test_super_productivity_onboarding_verifies_round_trip() {
+  local tmp out state
+  tmp=$(mktemp -d)
+  out=$(printf '\n\nSYNCED\n' | HOME="${tmp}/home" STATE_FILE="${tmp}/state" bash -c '
+    source "$1"
+    SETUP_FAILED=()
+    is_interactive() { return 0; }
+    workspace_task_manager() { printf "%s\n" super-productivity; }
+    passkey_checks=0
+    workspace_supersync_passkey_ready() {
+      passkey_checks=$((passkey_checks + 1))
+      [[ "$passkey_checks" -gt 1 ]]
+    }
+    workspace_super_productivity_browser_sync_ready() { return 1; }
+    workspace_supersync_create_passkey_enrollment_url() {
+      printf "%s\n" https://tasks.example.ts.net/recover-passkey?token=temporary
+    }
+    workspace_show_super_productivity_sync_access() {
+      [[ "$WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL" == *"temporary"* ]]
+    }
+    workspace_task_manager_url() { printf "%s\n" https://tasks.example.ts.net; }
+    workspace_read_env() {
+      [[ "$1" == SUPER_PRODUCTIVITY_USER_EMAIL ]] && printf "%s\n" m@example.com
+    }
+    workspace_random_hex_token() { printf "%s\n" 1234567890abcdef; }
+    workspace_wait_for_super_productivity_sync_task() {
+      [[ "$1" == spark-sync-check-1234567890 ]] && printf "%s\n" task-1
+    }
+    workspace_delete_super_productivity_sync_task() { [[ "$1" == task-1 ]]; }
+    workspace_set_env_key() { printf "%s=%s\n" "$1" "$2" >> "$STATE_FILE"; }
+    workspace_complete_super_productivity_browser_sync
+  ' _ "$SPARK" 2>&1)
+  state=$(cat "${tmp}/state")
+  rm -rf "$tmp"
+  [[ "$out" == *"Browser-to-Electron SuperSync verified"* ]]
+  [[ "$out" == *"verified in both directions"* ]]
+  [[ "$state" == *"SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS=verified"* ]]
+  [[ "$state" == *"SUPER_PRODUCTIVITY_BROWSER_SYNC_URL=https://tasks.example.ts.net"* ]]
+}
+
+test_super_productivity_onboarding_requires_interactive_terminal() {
+  local out status
+  set +e
+  out=$(bash -c '
+    source "$1"
+    SETUP_FAILED=()
+    is_interactive() { return 1; }
+    workspace_task_manager() { printf "%s\n" super-productivity; }
+    workspace_supersync_passkey_ready() { return 0; }
+    workspace_super_productivity_browser_sync_ready() { return 1; }
+    workspace_complete_super_productivity_browser_sync
+  ' _ "$SPARK" 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]]
+  [[ "$out" == *"requires an interactive terminal"* ]]
 }
 
 test_workspace_preserves_legacy_postgres_mount() {
@@ -7447,6 +7534,9 @@ run_test "workspace baseline reconciliation is idempotent" test_supersync_baseli
 run_test "workspace baseline reconciliation fails closed without history" test_supersync_baseline_reconciliation_fails_closed_without_history
 run_test "workspace checks SuperSync user through stdin SQL" test_supersync_user_ready_uses_stdin_query
 run_test "SuperSync setup creates initial passkey enrollment URL" test_supersync_initial_passkey_enrollment_url
+run_test "SuperSync access is shown only in a temporary pager" test_super_productivity_sync_access_uses_temporary_pager
+run_test "Super Productivity onboarding verifies two-way sync" test_super_productivity_onboarding_verifies_round_trip
+run_test "Super Productivity onboarding requires an interactive terminal" test_super_productivity_onboarding_requires_interactive_terminal
 run_test "workspace preserves legacy Postgres mount" test_workspace_preserves_legacy_postgres_mount
 run_test "Super Productivity rejects insecure ports mode" test_super_productivity_rejects_http_ports_mode
 run_test "workspace always asks and confirms task manager migration" test_workspace_interactive_task_manager_selector
