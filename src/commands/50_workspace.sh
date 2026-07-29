@@ -1842,6 +1842,32 @@ workspace_delete_super_productivity_sync_task() {
     | jq -e '.ok == true' >/dev/null
 }
 
+workspace_wait_for_super_productivity_sync_settle() {
+  local seconds="${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_SYNC_SETTLE_SECONDS:-4}"
+  [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=4
+  ((seconds > 0)) && sleep "$seconds"
+}
+
+workspace_supersync_task_delete_recorded() {
+  local task_id="$1" out
+  [[ "$task_id" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  out=$(workspace_compose exec -T \
+    -e "PGPASSWORD=$(workspace_read_env SUPERSYNC_DATABASE_PASSWORD)" \
+    postgres psql -qAt -U supersync -d supersync \
+    -c "SELECT 1 FROM operations WHERE entity_id='${task_id}' AND op_type='DEL' LIMIT 1" \
+    2>/dev/null || true)
+  [[ "$out" == "1" ]]
+}
+
+workspace_wait_for_supersync_task_delete() {
+  local task_id="$1" attempt
+  for ((attempt = 0; attempt < 15; attempt++)); do
+    workspace_supersync_task_delete_recorded "$task_id" && return 0
+    sleep 2
+  done
+  return 1
+}
+
 workspace_wait_for_supersync_passkey() {
   local attempt
   for ((attempt = 0; attempt < 15; attempt++)); do
@@ -1874,7 +1900,8 @@ workspace_show_super_productivity_sync_access() {
 }
 
 workspace_complete_super_productivity_browser_sync() {
-  local task_url email marker task_id confirmation needs_passkey=0 needs_sync=0
+  local task_url email marker task_id confirmation retry_choice failure
+  local needs_passkey=0 needs_sync=0
   [[ "$(workspace_task_manager)" == "super-productivity" ]] || return 0
   workspace_supersync_passkey_ready || needs_passkey=1
   workspace_super_productivity_browser_sync_ready || needs_sync=1
@@ -1917,46 +1944,72 @@ workspace_complete_super_productivity_browser_sync() {
     WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=""
     return 0
   fi
-  marker="spark-sync-check-$(workspace_random_hex_token | cut -c1-10)"
-  printf "\n  ${BOLD}Connect the browser app to this workspace${NC}\n\n"
-  printf "    1. Keep Tailscale connected and open https://app.super-productivity.com.\n"
-  printf "    2. Open Settings > Sync and enable syncing.\n"
-  printf "    3. Select SuperSync; under Advanced set server URL to:\n       %s\n" "$task_url"
-  printf "    4. Paste the access token from the temporary page and save.\n"
-  printf "    5. Enter the same encryption key when the mandatory encryption dialog opens.\n"
-  printf "    6. If asked which data to keep, choose the browser/local copy only when it contains\n"
-  printf "       the tasks you want to upload; otherwise choose the remote copy.\n"
-  printf "    7. Run Sync Now, then create this temporary Inbox task exactly:\n\n"
-  printf "       ${BOLD}%s${NC}\n\n" "$marker"
-  printf "  Press Enter after the browser reports a successful sync: "
-  read -r confirmation || {
-    setup_fail "Super Productivity browser sync was not confirmed"
-    return 1
-  }
-  task_id=$(workspace_wait_for_super_productivity_sync_task "$marker" 2>/dev/null || true)
-  if [[ -z "$task_id" ]]; then
-    setup_fail "The browser verification task did not reach Electron through SuperSync"
-    return 1
-  fi
-  info "Browser-to-Electron SuperSync verified"
-  workspace_delete_super_productivity_sync_task "$task_id" || {
-    setup_fail "Could not remove the temporary sync verification task through Electron"
-    return 1
-  }
-  printf "\n  Spark deleted the verification task through Electron. Wait for it to disappear\n"
-  printf "  from the browser, then type SYNCED: "
-  read -r confirmation || {
-    setup_fail "Electron-to-browser SuperSync was not confirmed"
-    return 1
-  }
-  if [[ "$confirmation" != "SYNCED" ]]; then
-    setup_fail "Electron-to-browser SuperSync was not confirmed"
-    return 1
-  fi
-  workspace_set_env_key SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS verified
-  workspace_set_env_key SUPER_PRODUCTIVITY_BROWSER_SYNC_URL "$task_url"
-  WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=""
-  info "Super Productivity browser sync verified in both directions"
+
+  while true; do
+    marker="spark-sync-check-$(workspace_random_hex_token | cut -c1-10)"
+    failure=""
+    printf "\n  ${BOLD}Connect the browser app to this workspace${NC}\n\n"
+    printf "    1. Keep Tailscale connected and open https://app.super-productivity.com.\n"
+    printf "    2. Open Settings > Sync and enable syncing.\n"
+    printf "    3. Select SuperSync; under Advanced set server URL to:\n       %s\n" "$task_url"
+    printf "    4. Paste the access token from the temporary page and save.\n"
+    printf "    5. Enter the same encryption key when the mandatory encryption dialog opens.\n"
+    printf "    6. If asked which data to keep, choose the browser/local copy only when it contains\n"
+    printf "       the tasks you want to upload; otherwise choose the remote copy.\n"
+    printf "    7. Run Sync Now, then create this temporary Inbox task exactly:\n\n"
+    printf "       ${BOLD}%s${NC}\n\n" "$marker"
+    printf "  Press Enter after the browser reports a successful sync: "
+    if ! read -r confirmation; then
+      failure="Super Productivity browser sync was not confirmed"
+    else
+      task_id=$(workspace_wait_for_super_productivity_sync_task "$marker" 2>/dev/null || true)
+      if [[ -z "$task_id" ]]; then
+        failure="The browser verification task did not reach Electron through SuperSync"
+      else
+        info "Browser-to-Electron SuperSync verified"
+        workspace_wait_for_super_productivity_sync_settle
+        if ! workspace_delete_super_productivity_sync_task "$task_id"; then
+          failure="Could not remove the temporary sync verification task through Electron"
+        elif ! workspace_wait_for_supersync_task_delete "$task_id"; then
+          failure="Electron deleted the verification task locally but did not publish the deletion to SuperSync"
+          warn "Delete ${marker} manually in the browser if it remains there."
+        else
+          info "Electron-to-SuperSync deletion verified"
+          printf "\n  Run Sync Now in the browser. When the task disappears, type SYNCED.\n"
+          printf "  Type RETRY to repeat only this verification: "
+          if read -r confirmation && [[ "$confirmation" == "SYNCED" ]]; then
+            workspace_set_env_key SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS verified
+            workspace_set_env_key SUPER_PRODUCTIVITY_BROWSER_SYNC_URL "$task_url"
+            WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=""
+            info "Super Productivity browser sync verified in both directions"
+            return 0
+          fi
+          failure="Electron-to-browser SuperSync was not confirmed"
+          if [[ "$confirmation" == "RETRY" ]]; then
+            info "Retrying only the browser sync verification"
+            continue
+          fi
+        fi
+      fi
+    fi
+
+    warn "$failure"
+    printf "\n    [1] Retry only the browser sync verification\n"
+    printf "    [2] Exit and resume it later\n\n"
+    printf "  > "
+    read -r retry_choice || retry_choice=2
+    case "$retry_choice" in
+      1)
+        info "Retrying only the browser sync verification"
+        ;;
+      *)
+        WORKSPACE_SETUP_RESUME_HINT="Rerun spark ws setup to resume the Super Productivity browser sync verification; existing services and credentials will be reused."
+        setup_fail "$failure"
+        WORKSPACE_SUPERSYNC_PASSKEY_ENROLLMENT_URL=""
+        return 1
+        ;;
+    esac
+  done
 }
 
 workspace_vikunja_cli() {
@@ -3917,6 +3970,7 @@ workspace_setup() {
   [[ -n "$n8n_image" ]] && SPARK_WORKSPACE_N8N_IMAGE="$n8n_image"
   SETUP_FAILED=()
   SETUP_SKIPPED=()
+  WORKSPACE_SETUP_RESUME_HINT=""
   printf "\n  ${BOLD}spark ws setup${NC} — %s + n8n + Hermes\n\n" "$(workspace_task_manager_label "$task_manager")"
   workspace_preflight "$check_only" || true
   existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
@@ -6528,7 +6582,11 @@ workspace_summary() {
     printf "  ${RED}${BOLD}Workspace incomplete:${NC} %d issue(s)\n" "${#SETUP_FAILED[@]}"
     local step
     for step in "${SETUP_FAILED[@]}"; do printf "    ${RED}✗${NC} %s\n" "$step"; done
-    printf "\n  Fix them and re-run: ${BOLD}spark ws setup${NC}\n\n"
+    if [[ -n "${WORKSPACE_SETUP_RESUME_HINT:-}" ]]; then
+      printf "\n  %s\n\n" "$WORKSPACE_SETUP_RESUME_HINT"
+    else
+      printf "\n  Fix them and re-run: ${BOLD}spark ws setup${NC}\n\n"
+    fi
     return 1
   elif [[ ${#SETUP_SKIPPED[@]} -gt 0 ]]; then
     printf "  ${YELLOW}${BOLD}Skipped steps:${NC}\n"

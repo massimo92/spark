@@ -1155,7 +1155,9 @@ test_super_productivity_onboarding_verifies_round_trip() {
     workspace_wait_for_super_productivity_sync_task() {
       [[ "$1" == spark-sync-check-1234567890 ]] && printf "%s\n" task-1
     }
+    workspace_wait_for_super_productivity_sync_settle() { return 0; }
     workspace_delete_super_productivity_sync_task() { [[ "$1" == task-1 ]]; }
+    workspace_wait_for_supersync_task_delete() { [[ "$1" == task-1 ]]; }
     workspace_set_env_key() { printf "%s=%s\n" "$1" "$2" >> "$STATE_FILE"; }
     workspace_complete_super_productivity_browser_sync
   ' _ "$SPARK" 2>&1)
@@ -1165,6 +1167,60 @@ test_super_productivity_onboarding_verifies_round_trip() {
   [[ "$out" == *"verified in both directions"* ]]
   [[ "$state" == *"SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS=verified"* ]]
   [[ "$state" == *"SUPER_PRODUCTIVITY_BROWSER_SYNC_URL=https://tasks.example.ts.net"* ]]
+}
+
+test_super_productivity_onboarding_retries_verification_in_place() {
+  local tmp out state deletes delete_checks
+  tmp=$(mktemp -d)
+  out=$(printf '\nRETRY\n\nSYNCED\n' | HOME="${tmp}/home" STATE_FILE="${tmp}/state" DELETE_FILE="${tmp}/deletes" DELETE_CHECK_FILE="${tmp}/delete-checks" bash -c '
+    source "$1"
+    SETUP_FAILED=()
+    is_interactive() { return 0; }
+    workspace_task_manager() { printf "%s\n" super-productivity; }
+    workspace_supersync_passkey_ready() { return 0; }
+    workspace_super_productivity_browser_sync_ready() { return 1; }
+    workspace_show_super_productivity_sync_access() { return 0; }
+    workspace_task_manager_url() { printf "%s\n" https://tasks.example.ts.net; }
+    workspace_read_env() {
+      [[ "$1" == SUPER_PRODUCTIVITY_USER_EMAIL ]] && printf "%s\n" m@example.com
+    }
+    workspace_random_hex_token() { printf "%s\n" 1234567890abcdef; }
+    workspace_wait_for_super_productivity_sync_task() { printf "%s\n" task-1; }
+    workspace_wait_for_super_productivity_sync_settle() { return 0; }
+    workspace_delete_super_productivity_sync_task() {
+      printf "delete\n" >> "$DELETE_FILE"
+    }
+    workspace_wait_for_supersync_task_delete() {
+      printf "checked\n" >> "$DELETE_CHECK_FILE"
+    }
+    workspace_set_env_key() { printf "%s=%s\n" "$1" "$2" >> "$STATE_FILE"; }
+    workspace_complete_super_productivity_browser_sync
+  ' _ "$SPARK" 2>&1)
+  state=$(cat "${tmp}/state" 2>/dev/null || true)
+  deletes=$(wc -l < "${tmp}/deletes" 2>/dev/null || printf '0')
+  delete_checks=$(wc -l < "${tmp}/delete-checks" 2>/dev/null || printf '0')
+  rm -rf "$tmp"
+  [[ "$out" == *"Retrying only the browser sync verification"* ]]
+  [[ "$out" == *"Electron-to-SuperSync deletion verified"* ]]
+  [[ "$out" == *"verified in both directions"* ]]
+  [[ "$deletes" -eq 2 ]]
+  [[ "$delete_checks" -eq 2 ]]
+  [[ "$state" == *"SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS=verified"* ]]
+}
+
+test_workspace_summary_uses_super_productivity_resume_hint() {
+  local tmp out
+  tmp=$(mktemp -d)
+  out=$(HOME="$tmp/home" bash -c '
+    source "$1"
+    SETUP_FAILED=("Electron-to-browser SuperSync was not confirmed")
+    SETUP_SKIPPED=()
+    WORKSPACE_SETUP_RESUME_HINT="Resume only the Super Productivity browser sync verification."
+    workspace_summary
+  ' _ "$SPARK" 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Resume only the Super Productivity browser sync verification."* ]]
+  [[ "$out" != *"Fix them and re-run"* ]]
 }
 
 test_super_productivity_onboarding_requires_interactive_terminal() {
@@ -7536,6 +7592,8 @@ run_test "workspace checks SuperSync user through stdin SQL" test_supersync_user
 run_test "SuperSync setup creates initial passkey enrollment URL" test_supersync_initial_passkey_enrollment_url
 run_test "SuperSync access is shown only in a temporary pager" test_super_productivity_sync_access_uses_temporary_pager
 run_test "Super Productivity onboarding verifies two-way sync" test_super_productivity_onboarding_verifies_round_trip
+run_test "Super Productivity onboarding retries verification in place" test_super_productivity_onboarding_retries_verification_in_place
+run_test "Workspace summary shows Super Productivity resume guidance" test_workspace_summary_uses_super_productivity_resume_hint
 run_test "Super Productivity onboarding requires an interactive terminal" test_super_productivity_onboarding_requires_interactive_terminal
 run_test "workspace preserves legacy Postgres mount" test_workspace_preserves_legacy_postgres_mount
 run_test "Super Productivity rejects insecure ports mode" test_super_productivity_rejects_http_ports_mode
