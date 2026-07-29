@@ -916,6 +916,10 @@ EOF
     [[ "$supersync_patch" == *"existingPasskeyCount === 0"* ]] &&
     [[ "$supersync_patch" == *": { tokenVersion: { increment: 1 } })"* ]] &&
     [[ "$headless_patch" != *$'+import { SyncProviderId '* ]] &&
+    [[ "$headless_patch" == *"import { SyncWrapperService } from '../../imex/sync/sync-wrapper.service';"* ]] &&
+    [[ "$headless_patch" == *"method === 'POST' && path === '/sync'"* ]] &&
+    [[ "$headless_patch" == *"const syncResult = await this._syncWrapperService.sync(true);"* ]] &&
+    [[ "$headless_patch" == *"synced: syncResult !== 'HANDLED_ERROR'"* ]] &&
     [[ "$gateway_absent" -eq 1 ]] &&
     [[ "$mode" == "600" ]] &&
     [[ "$init_mode" == "644" ]]
@@ -1155,7 +1159,7 @@ test_super_productivity_onboarding_verifies_round_trip() {
     workspace_wait_for_super_productivity_sync_task() {
       [[ "$1" == spark-sync-check-1234567890 ]] && printf "%s\n" task-1
     }
-    workspace_wait_for_super_productivity_sync_settle() { return 0; }
+    workspace_wait_for_super_productivity_sync_ready() { return 0; }
     workspace_delete_super_productivity_sync_task() { [[ "$1" == task-1 ]]; }
     workspace_wait_for_supersync_task_delete() { [[ "$1" == task-1 ]]; }
     workspace_set_env_key() { printf "%s=%s\n" "$1" "$2" >> "$STATE_FILE"; }
@@ -1170,9 +1174,9 @@ test_super_productivity_onboarding_verifies_round_trip() {
 }
 
 test_super_productivity_onboarding_retries_verification_in_place() {
-  local tmp out state deletes delete_checks
+  local tmp out state deletes delete_checks sync_triggers
   tmp=$(mktemp -d)
-  out=$(printf '\nRETRY\n\nSYNCED\n' | HOME="${tmp}/home" STATE_FILE="${tmp}/state" DELETE_FILE="${tmp}/deletes" DELETE_CHECK_FILE="${tmp}/delete-checks" bash -c '
+  out=$(printf '\nRETRY\n\nSYNCED\n' | HOME="${tmp}/home" STATE_FILE="${tmp}/state" DELETE_FILE="${tmp}/deletes" DELETE_CHECK_FILE="${tmp}/delete-checks" SYNC_TRIGGER_FILE="${tmp}/sync-triggers" bash -c '
     source "$1"
     SETUP_FAILED=()
     is_interactive() { return 0; }
@@ -1186,25 +1190,43 @@ test_super_productivity_onboarding_retries_verification_in_place() {
     }
     workspace_random_hex_token() { printf "%s\n" 1234567890abcdef; }
     workspace_wait_for_super_productivity_sync_task() { printf "%s\n" task-1; }
-    workspace_wait_for_super_productivity_sync_settle() { return 0; }
     workspace_delete_super_productivity_sync_task() {
+      local deletes=0 triggers=0
+      [[ -f "$DELETE_FILE" ]] && deletes=$(wc -l < "$DELETE_FILE")
+      [[ -f "$SYNC_TRIGGER_FILE" ]] && triggers=$(wc -l < "$SYNC_TRIGGER_FILE")
+      [[ "$triggers" -eq $((deletes * 2 + 1)) ]] || return 1
       printf "delete\n" >> "$DELETE_FILE"
     }
-    workspace_wait_for_supersync_task_delete() {
-      printf "checked\n" >> "$DELETE_CHECK_FILE"
+    workspace_trigger_super_productivity_sync() {
+      printf "triggered\n" >> "$SYNC_TRIGGER_FILE"
     }
+    workspace_supersync_task_delete_recorded() {
+      local deletes triggers
+      printf "checked\n" >> "$DELETE_CHECK_FILE"
+      [[ -f "$SYNC_TRIGGER_FILE" ]] || return 1
+      deletes=$(wc -l < "$DELETE_FILE")
+      triggers=$(wc -l < "$SYNC_TRIGGER_FILE")
+      [[ "$triggers" -ge $((deletes * 2)) ]]
+    }
+    sleep() { :; }
     workspace_set_env_key() { printf "%s=%s\n" "$1" "$2" >> "$STATE_FILE"; }
     workspace_complete_super_productivity_browser_sync
   ' _ "$SPARK" 2>&1)
   state=$(cat "${tmp}/state" 2>/dev/null || true)
   deletes=$(wc -l < "${tmp}/deletes" 2>/dev/null || printf '0')
   delete_checks=$(wc -l < "${tmp}/delete-checks" 2>/dev/null || printf '0')
+  if [[ -f "${tmp}/sync-triggers" ]]; then
+    sync_triggers=$(wc -l < "${tmp}/sync-triggers")
+  else
+    sync_triggers=0
+  fi
   rm -rf "$tmp"
   [[ "$out" == *"Retrying only the browser sync verification"* ]]
   [[ "$out" == *"Electron-to-SuperSync deletion verified"* ]]
   [[ "$out" == *"verified in both directions"* ]]
   [[ "$deletes" -eq 2 ]]
-  [[ "$delete_checks" -eq 2 ]]
+  [[ "$delete_checks" -eq 4 ]]
+  [[ "$sync_triggers" -eq 4 ]]
   [[ "$state" == *"SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS=verified"* ]]
 }
 
