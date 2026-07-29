@@ -14,6 +14,31 @@ export SPARK_ACCEL="${SPARK_ACCEL:-cuda-unified}"
 passed=0
 failed=0
 
+test_suite="${SPARK_TEST_SUITE:-all}"
+test_shard_total="${SPARK_TEST_SHARD_TOTAL:-1}"
+test_shard_index="${SPARK_TEST_SHARD_INDEX:-0}"
+test_list_only="${SPARK_TEST_LIST_ONLY:-0}"
+discovered=0
+eligible=0
+selected=0
+
+case "$test_suite" in
+  all|portability) ;;
+  *) printf "Unknown SPARK_TEST_SUITE: %s\n" "$test_suite" >&2; exit 2 ;;
+esac
+[[ "$test_shard_total" =~ ^[1-9][0-9]*$ ]] || {
+  printf "SPARK_TEST_SHARD_TOTAL must be a positive integer\n" >&2
+  exit 2
+}
+[[ "$test_shard_index" =~ ^[0-9]+$ ]] && (( test_shard_index < test_shard_total )) || {
+  printf "SPARK_TEST_SHARD_INDEX must be between 0 and total - 1\n" >&2
+  exit 2
+}
+[[ "$test_list_only" == "0" || "$test_list_only" == "1" ]] || {
+  printf "SPARK_TEST_LIST_ONLY must be 0 or 1\n" >&2
+  exit 2
+}
+
 make_fake_bin() {
   local dir="$1"
   mkdir -p "$dir"
@@ -806,9 +831,52 @@ EOF
   chmod +x "${dir}/hf"
 }
 
+test_suite_includes() {
+  local test_id="$1"
+  [[ "$test_suite" == "all" ]] && return 0
+
+  case "$test_id" in
+    test_architecture_command_maps_core_boundaries|\
+    test_single_file_build_matches_modules|\
+    test_source_guard_loads_without_dispatch|\
+    test_total_mem_detection_positive|\
+    test_port_auto_skips_busy|\
+    test_config_set_and_show|\
+    test_pull_ollama_routes|\
+    test_status_ollama_lists|\
+    test_stop_ollama_unloads|\
+    test_detect_metal_on_apple_silicon|\
+    test_detect_cpu_without_gpu|\
+    test_gateway_ollama_route_mac|\
+    test_setup_picker_routes_to_host|\
+    test_workspace_help_and_command|\
+    test_workspace_dashboard_proxy_rewrites_host_on_loopback|\
+    test_workspace_status_json_quiet_and_containers|\
+    test_workspace_backup_manifest_and_verify|\
+    test_workspace_backup_verify_flags_public_backup_file)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 run_test() {
-  local name="$1"
+  local name="$1" test_id="${2:-}" test_number
   shift
+
+  discovered=$((discovered + 1))
+  test_suite_includes "$test_id" || return 0
+  eligible=$((eligible + 1))
+  test_number=$((eligible - 1))
+  (( test_number % test_shard_total == test_shard_index )) || return 0
+  selected=$((selected + 1))
+
+  if [[ "$test_list_only" == "1" ]]; then
+    printf "%s\n" "$test_id"
+    return 0
+  fi
 
   if "$@"; then
     printf "ok - %s\n" "$name"
@@ -3437,6 +3505,8 @@ test_workspace_setup_keeps_hermes_dashboard_on_loopback() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin docker_calls nemo_calls
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${fake_bin}/sleep"
+  chmod +x "${fake_bin}/sleep"
   make_cached_model "${tmp}/home" "Org/Alpha"
   mkdir -p "${tmp}/home/.config/spark/workspace"
   printf 'HERMES_URL=http://127.0.0.1:18789\n' > "${tmp}/home/.config/spark/workspace/secrets.env"
@@ -7912,5 +7982,12 @@ run_test "workspace setup rejects multiline Vikunja token" test_workspace_setup_
 run_test "workspace setup rerun bootstraps n8n owner" test_workspace_setup_rerun_bootstraps_n8n_owner
 run_test "workspace setup uses only n8n 2.x login field" test_workspace_setup_uses_only_n8n_2x_login_field
 
-printf "\n%d passed, %d failed\n" "$passed" "$failed"
-[[ "$failed" -eq 0 ]]
+if [[ "$test_list_only" == "1" ]]; then
+  (( selected > 0 ))
+  exit
+fi
+
+printf "\n%d passed, %d failed (%d selected, %d eligible, %d discovered; suite=%s; shard=%d/%d)\n" \
+  "$passed" "$failed" "$selected" "$eligible" "$discovered" "$test_suite" \
+  "$((test_shard_index + 1))" "$test_shard_total"
+(( selected > 0 && failed == 0 ))
