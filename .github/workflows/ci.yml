@@ -4,28 +4,23 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  lint:
+    name: Lint and test partition
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
-
-      - name: Install tools (macOS)
-        if: runner.os == 'macOS'
-        run: brew install jq shellcheck
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Check generated spark artifact
         run: scripts/build-single-file.sh --check
@@ -36,5 +31,76 @@ jobs:
       - name: Run ShellCheck
         run: shellcheck --exclude=SC2059,SC2015,SC2016 spark install.sh tests/run.sh scripts/build-single-file.sh
 
+      - name: Verify four shards cover every test exactly once
+        shell: bash
+        run: |
+          expected="$(grep -c '^run_test "' tests/run.sh)"
+          all="$(SPARK_TEST_LIST_ONLY=1 bash tests/run.sh)"
+          sharded="$({
+            for shard in 0 1 2 3; do
+              SPARK_TEST_LIST_ONLY=1 \
+                SPARK_TEST_SHARD_INDEX="$shard" \
+                SPARK_TEST_SHARD_TOTAL=4 \
+                bash tests/run.sh
+            done
+          } | sort)"
+          all_sorted="$(printf '%s\n' "$all" | sort)"
+          unique="$(printf '%s\n' "$all_sorted" | sort -u)"
+          test "$(printf '%s\n' "$all_sorted" | wc -l | tr -d ' ')" -eq "$expected"
+          test "$(printf '%s\n' "$unique" | wc -l | tr -d ' ')" -eq "$expected"
+          diff <(printf '%s\n' "$all_sorted") <(printf '%s\n' "$sharded")
+
+  linux-tests:
+    name: Linux tests (shard ${{ matrix.shard }})
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Run tests
+        env:
+          SPARK_TEST_SHARD_INDEX: ${{ matrix.shard }}
+          SPARK_TEST_SHARD_TOTAL: 4
+        run: bash tests/run.sh
+
+  macos-portability:
+    name: macOS portability smoke
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: brew install jq
+
+      - name: Run portability tests
+        env:
+          SPARK_TEST_SUITE: portability
+        run: bash tests/run.sh
+
+  macos-full:
+    name: macOS full tests (shard ${{ matrix.shard }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: brew install jq
+
+      - name: Run tests
+        env:
+          SPARK_TEST_SHARD_INDEX: ${{ matrix.shard }}
+          SPARK_TEST_SHARD_TOTAL: 4
         run: bash tests/run.sh
