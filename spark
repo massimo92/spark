@@ -9587,32 +9587,45 @@ workspace_cleanup_abandoned_hermes_access() {
   [[ "$failed" == "0" ]]
 }
 
+workspace_teardown_vikunja() {
+  local image_refs_csv="${1:-}" failed=0
+  workspace_cleanup_abandoned_hermes_access vikunja || failed=1
+  docker rm -f "$WORKSPACE_VIKUNJA_CONTAINER" >/dev/null 2>&1 || true
+  workspace_remove_task_manager_images "$image_refs_csv" || failed=1
+  workspace_drop_task_manager_database vikunja || failed=1
+  workspace_remove_managed_path "${WORKSPACE_DATA_DIR}/vikunja-files" || failed=1
+  workspace_remove_managed_path "$WORKSPACE_VIKUNJA_ENV_FILE" || failed=1
+  [[ "$failed" == "0" ]]
+}
+
+workspace_teardown_super_productivity() {
+  local image_refs_csv="${1:-}" failed=0
+  workspace_cleanup_abandoned_hermes_access super-productivity || failed=1
+  docker rm -f "$WORKSPACE_SUPERSYNC_CONTAINER" "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_CONTAINER" >/dev/null 2>&1 || true
+  workspace_remove_task_manager_images "$image_refs_csv" || failed=1
+  workspace_drop_task_manager_database super-productivity || failed=1
+  workspace_remove_managed_path "${WORKSPACE_DATA_DIR}/super-productivity-electron" || failed=1
+  workspace_remove_managed_path "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" || failed=1
+  workspace_remove_managed_path "$WORKSPACE_SUPERSYNC_DIR" || failed=1
+  workspace_remove_managed_path "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR" || failed=1
+  [[ "$failed" == "0" ]]
+}
+
+workspace_teardown_todoist() {
+  local failed=0
+  workspace_cleanup_abandoned_hermes_access todoist || failed=1
+  workspace_remove_managed_path "${WORKSPACE_CONFIG_DIR}/hermes-skills/todoist" || failed=1
+  [[ "$failed" == "0" ]]
+}
+
 workspace_cleanup_abandoned_task_manager() {
-  local manager="$1" image_refs_csv="${2:-}" failed=0
-  workspace_cleanup_abandoned_hermes_access "$manager" || failed=1
+  local manager="$1" image_refs_csv="${2:-}"
   case "$manager" in
-    vikunja)
-      docker rm -f "$WORKSPACE_VIKUNJA_CONTAINER" >/dev/null 2>&1 || true
-      workspace_remove_task_manager_images "$image_refs_csv" || failed=1
-      workspace_drop_task_manager_database "$manager" || failed=1
-      workspace_remove_managed_path "${WORKSPACE_DATA_DIR}/vikunja-files" || failed=1
-      workspace_remove_managed_path "$WORKSPACE_VIKUNJA_ENV_FILE" || failed=1
-      ;;
-    super-productivity)
-      docker rm -f "$WORKSPACE_SUPERSYNC_CONTAINER" "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_CONTAINER" >/dev/null 2>&1 || true
-      workspace_remove_task_manager_images "$image_refs_csv" || failed=1
-      workspace_drop_task_manager_database "$manager" || failed=1
-      workspace_remove_managed_path "${WORKSPACE_DATA_DIR}/super-productivity-electron" || failed=1
-      workspace_remove_managed_path "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE" || failed=1
-      workspace_remove_managed_path "$WORKSPACE_SUPERSYNC_DIR" || failed=1
-      workspace_remove_managed_path "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_DIR" || failed=1
-      ;;
-    todoist)
-      workspace_remove_managed_path "${WORKSPACE_CONFIG_DIR}/hermes-skills/todoist" || failed=1
-      ;;
+    vikunja) workspace_teardown_vikunja "$image_refs_csv" ;;
+    super-productivity) workspace_teardown_super_productivity "$image_refs_csv" ;;
+    todoist) workspace_teardown_todoist ;;
     *) return 1 ;;
   esac
-  [[ "$failed" == "0" ]]
 }
 
 workspace_finalize_task_manager_teardown() {
@@ -9624,16 +9637,17 @@ workspace_finalize_task_manager_teardown() {
     info "Preserved $(workspace_task_manager_label "$abandoned") data because the new workspace is incomplete"
     return 0
   fi
-  workspace_cleanup_abandoned_task_manager "$abandoned" "$teardown_images_csv" || return 1
   for ((attempt = 1; attempt <= 30; attempt++)); do
     case "$current" in
       vikunja) workspace_hermes_vikunja_api_ready && ready=1 ;;
       super-productivity) workspace_hermes_super_productivity_api_ready && ready=1 ;;
+      todoist) workspace_hermes_todoist_api_ready && ready=1 ;;
     esac
     [[ "$ready" == "1" ]] && break
     sleep 1
   done
   [[ "$ready" == "1" ]] || return 1
+  workspace_cleanup_abandoned_task_manager "$abandoned" "$teardown_images_csv" || return 1
   workspace_remove_env_file_key "$WORKSPACE_ENV_FILE" WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING
   workspace_remove_env_file_key "$WORKSPACE_ENV_FILE" WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES
   info "Removed abandoned $(workspace_task_manager_label "$abandoned") services, images and data"
