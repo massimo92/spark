@@ -732,6 +732,24 @@ Update available:         no}"; exit "${FAKE_NEMOHERMES_UPDATE_CHECK_EXIT:-0}" ;
   disabled  yuanbao
   disabled  computer_use}" ;;
   *"channels status --channel whatsapp --json"*) echo "${FAKE_WHATSAPP_STATUS_JSON:-{\"verdict\":\"healthy\"}}" ;;
+  *"hermes exec"*"-X POST"*"/labels"*)
+    [[ "${FAKE_HERMES_TODOIST_LABEL_CREATE_EXIT:-0}" == "0" ]] || exit "${FAKE_HERMES_TODOIST_LABEL_CREATE_EXIT}"
+    [[ -n "${FAKE_HERMES_TODOIST_LABEL_STATE_FILE:-}" ]] && : > "$FAKE_HERMES_TODOIST_LABEL_STATE_FILE"
+    echo '{"id":"label-hermes","name":"Hermes"}'
+    exit 0 ;;
+  *"hermes exec"*"/labels?limit=200"*)
+    if [[ -n "${FAKE_HERMES_TODOIST_LABELS_JSON:-}" ]]; then
+      printf '%s\n' "$FAKE_HERMES_TODOIST_LABELS_JSON"
+    elif [[ -n "${FAKE_HERMES_TODOIST_LABEL_STATE_FILE:-}" && ! -e "$FAKE_HERMES_TODOIST_LABEL_STATE_FILE" ]]; then
+      echo '{"results":[],"next_cursor":null}'
+      exit 1
+    else
+      echo '{"results":[{"id":"label-hermes","name":"Hermes"}],"next_cursor":null}'
+    fi
+    exit "${FAKE_HERMES_TODOIST_API_EXIT:-0}" ;;
+  *"hermes exec"*"/projects?limit=1"*)
+    echo "${FAKE_HERMES_TODOIST_PROJECTS_JSON:-{\"results\":[]}}"
+    exit "${FAKE_HERMES_TODOIST_API_EXIT:-0}" ;;
   *"hermes exec"*"/user"*)
     echo "${FAKE_HERMES_VIKUNJA_USER_JSON:-{\"id\":3,\"username\":\"bot-hermes\",\"bot_owner_id\":1}}"
     exit "${FAKE_HERMES_VIKUNJA_API_EXIT:-0}" ;;
@@ -1009,6 +1027,42 @@ EOF
     [[ "$gateway_absent" -eq 1 ]] &&
     [[ "$mode" == "600" ]] &&
     [[ "$init_mode" == "644" ]]
+}
+
+test_todoist_workspace_files() {
+  local tmp compose env postgres_env n8n_env init mode
+  tmp=$(mktemp -d)
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_WORKSPACE_TASK_MANAGER=todoist \
+    SPARK_WORKSPACE_TAILSCALE_MODE=services SPARK_WORKSPACE_TODOIST_TOKEN=todoist_test_token bash -c '
+      source "$1"
+      workspace_write_files_todoist robin-triceratops.ts.net massimo m@example.com unused m@example.com unused Org/Alpha
+    ' _ "$SPARK" >/dev/null 2>&1
+  compose=$(cat "${tmp}/home/.config/spark/workspace/docker-compose.yml")
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  postgres_env=$(cat "${tmp}/home/.config/spark/workspace/postgres.env")
+  n8n_env=$(cat "${tmp}/home/.config/spark/workspace/n8n.env")
+  init=$(cat "${tmp}/home/.config/spark/workspace/init-db.sh")
+  mode=$(stat -c '%a' "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || stat -f '%Lp' "${tmp}/home/.config/spark/workspace/secrets.env")
+  rm -rf "$tmp"
+  [[ "$env" == *"WORKSPACE_TASK_MANAGER=todoist"* ]] &&
+    [[ "$env" == *"TODOIST_API_URL=https://api.todoist.com/api/v1"* ]] &&
+    [[ "$env" == *"TODOIST_URL=https://app.todoist.com/app"* ]] &&
+    [[ "$env" == *"TODOIST_API_TOKEN=todoist_test_token"* ]] &&
+    [[ "$env" == *"TODOIST_API_STATUS=pending"* ]] &&
+    [[ "$env" == *"TASK_MANAGER_URL=https://app.todoist.com/app"* ]] &&
+    [[ "$compose" == *$'  postgres:\n'* ]] &&
+    [[ "$compose" == *$'  n8n:\n'* ]] &&
+    [[ "$compose" != *$'  vikunja:\n'* ]] &&
+    [[ "$compose" != *$'  supersync:\n'* ]] &&
+    [[ "$compose" != *$'  super-productivity-electron:\n'* ]] &&
+    [[ "$compose" != *":3456:"* ]] &&
+    [[ "$postgres_env" != *"TODOIST"* ]] &&
+    [[ "$n8n_env" != *"TODOIST"* ]] &&
+    [[ "$init" == *"CREATE DATABASE n8n"* ]] &&
+    [[ "$init" != *"CREATE DATABASE vikunja"* ]] &&
+    [[ "$init" != *"CREATE DATABASE supersync"* ]] &&
+    [[ "$mode" == "600" ]]
 }
 
 
@@ -1376,7 +1430,7 @@ test_super_productivity_rejects_http_ports_mode() {
 }
 
 test_workspace_interactive_task_manager_selector() {
-  local tmp super_productivity vikunja kept migrated cancelled status
+  local tmp super_productivity vikunja todoist kept migrated cancelled status
   tmp=$(mktemp -d)
   super_productivity=$(printf '\n1\n' | SPARK_WORKSPACE_TASK_MANAGER=vikunja HOME="${tmp}/home" bash -c '
     source "$1"
@@ -1384,6 +1438,11 @@ test_workspace_interactive_task_manager_selector() {
     workspace_select_task_manager "" "" 0
   ' _ "$SPARK" 2>"${tmp}/new.err")
   vikunja=$(printf '2\n' | HOME="${tmp}/home" bash -c '
+    source "$1"
+    is_interactive() { return 0; }
+    workspace_select_task_manager "" "" 0
+  ' _ "$SPARK" 2>/dev/null)
+  todoist=$(printf '3\n' | HOME="${tmp}/home" bash -c '
     source "$1"
     is_interactive() { return 0; }
     workspace_select_task_manager "" "" 0
@@ -1408,6 +1467,7 @@ test_workspace_interactive_task_manager_selector() {
   set -e
   [[ "$super_productivity" == "super-productivity" ]]
   [[ "$vikunja" == "vikunja" ]]
+  [[ "$todoist" == "todoist" ]]
   [[ "$kept" == "super-productivity" ]]
   [[ "$migrated" == "vikunja" ]]
   [[ "$status" -ne 0 && "$cancelled" == *"migration cancelled"* ]]
@@ -1501,9 +1561,11 @@ test_workspace_selects_abandoned_task_manager_for_teardown() {
       printf "pending=%s\n" "$(workspace_teardown_task_manager_candidate vikunja super-productivity vikunja)"
       workspace_task_manager_artifacts_exist() { [[ "$1" == vikunja ]]; }
       printf "legacy=%s\n" "$(workspace_teardown_task_manager_candidate "" "" super-productivity)"
+      workspace_task_manager_artifacts_exist() { [[ "$1" == todoist ]]; }
+      printf "hosted=%s\n" "$(workspace_teardown_task_manager_candidate "" "" vikunja)"
     ' _ "$SPARK")
   rm -rf "$tmp"
-  [[ "$out" == $'switch=super-productivity\npending=super-productivity\nlegacy=vikunja' ]]
+  [[ "$out" == $'switch=super-productivity\npending=super-productivity\nlegacy=vikunja\nhosted=todoist' ]]
 }
 
 test_workspace_task_manager_teardown_removes_images() {
@@ -1611,9 +1673,12 @@ test_workspace_task_manager_teardown_removes_hermes_access() {
       workspace_stop_hermes_super_productivity_proxy() { printf "%s\n" stop-super-productivity-proxy >> "$SPARK_TEST_LOG"; }
       workspace_hermes_vikunja_provider_attached() { return 0; }
       workspace_hermes_vikunja_provider_exists() { return 0; }
+      workspace_hermes_todoist_provider_attached() { return 0; }
+      workspace_hermes_todoist_provider_exists() { return 0; }
       workspace_remove_managed_path() { printf "remove:%s\n" "$1" >> "$SPARK_TEST_LOG"; }
       workspace_cleanup_abandoned_hermes_access vikunja
       workspace_cleanup_abandoned_hermes_access super-productivity
+      workspace_cleanup_abandoned_hermes_access todoist
     ' _ "$SPARK" >/dev/null 2>&1
   calls=$(cat "$log")
   rm -rf "$tmp"
@@ -1627,7 +1692,12 @@ test_workspace_task_manager_teardown_removes_hermes_access() {
     [[ "$calls" == *"openshell:policy update hermes --remove-rule spark-super-productivity-api --wait"* ]] &&
     [[ "$calls" == *"nemohermes:hermes skill remove super-productivity"* ]] &&
     [[ "$calls" == *"remove:${tmp}/home/.config/spark/workspace/hermes-skills/super-productivity"* ]] &&
-    [[ "$(grep -c '^nemohermes:hermes gateway restart --quiet$' <<<"$calls")" == 2 ]]
+    [[ "$calls" == *"openshell:policy update hermes --remove-rule spark-todoist-api --wait"* ]] &&
+    [[ "$calls" == *"openshell:sandbox provider detach hermes spark-todoist"* ]] &&
+    [[ "$calls" == *"openshell:provider delete spark-todoist"* ]] &&
+    [[ "$calls" == *"nemohermes:hermes skill remove todoist"* ]] &&
+    [[ "$calls" == *"remove:${tmp}/home/.config/spark/workspace/hermes-skills/todoist"* ]] &&
+    [[ "$(grep -c '^nemohermes:hermes gateway restart --quiet$' <<<"$calls")" == 3 ]]
 }
 
 
@@ -4178,21 +4248,25 @@ test_workspace_setup_repairs_shared_postgres_runtime() {
     [[ "$calls" == *"CREATE DATABASE n8n"* ]]
 }
 
-test_workspace_setup_manual_token_fallback() {
+test_workspace_setup_fails_when_vikunja_token_creation_fails() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out env
+  local tmp fake_bin out env status
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_VIKUNJA_TOKEN_CREATE_EXIT=1 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha 2>&1 || true)
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha 2>&1)
+  status=$?
+  set -e
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$out" == *"Create a token for bot-hermes under Settings > Bots"* ]] &&
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Could not configure Vikunja bot-hermes automatically"* ]] &&
     [[ "$env" == *"VIKUNJA_HERMES_API_STATUS=manual"* ]] &&
     [[ "$env" != *"VIKUNJA_HERMES_API_TOKEN=vk_auto_hermes"* ]]
 }
@@ -4310,7 +4384,7 @@ test_workspace_rejects_regular_user_token_for_hermes() {
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
-    SPARK_WORKSPACE_N8N_PASSWORD=secret456 SPARK_WORKSPACE_VIKUNJA_TOKEN=vk_regular \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_VIKUNJA_CREATED_TOKEN=vk_regular \
     FAKE_VIKUNJA_USER_JSON='{"id":2,"username":"hermes","email":"hermes@spark.invalid","bot_owner_id":0}' \
     FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
@@ -4329,7 +4403,7 @@ test_workspace_rejects_bot_owned_by_another_user() {
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
-    SPARK_WORKSPACE_N8N_PASSWORD=secret456 SPARK_WORKSPACE_VIKUNJA_TOKEN=vk_foreign_bot \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_VIKUNJA_CREATED_TOKEN=vk_foreign_bot \
     FAKE_VIKUNJA_USER_JSON='{"id":3,"username":"bot-hermes","email":"","bot_owner_id":9}' \
     FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
@@ -4362,13 +4436,13 @@ test_workspace_setup_never_persists_human_password_on_vikunja_failure() {
 
 test_workspace_setup_preserves_existing_secrets() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin env_file pg_before vdb_before n8n_before token_after pg_after vdb_after n8n_after
+  local tmp fake_bin env_file pg_before vdb_before n8n_before token_before token_after pg_after vdb_after n8n_after
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
-    SPARK_WORKSPACE_N8N_PASSWORD=secret456 \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_VIKUNJA_CREATED_TOKEN=vk_keep \
     SPARK_WORKSPACE_VIKUNJA_IMAGE=vikunja/vikunja:1.0.0 \
     SPARK_WORKSPACE_N8N_IMAGE=docker.n8n.io/n8nio/n8n:1.100.0 \
     FAKE_TAILSCALE_STATUS_EXIT=0 \
@@ -4378,12 +4452,13 @@ test_workspace_setup_preserves_existing_secrets() {
   pg_before=$(sed -n 's/^POSTGRES_PASSWORD=//p' "$env_file")
   vdb_before=$(sed -n 's/^VIKUNJA_DATABASE_PASSWORD=//p' "$env_file")
   n8n_before=$(sed -n 's/^DB_POSTGRESDB_PASSWORD=//p' "$env_file")
+  token_before=$(sed -n 's/^VIKUNJA_HERMES_API_TOKEN=//p' "$env_file")
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=changed123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=changed456 FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha --vikunja-token vk_keep >/dev/null 2>&1 || true
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
   pg_after=$(sed -n 's/^POSTGRES_PASSWORD=//p' "$env_file")
   vdb_after=$(sed -n 's/^VIKUNJA_DATABASE_PASSWORD=//p' "$env_file")
   n8n_after=$(sed -n 's/^DB_POSTGRESDB_PASSWORD=//p' "$env_file")
@@ -4392,7 +4467,7 @@ test_workspace_setup_preserves_existing_secrets() {
   [[ -n "$pg_before" ]] && [[ "$pg_before" == "$pg_after" ]] &&
     [[ "$vdb_before" == "$vdb_after" ]] &&
     [[ "$n8n_before" == "$n8n_after" ]] &&
-    [[ "$token_after" == "vk_keep" ]]
+    [[ "$token_before" == "vk_keep" ]] && [[ "$token_before" == "$token_after" ]]
 }
 
 test_workspace_setup_missing_required_values_do_not_pollute_env() {
@@ -6482,35 +6557,84 @@ test_workspace_removed_commands_are_unknown() {
     [[ "$mutated" -eq 0 ]]
 }
 
-test_workspace_setup_accepts_vikunja_token() {
+test_workspace_setup_accepts_todoist_token() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin env
+  local tmp fake_bin env out status label_state skill
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  label_state="${tmp}/todoist-hermes-label"
   make_cached_model "${tmp}/home" "Org/Alpha"
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
-    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
-    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
-    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 SPARK_WORKSPACE_HERMES_API_ATTEMPTS=1 \
+    FAKE_HERMES_TODOIST_LABEL_STATE_FILE="$label_state" FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
-    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha --vikunja-token vk_test >/dev/null 2>&1 || true
+    "$SPARK" ws setup --task-manager todoist --yes --model Org/Alpha --token td_test 2>&1)
+  status=$?
+  set -e
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  skill=$(cat "${tmp}/home/.config/spark/workspace/hermes-skills/todoist/SKILL.md" 2>/dev/null || echo "")
+  [[ "$status" -eq 0 ]] && [[ "$out" == *"Workspace complete!"* ]] &&
+    [[ "$env" == *"TODOIST_API_TOKEN=td_test"* ]] &&
+    [[ "$env" == *"TODOIST_API_STATUS=verified"* ]] &&
+    [[ -e "$label_state" ]] &&
+    [[ "$skill" == *'Every task that Hermes changes must retain this label'* ]]
+  status=$?
   rm -rf "$tmp"
-  [[ "$env" == *"VIKUNJA_HERMES_API_TOKEN=vk_test"* ]] &&
-    [[ "$env" == *"VIKUNJA_HERMES_API_STATUS=verified"* ]]
+  return "$status"
 }
 
-test_workspace_setup_rejects_multiline_vikunja_token() {
+test_workspace_setup_fails_when_todoist_label_creation_fails() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env out status label_state
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  label_state="${tmp}/todoist-hermes-label"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 SPARK_WORKSPACE_HERMES_API_ATTEMPTS=1 \
+    FAKE_HERMES_TODOIST_LABEL_STATE_FILE="$label_state" \
+    FAKE_HERMES_TODOIST_LABEL_CREATE_EXIT=1 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager todoist --yes --model Org/Alpha --token td_test 2>&1)
+  status=$?
+  set -e
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Could not give Hermes verified Todoist API access"* ]] &&
+    [[ "$env" == *"TODOIST_API_STATUS=pending"* ]] &&
+    [[ ! -e "$label_state" ]]
+}
+
+test_workspace_setup_rejects_multiline_todoist_token() {
   local tmp fake_bin out status mutated=0
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
-    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha --vikunja-token $'vk_test\nbad' 2>&1)
+    "$SPARK" ws setup --task-manager todoist --yes --model Org/Alpha --token $'td_test\nbad' 2>&1)
   status=$?
   set -e
   [[ -e "${tmp}/home/.config/spark/workspace/secrets.env" ]] && mutated=1
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$out" == *"Vikunja Hermes API token must be a single line"* ]] &&
+    [[ "$out" == *"Todoist API token is invalid or missing"* ]] &&
+    [[ "$mutated" -eq 0 ]]
+}
+
+test_workspace_setup_rejects_removed_vikunja_token_flag() {
+  local tmp fake_bin out status mutated=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha --vikunja-token vk_test 2>&1)
+  status=$?
+  set -e
+  [[ -e "${tmp}/home/.config/spark/workspace/secrets.env" ]] && mutated=1
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Unknown ws setup flag: --vikunja-token"* ]] &&
     [[ "$mutated" -eq 0 ]]
 }
 
@@ -7853,6 +7977,7 @@ run_test "architecture command maps core boundaries" test_architecture_command_m
 run_test "single-file build matches modules" test_single_file_build_matches_modules
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "workspace generates Super Productivity alternative" test_super_productivity_workspace_files
+run_test "workspace generates Todoist alternative" test_todoist_workspace_files
 run_test "workspace preserves custom Super Productivity pins" test_super_productivity_custom_pins_are_preserved
 run_test "workspace reconciles pre-baseline SuperSync migrations" test_supersync_reconciles_pre_baseline_migration_history
 run_test "workspace baseline reconciliation is idempotent" test_supersync_baseline_reconciliation_is_idempotent
@@ -8071,7 +8196,7 @@ run_test "workspace setup blocks Tailscale Funnel" test_workspace_setup_blocks_t
 run_test "workspace setup resets Tailscale Funnel with flag" test_workspace_setup_resets_tailscale_funnel_with_flag
 run_test "workspace setup --check reports Funnel without reset" test_workspace_setup_check_reports_funnel_without_reset
 run_test "workspace setup repairs shared Postgres runtime" test_workspace_setup_repairs_shared_postgres_runtime
-run_test "workspace setup falls back to manual Vikunja token" test_workspace_setup_manual_token_fallback
+run_test "workspace setup fails when Vikunja token creation fails" test_workspace_setup_fails_when_vikunja_token_creation_fails
 run_test "workspace setup waits for Vikunja CLI" test_workspace_setup_waits_for_vikunja_cli
 run_test "workspace setup creates Hermes bot" test_workspace_setup_creates_hermes_bot
 run_test "workspace setup requires Hermes Vikunja API access" test_workspace_setup_requires_hermes_vikunja_api_access
@@ -8160,8 +8285,10 @@ run_test "workspace backup --verify flags checksum mismatch" test_workspace_back
 run_test "workspace backup --verify flags missing checksum entry" test_workspace_backup_verify_flags_missing_checksum_entry
 run_test "workspace backup --verify flags unexpected checksum entry" test_workspace_backup_verify_flags_unexpected_checksum_entry
 run_test "workspace removed commands are unknown" test_workspace_removed_commands_are_unknown
-run_test "workspace setup accepts Vikunja token" test_workspace_setup_accepts_vikunja_token
-run_test "workspace setup rejects multiline Vikunja token" test_workspace_setup_rejects_multiline_vikunja_token
+run_test "workspace setup accepts Todoist token and creates Hermes label" test_workspace_setup_accepts_todoist_token
+run_test "workspace setup fails when Todoist Hermes label cannot be created" test_workspace_setup_fails_when_todoist_label_creation_fails
+run_test "workspace setup rejects multiline Todoist token" test_workspace_setup_rejects_multiline_todoist_token
+run_test "workspace setup rejects removed Vikunja token flag" test_workspace_setup_rejects_removed_vikunja_token_flag
 run_test "workspace setup rerun bootstraps n8n owner" test_workspace_setup_rerun_bootstraps_n8n_owner
 run_test "workspace setup uses only n8n 2.x login field" test_workspace_setup_uses_only_n8n_2x_login_field
 

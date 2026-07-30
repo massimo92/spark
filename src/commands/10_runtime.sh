@@ -2155,20 +2155,21 @@ print_models_overview() {
 }
 
 print_workspace_overview() {
-  local vikunja_url="" n8n_url="" hermes_url="" mode="" model=""
+  local task_url="" n8n_url="" hermes_url="" mode="" model="" task_manager=""
   printf "\n  ${BOLD}Agent workspace${NC}\n"
   if ! workspace_configured; then
     dashboard_row missing "workspace" "not configured"
     return 0
   fi
-  vikunja_url=$(workspace_read_env VIKUNJA_URL 2>/dev/null || true)
+  task_manager=$(workspace_task_manager)
+  task_url=$(workspace_task_manager_url)
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   dashboard_row ok "workspace" "configured (${mode:-unknown} mode)"
   dashboard_row ok "Hermes model" "${model:-unset}"
-  dashboard_row ok "Vikunja" "${vikunja_url:-unset}"
+  dashboard_row ok "$(workspace_task_manager_label "$task_manager")" "${task_url:-unset}"
   dashboard_row ok "n8n" "${n8n_url:-unset}"
   dashboard_row ok "Hermes" "${hermes_url:-unset}"
   return 0

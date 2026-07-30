@@ -30,6 +30,7 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 - Gemma 4 tool parser: https://docs.vllm.ai/en/stable/api/vllm/tool_parsers/gemma4_tool_parser/
 - Tailscale Serve CLI: https://tailscale.com/docs/reference/tailscale-cli/serve
 - Tailscale Services: https://tailscale.com/docs/features/tailscale-services
+- Todoist API v1: https://developer.todoist.com/api/v1/
 
 ## Install method decisions
 
@@ -43,6 +44,10 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 - Hermes requires vLLM automatic tool calling. Workspace setup reconciles an existing model that lacks `--enable-auto-tool-choice` or the expected parser; Qwen3.5/3.6 profiles use `qwen3_coder` as documented by Qwen.
 - Hermes rejects contexts below 64K. Spark serves workspace models at 65,536 tokens and caps each local response at 512 tokens; this keeps multi-turn tool calls responsive without reducing the agent loop.
 - Spark keeps Hermes' terminal, file, web, skills, memory, task, cron, and delegation toolsets. Heavy media, browser, and computer-control schemas stay disabled so smaller local models choose the Vikunja HTTP path reliably.
+- Todoist is a hosted alternative. Spark installs no Todoist container or database, stores the personal API token in the `0600` workspace config, and gives Hermes direct access to the official API v1.
+- Todoist credentials use a generic OpenShell provider. Policy permits `/usr/bin/curl` to reach only `api.todoist.com:443`, and a Spark-managed `todoist` skill documents API v1, cursor pagination, CRUD operations, destructive-action safeguards, and mandatory attribution through the `Hermes` label.
+- After validating Todoist access, setup idempotently creates or normalizes the personal label `Hermes` and verifies it before completing. Hermes preserves existing labels and adds `Hermes` to every task it creates or persistently changes.
+- Todoist setup accepts `--token`; interactive setup asks with hidden input when it is absent. Spark cannot mint a personal Todoist token without an OAuth application, unlike the self-hosted Vikunja bot flow.
 - Gemma 4 uses its `gemma4` reasoning/tool parsers and automatic attention-backend selection because its partial multimodal attention is incompatible with forced FlashInfer.
 - Vikunja n8n docs document a community node, but `spark ws` keeps community packages disabled by default and uses the generic HTTP/webhook path for the inactive scaffold.
 - Vikunja webhooks docs document project/user webhook endpoints plus HMAC-SHA256 signatures with `X-Vikunja-Signature`; the future workflow scaffold stores a shared mention secret for that verification contract.
@@ -65,6 +70,7 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 - Compose services get scoped env files, `no-new-privileges`, bounded json-file logs, and no public `0.0.0.0` bindings in the default Services mode.
 - The human Vikunja password is transient and only used in memory during setup. `spark ws doctor` fails if it is ever found in `secrets.env`.
 - The Vikunja bot token is passed to `openshell provider create/update` through the command environment, not the process argument list. Hermes sees only an opaque placeholder; OpenShell substitutes the real token in the approved Authorization header.
+- The Todoist token follows the same provider isolation model and is never copied into Compose service env files.
 - Secrets and env-backed inputs are single-line only, so malicious or accidental newlines cannot corrupt Compose env files.
 - n8n is hardened by blocking env/file access from workflow nodes, excluding high-risk command/file nodes, and disabling community package installation by default.
 - Compose services use `no-new-privileges`, init, graceful stop, process limits, and bounded logs as baseline runtime hardening without adding image-breaking privilege drops.
@@ -75,8 +81,10 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 
 ## Integration decision
 
-- Vikunja remains the source of truth for tasks.
-- Hermes acts as `bot-hermes` through direct Vikunja REST calls. Activity is attributed to the bot, while project access is granted explicitly.
+- The selected task manager remains the source of truth for tasks.
+- With Vikunja, Hermes acts as `bot-hermes` through direct REST calls. Activity is attributed to the bot, while project access is granted explicitly.
+- With Todoist, Hermes uses the official API v1 and activity is attributed to the personal token owner.
+- Switching providers does not import tasks. Spark removes only the abandoned local manager after the new provider verifies successfully.
 - n8n should only detect events/mentions and notify Hermes with IDs. It should not become the task source of truth.
 - Direct Hermes task access is active. The n8n workflow scaffold remains inactive; event-driven workflows are intentionally deferred.
 
