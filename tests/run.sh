@@ -132,8 +132,8 @@ ${stdin_payload}"
     fi
     ;;
   buildx)
-    [[ -n "${FAKE_DOCKER_REMOTE_DIGEST:-}" ]] || exit 1
-    printf '%s\n' "$FAKE_DOCKER_REMOTE_DIGEST"
+    [[ -n "${FAKE_DOCKER_REMOTE_OUTPUT:-${FAKE_DOCKER_REMOTE_DIGEST:-}}" ]] || exit 1
+    printf '%b\n' "${FAKE_DOCKER_REMOTE_OUTPUT:-$FAKE_DOCKER_REMOTE_DIGEST}"
     ;;
   images)
     [[ -n "${FAKE_DOCKER_IMAGE:-}" ]] && printf '%b\n' "${FAKE_DOCKER_IMAGE}"
@@ -7899,6 +7899,95 @@ test_update_skips_images_already_at_remote_digest() {
     [[ "$compose_log" != *"pull"* ]]
 }
 
+test_update_parses_human_buildx_digest_output() {
+  local tmp fake_bin out digest remote_output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  digest="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  remote_output=$'Name: docker.io/library/postgres:17\nMediaType: application/vnd.oci.image.index.v1+json\nDigest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf '%s\n' \
+    'WORKSPACE_TASK_MANAGER=todoist' \
+    'WORKSPACE_POSTGRES_IMAGE=postgres:17' \
+    > "${tmp}/home/.config/spark/workspace/secrets.env"
+  : > "${tmp}/home/.config/spark/workspace/docker-compose.yml"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_DOCKER_LOCAL_DIGEST="$digest" FAKE_DOCKER_REMOTE_OUTPUT="$remote_output" \
+    "$SPARK" update --postgresql 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Postgres image is up to date (postgres:17)"* ]] &&
+    [[ "$out" != *"Could not check latest Postgres image"* ]]
+}
+
+test_update_uses_supported_nemohermes_check_command() {
+  local tmp fake_bin out nemo_log
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  nemo_log="${tmp}/nemohermes.log"
+  out=$(printf 'n\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_NEMOHERMES_FILE="$nemo_log" \
+    FAKE_NEMOHERMES_UPDATE_CHECK=$'Current NemoHermes version: 0.0.55\nLatest maintained version: 0.0.78\nUpdate available:         yes' \
+    "$SPARK" update --nemohermes 2>&1)
+  [[ -n "$out" ]]
+  grep -qx 'update --check' "$nemo_log"
+  local status=$?
+  rm -rf "$tmp"
+  return "$status"
+}
+
+test_update_checks_active_super_productivity_release() {
+  local tmp fake_bin out curl_log
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  curl_log="${tmp}/curl.log"
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf '%s\n' \
+    'WORKSPACE_TASK_MANAGER=super-productivity' \
+    'WORKSPACE_SUPER_PRODUCTIVITY_VERSION=v18.15.1' \
+    'WORKSPACE_SUPERSYNC_IMAGE=spark/supersync:18.15.1' \
+    > "${tmp}/home/.config/spark/workspace/secrets.env"
+  : > "${tmp}/home/.config/spark/workspace/docker-compose.yml"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_CURL_FILE"\nprintf '\''{"tag_name":"v18.16.0"}\\n'\''\n' > "${fake_bin}/curl"
+  chmod +x "${fake_bin}/curl"
+  out=$(printf 'n\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_CURL_FILE="$curl_log" \
+    "$SPARK" update --task-manager 2>&1)
+  [[ "$out" == *"Super Productivity: v18.15.1 → v18.16.0"* ]] &&
+    grep -q 'super-productivity/super-productivity/releases/latest' "$curl_log"
+  local status=$?
+  rm -rf "$tmp"
+  return "$status"
+}
+
+test_update_rebuilds_active_super_productivity_release() {
+  local tmp log status calls
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf '%s\n' \
+    'HERMES_MODEL=Org/Alpha' \
+    'N8N_OWNER_FIRST_NAME=massimo' \
+    'SUPER_PRODUCTIVITY_USER_EMAIL=m@example.com' \
+    'N8N_BASIC_AUTH_USER=m@example.com' \
+    > "${tmp}/home/.config/spark/workspace/secrets.env"
+  log="${tmp}/calls"
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      workspace_setup() {
+        printf "version=%s\nsync=%s\nelectron=%s\nargs=%s\n" \
+          "$SPARK_WORKSPACE_SUPER_PRODUCTIVITY_VERSION" \
+          "$SPARK_WORKSPACE_SUPERSYNC_IMAGE" \
+          "$SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE" "$*" \
+          > "$SPARK_TEST_LOG"
+      }
+      workspace_update_super_productivity_release v18.16.0
+    ' _ "$SPARK"
+  status=$?
+  calls=$(cat "$log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$calls" == *"version=v18.16.0"* ]] &&
+    [[ "$calls" == *"sync=spark/supersync:18.16.0"* ]] &&
+    [[ "$calls" == *"electron=spark/super-productivity-electron:18.16.0"* ]] &&
+    [[ "$calls" == *"args=--yes --task-manager super-productivity --model Org/Alpha"* ]]
+}
+
 test_update_flags_limit_checks_and_actions() {
   local tmp fake_bin out compose_log old_digest new_digest
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -8177,6 +8266,10 @@ run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
 run_test "update prompts workspace tool updates one by one" test_update_prompts_workspace_tool_updates_one_by_one
 run_test "update skips images already at remote digest" test_update_skips_images_already_at_remote_digest
+run_test "update parses human Buildx digest output" test_update_parses_human_buildx_digest_output
+run_test "update uses supported NemoHermes check command" test_update_uses_supported_nemohermes_check_command
+run_test "update checks active Super Productivity release" test_update_checks_active_super_productivity_release
+run_test "update rebuilds active Super Productivity release" test_update_rebuilds_active_super_productivity_release
 run_test "update flags limit checks and actions" test_update_flags_limit_checks_and_actions
 run_test "update solo alias checks only spark" test_update_solo_alias_checks_only_spark
 run_test "update does not suggest spark downgrade" test_update_does_not_suggest_spark_downgrade
