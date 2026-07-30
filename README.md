@@ -6,7 +6,7 @@ Turn a clean macOS/Linux machine into a private local agent environment:
 
 - local LLM serving through one OpenAI-compatible gateway
 - hardware-aware model startup on NVIDIA, Apple Silicon, or CPU
-- optional daily workspace with Vikunja or Super Productivity, n8n, Hermes, Postgres, and Tailscale
+- optional daily workspace with Vikunja, Super Productivity, or Todoist, plus n8n, Hermes, Postgres, and Tailscale
 - status, dashboard, backups, uninstall/reinstall, and diagnostics
 
 ```bash
@@ -87,7 +87,7 @@ spark down                   # stop all model and gateway services
 
 The workspace is optional. It installs a private agent environment:
 
-- Vikunja or Super Productivity for tasks (selected on every interactive setup; changing it fully removes the previous manager after verification)
+- Vikunja, Super Productivity, or Todoist for tasks (selected on every interactive setup; changing it fully removes the previous local manager after verification)
 - n8n for automations
 - Postgres for data
 - Hermes/NemoClaw for agent runtime
@@ -98,6 +98,13 @@ Super Productivity, browsers keep their local data in IndexedDB and sync it
 through the self-hosted SuperSync server. Spark runs one persistent headless
 Electron client only so Hermes can use Super Productivity's localhost REST API;
 humans use the official web app at `https://app.super-productivity.com`.
+With Todoist, no task-manager container or database is installed. Spark stores
+the Todoist token in its `0600` workspace config, exposes it to Hermes through a
+restricted OpenShell provider, and allows API access only to
+`https://api.todoist.com`. Spark also installs a workspace-managed Hermes
+`todoist` skill for API v1 pagination and task/project CRUD. Setup creates the
+Todoist label `Hermes`; the skill preserves existing labels and adds `Hermes`
+whenever the agent creates or changes a task.
 
 OpenShell restricts each API bridge to Hermes. Spark also starts the Hermes model
 with at least 64K context, vLLM automatic tool calling, and the model-specific
@@ -123,7 +130,13 @@ Choose explicitly for unattended setup:
 ```bash
 spark ws setup --task-manager vikunja
 spark ws setup --task-manager super-productivity
+spark ws setup --task-manager todoist --token "$TODOIST_API_TOKEN"
 ```
+
+When Todoist is selected interactively and `--token` is omitted, setup asks for
+the token with hidden terminal input. Existing Todoist workspaces reuse the
+stored token. Vikunja always creates and verifies `bot-hermes` and its API token
+automatically.
 
 The Super Productivity setup publishes only SuperSync at the private
 `tasks.<tailnet>` URL; it does not host another copy of the web app. It creates a
@@ -141,7 +154,8 @@ tailnet again.
 
 Workspace containers use stable names, including `workspace-postgres`,
 `workspace-vikunja` or `workspace-supersync` plus
-`workspace-super-productivity-electron`, and `workspace-n8n`.
+`workspace-super-productivity-electron`, and `workspace-n8n`. Todoist mode runs
+only the shared Postgres and n8n containers because Todoist is hosted.
 
 For Vikunja, setup creates different strong passwords for Vikunja and n8n,
 prints them once, and never stores them. Choose initial passwords with `--vikunja-password-file`

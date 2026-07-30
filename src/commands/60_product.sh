@@ -204,7 +204,7 @@ cmd_update() {
       sp_sync_image=$(workspace_read_env WORKSPACE_SUPERSYNC_IMAGE 2>/dev/null || true)
       task_image="$sp_sync_image"
       task_services=(supersync)
-    else
+    elif [[ "$task_manager" == "vikunja" ]]; then
       task_image=$(workspace_read_env WORKSPACE_VIKUNJA_IMAGE 2>/dev/null || true)
       task_services=(vikunja)
     fi
