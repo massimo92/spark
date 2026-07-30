@@ -72,7 +72,7 @@ cmd_models() {
   case "$subcmd" in
     recommend) cmd_models_recommend "$@" ;;
     help|--help|-h)
-      printf "\n  ${BOLD}Usage:${NC} spark models <recommend>\n\n"
+      printf "\n  ${BOLD}Usage:${NC} spark models [recommend [--json]]\n\n"
       printf "  Commands:\n    recommend    Suggest models for this hardware/backend\n\n" ;;
     *) die "Unknown models command: $subcmd" "Run 'spark models help'" ;;
   esac
@@ -346,7 +346,7 @@ cmd_uninstall() {
       -h|--help)
         cat <<EOF
 
-  ${BOLD}Usage:${NC} spark uninstall [--yes] [--purge] [--purge-models] [--keep-models] [--keep-binary] [--dry-run]
+  ${BOLD}Usage:${NC} spark uninstall [-y|--yes] [--purge] [--purge-models|--keep-models] [--keep-binary] [--dry-run]
 
   Removes spark-managed containers, gateway config, workspace config/data, and profiles.
   Shared system dependencies (Docker, Tailscale, system packages) are kept.
@@ -449,7 +449,22 @@ cmd_reinstall() {
         setup_args+=("--funnel-action" "$funnel_action")
         shift 2 ;;
       -h|--help)
-        printf "\n  ${BOLD}Usage:${NC} spark reinstall [--yes] [--keep-models] [--funnel-action reset|abort] [--dry-run]\n\n"
+        cat <<EOF
+
+  ${BOLD}Usage:${NC} spark reinstall [-y|--yes] [--purge] [--purge-models|--keep-models] [--funnel-action reset|abort] [--dry-run]
+
+  Removes Spark-managed state and models, then runs setup again.
+  Models are purged by default; use --keep-models to preserve them.
+
+  ${BOLD}Flags:${NC}
+    -y, --yes                   Skip confirmation and accept setup defaults.
+    --purge                     Explicitly request the default full state purge.
+    --purge-models              Explicitly request the default model-cache purge.
+    --keep-models               Preserve downloaded model caches.
+    --funnel-action reset|abort Forward the Funnel decision to setup.
+    --dry-run                   Print the uninstall/setup actions only.
+
+EOF
         return 0 ;;
       *) die "Unknown reinstall flag: $1" ;;
     esac
@@ -528,8 +543,8 @@ cmd_help() {
 
   ${BOLD}Commands:${NC}
     setup            Set up a model server — this machine or a remote one over SSH
-    dashboard        Terminal UI for setup, services, models, gateway, workspace
-    status           Excellent one-shot health and runtime snapshot
+    dashboard        Web dashboard, with an optional terminal view
+    status           One-shot health and runtime snapshot
     ws               Set up a private agent workspace (task manager + n8n + Hermes)
     doctor           Check all prerequisites (read-only)
     models           Recommend models for this hardware
@@ -542,48 +557,59 @@ cmd_help() {
     list             List downloaded models
     rm <model> [...] Remove downloaded model(s)
     logs [<model>]   Show container logs (-f to follow)
-    gateway          Manage LiteLLM gateway (start|stop|status|logs)
-    reinstall        Remove spark state and run setup again
-    uninstall        Remove spark-managed runtime/config/data
+    gateway          Manage LiteLLM gateway and providers
+    reinstall        Remove Spark state and run setup again
+    uninstall        Remove Spark-managed runtime/config/data
     update           Check and apply Spark, model, gateway, workspace, and NemoHermes updates
-    config           Configure spark settings (e.g. auto-update)
+    config           Configure Spark settings (e.g. auto-update)
     architecture     Show developer architecture map and invariants
+    version          Show the installed Spark version
 
   ${BOLD}Run flags:${NC}
-    --mem <float>          GPU memory utilization (0.0-1.0), overrides auto-sizing
-    --max-len <int>        Context length (default: 128K, capped to model max)
-    --kv-cache-dtype fp8   Halve KV cache memory
-    --max-num-seqs <int>   Max concurrent requests (default: 5; raise for more throughput)
-    --enforce-eager        Disable CUDA graphs (smaller startup peak; ~10-20% slower). Auto for big MoE.
+    --mem <float>          Force GPU memory fraction (0.0-1.0); bypasses auto-sizing
+    --no-mem-limit         Do not set a cgroup memory cap on unified-memory backends
+    --max-len <int>        Force context length; affects KV cache memory
+    --kv-cache-dtype fp8   Reduce KV cache memory
+    --max-num-seqs <int>   Force max concurrent requests; higher uses more memory
+    --mtp / --no-mtp       Enable or disable MTP speculative decoding
+    --enforce-eager        Disable CUDA graphs; lower startup peak, slower inference
     --no-enforce-eager     Force CUDA graphs on
-    --port <int>           API port (default: auto from 8000)
-    --tools                Enable tool calling
-    --text-only            Skip vision encoder
-    --no-reasoning         Disable reasoning parser
-    --no-pull              Don't offer to download a missing model; just error
+    --port <int>           Direct model API port; default auto-selects from 8000
+    --tools                Enable tool calling when supported
+    --text-only            Disable vision input for multimodal models
+    --no-reasoning         Disable the reasoning parser
+    --no-pull              Fail if the model is missing; do not offer download
     --dry-run              Print the memory plan and Docker command only
-    --no-wait              Don't supervise startup (launch and return immediately)
+    --explain              Explain the plan; implies --dry-run
+    --no-wait              Start and return without health supervision
     --tail                 Follow logs after launch
-    --force                Replace this model if already running
-    --regen-profile        Regenerate model profile
+    --force                Replace an already running instance of this model
+    --regen-profile        Recompute the cached model memory profile
 
   ${BOLD}Setup flags:${NC}
-    --check                Read-only validation
-    --yes                  Accept safe defaults
-    --funnel-action reset  Reset active Tailscale Funnel, then continue
-    --funnel-action abort  Fail if Tailscale Funnel is active
+    --check                     Read-only validation
+    --yes                       Accept safe defaults
+    --full                      Set up model server + agent workspace
+    --model MODEL               Workspace/Hermes model for --full
+    --tailscale-mode services|ports
+                                Workspace private-access mode for --full
+    --funnel-action reset|abort Handle active Tailscale Funnel explicitly
 
   ${BOLD}Help:${NC}
     spark run --help
     spark setup --help
+    spark dashboard --help
     spark doctor --help
+    spark models --help
+    spark gateway --help
     spark ws --help
     spark ws setup --help
     spark ws doctor --help
 
   ${BOLD}Examples:${NC}
     spark setup                                            # interactive: this machine or a remote one
-    spark dashboard --watch                                # observe the whole environment
+    spark dashboard                                       # serve the web dashboard
+    spark dashboard --terminal --watch                    # observe in the terminal
     spark models recommend                                 # pick a model for this machine
     spark ws setup                                         # choose task manager + n8n + Hermes
     spark setup --check                                    # just report what's missing

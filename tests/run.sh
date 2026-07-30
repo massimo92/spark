@@ -857,6 +857,7 @@ test_suite_includes() {
     test_detect_cpu_without_gpu|\
     test_gateway_ollama_route_mac|\
     test_setup_picker_routes_to_host|\
+    test_help_text_tracks_current_cli|\
     test_workspace_help_and_command|\
     test_workspace_dashboard_proxy_rewrites_host_on_loopback|\
     test_workspace_status_json_quiet_and_containers|\
@@ -2839,6 +2840,43 @@ make_min_workspace_config() {
     : > "${dir}/secrets.env"
     chmod 600 "${dir}/secrets.env"
   fi
+}
+
+test_help_text_tracks_current_cli() {
+  local top dashboard gateway config models reinstall uninstall ws recover setup_error status
+  top=$("$SPARK" help 2>&1)
+  dashboard=$("$SPARK" dashboard --help 2>&1)
+  gateway=$("$SPARK" gateway --help 2>&1)
+  config=$("$SPARK" config --help 2>&1)
+  models=$("$SPARK" models --help 2>&1)
+  reinstall=$("$SPARK" reinstall --help 2>&1)
+  uninstall=$("$SPARK" uninstall --help 2>&1)
+  ws=$("$SPARK" ws --help 2>&1)
+  recover=$("$SPARK" ws recover --help 2>&1)
+  status=$("$SPARK" status --help 2>&1)
+  set +e
+  setup_error=$("$SPARK" setup --not-a-real-flag 2>&1)
+  set -e
+
+  [[ "$top" == *"Web dashboard, with an optional terminal view"* ]] &&
+    [[ "$top" == *"version          Show the installed Spark version"* ]] &&
+    [[ "$top" == *"--no-mem-limit"* ]] &&
+    [[ "$top" == *"--mtp / --no-mtp"* ]] &&
+    [[ "$top" == *"--explain"* ]] &&
+    [[ "$top" != *"default: 128K"* ]] &&
+    [[ "$top" != *"default: 5"* ]] &&
+    [[ "$dashboard" == *"--terminal"* ]] &&
+    [[ "$dashboard" == *"--watch [seconds]"* ]] &&
+    [[ "$gateway" == *"start|stop|status|logs|add|remove"* ]] &&
+    [[ "$config" == *"auto-update on|off"* ]] &&
+    [[ "$models" == *"recommend [--json]"* ]] &&
+    [[ "$reinstall" == *"--purge-models|--keep-models"* ]] &&
+    [[ "$uninstall" == *"-y|--yes"* ]] &&
+    [[ "$ws" == *"Reset a Vikunja human or n8n owner password"* ]] &&
+    [[ "$ws" == *"SuperSync/Electron"* ]] &&
+    [[ "$recover" == *"Vikunja human or n8n owner password"* ]] &&
+    [[ "$status" == *"--verbose"* ]] &&
+    [[ "$setup_error" == *"--tailscale-mode services|ports"* ]]
 }
 
 test_workspace_help_and_command() {
@@ -7950,6 +7988,7 @@ run_test "setup --server installs the same set (parity)" test_setup_server_check
 run_test "setup rejects unknown flags" test_setup_unknown_flag_fails
 run_test "setup --full --check runs workspace phase" test_setup_full_check_runs_workspace_phase
 run_test "setup --full continues after swap reconcile" test_setup_full_continues_after_swap_reconcile
+run_test "help text tracks current CLI" test_help_text_tracks_current_cli
 run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
