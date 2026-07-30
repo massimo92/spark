@@ -1768,6 +1768,40 @@ test_workspace_task_manager_teardown_waits_and_retries() {
     [[ "$env" != *"WORKSPACE_TASK_MANAGER_TEARDOWN_IMAGES="* ]]
 }
 
+test_workspace_task_manager_teardown_covers_all_transitions() {
+  local tmp log status calls
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  log="${tmp}/calls"
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      workspace_cleanup_abandoned_task_manager() {
+        printf "%s->%s\n" "$1" "$SPARK_TEST_CURRENT" >> "$SPARK_TEST_LOG"
+      }
+      workspace_hermes_vikunja_api_ready() { [[ "$SPARK_TEST_CURRENT" == vikunja ]]; }
+      workspace_hermes_super_productivity_api_ready() { [[ "$SPARK_TEST_CURRENT" == super-productivity ]]; }
+      workspace_hermes_todoist_api_ready() { [[ "$SPARK_TEST_CURRENT" == todoist ]]; }
+      sleep() { :; }
+      SETUP_FAILED=()
+      for transition in \
+        vikunja:super-productivity vikunja:todoist \
+        super-productivity:vikunja super-productivity:todoist \
+        todoist:vikunja todoist:super-productivity; do
+        abandoned=${transition%%:*}
+        SPARK_TEST_CURRENT=${transition#*:}
+        workspace_set_env_key WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING "$abandoned"
+        workspace_finalize_task_manager_teardown "$abandoned" "$SPARK_TEST_CURRENT"
+        [[ -z "$(workspace_read_env WORKSPACE_TASK_MANAGER_TEARDOWN_PENDING)" ]]
+      done
+    ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  calls=$(cat "$log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$calls" == $'vikunja->super-productivity\nvikunja->todoist\nsuper-productivity->vikunja\nsuper-productivity->todoist\ntodoist->vikunja\ntodoist->super-productivity' ]]
+}
+
 
 test_workspace_remove_managed_path_rejects_broad_targets() {
   local tmp status
@@ -8002,6 +8036,7 @@ run_test "workspace task manager teardown covers services and data" test_workspa
 run_test "workspace task manager teardown removes Hermes access" test_workspace_task_manager_teardown_removes_hermes_access
 run_test "workspace task manager teardown drops database and role" test_workspace_task_manager_teardown_drops_database_and_role
 run_test "workspace task manager teardown waits and retries" test_workspace_task_manager_teardown_waits_and_retries
+run_test "workspace task manager teardown covers all transitions" test_workspace_task_manager_teardown_covers_all_transitions
 run_test "workspace task manager teardown rejects broad paths" test_workspace_remove_managed_path_rejects_broad_targets
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vllm_image
