@@ -6575,7 +6575,8 @@ workspace_recover() {
       --yes) auto_yes=1; shift ;;
       --help|-h)
         printf "Usage: spark ws recover vikunja|n8n [--yes]\n"
-        printf "  --yes  Generate a secure password and recover access without questions.\n"
+        printf "  Reset an existing Vikunja human or n8n owner password.\n"
+        printf "  --yes  Generate a secure password and continue without questions.\n"
         return 0
         ;;
       *) die "Unknown ws recover option: $1" "Usage: spark ws recover vikunja|n8n [--yes]" ;;
@@ -6585,6 +6586,7 @@ workspace_recover() {
     vikunja|n8n) ;;
     help|--help|-h|"")
       printf "Usage: spark ws recover vikunja|n8n [--yes]\n"
+      printf "  Reset an existing Vikunja human or n8n owner password.\n"
       return 0
       ;;
     *) die "Unknown workspace service: $service" "Choose vikunja or n8n" ;;
@@ -6680,18 +6682,18 @@ cmd_workspace_help() {
   ${BOLD}Usage:${NC} spark ws <command> [options]
 
   ${BOLD}Commands:${NC}
-    setup      Install/check the selected task manager + n8n + Hermes
-    start      Start the configured workspace runtime
-    stop       Stop the workspace runtime and preserve all data
-    restart    Stop and start the configured workspace runtime
-    recover    Recover Vikunja or n8n access with a new password
-    status     Show operational workspace state
-    containers Show raw workspace container state
-    logs       Follow task-manager, n8n, postgres, Hermes, or gateway logs
-    doctor     Read-only workspace check
-    backup     Back up task manager, n8n, and Hermes state
+    setup       Install/check the selected task manager + n8n + Hermes
+    start       Start the configured workspace runtime
+    stop        Stop the workspace runtime and preserve all data
+    restart     Stop and start the configured workspace runtime
+    recover     Reset a Vikunja human or n8n owner password
+    status      Show operational workspace state
+    containers  Show raw workspace container state
+    logs        Follow task-manager, SuperSync/Electron, n8n, Postgres, Hermes, or gateway logs
+    doctor      Read-only workspace check
+    backup      Back up config, task-manager data, n8n, Hermes, and NemoClaw state
 
-  Run ${BOLD}spark ws <command> --help${NC} for command-specific flags.
+  Use ${BOLD}spark ws <command> --help${NC} on commands with options.
 
   ${BOLD}Setup flags:${NC}
     --check                     Read-only validation

@@ -1158,7 +1158,7 @@ cmd_setup() {
         shift 2
         ;;
       -h|--help) cmd_setup_help; return 0 ;;
-      *)         die "Unknown flag: $1" "Usage: spark setup [--check] [--yes] [--full] [--model MODEL] [--funnel-action reset|abort]" ;;
+      *)         die "Unknown flag: $1" "Usage: spark setup [--check] [--yes] [--full] [--model MODEL] [--tailscale-mode services|ports] [--funnel-action reset|abort]" ;;
     esac
   done
 

@@ -234,6 +234,22 @@ check_for_updates() {
 cmd_config() {
   local key="${1:-}" value="${2:-}"
 
+  case "$key" in
+    help|-h|--help)
+      cat <<EOF
+
+  ${BOLD}Usage:${NC} spark config [auto-update on|off]
+
+  With no arguments, show the current Spark configuration.
+
+  ${BOLD}Settings:${NC}
+    auto-update on|off   Enable or disable automatic Spark updates.
+
+EOF
+      return 0
+      ;;
+  esac
+
   if [[ -z "$key" ]]; then
     printf "\n  ${BOLD}Configuration:${NC}\n"
     printf "    auto-update: %s\n\n" "$(get_update_config "auto_update" "false")"
@@ -265,18 +281,20 @@ cmd_config() {
 # --- Gateway ---
 cmd_gateway() {
   local subcmd="${1:-}"
-  [[ -z "$subcmd" ]] && {
-    printf "\n  ${BOLD}Usage:${NC} spark gateway <start|stop|status|logs>\n\n"
-    printf "  ${BOLD}Subcommands:${NC}\n"
-    printf "    start     Start LiteLLM gateway container\n"
-    printf "    stop      Stop LiteLLM gateway container\n"
-    printf "    status    Show gateway status and providers\n"
-    printf "    logs      Show gateway logs (-f to follow)\n"
-    printf "    add       Enable a provider (openrouter|ollama|zen|together)\n"
-    printf "    remove    Disable a provider\n"
-    printf "\n"
-    return 0
-  }
+  case "$subcmd" in
+    ""|help|-h|--help)
+      printf "\n  ${BOLD}Usage:${NC} spark gateway <start|stop|status|logs|add|remove>\n\n"
+      printf "  ${BOLD}Subcommands:${NC}\n"
+      printf "    start     Start the LiteLLM gateway container\n"
+      printf "    stop      Stop the LiteLLM gateway container\n"
+      printf "    status    Show gateway status and providers\n"
+      printf "    logs      Show gateway logs (-f to follow)\n"
+      printf "    add       Enable a provider (openrouter|ollama|zen|together)\n"
+      printf "    remove    Disable a provider\n"
+      printf "\n"
+      return 0
+      ;;
+  esac
   shift
 
   case "$subcmd" in
@@ -286,7 +304,7 @@ cmd_gateway() {
     logs)   gateway_logs "$@" ;;
     add)    gateway_add "$@" ;;
     remove) gateway_remove "$@" ;;
-    *)      die "Unknown gateway command: $subcmd" "Run 'spark gateway' for usage" ;;
+    *)      die "Unknown gateway command: $subcmd" "Run 'spark gateway --help' for usage" ;;
   esac
 }
 
