@@ -13,7 +13,7 @@ workspace_task_manager_valid() {
 }
 
 workspace_task_manager_hosted() {
-  [[ "${1:-$(workspace_task_manager)}" != "todoist" ]]
+  [[ "$(workspace_task_manager)" != "todoist" ]]
 }
 
 workspace_persisted_task_manager() {
