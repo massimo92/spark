@@ -21,11 +21,14 @@ cmd_run_help() {
     --no-reasoning         Disable reasoning parser.
     --no-pull              Fail if model is missing; do not offer download.
     --dry-run              Print memory plan and Docker command; do not run.
-    --explain              With --dry-run, show HF metadata, chosen flags and questions.
+    --explain              Explain the dry-run plan; implies --dry-run.
     --no-wait              Start container and return without health supervision.
     --tail                 Follow logs after launch.
     --force                Replace an already running instance of the model.
     --regen-profile        Recompute cached model memory profile.
+
+  Aliases keep model settings frozen and accept operational overrides only:
+  --dry-run, --explain, --force, --port, --tail, --no-wait.
 
 EOF
 }
@@ -33,30 +36,32 @@ EOF
 cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
-  local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" run_flags=0
+  local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" alias_frozen_flags=0
+  local ALIAS_VLLM_ARGS_JSON="" ALIAS_VLLM_IMAGE="" ALIAS_VLLM_IMAGE_ID="" ALIAS_VLLM_ENTRYPOINT="" ALIAS_VLLM_ENV_JSON=""
+  local -a alias_override_args=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; run_flags=1; shift 2 ;;
-      --no-mem-limit) no_mem_limit=1; run_flags=1; shift ;;
-      --enforce-eager)    enforce_eager_flag=1; run_flags=1; shift ;;
-      --no-enforce-eager) enforce_eager_flag=0; run_flags=1; shift ;;
-      --no-wait)   no_wait=1; run_flags=1; shift ;;
-      --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; run_flags=1; shift 2 ;;
-      --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; run_flags=1; shift 2 ;;
-      --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; run_flags=1; shift 2 ;;
-      --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; run_flags=1; shift 2 ;;
-      --mtp)       mtp_flag=1; run_flags=1; shift ;;
-      --no-mtp)    mtp_flag=0; run_flags=1; shift ;;
-      --tools)     tools=1; run_flags=1; shift ;;
-      --text-only) text_only=1; run_flags=1; shift ;;
-      --no-reasoning) no_reasoning=1; run_flags=1; shift ;;
-      --no-pull)   no_pull=1; run_flags=1; shift ;;
-      --dry-run)   dry_run=1; run_flags=1; shift ;;
-      --explain)   explain=1; run_flags=1; shift ;;
-      --tail)      tail_logs=1; run_flags=1; shift ;;
-      --force)     force=1; run_flags=1; shift ;;
-      --regen-profile) regen=1; run_flags=1; shift ;;
+      --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; alias_frozen_flags=1; shift 2 ;;
+      --no-mem-limit) no_mem_limit=1; alias_frozen_flags=1; shift ;;
+      --enforce-eager)    enforce_eager_flag=1; alias_frozen_flags=1; shift ;;
+      --no-enforce-eager) enforce_eager_flag=0; alias_frozen_flags=1; shift ;;
+      --no-wait)   no_wait=1; alias_override_args+=(--no-wait); shift ;;
+      --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; alias_frozen_flags=1; shift 2 ;;
+      --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; alias_frozen_flags=1; shift 2 ;;
+      --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; alias_override_args+=(--port "$2"); shift 2 ;;
+      --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; alias_frozen_flags=1; shift 2 ;;
+      --mtp)       mtp_flag=1; alias_frozen_flags=1; shift ;;
+      --no-mtp)    mtp_flag=0; alias_frozen_flags=1; shift ;;
+      --tools)     tools=1; alias_frozen_flags=1; shift ;;
+      --text-only) text_only=1; alias_frozen_flags=1; shift ;;
+      --no-reasoning) no_reasoning=1; alias_frozen_flags=1; shift ;;
+      --no-pull)   no_pull=1; alias_frozen_flags=1; shift ;;
+      --dry-run)   dry_run=1; alias_override_args+=(--dry-run); shift ;;
+      --explain)   explain=1; dry_run=1; alias_override_args+=(--explain); shift ;;
+      --tail)      tail_logs=1; alias_override_args+=(--tail); shift ;;
+      --force)     force=1; alias_override_args+=(--force); shift ;;
+      --regen-profile) regen=1; alias_frozen_flags=1; shift ;;
       -h|--help)   cmd_run_help; return 0 ;;
       -*)          die "Unknown flag: $1" "Run 'spark run --help' for usage" ;;
       *)           [[ -z "$model" ]] || die "Only one model can be specified"; model="$1"; shift ;;
@@ -65,8 +70,9 @@ cmd_run() {
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
   if [[ "${SPARK_ALIAS_BYPASS:-0}" != "1" ]] && alias_exists "$model"; then
-    [[ "$run_flags" == "0" ]] || die "Aliases do not accept run flags" "Edit it first: spark alias edit ${model}"
-    cmd_alias_run "$model"
+    [[ "$alias_frozen_flags" == "0" ]] || die "Alias model settings are frozen" \
+      "Allowed overrides: --dry-run, --explain, --force, --port, --tail, --no-wait"
+    cmd_alias_run "$model" "${alias_override_args[@]}"
     return 0
   fi
   validate_model_ref_for_backend "$model"
@@ -91,8 +97,8 @@ alias_init_store() {
   chmod 700 "$SPARK_CONFIG_DIR" 2>/dev/null || true
   if [[ ! -f "$ALIASES_FILE" ]]; then
     printf '{}\n' > "$ALIASES_FILE" || die "Cannot write ${ALIASES_FILE}"
-    chmod 600 "$ALIASES_FILE" || die "Cannot secure ${ALIASES_FILE}"
   fi
+  chmod 600 "$ALIASES_FILE" || die "Cannot secure ${ALIASES_FILE}"
   jq -e 'type == "object"' "$ALIASES_FILE" >/dev/null 2>&1 \
     || die "Invalid alias store: ${ALIASES_FILE}" "Restore it from ${ALIASES_BACKUP_FILE} or fix its JSON."
 }
@@ -119,8 +125,7 @@ alias_definition() {
 alias_save_definition() {
   local name="$1" definition="$2" force="${3:-0}" current updated backup
   is_safe_alias_name "$name" || die "Invalid alias: ${name}" "Use 1-64 letters, numbers, dots, underscores, or hyphens."
-  jq -e 'type == "object" and (.backend | strings) and (.model | strings) and (.kind | strings)' \
-    >/dev/null <<<"$definition" || die "Invalid alias definition"
+  alias_validate_definition "$definition" || die "Invalid or unsafe alias definition"
   alias_init_store
   current=$(jq -ce --arg name "$name" '.[$name] // empty' "$ALIASES_FILE" 2>/dev/null || true)
   if [[ -n "$current" && "$force" != "1" ]]; then
@@ -149,6 +154,92 @@ alias_vllm_value() {
 
 alias_vllm_has() {
   jq -e --arg flag "$2" 'index($flag) != null' <<<"$1" >/dev/null
+}
+
+
+alias_vllm_set_value_json() {
+  local args="$1" flag="$2" value="$3"
+  jq -ce --arg flag "$flag" --arg value "$value" '
+    . as $args
+    | reduce range(0; $args | length) as $i
+        ({out: [], skip: false};
+          if .skip then .skip = false
+          elif $args[$i] == $flag then .skip = true
+          elif ($args[$i] | startswith($flag + "=")) then .
+          else .out += [$args[$i]]
+          end)
+    | .out + [$flag, $value]
+  ' <<<"$args"
+}
+
+is_safe_container_image_ref() {
+  local ref="${1:-}"
+  [[ -n "$ref" && ${#ref} -le 255 && "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$ ]]
+}
+
+alias_env_allowed() {
+  case "${1:-}" in
+    VLLM_MARLIN_USE_ATOMIC_ADD) [[ "${2:-}" =~ ^[01]$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+alias_validate_definition() {
+  local definition="$1" kind backend model image image_id key value arg flag
+  jq -e '
+    type == "object"
+    and (.kind | type == "string")
+    and (.backend | type == "string")
+    and (.model | type == "string" and length > 0)
+  ' >/dev/null <<<"$definition" || return 1
+
+  kind=$(jq -r '.kind' <<<"$definition")
+  backend=$(jq -r '.backend' <<<"$definition")
+  model=$(jq -r '.model' <<<"$definition")
+  case "$kind" in
+    guided)
+      jq -e '
+        (.backend == "vllm" or .backend == "ollama")
+        and (.run_args | type == "array" and all(.[]; type == "string"))
+        and (.run_args | all(.[]; ([explode[] | select(. < 32 or . == 127)] | length) == 0))
+      ' >/dev/null <<<"$definition" || return 1
+      case "$backend" in
+        vllm) is_safe_model_ref "$model" || return 1 ;;
+        ollama) is_ollama_ref "$model" || return 1 ;;
+      esac
+      ;;
+    captured-vllm)
+      jq -e '
+        .backend == "vllm"
+        and (.vllm_args | type == "array" and length >= 3 and all(.[]; type == "string"))
+        and (.vllm_args | all(.[]; ([explode[] | select(. < 32 or . == 127)] | length) == 0))
+        and .vllm_args[0] == "vllm"
+        and .vllm_args[1] == "serve"
+        and .vllm_args[2] == .model
+        and ((.image // null) == null or (.image | type == "string" and length > 0))
+        and ((.image_id // null) == null or (.image_id | type == "string" and length > 0))
+        and ((has("vllm_entrypoint") | not) or (.vllm_entrypoint | type == "boolean"))
+        and ((.env // {}) | type == "object" and all(to_entries[]; (.value | type == "string") and ([.value | explode[] | select(. < 32 or . == 127)] | length) == 0))
+      ' >/dev/null <<<"$definition" || return 1
+      is_safe_model_ref "$model" || return 1
+      image=$(jq -r '.image // empty' <<<"$definition")
+      [[ -z "$image" ]] || is_safe_container_image_ref "$image" || return 1
+      image_id=$(jq -r '.image_id // empty' <<<"$definition")
+      [[ -z "$image_id" || "$image_id" =~ ^sha256:[a-fA-F0-9]{64}$ ]] || return 1
+      while IFS=$'\t' read -r key value; do
+        alias_env_allowed "$key" "$value" || return 1
+      done < <(jq -r '(.env // {}) | to_entries[] | [.key, .value] | @tsv' <<<"$definition")
+      while IFS= read -r arg; do
+        flag="${arg%%=*}"
+        case "$flag" in
+          --api-key|--hf-token|--config|--ssl-keyfile|--ssl-keyfile-password)
+            return 1
+            ;;
+        esac
+      done < <(jq -r '.vllm_args[]' <<<"$definition")
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 alias_prompt_value() {
@@ -219,14 +310,69 @@ alias_guided_definition() {
   alias_prompt_yes "Recompute model profile before launch" && args+=(--regen-profile)
   :
 
-  args_json=$(jq -nc '$ARGS.positional' --args "${args[@]}")
+  args_json=$(jq -nc --args '$ARGS.positional' -- "${args[@]}")
   definition=$(jq -nc --arg backend "$BACKEND" --arg model "$model" --argjson args "$args_json" \
     '{kind:"guided", backend:$backend, model:$model, run_args:$args}')
   printf '%s\n' "$definition"
 }
 
+
+alias_capture_definition() {
+  local cname="$1" expected_model="${2:-}" inspect args model image image_id vllm_entrypoint env definition
+  inspect=$(docker inspect "$cname" 2>/dev/null) || die "Cannot inspect container ${cname}"
+  jq -e 'type == "array" and length == 1 and .[0].State.Running == true' >/dev/null <<<"$inspect" \
+    || die "Container '${cname}' is not running"
+
+  args=$(jq -ce '
+    .[0] as $c
+    | ($c.Args // []) as $args
+    | ($c.Config.Cmd // []) as $cmd
+    | ($c.Config.Entrypoint // []) as $entry
+    | if (($c.Path // "") | split("/")[-1]) == "vllm" and $args[0] == "serve" then ["vllm"] + $args
+      elif $cmd[0] == "vllm" and $cmd[1] == "serve" then $cmd
+      elif $entry[0] == "vllm" and $entry[1] == "serve" then $entry + $cmd
+      else error("not a direct vllm serve command")
+      end
+  ' <<<"$inspect" 2>/dev/null) || die "Container '${cname}' does not run a direct vllm serve command"
+  model=$(jq -er '.[2] | select(type == "string" and length > 0)' <<<"$args" 2>/dev/null) \
+    || die "Cannot identify the vLLM model in ${cname}"
+  is_safe_model_ref "$model" || die "Unsafe model reference in ${cname}: ${model}"
+  [[ -z "$expected_model" || "$model" == "$expected_model" ]] \
+    || die "Container model mismatch" "Label says '${expected_model}', command serves '${model}'."
+
+  image=$(jq -er '.[0].Config.Image | select(type == "string" and length > 0)' <<<"$inspect" 2>/dev/null) \
+    || die "Cannot identify the container image for ${cname}"
+  is_safe_container_image_ref "$image" || die "Unsafe container image reference: ${image}"
+  image_id=$(jq -er '.[0].Image | select(type == "string" and test("^sha256:[a-fA-F0-9]{64}$"))' <<<"$inspect" 2>/dev/null) \
+    || die "Cannot identify the immutable image ID for ${cname}"
+  vllm_entrypoint=$(jq -r '
+    (.[0].Config.Entrypoint // []) as $entry
+    | (($entry[0] // "") | split("/")[-1]) == "vllm" and $entry[1] == "serve"
+  ' <<<"$inspect")
+  env=$(jq -c '
+    reduce (.[0].Config.Env // [])[] as $entry ({};
+      ($entry | index("=")) as $separator
+      | if $separator == null then .
+        else ($entry[0:$separator]) as $key
+        | ($entry[$separator + 1:]) as $value
+        | if $key == "VLLM_MARLIN_USE_ATOMIC_ADD" and ($value == "0" or $value == "1")
+          then .[$key] = $value else . end
+        end
+    )
+  ' <<<"$inspect") || die "Cannot inspect the container environment for ${cname}"
+
+  definition=$(jq -nc --arg model "$model" --arg image "$image" --arg image_id "$image_id" \
+    --argjson vllm_entrypoint "$vllm_entrypoint" --argjson args "$args" --argjson env "$env" '
+      {kind:"captured-vllm", backend:"vllm", model:$model, image:$image, image_id:$image_id,
+       vllm_entrypoint:$vllm_entrypoint, env:$env, vllm_args:$args}
+    ')
+  alias_validate_definition "$definition" \
+    || die "Unsafe or unsupported vLLM command in ${cname}" "Secret-bearing and external-config flags cannot be captured."
+  printf '%s\n' "$definition"
+}
+
 cmd_alias_capture() {
-  local name="$1" force="${2:-0}" line cname model port rest choice args definition
+  local name="$1" force="${2:-0}" cname model port rest choice definition
   local -a names=() models=()
   while IFS=$'\t' read -r cname model port rest; do
     [[ -n "$cname" && -n "$model" ]] || continue
@@ -240,27 +386,29 @@ cmd_alias_capture() {
   [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#names[@]} ]] \
     || die "Choose a run number from the list"
   i=$((choice - 1)); cname="${names[$i]}"; model="${models[$i]}"
-  args=$(docker inspect -f '{{json .Config.Cmd}}' "$cname" 2>/dev/null || true)
-  jq -e 'type == "array" and length >= 3 and .[0] == "vllm" and .[1] == "serve"' >/dev/null <<<"$args" \
-    || die "Cannot read effective vLLM arguments from ${cname}"
-  definition=$(jq -nc --arg model "$model" --argjson args "$args" \
-    '{kind:"captured-vllm", backend:"vllm", model:$model, vllm_args:$args}')
+  definition=$(alias_capture_definition "$cname" "$model")
   alias_save_definition "$name" "$definition" "$force"
   info "Captured '${name}' from ${cname}"
 }
 
 cmd_alias_run() {
   local name="$1" definition backend kind
+  shift
+  local -a overrides=("$@")
   definition=$(alias_definition "$name") || die "Alias '${name}' does not exist"
+  alias_validate_definition "$definition" || die "Alias '${name}' has an invalid or unsafe definition" \
+    "Recreate it with: spark alias edit ${name}"
   backend=$(jq -r '.backend' <<<"$definition")
   kind=$(jq -r '.kind' <<<"$definition")
   case "$kind" in
     guided)
-      [[ "$backend" == "$BACKEND" ]] || warn "Alias '${name}' was created for ${backend}; checking it on ${BACKEND}."
+      [[ "$backend" == "$BACKEND" ]] || die "Alias '${name}' targets ${backend}; this machine uses ${BACKEND}" \
+        "Create or edit an alias for this backend: spark alias edit ${name}"
       local model SPARK_ALIAS_BYPASS=1
       local -a run_args=()
       model=$(jq -r '.model' <<<"$definition")
       while IFS= read -r arg; do run_args+=("$arg"); done < <(jq -r '.run_args[]' <<<"$definition")
+      run_args+=("${overrides[@]}")
       cmd_run "$model" "${run_args[@]}"
       ;;
     captured-vllm)
@@ -268,8 +416,13 @@ cmd_alias_run() {
         "Create or edit an alias for this backend: spark alias edit ${name}"
       local model port mem max_len kv_dtype tools=0 text_only=0 no_reasoning=0 dry_run=0 explain=0 tail_logs=0
       local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto"
-      local ALIAS_VLLM_ARGS_JSON
+      local ALIAS_VLLM_ARGS_JSON ALIAS_VLLM_IMAGE ALIAS_VLLM_IMAGE_ID ALIAS_VLLM_ENTRYPOINT ALIAS_VLLM_ENV_JSON override_port=""
       ALIAS_VLLM_ARGS_JSON=$(jq -c '.vllm_args' <<<"$definition")
+      ALIAS_VLLM_IMAGE=$(jq -r '.image // empty' <<<"$definition")
+      ALIAS_VLLM_IMAGE_ID=$(jq -r '.image_id // empty' <<<"$definition")
+      ALIAS_VLLM_ENTRYPOINT=$(jq -r 'if has("vllm_entrypoint") then .vllm_entrypoint else empty end' <<<"$definition")
+      ALIAS_VLLM_ENV_JSON=$(jq -c '.env // {}' <<<"$definition")
+      [[ -n "$ALIAS_VLLM_IMAGE" ]] || warn "Alias '${name}' predates image capture; resolving the current vLLM image."
       model=$(jq -r '.model' <<<"$definition")
       mem=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --gpu-memory-utilization)
       max_len=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-model-len)
@@ -280,6 +433,23 @@ cmd_alias_run() {
       alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --speculative-config && mtp_flag=1
       alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enable-auto-tool-choice && tools=1
       alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --limit-mm-per-prompt && text_only=1
+      set -- "${overrides[@]}"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --dry-run) dry_run=1; shift ;;
+          --explain) explain=1; dry_run=1; shift ;;
+          --force) force=1; shift ;;
+          --port) [[ $# -ge 2 ]] || die "Missing value for --port"; override_port="$2"; shift 2 ;;
+          --tail) tail_logs=1; shift ;;
+          --no-wait) no_wait=1; shift ;;
+          *) die "Unsupported alias override: $1" ;;
+        esac
+      done
+      if [[ -n "$override_port" ]]; then
+        port="$override_port"
+        ALIAS_VLLM_ARGS_JSON=$(alias_vllm_set_value_json "$ALIAS_VLLM_ARGS_JSON" --port "$port") \
+          || die "Captured alias has an invalid --port argument"
+      fi
       validate_model_ref_for_backend "$model"
       run_backend_vllm
       ;;
@@ -640,6 +810,7 @@ print_launch_explain() {
     printf "      - Tool calling: ask, default no\n"; any=1
   fi
   [[ "$any" == "0" ]] && printf "      - none\n"
+  return 0
 }
 
 # (Re)build vllm_args + docker_cmd from the current $seqs (concurrency), $headroom_gb (cgroup cap
@@ -694,6 +865,7 @@ build_launch() {
   if [[ -n "${ALIAS_VLLM_ARGS_JSON:-}" ]]; then
     vllm_args=()
     while IFS= read -r arg; do vllm_args+=("$arg"); done < <(jq -r '.[]' <<<"$ALIAS_VLLM_ARGS_JSON")
+    use_marlin_atomic=0
   fi
 
   # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
@@ -734,10 +906,18 @@ build_launch() {
     docker_cmd+=(-e USER=spark -e LOGNAME=spark)
   fi
   [[ "$use_marlin_atomic" == "1" ]] && docker_cmd+=(-e VLLM_MARLIN_USE_ATOMIC_ADD=1)
+  if [[ -n "${ALIAS_VLLM_ENV_JSON:-}" ]]; then
+    local env_pair
+    while IFS= read -r env_pair; do docker_cmd+=(-e "$env_pair"); done \
+      < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$ALIAS_VLLM_ENV_JSON")
+  fi
   [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_swap_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
-  docker_cmd+=("$ngc_image")
+  docker_cmd+=("${ALIAS_VLLM_IMAGE_ID:-$ngc_image}")
   container_vllm_args=("${vllm_args[@]}")
-  [[ "$ngc_image" == vllm/vllm-openai:* ]] && container_vllm_args=("${vllm_args[@]:2}")
+  if [[ "${ALIAS_VLLM_ENTRYPOINT:-}" == "true" || \
+        ( -z "${ALIAS_VLLM_ENTRYPOINT:-}" && "$ngc_image" == vllm/vllm-openai:* ) ]]; then
+    container_vllm_args=("${vllm_args[@]:2}")
+  fi
   return 0
 }
 
@@ -799,7 +979,7 @@ run_backend_vllm() {
   local existing
   existing=$(container_for_ref "$model" 2>/dev/null || true)
   [[ -z "$existing" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$" && existing="$cname"
-  if [[ -n "$existing" ]]; then
+  if [[ -n "$existing" && "$dry_run" != "1" ]]; then
     if [[ "$force" == "1" ]]; then
       docker stop "$existing" >/dev/null 2>&1 || true
       docker rm "$existing" >/dev/null 2>&1 || true
@@ -811,8 +991,8 @@ run_backend_vllm() {
     fi
   fi
 
-  # Remove stopped container with same name
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$"; then
+  # Dry-runs never remove containers; cleanup happens only for a real launch.
+  if [[ "$dry_run" != "1" ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$"; then
     docker rm "$cname" >/dev/null 2>&1 || true
   fi
 
@@ -931,23 +1111,31 @@ run_backend_vllm() {
   # Assign a port (auto unless --port given). Reject collisions with live models.
   if [[ -z "$port" ]]; then
     port=$(next_free_port "$DEFAULT_PORT")
-  elif list_managed_containers | awk -F'\t' -v p="$port" '$3 == p {exit 0} END {exit 1}'; then
-    die "Port ${port} is already used by another model" "Pick a free port or omit --port to auto-assign"
+  elif list_managed_containers | awk -F'\t' -v p="$port" '$3 == p {found=1} END {exit !found}'; then
+    if [[ "$dry_run" == "1" ]]; then
+      warn "Port ${port} is currently used; a real launch would require a free port."
+    else
+      die "Port ${port} is already used by another model" "Pick a free port or omit --port to auto-assign"
+    fi
   fi
 
-  # Detect NGC image
+  # Captured aliases pin their image; other launches use the normal resolver.
   local ngc_image recommended_image="${HF_RECOMMENDED_IMAGE:-}"
-  ngc_image=$(detect_ngc_image)
-  if [[ ! "$recommended_image" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ && \
-        -f "${model_path}/README.md" ]]; then
-    recommended_image=$(grep -Eo 'vllm/vllm-openai:[A-Za-z0-9_.-]+' "${model_path}/README.md" 2>/dev/null | head -1 || true)
+  if [[ -n "${ALIAS_VLLM_IMAGE:-}" ]]; then
+    ngc_image="$ALIAS_VLLM_IMAGE"
+  else
+    ngc_image=$(detect_ngc_image)
+    if [[ ! "$recommended_image" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ && \
+          -f "${model_path}/README.md" ]]; then
+      recommended_image=$(grep -Eo 'vllm/vllm-openai:[A-Za-z0-9_.-]+' "${model_path}/README.md" 2>/dev/null | head -1 || true)
+    fi
+    if [[ -z "${SPARK_VLLM_IMAGE:-}" && \
+          "$recommended_image" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ ]] && \
+       docker image inspect "$recommended_image" >/dev/null 2>&1; then
+      ngc_image="$recommended_image"
+    fi
   fi
-  if [[ -z "${SPARK_VLLM_IMAGE:-}" && \
-        "$recommended_image" =~ ^vllm/vllm-openai:[A-Za-z0-9_.-]+$ ]] && \
-     docker image inspect "$recommended_image" >/dev/null 2>&1; then
-    ngc_image="$recommended_image"
-  fi
-  [[ -z "$ngc_image" ]] && die "No NGC vLLM container found" "Run: spark setup"
+  [[ -z "$ngc_image" ]] && die "No vLLM container image found" "Run: spark setup"
 
   # Concurrency cap (raise with --max-num-seqs); cgroup headroom for the startup peak (cached per
   # model, else default); and enforce-eager (kills the torch.compile/CUDA-graph peak). The adaptive

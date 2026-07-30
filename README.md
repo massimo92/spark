@@ -77,6 +77,7 @@ spark models recommend       # model suggestions for current hardware
 spark list                   # downloaded HuggingFace models
 spark alias list             # saved local launch aliases
 spark alias capture <alias>  # capture a live vLLM launch exactly
+spark run <alias> --explain  # inspect its resolved, non-destructive launch plan
 spark logs [model]           # model logs
 spark stop [model|--all]     # stop running models
 spark down                   # stop all model and gateway services

@@ -155,6 +155,10 @@ ${stdin_payload}"
     exit "${FAKE_DOCKER_STOP_EXIT:-0}"
     ;;
   inspect)
+    if [[ -n "${FAKE_CONTAINER_INSPECT_JSON:-}" && "$args" != *"{{"* ]]; then
+      printf '%s\n' "$FAKE_CONTAINER_INSPECT_JSON"
+      exit 0
+    fi
     # Adaptive-startup tests: vary by attempt (= number of `run` lines captured so far).
     _att=0
     [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run ' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
@@ -839,6 +843,10 @@ test_suite_includes() {
     test_architecture_command_maps_core_boundaries|\
     test_single_file_build_matches_modules|\
     test_source_guard_loads_without_dispatch|\
+    test_alias_create_preserves_dash_prefixed_args|\
+    test_alias_capture_replays_image_env_and_operational_overrides|\
+    test_alias_capture_rejects_secret_flags|\
+    test_alias_backend_mismatch_fails_closed|\
     test_total_mem_detection_positive|\
     test_port_auto_skips_busy|\
     test_config_set_and_show|\
@@ -1964,6 +1972,99 @@ hf_inspect_json() {
       features:{family:"qwen", architecture:$arch, quantization:$quant, has_mtp:$mtp, has_reasoning:true, supports_tools:$tools, is_multimodal:false, is_moe:($arch == "moe"), is_nvfp4:($quant == "nvfp4"), is_fp8:($quant == "fp8"), is_gguf:false},
       raw:{model_type:"qwen3", architectures:["Qwen3ForCausalLM"], quantization_config:{quant_method:$quant}}
     }'
+}
+
+
+test_alias_create_preserves_dash_prefixed_args() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(printf 'Org/Model\n0.65\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_ASSUME_INTERACTIVE=1 "$SPARK" alias create demo 2>&1)
+  jq -e '.demo.kind == "guided" and .demo.run_args == ["--mem", "0.65"]' \
+    "${tmp}/home/.config/spark/aliases.json" >/dev/null
+  local ok=$?
+  rm -rf "$tmp"
+  [[ "$ok" == "0" && "$out" == *"Saved alias 'demo'"* ]]
+}
+
+test_alias_capture_replays_image_env_and_operational_overrides() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin inspect managed out stop_file run_file
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Captured" "$KV_CONFIG"
+  managed=$'spark-vllm-captured\tOrg/Captured\t8000\t78\t14\t24\n'
+  inspect=$(jq -nc '[{
+    State:{Running:true}, Path:"vllm",
+    Args:["serve","Org/Captured","--gpu-memory-utilization","0.65","--max-model-len","4096","--max-num-seqs","2","--port","8000","--port=9000"],
+    Config:{
+      Entrypoint:["vllm","serve"],
+      Cmd:["Org/Captured","--gpu-memory-utilization","0.65","--max-model-len","4096","--max-num-seqs","2","--port","8000","--port=9000"],
+      Image:"eugr/spark-vllm:latest",
+      Env:["VLLM_MARLIN_USE_ATOMIC_ADD=1","HF_TOKEN=must-not-be-captured","AWS_SECRET_ACCESS_KEY=must-not-be-captured"]
+    },
+    Image:("sha256:" + ("a" * 64))
+  }]')
+
+  printf '1\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+    FAKE_MANAGED="$managed" FAKE_CONTAINER_INSPECT_JSON="$inspect" \
+    "$SPARK" alias capture replay >/dev/null 2>&1
+  jq -e '
+    .replay.image == "eugr/spark-vllm:latest"
+    and .replay.image_id == ("sha256:" + ("a" * 64))
+    and .replay.vllm_entrypoint == true
+    and .replay.vllm_args[0:3] == ["vllm","serve","Org/Captured"]
+    and .replay.env == {VLLM_MARLIN_USE_ATOMIC_ADD:"1"}
+  ' "${tmp}/home/.config/spark/aliases.json" >/dev/null
+
+  stop_file="${tmp}/docker-stop"; run_file="${tmp}/docker-run"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_VLLM_IMAGE="other/should-not-win:latest" FAKE_MANAGED="$managed" \
+    FAKE_DOCKER_STOP_FILE="$stop_file" FAKE_DOCKER_ARGS_FILE="$run_file" \
+    "$SPARK" run replay --force --port 8001 --explain </dev/null 2>&1)
+  local ok=0
+  [[ "$out" == *"image=eugr/spark-vllm:latest"* ]] || ok=1
+  [[ "$out" == *"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa Org/Captured"* ]] || ok=1
+  [[ "$out" != *"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa vllm serve"* ]] || ok=1
+  [[ "$out" == *"VLLM_MARLIN_USE_ATOMIC_ADD=1"* ]] || ok=1
+  [[ "$out" == *"--port 8001"* && "$out" != *"--port 8000"* && "$out" != *"--port=9000"* ]] || ok=1
+  [[ ! -s "$stop_file" && ! -s "$run_file" ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_alias_capture_rejects_secret_flags() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin inspect managed out status=0 aliases
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  managed=$'spark-vllm-secret\tOrg/Secret\t8000\t10\t5\t5\n'
+  inspect=$(jq -nc '[{
+    State:{Running:true}, Path:"vllm", Args:["serve","Org/Secret","--api-key","topsecret"],
+    Config:{Entrypoint:["vllm","serve"], Cmd:["Org/Secret","--api-key","topsecret"], Image:"eugr/spark-vllm:latest", Env:[]},
+    Image:("sha256:" + ("b" * 64))
+  }]')
+  out=$(printf '1\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+    FAKE_MANAGED="$managed" FAKE_CONTAINER_INSPECT_JSON="$inspect" \
+    "$SPARK" alias capture unsafe 2>&1) || status=$?
+  aliases="${tmp}/home/.config/spark/aliases.json"
+  local ok=0
+  [[ "$status" -ne 0 && "$out" != *"topsecret"* ]] || ok=1
+  [[ ! -f "$aliases" ]] || ! grep -Eq 'topsecret|api-key' "$aliases" || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_alias_backend_mismatch_fails_closed() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"cross":{"kind":"guided","backend":"vllm","model":"Org/Model","run_args":[]}}' \
+    > "${tmp}/home/.config/spark/aliases.json"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
+    "$SPARK" run cross --dry-run </dev/null 2>&1) || status=$?
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 && "$out" == *"targets vllm; this machine uses ollama"* ]]
 }
 
 test_total_mem_detection_positive() {
@@ -7130,17 +7231,21 @@ test_kv_fp8_override_does_not_persist_to_profile() {
 
 test_dry_run_explain_shows_hf_and_flags() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out meta
+  local tmp fake_bin out meta status=0
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "Org/Explain" "$KV_CONFIG"
   meta=$(hf_inspect_json false false null true dense nvfp4)
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
-    "$SPARK" run Org/Explain --dry-run --explain </dev/null 2>&1 || true)
+    ALIAS_VLLM_IMAGE_ID="--privileged" ALIAS_VLLM_ENV_JSON='{"EVIL":"1"}' \
+    ALIAS_VLLM_ARGS_JSON='["vllm","serve","Evil/Model"]' \
+    "$SPARK" run Org/Explain --explain </dev/null 2>&1) || status=$?
   rm -rf "$tmp"
-  [[ "$out" == *"Explain"* ]] && [[ "$out" == *"HF:"* ]] && [[ "$out" == *"Features:"* ]] &&
-    [[ "$out" == *"vLLM:"* ]] && [[ "$out" == *"--load-format fastsafetensors"* ]] &&
-    [[ "$out" == *"Tool calling: ask"* ]]
+  [[ "$status" == "0" ]] && [[ "$out" == *"Explain"* ]] && [[ "$out" == *"HF:"* ]] && \
+    [[ "$out" == *"Features:"* ]] && [[ "$out" == *"vLLM:"* ]] && \
+    [[ "$out" == *"--load-format fastsafetensors"* ]] && [[ "$out" == *"Tool calling: ask"* ]] && \
+    [[ "$out" == *"Docker command that would be executed"* ]] && \
+    [[ "$out" != *"--privileged"* && "$out" != *"EVIL=1"* && "$out" != *"Evil/Model"* ]]
 }
 
 test_hf_metadata_cli_overrides_win() {
@@ -7704,6 +7809,10 @@ run_test "workspace task manager teardown rejects broad paths" test_workspace_re
 run_test "doctor reports missing NGC image without aborting" test_doctor_reports_no_ngc_image
 run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vllm_image
 run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wins
+run_test "alias create preserves dash-prefixed arguments" test_alias_create_preserves_dash_prefixed_args
+run_test "captured alias pins image/env and accepts safe overrides" test_alias_capture_replays_image_env_and_operational_overrides
+run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
+run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
 run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "setup --check reports Tailscale Funnel" test_setup_check_reports_tailscale_funnel
