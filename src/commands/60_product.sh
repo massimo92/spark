@@ -134,14 +134,43 @@ nemohermes_rebuild_with_workspace_env() {
 }
 
 docker_image_update_available() {
-  local image="$1" local_digests remote_digest
+  local image="$1" local_digests remote_output remote_digest
   command -v docker >/dev/null 2>&1 || return 2
   local_digests=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" 2>/dev/null) || return 0
   [[ -n "$local_digests" ]] || return 0
-  remote_digest=$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}' 2>/dev/null) || return 2
+  remote_output=$(docker buildx imagetools inspect "$image" 2>/dev/null) || return 2
+  remote_digest=$(printf '%s\n' "$remote_output" | awk '$1 == "Digest:" { print $2; exit }')
+  if [[ -z "$remote_digest" && "$remote_output" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    remote_digest="$remote_output"
+  fi
   [[ "$remote_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 2
   printf '%s\n' "$local_digests" | grep -Fq "@${remote_digest}" && return 1
   return 0
+}
+
+super_productivity_latest_version() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsSL --max-time 8 \
+    https://api.github.com/repos/super-productivity/super-productivity/releases/latest 2>/dev/null \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -1
+}
+
+workspace_update_super_productivity_release() {
+  local version="$1" tag model human_user human_email n8n_email
+  tag="${version#v}"
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  human_user=$(workspace_read_env N8N_OWNER_FIRST_NAME 2>/dev/null || true)
+  human_email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
+  n8n_email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
+  [[ -n "$version" && -n "$model" && -n "$human_user" && -n "$human_email" && -n "$n8n_email" ]] || return 1
+  SPARK_WORKSPACE_SUPER_PRODUCTIVITY_VERSION="$version" \
+  SPARK_WORKSPACE_SUPERSYNC_IMAGE="spark/supersync:${tag}" \
+  SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE="spark/super-productivity-electron:${tag}" \
+  SPARK_WORKSPACE_VIKUNJA_USERNAME="$human_user" \
+  SPARK_WORKSPACE_VIKUNJA_EMAIL="$human_email" \
+  SPARK_WORKSPACE_N8N_EMAIL="$n8n_email" \
+    workspace_setup --yes --task-manager super-productivity --model "$model"
 }
 
 cmd_update_help() {
@@ -170,6 +199,7 @@ cmd_update() {
   local gateway_update=0 gateway_config=""
   local postgres_update=0 task_update=0 n8n_update=0 task_manager="" task_label=""
   local postgres_image="" task_image="" n8n_image="" sp_sync_image=""
+  local task_current_version="" task_latest_version="" task_update_kind=""
   local task_services=()
   local nemohermes_update=0 nemohermes_status="" nemohermes_update_line=""
   local update_count=0 workspace_images_updated=0
@@ -262,6 +292,8 @@ cmd_update() {
       if [[ "$task_manager" == "super-productivity" ]]; then
         sp_sync_image=$(workspace_read_env WORKSPACE_SUPERSYNC_IMAGE 2>/dev/null || true)
         task_image="$sp_sync_image"
+        task_current_version=$(workspace_read_env WORKSPACE_SUPER_PRODUCTIVITY_VERSION 2>/dev/null || true)
+        [[ -n "$task_current_version" ]] || task_current_version="v${sp_sync_image##*:}"
         task_services=(supersync)
       elif [[ "$task_manager" == "vikunja" ]]; then
         task_image=$(workspace_read_env WORKSPACE_VIKUNJA_IMAGE 2>/dev/null || true)
@@ -280,7 +312,23 @@ cmd_update() {
         fi
       fi
       if [[ "$selected_all" -eq 1 || "$selected_task" -eq 1 ]]; then
-        if [[ -n "$task_image" ]]; then
+        if [[ "$task_manager" == "super-productivity" ]]; then
+          task_latest_version=$(super_productivity_latest_version 2>/dev/null || true)
+          if [[ -z "$task_latest_version" ]]; then
+            warn "Could not check latest Super Productivity version"
+          elif workspace_semver_at_least "$task_current_version" "$task_latest_version"; then
+            if docker image inspect "$task_image" >/dev/null 2>&1; then
+              info "Super Productivity is up to date (${task_current_version})"
+            else
+              task_update=1
+              task_update_kind=rebuild
+            fi
+          else
+            task_update=1
+            task_update_kind=release
+            task_image="spark/supersync:${task_latest_version#v}"
+          fi
+        elif [[ -n "$task_image" ]]; then
           if docker_image_update_available "$task_image"; then
             task_update=1
           else
@@ -308,7 +356,7 @@ cmd_update() {
 
   if [[ "$selected_all" -eq 1 || "$selected_nemohermes" -eq 1 ]]; then
     if command -v nemohermes >/dev/null 2>&1; then
-      nemohermes_status=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes update --check 2>/dev/null || true)
+      nemohermes_status=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes update --check 2>/dev/null || true)
       nemohermes_update_line=$(printf '%s\n' "$nemohermes_status" | grep -i 'Update available:.*yes' | head -1 || true)
       if [[ -n "$nemohermes_update_line" ]]; then
         nemohermes_update=1
@@ -337,7 +385,15 @@ cmd_update() {
   fi
   [[ "$gateway_update" -eq 1 ]] && printf "    - LiteLLM gateway image: %s\n" "$LITELLM_IMAGE"
   [[ "$postgres_update" -eq 1 ]] && printf "    - Postgres image: %s\n" "$postgres_image"
-  [[ "$task_update" -eq 1 ]] && printf "    - %s image: %s\n" "$task_label" "$task_image"
+  if [[ "$task_update" -eq 1 ]]; then
+    if [[ "$task_manager" == "super-productivity" && "$task_update_kind" == "release" ]]; then
+      printf "    - Super Productivity: %s → %s\n" "$task_current_version" "$task_latest_version"
+    elif [[ "$task_manager" == "super-productivity" ]]; then
+      printf "    - Super Productivity image: rebuild %s\n" "$task_image"
+    else
+      printf "    - %s image: %s\n" "$task_label" "$task_image"
+    fi
+  fi
   [[ "$n8n_update" -eq 1 ]] && printf "    - n8n image: %s\n" "$n8n_image"
   [[ "$nemohermes_update" -eq 1 ]] && printf "    - NemoHermes: update available\n"
   printf "\n"
@@ -383,7 +439,16 @@ cmd_update() {
     workspace_compose pull postgres && workspace_images_updated=1 && did_update=1 || err "Failed to pull Postgres image"
   fi
   if [[ "$task_update" -eq 1 ]] && confirm "Update ${task_label} images (${task_image})?"; then
-    workspace_compose pull "${task_services[@]}" && workspace_images_updated=1 && did_update=1 || err "Failed to pull ${task_label} images"
+    if [[ "$task_manager" == "super-productivity" ]]; then
+      if workspace_update_super_productivity_release "${task_latest_version:-$task_current_version}"; then
+        info "Super Productivity updated to ${task_latest_version:-$task_current_version}"
+        did_update=1
+      else
+        err "Failed to rebuild Super Productivity"
+      fi
+    else
+      workspace_compose pull "${task_services[@]}" && workspace_images_updated=1 && did_update=1 || err "Failed to pull ${task_label} images"
+    fi
   fi
   if [[ "$n8n_update" -eq 1 ]] && confirm "Update n8n image (${n8n_image})?"; then
     workspace_compose pull n8n && workspace_images_updated=1 && did_update=1 || err "Failed to pull n8n image"
