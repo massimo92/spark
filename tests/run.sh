@@ -318,6 +318,15 @@ case "$args" in
   *:5678/healthz*) exit "${FAKE_N8N_HEALTH_EXIT:-0}" ;;
   *:5678/rest/owner/setup*) [[ -n "${FAKE_N8N_OWNER_MARKER:-}" ]] && : > "$FAKE_N8N_OWNER_MARKER"; echo '{"data":{"id":"owner"}}'; exit "${FAKE_N8N_OWNER_EXIT:-0}" ;;
   *:5678/rest/login*)
+    if [[ -n "${FAKE_N8N_LOGIN_COUNT_FILE:-}" ]]; then
+      login_count=0
+      [[ -f "$FAKE_N8N_LOGIN_COUNT_FILE" ]] && login_count=$(cat "$FAKE_N8N_LOGIN_COUNT_FILE")
+      login_count=$((login_count + 1))
+      printf '%s\n' "$login_count" > "$FAKE_N8N_LOGIN_COUNT_FILE"
+      if [[ ",${FAKE_N8N_LOGIN_FAIL_CALLS:-}," == *",$login_count,"* ]]; then
+        exit 22
+      fi
+    fi
     if [[ "${FAKE_N8N_LOGIN_FORBID_EMAIL_FIELD:-0}" == "1" && "$args" == *'"email"'* ]]; then
       echo '{"code":"email_field_forbidden"}'
       exit 400
@@ -4573,7 +4582,7 @@ EOF
 
 test_workspace_recover_n8n() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out password config calls n8n_env
+  local tmp fake_bin out password config calls n8n_env login_count
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_cached_model "${tmp}/home" "Org/Alpha"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
@@ -4582,17 +4591,42 @@ test_workspace_recover_n8n() {
     "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     SPARK_WORKSPACE_WAIT_SLEEP=0 FAKE_COMPOSE_FILE="${tmp}/calls" \
+    FAKE_N8N_LOGIN_COUNT_FILE="${tmp}/login-count" FAKE_N8N_LOGIN_FAIL_CALLS=1,3 \
     "$SPARK" ws recover n8n --yes 2>&1)
   password=$(sed -n 's/^    password: //p' <<< "$out")
   config="${tmp}/home/.config/spark/workspace"
   calls=$(cat "${tmp}/calls")
   n8n_env=$(cat "${config}/n8n.env")
+  login_count=$(cat "${tmp}/login-count")
   rm -rf "$tmp"
   [[ "$out" == *"n8n access recovered for m@example.com"* ]] &&
     [[ $(grep -c 'force-recreate --no-deps n8n' <<< "$calls") -eq 2 ]] &&
     [[ "$calls" != *"user-management:reset"* ]] &&
+    [[ "$login_count" -eq 4 ]] &&
     [[ "$n8n_env" != *"N8N_INSTANCE_OWNER_"* ]] &&
     [[ -n "$password" ]] && [[ "$n8n_env" != *"$password"* ]]
+}
+
+test_workspace_recover_n8n_fails_after_two_login_attempts() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status login_count
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_WAIT_SLEEP=0 FAKE_N8N_LOGIN_COUNT_FILE="${tmp}/login-count" \
+    FAKE_N8N_LOGIN_FAIL_CALLS=1,2 "$SPARK" ws recover n8n --yes 2>&1)
+  status=$?
+  set -e
+  login_count=$(cat "${tmp}/login-count")
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$login_count" -eq 2 ]] &&
+    [[ "$out" == *"n8n recovery did not complete cleanly"* ]]
 }
 
 test_workspace_recover_n8n_requires_supported_version() {
@@ -8056,6 +8090,7 @@ run_test "workspace setup rejects removed SMTP" test_workspace_setup_rejects_rem
 run_test "workspace setup removes legacy SMTP" test_workspace_setup_removes_legacy_smtp
 run_test "workspace recover changes Vikunja password" test_workspace_recover_vikunja
 run_test "workspace recover changes n8n password" test_workspace_recover_n8n
+run_test "workspace recover fails after two login attempts" test_workspace_recover_n8n_fails_after_two_login_attempts
 run_test "workspace recover requires supported n8n" test_workspace_recover_n8n_requires_supported_version
 run_test "workspace setup repairs polluted required env values" test_workspace_setup_repairs_polluted_required_env_values
 run_test "workspace setup cleans polluted env before missing value abort" test_workspace_setup_cleans_polluted_env_before_missing_value_abort
