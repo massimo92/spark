@@ -12145,6 +12145,15 @@ EOF
   chmod 600 "$WORKSPACE_N8N_ENV_FILE"
 }
 
+workspace_n8n_login_after_startup() {
+  # n8n returns healthz=200 about one second before /rest/login is ready.
+  local email="$1" password="$2" delay="${SPARK_WORKSPACE_WAIT_SLEEP:-1}"
+  sleep "$delay"
+  workspace_n8n_login "$email" "$password" && return 0
+  sleep "$delay"
+  workspace_n8n_login "$email" "$password"
+}
+
 workspace_recover_n8n() {
   local password="$1" version email first last hash backup="" rc=0
   version=$(workspace_n8n_version) || true
@@ -12174,14 +12183,14 @@ workspace_recover_n8n() {
     workspace_n8n_wait_ready || rc=1
   fi
   if [[ "$rc" == "0" ]]; then
-    workspace_n8n_login "$email" "$password" || rc=1
+    workspace_n8n_login_after_startup "$email" "$password" || rc=1
   fi
   workspace_n8n_restore_env "$backup" || rc=1
   rm -f "$backup"
   workspace_compose up -d --force-recreate --no-deps n8n >/dev/null 2>&1 || rc=1
   workspace_n8n_wait_ready || rc=1
   if [[ "$rc" == "0" ]]; then
-    workspace_n8n_login "$email" "$password" || rc=1
+    workspace_n8n_login_after_startup "$email" "$password" || rc=1
   fi
   if [[ "$rc" != "0" ]]; then
     err "n8n recovery did not complete cleanly"
