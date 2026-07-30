@@ -124,6 +124,17 @@ ${stdin_payload}"
       *) ;;
     esac
     ;;
+  image)
+    if [[ "${2:-}" == "inspect" && -n "${FAKE_DOCKER_LOCAL_DIGEST:-}" ]]; then
+      printf '%s@%s\n' "${*: -1}" "$FAKE_DOCKER_LOCAL_DIGEST"
+    else
+      exit 0
+    fi
+    ;;
+  buildx)
+    [[ -n "${FAKE_DOCKER_REMOTE_DIGEST:-}" ]] || exit 1
+    printf '%s\n' "$FAKE_DOCKER_REMOTE_DIGEST"
+    ;;
   images)
     [[ -n "${FAKE_DOCKER_IMAGE:-}" ]] && printf '%b\n' "${FAKE_DOCKER_IMAGE}"
     ;;
@@ -7841,7 +7852,7 @@ EOF
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:${current_tag}" \
     FAKE_COMPOSE_FILE="${tmp}/compose.log" \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
-    FAKE_NEMOHERMES_STATUS=$'Hermes ready\nUpdate:   v2026.5.22 available\n' \
+    FAKE_NEMOHERMES_UPDATE_CHECK=$'Current NemoHermes version: 0.0.55\nLatest maintained version: 0.0.78\nUpdate available:         yes' \
     "$SPARK" update 2>&1)
   compose_log=$(cat "${tmp}/compose.log" 2>/dev/null || echo "")
   nemo_log=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
@@ -7864,6 +7875,81 @@ EOF
     [[ "$nemo_log" == *"COMPATIBLE_API_KEY=dummy"* ]]
 }
 
+test_update_skips_images_already_at_remote_digest() {
+  local tmp fake_bin out compose_log digest
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  digest="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf '%s\n' \
+    'WORKSPACE_TASK_MANAGER=vikunja' \
+    'WORKSPACE_POSTGRES_IMAGE=postgres:18' \
+    'WORKSPACE_VIKUNJA_IMAGE=vikunja/vikunja:latest' \
+    'WORKSPACE_N8N_IMAGE=docker.n8n.io/n8nio/n8n:latest' \
+    > "${tmp}/home/.config/spark/workspace/secrets.env"
+  : > "${tmp}/home/.config/spark/workspace/docker-compose.yml"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_DOCKER_LOCAL_DIGEST="$digest" FAKE_DOCKER_REMOTE_DIGEST="$digest" \
+    FAKE_COMPOSE_FILE="${tmp}/compose.log" "$SPARK" update --postgresql --task-manager --n8n 2>&1)
+  compose_log=$(cat "${tmp}/compose.log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Postgres image is up to date"* ]] &&
+    [[ "$out" == *"Vikunja image is up to date"* ]] &&
+    [[ "$out" == *"n8n image is up to date"* ]] &&
+    [[ "$out" == *$'Available update actions:\n    none'* ]] &&
+    [[ "$compose_log" != *"pull"* ]]
+}
+
+test_update_flags_limit_checks_and_actions() {
+  local tmp fake_bin out compose_log old_digest new_digest
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  old_digest="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  new_digest="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf '%s\n' \
+    'WORKSPACE_TASK_MANAGER=vikunja' \
+    'WORKSPACE_POSTGRES_IMAGE=postgres:18' \
+    'WORKSPACE_VIKUNJA_IMAGE=vikunja/vikunja:latest' \
+    'WORKSPACE_N8N_IMAGE=docker.n8n.io/n8nio/n8n:latest' \
+    > "${tmp}/home/.config/spark/workspace/secrets.env"
+  : > "${tmp}/home/.config/spark/workspace/docker-compose.yml"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_DOCKER_LOCAL_DIGEST="$old_digest" FAKE_DOCKER_REMOTE_DIGEST="$new_digest" \
+    FAKE_COMPOSE_FILE="${tmp}/compose.log" "$SPARK" update --postgresql 2>&1)
+  compose_log=$(cat "${tmp}/compose.log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Postgres image: postgres:18"* ]] &&
+    [[ "$out" != *"Vikunja image:"* ]] &&
+    [[ "$out" != *"n8n image:"* ]] &&
+    [[ "$out" != *"NemoHermes"* ]] &&
+    [[ "$compose_log" == *"pull postgres"* ]] &&
+    [[ "$compose_log" != *"pull vikunja"* ]] &&
+    [[ "$compose_log" != *"pull n8n"* ]]
+}
+
+test_update_solo_alias_checks_only_spark() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  printf '#!/usr/bin/env bash\nprintf '\''VERSION="99.0.0"\\n'\''\n' > "${fake_bin}/curl"
+  chmod +x "${fake_bin}/curl"
+  out=$(printf 'n\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" update --solo 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"spark CLI: v${SPARK_VERSION} → v99.0.0"* ]] &&
+    [[ "$out" != *"NGC vLLM"* ]] &&
+    [[ "$out" != *"Postgres"* ]] &&
+    [[ "$out" != *"NemoHermes"* ]]
+}
+
+test_update_does_not_suggest_spark_downgrade() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  printf '#!/usr/bin/env bash\nprintf '\''VERSION="0.0.1"\\n'\''\n' > "${fake_bin}/curl"
+  chmod +x "${fake_bin}/curl"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" update --spark 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"spark CLI is up to date (v${SPARK_VERSION})"* ]] &&
+    [[ "$out" == *$'Available update actions:\n    none'* ]]
+}
+
 test_update_nemohermes_failure_explains_rebuild_env() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -7874,7 +7960,7 @@ EOF
   chmod +x "${fake_bin}/curl"
   out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:$(date +%y.%m)-py3" \
-    FAKE_NEMOHERMES_STATUS=$'Hermes ready\nUpdate:   v2026.5.22 available\n' \
+    FAKE_NEMOHERMES_UPDATE_CHECK=$'Current NemoHermes version: 0.0.55\nLatest maintained version: 0.0.78\nUpdate available:         yes' \
     FAKE_NEMOHERMES_EXIT=9 \
     "$SPARK" update 2>&1 || true)
   rm -rf "$tmp"
@@ -7903,7 +7989,7 @@ EOF
   printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:$(date +%y.%m)-py3" \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
-    FAKE_NEMOHERMES_STATUS=$'Hermes ready\nUpdate:   v2026.5.22 available\n' \
+    FAKE_NEMOHERMES_UPDATE_CHECK=$'Current NemoHermes version: 0.0.55\nLatest maintained version: 0.0.78\nUpdate available:         yes' \
     "$SPARK" update >/dev/null 2>&1
   nemo_log=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
   rm -rf "$tmp"
@@ -8090,6 +8176,10 @@ run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
 run_test "update prompts workspace tool updates one by one" test_update_prompts_workspace_tool_updates_one_by_one
+run_test "update skips images already at remote digest" test_update_skips_images_already_at_remote_digest
+run_test "update flags limit checks and actions" test_update_flags_limit_checks_and_actions
+run_test "update solo alias checks only spark" test_update_solo_alias_checks_only_spark
+run_test "update does not suggest spark downgrade" test_update_does_not_suggest_spark_downgrade
 run_test "update NemoHermes failure explains rebuild env" test_update_nemohermes_failure_explains_rebuild_env
 run_test "update NemoHermes rebuild uses stored compatible key" test_update_nemohermes_rebuild_uses_stored_compatible_key
 run_test "update does not suggest NGC downgrade" test_update_does_not_suggest_ngc_downgrade
