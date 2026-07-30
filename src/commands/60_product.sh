@@ -133,11 +133,38 @@ nemohermes_rebuild_with_workspace_env() {
   env "${env_args[@]}" nemohermes hermes rebuild
 }
 
-cmd_update() {
-  printf "\n"
-  command -v curl >/dev/null 2>&1 || die "curl is required for updates"
+docker_image_update_available() {
+  local image="$1" local_digests remote_digest
+  command -v docker >/dev/null 2>&1 || return 2
+  local_digests=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" 2>/dev/null) || return 0
+  [[ -n "$local_digests" ]] || return 0
+  remote_digest=$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}' 2>/dev/null) || return 2
+  [[ "$remote_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || return 2
+  printf '%s\n' "$local_digests" | grep -Fq "@${remote_digest}" && return 1
+  return 0
+}
 
-  local did_update=0
+cmd_update_help() {
+  cat <<'EOF'
+Usage: spark update [targets]
+
+Without targets, checks every managed component and asks only for real updates.
+Targets may be combined:
+  --spark, --solo     Spark CLI only
+  --vllm              NGC vLLM image
+  --litellm           LiteLLM gateway image
+  --postgresql        Workspace PostgreSQL image
+  --task-manager      Workspace task-manager images
+  --n8n               Workspace n8n image
+  --nemohermes        NemoHermes sandbox
+  --all               Every managed component
+EOF
+}
+
+cmd_update() {
+  local selected_all=1 selected_spark=0 selected_ngc=0 selected_gateway=0
+  local selected_postgres=0 selected_task=0 selected_n8n=0 selected_nemohermes=0
+  local did_update=0 image_check_rc=0
   local spark_update=0 spark_remote_version=""
   local ngc_update=0 current_ngc="" current_tag="" latest_tag=""
   local gateway_update=0 gateway_config=""
@@ -145,85 +172,155 @@ cmd_update() {
   local postgres_image="" task_image="" n8n_image="" sp_sync_image=""
   local task_services=()
   local nemohermes_update=0 nemohermes_status="" nemohermes_update_line=""
-  local update_count=0
+  local update_count=0 workspace_images_updated=0
 
-  printf "  Checking updates...\n"
-
-  # --- spark CLI ---
-  spark_remote_version=$(curl -fsSL --max-time 5 \
-    "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" 2>/dev/null \
-    | grep -m1 '^VERSION=' | sed 's/VERSION="//' | sed 's/"//' || true)
-
-  if [[ -z "$spark_remote_version" ]]; then
-    warn "Could not check latest spark version"
-  elif [[ "$spark_remote_version" == "$VERSION" ]]; then
-    info "spark CLI is up to date (v${VERSION})"
-  else
-    spark_update=1
+  if [[ $# -gt 0 ]]; then
+    selected_all=0
   fi
-
-  # --- NGC vLLM container ---
-  current_ngc=$(detect_ngc_image)
-  [[ -n "$current_ngc" ]] && current_tag="${current_ngc##*:}"
-
-  local year month m candidate
-  year=$(date +%y)
-  month=$(date +%m)
-  for m in "$month" "$(printf '%02d' $(( 10#$month - 1 )))"; do
-    [[ "$m" == "00" ]] && continue
-    candidate="${year}.${m}-py3"
-    if { [[ -z "$current_tag" ]] || ngc_vllm_tag_newer_than "$candidate" "$current_tag"; } && \
-       docker manifest inspect "nvcr.io/nvidia/vllm:${candidate}" >/dev/null 2>&1; then
-      latest_tag="$candidate"
-      break
-    fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --spark|--solo) selected_spark=1 ;;
+      --vllm) selected_ngc=1 ;;
+      --litellm) selected_gateway=1 ;;
+      --postgresql|--postgres) selected_postgres=1 ;;
+      --task-manager) selected_task=1 ;;
+      --n8n) selected_n8n=1 ;;
+      --nemohermes) selected_nemohermes=1 ;;
+      --all) selected_all=1 ;;
+      -h|--help) cmd_update_help; return 0 ;;
+      *) die "Unknown update target: $1" "Run: spark update --help" ;;
+    esac
+    shift
   done
 
-  if [[ -z "$current_ngc" && -z "$latest_tag" ]]; then
-    warn "No vLLM container found and could not detect latest"
-  elif [[ -z "$latest_tag" ]]; then
-    info "NGC vLLM is up to date (${current_tag})"
-  else
-    ngc_update=1
-  fi
+  printf "\n  Checking updates...\n"
 
-  # --- LiteLLM gateway image ---
-  if command -v docker >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-    gateway_config=$(gateway_load_config 2>/dev/null || echo '{}')
-    if [[ "$(printf '%s' "$gateway_config" | jq -r '.enabled // false' 2>/dev/null)" == "true" ]]; then
-      gateway_update=1
+  if [[ "$selected_all" -eq 1 || "$selected_spark" -eq 1 ]]; then
+    if ! command -v curl >/dev/null 2>&1; then
+      warn "Could not check spark CLI: curl is required"
+    else
+      spark_remote_version=$(curl -fsSL --max-time 5 \
+        "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" 2>/dev/null \
+        | grep -m1 '^VERSION=' | sed 's/VERSION="//' | sed 's/"//' || true)
+      if [[ -z "$spark_remote_version" ]]; then
+        warn "Could not check latest spark version"
+      elif workspace_semver_at_least "$VERSION" "$spark_remote_version"; then
+        info "spark CLI is up to date (v${VERSION})"
+      else
+        spark_update=1
+      fi
     fi
   fi
 
-  # --- Workspace Compose images ---
-  if [[ -f "$WORKSPACE_ENV_FILE" && -f "$WORKSPACE_COMPOSE_FILE" ]] && command -v docker >/dev/null 2>&1; then
-    postgres_image=$(workspace_read_env WORKSPACE_POSTGRES_IMAGE 2>/dev/null || true)
-    task_manager=$(workspace_task_manager)
-    task_label=$(workspace_task_manager_label "$task_manager")
-    if [[ "$task_manager" == "super-productivity" ]]; then
-      sp_sync_image=$(workspace_read_env WORKSPACE_SUPERSYNC_IMAGE 2>/dev/null || true)
-      task_image="$sp_sync_image"
-      task_services=(supersync)
-    elif [[ "$task_manager" == "vikunja" ]]; then
-      task_image=$(workspace_read_env WORKSPACE_VIKUNJA_IMAGE 2>/dev/null || true)
-      task_services=(vikunja)
+  if [[ "$selected_all" -eq 1 || "$selected_ngc" -eq 1 ]]; then
+    current_ngc=$(detect_ngc_image)
+    [[ -n "$current_ngc" ]] && current_tag="${current_ngc##*:}"
+    local year month m candidate
+    year=$(date +%y)
+    month=$(date +%m)
+    for m in "$month" "$(printf '%02d' $(( 10#$month - 1 )))"; do
+      [[ "$m" == "00" ]] && continue
+      candidate="${year}.${m}-py3"
+      if { [[ -z "$current_tag" ]] || ngc_vllm_tag_newer_than "$candidate" "$current_tag"; } && \
+         docker manifest inspect "nvcr.io/nvidia/vllm:${candidate}" >/dev/null 2>&1; then
+        latest_tag="$candidate"
+        break
+      fi
+    done
+    if [[ -z "$current_ngc" && -z "$latest_tag" ]]; then
+      warn "No vLLM container found and could not detect latest"
+    elif [[ -z "$latest_tag" ]]; then
+      info "NGC vLLM is up to date (${current_tag})"
+    else
+      ngc_update=1
     fi
-    n8n_image=$(workspace_read_env WORKSPACE_N8N_IMAGE 2>/dev/null || true)
-    [[ -n "$postgres_image" ]] && postgres_update=1
-    [[ -n "$task_image" ]] && task_update=1
-    [[ -n "$n8n_image" ]] && n8n_update=1
   fi
 
-  # --- NemoHermes sandbox ---
-  if command -v nemohermes >/dev/null 2>&1; then
-    nemohermes_status=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes status 2>/dev/null || \
-      NEMOCLAW_SANDBOX_NAME=hermes nemohermes status 2>/dev/null || true)
-    nemohermes_update_line=$(printf '%s\n' "$nemohermes_status" | grep -i 'update:.*available' | head -1 || true)
-    [[ -n "$nemohermes_update_line" ]] && nemohermes_update=1
+  if [[ "$selected_all" -eq 1 || "$selected_gateway" -eq 1 ]]; then
+    if command -v docker >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+      gateway_config=$(gateway_load_config 2>/dev/null || echo '{}')
+      if [[ "$(printf '%s' "$gateway_config" | jq -r '.enabled // false' 2>/dev/null)" == "true" ]]; then
+        if docker_image_update_available "$LITELLM_IMAGE"; then
+          gateway_update=1
+        else
+          image_check_rc=$?
+          if [[ "$image_check_rc" -eq 1 ]]; then
+            info "LiteLLM gateway image is up to date (${LITELLM_IMAGE})"
+          else
+            warn "Could not check latest LiteLLM gateway image"
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  if [[ "$selected_all" -eq 1 || "$selected_postgres" -eq 1 || "$selected_task" -eq 1 || "$selected_n8n" -eq 1 ]]; then
+    if [[ -f "$WORKSPACE_ENV_FILE" && -f "$WORKSPACE_COMPOSE_FILE" ]] && command -v docker >/dev/null 2>&1; then
+      postgres_image=$(workspace_read_env WORKSPACE_POSTGRES_IMAGE 2>/dev/null || true)
+      task_manager=$(workspace_task_manager)
+      task_label=$(workspace_task_manager_label "$task_manager")
+      if [[ "$task_manager" == "super-productivity" ]]; then
+        sp_sync_image=$(workspace_read_env WORKSPACE_SUPERSYNC_IMAGE 2>/dev/null || true)
+        task_image="$sp_sync_image"
+        task_services=(supersync)
+      elif [[ "$task_manager" == "vikunja" ]]; then
+        task_image=$(workspace_read_env WORKSPACE_VIKUNJA_IMAGE 2>/dev/null || true)
+        task_services=(vikunja)
+      fi
+      n8n_image=$(workspace_read_env WORKSPACE_N8N_IMAGE 2>/dev/null || true)
+
+      if [[ "$selected_all" -eq 1 || "$selected_postgres" -eq 1 ]]; then
+        if [[ -n "$postgres_image" ]]; then
+          if docker_image_update_available "$postgres_image"; then
+            postgres_update=1
+          else
+            image_check_rc=$?
+            [[ "$image_check_rc" -eq 1 ]] && info "Postgres image is up to date (${postgres_image})" || warn "Could not check latest Postgres image"
+          fi
+        fi
+      fi
+      if [[ "$selected_all" -eq 1 || "$selected_task" -eq 1 ]]; then
+        if [[ -n "$task_image" ]]; then
+          if docker_image_update_available "$task_image"; then
+            task_update=1
+          else
+            image_check_rc=$?
+            [[ "$image_check_rc" -eq 1 ]] && info "${task_label} image is up to date (${task_image})" || warn "Could not check latest ${task_label} image"
+          fi
+        elif [[ "$task_manager" == "todoist" ]]; then
+          info "Todoist is managed externally; no container image to update"
+        fi
+      fi
+      if [[ "$selected_all" -eq 1 || "$selected_n8n" -eq 1 ]]; then
+        if [[ -n "$n8n_image" ]]; then
+          if docker_image_update_available "$n8n_image"; then
+            n8n_update=1
+          else
+            image_check_rc=$?
+            [[ "$image_check_rc" -eq 1 ]] && info "n8n image is up to date (${n8n_image})" || warn "Could not check latest n8n image"
+          fi
+        fi
+      fi
+    else
+      [[ "$selected_all" -eq 1 ]] || warn "Workspace is not configured; requested workspace update target skipped"
+    fi
+  fi
+
+  if [[ "$selected_all" -eq 1 || "$selected_nemohermes" -eq 1 ]]; then
+    if command -v nemohermes >/dev/null 2>&1; then
+      nemohermes_status=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes update --check 2>/dev/null || true)
+      nemohermes_update_line=$(printf '%s\n' "$nemohermes_status" | grep -i 'Update available:.*yes' | head -1 || true)
+      if [[ -n "$nemohermes_update_line" ]]; then
+        nemohermes_update=1
+      elif [[ -n "$nemohermes_status" ]]; then
+        info "NemoHermes is up to date"
+      else
+        warn "Could not check latest NemoHermes version"
+      fi
+    fi
   fi
 
   update_count=$(( spark_update + ngc_update + gateway_update + postgres_update + task_update + n8n_update + nemohermes_update ))
-
   printf "\n  Available update actions:\n"
   if [[ "$update_count" -eq 0 ]]; then
     printf "    none\n"
@@ -240,15 +337,9 @@ cmd_update() {
   fi
   [[ "$gateway_update" -eq 1 ]] && printf "    - LiteLLM gateway image: %s\n" "$LITELLM_IMAGE"
   [[ "$postgres_update" -eq 1 ]] && printf "    - Postgres image: %s\n" "$postgres_image"
-  if [[ "$task_update" -eq 1 ]]; then
-    if [[ "$task_manager" == "super-productivity" ]]; then
-      printf "    - %s images: %s\n" "$task_label" "$task_image"
-    else
-      printf "    - Vikunja image: %s\n" "$task_image"
-    fi
-  fi
+  [[ "$task_update" -eq 1 ]] && printf "    - %s image: %s\n" "$task_label" "$task_image"
   [[ "$n8n_update" -eq 1 ]] && printf "    - n8n image: %s\n" "$n8n_image"
-  [[ "$nemohermes_update" -eq 1 ]] && printf "    - NemoHermes: %s\n" "$(workspace_trim "$nemohermes_update_line")"
+  [[ "$nemohermes_update" -eq 1 ]] && printf "    - NemoHermes: update available\n"
   printf "\n"
 
   if [[ "$spark_update" -eq 1 ]] && confirm "Update spark CLI to v${spark_remote_version}?"; then
@@ -288,7 +379,6 @@ cmd_update() {
     fi
   fi
 
-  local workspace_images_updated=0
   if [[ "$postgres_update" -eq 1 ]] && confirm "Update Postgres image (${postgres_image})?"; then
     workspace_compose pull postgres && workspace_images_updated=1 && did_update=1 || err "Failed to pull Postgres image"
   fi
@@ -560,7 +650,7 @@ cmd_help() {
     gateway          Manage LiteLLM gateway and providers
     reinstall        Remove Spark state and run setup again
     uninstall        Remove Spark-managed runtime/config/data
-    update           Check and apply Spark, model, gateway, workspace, and NemoHermes updates
+    update [targets] Check and apply only real Spark, model, gateway, workspace, and NemoHermes updates
     config           Configure Spark settings (e.g. auto-update)
     architecture     Show developer architecture map and invariants
     version          Show the installed Spark version

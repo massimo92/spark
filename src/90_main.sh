@@ -21,7 +21,7 @@ main() {
     doctor)       shift; cmd_doctor "$@" ;;
     setup)        shift; cmd_setup "$@" ;;
     ws)           shift; cmd_workspace "$@" ;;
-    update)       cmd_update ;;
+    update)       shift; cmd_update "$@" ;;
     gateway)      shift; cmd_gateway "$@" ;;
     reinstall)    shift; cmd_reinstall "$@" ;;
     uninstall)    shift; cmd_uninstall "$@" ;;
