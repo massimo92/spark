@@ -820,7 +820,7 @@ workspace_write_files_vikunja() {
   local vikunja_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
   local tailscale_bind_addr tailscale_dns_name
   local postgres_pass vikunja_db_pass vikunja_secret n8n_db_pass n8n_key mention_secret
-  local n8n_owner_status vikunja_token tailscale_mode
+  local n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status vikunja_token tailscale_mode
   local vikunja_api_status vikunja_human_id vikunja_bot_id vikunja_project_access_status
   local vikunja_human_status vikunja_bot_status vikunja_human_admin_status
   local postgres_image postgres_volume_target vikunja_image n8n_image old_umask
@@ -871,6 +871,8 @@ workspace_write_files_vikunja() {
   n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
     || { setup_fail "Missing n8n encryption key (N8N_ENCRYPTION_KEY) while existing workspace data is present; restore it before rerun"; return 1; }
   n8n_owner_status=$(workspace_env_or_value N8N_OWNER_SETUP_STATUS pending)
+  n8n_hermes_folder_id=$(workspace_read_env N8N_HERMES_FOLDER_ID 2>/dev/null || true)
+  n8n_hermes_folder_status=$(workspace_env_or_value N8N_HERMES_FOLDER_STATUS pending)
   mention_secret=$(workspace_env_or_generated WORKSPACE_MENTION_SECRET)
   vikunja_token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
   vikunja_api_status=$(workspace_env_or_value VIKUNJA_HERMES_API_STATUS pending)
@@ -944,6 +946,8 @@ N8N_BASIC_AUTH_USER=${n8n_email}
 N8N_OWNER_FIRST_NAME=${human_user}
 N8N_OWNER_LAST_NAME=Spark
 N8N_OWNER_SETUP_STATUS=${n8n_owner_status}
+N8N_HERMES_FOLDER_ID=${n8n_hermes_folder_id}
+N8N_HERMES_FOLDER_STATUS=${n8n_hermes_folder_status}
 N8N_HOST=${n8n_host}
 N8N_PROTOCOL=${n8n_protocol}
 N8N_SECURE_COOKIE=${n8n_secure_cookie}
@@ -1147,7 +1151,7 @@ workspace_write_files_super_productivity() {
   local task_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
   local postgres_pass postgres_volume_target supersync_db_pass supersync_jwt supersync_token supersync_encryption n8n_db_pass n8n_key mention_secret
-  local n8n_owner_status browser_sync_status browser_sync_url postgres_image supersync_image electron_version electron_commit electron_image n8n_image rp_id old_umask
+  local n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status browser_sync_status browser_sync_url postgres_image supersync_image electron_version electron_commit electron_image n8n_image rp_id old_umask
 
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
   tailscale_bind_addr=$(workspace_env_or_value WORKSPACE_TAILSCALE_BIND_ADDR 127.0.0.1)
@@ -1198,6 +1202,8 @@ workspace_write_files_super_productivity() {
   n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
     || { setup_fail "Missing n8n encryption key while existing workspace data is present; restore it before rerun"; return 1; }
   n8n_owner_status=$(workspace_env_or_value N8N_OWNER_SETUP_STATUS pending)
+  n8n_hermes_folder_id=$(workspace_read_env N8N_HERMES_FOLDER_ID 2>/dev/null || true)
+  n8n_hermes_folder_status=$(workspace_env_or_value N8N_HERMES_FOLDER_STATUS pending)
   browser_sync_status=$(workspace_env_or_value SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS pending)
   browser_sync_url=$(workspace_env_or_value SUPER_PRODUCTIVITY_BROWSER_SYNC_URL "")
   mention_secret=$(workspace_env_or_generated WORKSPACE_MENTION_SECRET)
@@ -1275,6 +1281,8 @@ N8N_BASIC_AUTH_USER=${n8n_email}
 N8N_OWNER_FIRST_NAME=${human_user}
 N8N_OWNER_LAST_NAME=Spark
 N8N_OWNER_SETUP_STATUS=${n8n_owner_status}
+N8N_HERMES_FOLDER_ID=${n8n_hermes_folder_id}
+N8N_HERMES_FOLDER_STATUS=${n8n_hermes_folder_status}
 N8N_HOST=${n8n_host}
 N8N_PROTOCOL=${n8n_protocol}
 N8N_SECURE_COOKIE=${n8n_secure_cookie}
@@ -1504,7 +1512,7 @@ workspace_write_files_todoist() {
   local tailnet="$1" human_user="$2" human_email="$3" _human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
   local task_url="$WORKSPACE_TODOIST_APP_URL" n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
-  local postgres_pass postgres_volume_target n8n_db_pass n8n_key n8n_owner_status mention_secret
+  local postgres_pass postgres_volume_target n8n_db_pass n8n_key n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status mention_secret
   local postgres_image n8n_image todoist_token old_todoist_token todoist_status old_umask
 
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
@@ -1545,6 +1553,8 @@ workspace_write_files_todoist() {
   n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
     || { setup_fail "Missing n8n encryption key while existing workspace data is present; restore it before rerun"; return 1; }
   n8n_owner_status=$(workspace_env_or_value N8N_OWNER_SETUP_STATUS pending)
+  n8n_hermes_folder_id=$(workspace_read_env N8N_HERMES_FOLDER_ID 2>/dev/null || true)
+  n8n_hermes_folder_status=$(workspace_env_or_value N8N_HERMES_FOLDER_STATUS pending)
   mention_secret=$(workspace_env_or_generated WORKSPACE_MENTION_SECRET)
   postgres_image="${SPARK_WORKSPACE_POSTGRES_IMAGE:-$(workspace_env_or_value WORKSPACE_POSTGRES_IMAGE "$WORKSPACE_POSTGRES_IMAGE_DEFAULT")}"
   n8n_image="${SPARK_WORKSPACE_N8N_IMAGE:-$(workspace_env_or_value WORKSPACE_N8N_IMAGE "$WORKSPACE_N8N_IMAGE_DEFAULT")}"
@@ -1592,6 +1602,8 @@ N8N_BASIC_AUTH_USER=${n8n_email}
 N8N_OWNER_FIRST_NAME=${human_user}
 N8N_OWNER_LAST_NAME=Spark
 N8N_OWNER_SETUP_STATUS=${n8n_owner_status}
+N8N_HERMES_FOLDER_ID=${n8n_hermes_folder_id}
+N8N_HERMES_FOLDER_STATUS=${n8n_hermes_folder_status}
 N8N_HOST=${n8n_host}
 N8N_PROTOCOL=${n8n_protocol}
 N8N_SECURE_COOKIE=${n8n_secure_cookie}
@@ -2803,6 +2815,165 @@ workspace_create_n8n_owner() {
   fi
   workspace_set_env_key N8N_OWNER_SETUP_STATUS manual
   warn "Could not bootstrap n8n owner automatically; finish first-run setup in the n8n UI"
+  return 1
+}
+
+workspace_n8n_folders_supported() {
+  local license_info
+  license_info=$(workspace_compose exec -T n8n n8n license:info 2>/dev/null) || return 2
+  grep -Eq '"feat:folders"[[:space:]]*:[[:space:]]*true' <<< "$license_info"
+}
+
+workspace_n8n_login_session() {
+  local email="$1" pass="$2" cookie_jar="$3" payload base_url
+  [[ -n "$email" && -n "$pass" && -n "$cookie_jar" ]] || return 1
+  base_url=$(workspace_n8n_base_url) || return 1
+  payload=$(printf '{"emailOrLdapLoginId":"%s","password":"%s"}' \
+    "$(workspace_json_escape "$email")" "$(workspace_json_escape "$pass")")
+  printf '%s' "$payload" | curl -fsS --max-time 10 \
+    --cookie-jar "$cookie_jar" --cookie "$cookie_jar" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json' \
+    -X POST "${base_url}/rest/login" --data-binary @- >/dev/null 2>&1
+}
+
+workspace_n8n_session_request() {
+  local cookie_jar="$1" method="$2" path="$3" response_file="$4" payload="${5:-}" base_url
+  base_url=$(workspace_n8n_base_url) || return 1
+  if [[ -n "$payload" ]]; then
+    printf '%s' "$payload" | curl -sS --max-time 10 \
+      --cookie "$cookie_jar" --cookie-jar "$cookie_jar" \
+      -H 'Content-Type: application/json' -H 'Accept: application/json' \
+      -X "$method" "${base_url}${path}" --data-binary @- \
+      -o "$response_file" -w '%{http_code}' 2>/dev/null
+  else
+    curl -sS --max-time 10 \
+      --cookie "$cookie_jar" --cookie-jar "$cookie_jar" \
+      -H 'Accept: application/json' -X "$method" "${base_url}${path}" \
+      -o "$response_file" -w '%{http_code}' 2>/dev/null
+  fi
+}
+
+workspace_n8n_personal_project_id() {
+  jq -r 'if ((.data.type // .type) == "personal") then (.data.id // .id // empty) else empty end' "$1" 2>/dev/null
+}
+
+workspace_n8n_folder_matches() {
+  jq -r --arg name "$WORKSPACE_N8N_HERMES_FOLDER_NAME" '
+    (if (.data | type) == "array" then .data
+     elif (.data.data | type) == "array" then .data.data
+     elif type == "array" then .
+     else [] end)
+    | [.[] | select(.name == $name and ((.parentFolderId // .parentFolder.id // null) == null))]
+    | "\(length)\t\(.[0].id // "")"
+  ' "$1" 2>/dev/null
+}
+
+workspace_ensure_n8n_hermes_folder() {
+  local email="$1" pass="$2" support_rc cookie_jar response_file http personal_project_id matches count folder_id payload
+  command -v jq >/dev/null 2>&1 || {
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "jq missing; cannot reconcile the n8n Hermes folder"
+    return 1
+  }
+  if workspace_n8n_folders_supported; then
+    :
+  else
+    support_rc=$?
+    if [[ "$support_rc" -eq 1 ]]; then
+      workspace_set_env_key N8N_HERMES_FOLDER_ID ""
+      workspace_set_env_key N8N_HERMES_FOLDER_STATUS unsupported
+      warn "n8n folders are not available with the active license"
+      return 1
+    fi
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Could not inspect n8n folder capabilities"
+    return 1
+  fi
+
+  if workspace_n8n_hermes_folder_ready; then
+    info "n8n folder exists: Personal / ${WORKSPACE_N8N_HERMES_FOLDER_NAME}"
+    return 0
+  fi
+  [[ -n "$email" && -n "$pass" ]] || {
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "n8n owner password required to create the Hermes folder; rerun with --n8n-password-file"
+    return 1
+  }
+
+  cookie_jar=$(mktemp "${TMPDIR:-/tmp}/spark-n8n-cookie.XXXXXX") || return 1
+  response_file=$(mktemp "${TMPDIR:-/tmp}/spark-n8n-response.XXXXXX") || {
+    rm -f "$cookie_jar"
+    return 1
+  }
+  chmod 600 "$cookie_jar" "$response_file"
+  if ! workspace_n8n_login_session "$email" "$pass" "$cookie_jar"; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Could not authenticate the n8n owner to reconcile the Hermes folder"
+    return 1
+  fi
+  http=$(workspace_n8n_session_request "$cookie_jar" GET '/rest/projects/personal' "$response_file") || http=000
+  if [[ "$http" != "200" ]]; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Could not read the n8n Personal project (HTTP ${http})"
+    return 1
+  fi
+  personal_project_id=$(workspace_n8n_personal_project_id "$response_file") || personal_project_id=""
+  if [[ ! "$personal_project_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Could not identify the n8n Personal project"
+    return 1
+  fi
+  http=$(workspace_n8n_session_request "$cookie_jar" GET "/rest/projects/${personal_project_id}/folders/" "$response_file") || http=000
+  if [[ "$http" != "200" ]]; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Could not list folders in the n8n Personal project (HTTP ${http})"
+    return 1
+  fi
+  matches=$(workspace_n8n_folder_matches "$response_file") || matches=""
+  IFS=$'\t' read -r count folder_id <<< "$matches"
+  if [[ "$count" == "1" && "$folder_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_ID "$folder_id"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS exists
+    info "n8n folder exists: Personal / ${WORKSPACE_N8N_HERMES_FOLDER_NAME}"
+    return 0
+  fi
+  if [[ "$count" =~ ^[2-9][0-9]*$ ]]; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_ID ""
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS duplicate
+    warn "Multiple root folders named Hermes exist in n8n Personal; refusing to choose or create another"
+    return 1
+  fi
+  [[ "$count" == "0" ]] || {
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Unexpected n8n folder-list response"
+    return 1
+  }
+
+  payload=$(printf '{"name":"%s"}' "$(workspace_json_escape "$WORKSPACE_N8N_HERMES_FOLDER_NAME")")
+  http=$(workspace_n8n_session_request "$cookie_jar" POST "/rest/projects/${personal_project_id}/folders/" "$response_file" "$payload") || http=000
+  if [[ "$http" == "200" || "$http" == "201" ]]; then
+    folder_id=$(jq -r '.data.id // .id // empty' "$response_file" 2>/dev/null | head -1)
+    rm -f "$cookie_jar" "$response_file"
+    if [[ "$folder_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+      workspace_set_env_key N8N_HERMES_FOLDER_ID "$folder_id"
+      workspace_set_env_key N8N_HERMES_FOLDER_STATUS created
+      info "n8n folder created: Personal / ${WORKSPACE_N8N_HERMES_FOLDER_NAME}"
+      return 0
+    fi
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "n8n created the Hermes folder but returned no valid folder ID"
+    return 1
+  fi
+  rm -f "$cookie_jar" "$response_file"
+  workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+  warn "Could not create the n8n Hermes folder (HTTP ${http})"
   return 1
 }
 
@@ -4550,7 +4721,7 @@ workspace_setup() {
     return $?
   fi
   workspace_migrate_runtime_config
-  local human_user human_email human_pass n8n_email n8n_pass vikunja_previous_status n8n_previous_status setup_rc
+  local human_user human_email human_pass n8n_email n8n_pass n8n_folder_pass vikunja_previous_status n8n_previous_status setup_rc
   local existing_human_user existing_human_email existing_n8n_email
   if [[ "$task_manager" == "super-productivity" ]]; then
     existing_human_user=$(workspace_existing_prompt_value N8N_OWNER_FIRST_NAME "workspace username" username || true)
@@ -4649,10 +4820,14 @@ workspace_setup() {
   esac
   if [[ "$n8n_previous_status" =~ ^(created|exists)$ ]]; then
     info "n8n owner already configured: ${n8n_email}"
+    n8n_folder_pass="${SPARK_WORKSPACE_N8N_PASSWORD:-}"
   else
     workspace_create_n8n_owner "$n8n_email" "$n8n_pass" || true
     [[ "$(workspace_read_env N8N_OWNER_SETUP_STATUS 2>/dev/null || true)" == "created" ]] && WORKSPACE_SHOW_N8N_PASSWORD=1
+    n8n_folder_pass="$n8n_pass"
   fi
+  workspace_ensure_n8n_hermes_folder "$n8n_email" "$n8n_folder_pass" \
+    || setup_fail "Could not reconcile the n8n Hermes folder"
   if workspace_tailscale_services_mode && workspace_tailscale_service_host_advertised; then
     if workspace_tailscale_urls_ready_after_setup; then
       workspace_tailscale_clear_error
@@ -5755,6 +5930,17 @@ workspace_n8n_owner_ready() {
   [[ "$status" =~ ^(created|exists)$ ]] && workspace_n8n_http_ready
 }
 
+workspace_n8n_hermes_folder_ready() {
+  local status folder_id matches
+  status=$(workspace_read_env N8N_HERMES_FOLDER_STATUS 2>/dev/null || true)
+  folder_id=$(workspace_read_env N8N_HERMES_FOLDER_ID 2>/dev/null || true)
+  [[ "$status" =~ ^(created|exists)$ && "$folder_id" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  matches=$(workspace_compose exec -T postgres psql -U n8n -d n8n -Atqc \
+    "SELECT (SELECT count(*) FROM folder f JOIN project p ON p.id=f.\"projectId\" WHERE f.name='Hermes' AND f.\"parentFolderId\" IS NULL AND p.type='personal'), (SELECT count(*) FROM folder f JOIN project p ON p.id=f.\"projectId\" WHERE f.id='${folder_id}' AND f.name='Hermes' AND f.\"parentFolderId\" IS NULL AND p.type='personal');" \
+    2>/dev/null | tail -1 | tr -d '[:space:]')
+  [[ "$matches" == "1|1" ]]
+}
+
 workspace_vikunja_user_ready() {
   local username="$1" email="$2" status_key="$3" status rc
   workspace_vikunja_user_exists "$username" "$email" >/dev/null 2>&1 && return 0
@@ -6830,6 +7016,7 @@ cmd_workspace_doctor() {
   fi
   workspace_doctor_check "n8n hardened for private agent workflows" workspace_n8n_hardened
   workspace_doctor_check "n8n owner/admin ready" workspace_n8n_owner_ready
+  workspace_doctor_check "n8n Hermes folder ready in Personal" workspace_n8n_hermes_folder_ready
   workspace_doctor_check "No legacy or temporary password recovery configuration is stored" workspace_no_legacy_recovery_config
   workspace_doctor_check "Workspace URLs configured" workspace_urls_configured
   if [[ "$task_manager" == "super-productivity" ]]; then
