@@ -84,6 +84,18 @@ ${stdin_payload}"
           *"CREATE USER n8n"*|*"ALTER USER n8n"*|*"CREATE DATABASE n8n"*|*"ALTER DATABASE n8n"*) exit 0 ;;
           *"n8n user-management:reset"*) exit "${FAKE_N8N_USER_RESET_EXIT:-0}" ;;
           *"n8n --version"*) printf '%s\n' "${FAKE_N8N_VERSION:-2.30.5}" ;;
+          *"n8n license:info"*)
+            if [[ "${FAKE_N8N_FOLDERS:-1}" == "1" ]]; then
+              printf '%s\n' 'features: {"planName":"Registered Community","feat:folders":true}'
+            else
+              printf '%s\n' 'features: {"planName":"Community"}'
+            fi ;;
+          *"FROM folder f JOIN project p"*)
+            if [[ "${FAKE_N8N_FOLDER_DB_MATCH:-1}" == "1" || ( -n "${FAKE_N8N_FOLDER_MARKER:-}" && -e "${FAKE_N8N_FOLDER_MARKER}" ) ]]; then
+              printf '1|1\n'
+            else
+              printf '0|0\n'
+            fi ;;
           *"bcryptjs"*) printf '%s\n' "${FAKE_N8N_PASSWORD_HASH:-\$2b\$10\$12345678901234567890123456789012345678901234567890123}" ;;
           *"user reset-password "*) exit "${FAKE_VIKUNJA_PASSWORD_RESET_EXIT:-0}" ;;
           *"user create -u "*)
@@ -290,6 +302,19 @@ stdin_payload=""
 [[ "$*" == *"@-"* ]] && stdin_payload=$(cat || true)
 args="$*
 ${stdin_payload}"
+output_file=""
+write_status=0
+previous=""
+for argument in "$@"; do
+  [[ "$previous" == "-o" ]] && output_file="$argument"
+  [[ "$previous" == "-w" ]] && write_status=1
+  previous="$argument"
+done
+fake_n8n_response() {
+  local body="$1" status="$2"
+  if [[ -n "$output_file" ]]; then printf '%s\n' "$body" > "$output_file"; else printf '%s\n' "$body"; fi
+  [[ "$write_status" == "1" ]] && printf '%s' "$status"
+}
 case "$args" in
   *https://tasks.test-tailnet.ts.net/api/v1/info*) exit "${FAKE_TAILSCALE_VIKUNJA_EXIT:-0}" ;;
   *https://n8n.test-tailnet.ts.net/healthz*) exit "${FAKE_TAILSCALE_N8N_EXIT:-0}" ;;
@@ -328,6 +353,31 @@ case "$args" in
   *:3456/api/v1/user*) echo "${FAKE_VIKUNJA_USER_JSON:-{\"id\":3,\"username\":\"bot-hermes\",\"email\":\"\",\"bot_owner_id\":1}}"; exit "${FAKE_VIKUNJA_USER_EXIT:-0}" ;;
   *:5678/healthz*) exit "${FAKE_N8N_HEALTH_EXIT:-0}" ;;
   *:5678/rest/owner/setup*) [[ -n "${FAKE_N8N_OWNER_MARKER:-}" ]] && : > "$FAKE_N8N_OWNER_MARKER"; echo '{"data":{"id":"owner"}}'; exit "${FAKE_N8N_OWNER_EXIT:-0}" ;;
+  *:5678/rest/projects/personal" -o "*)
+    [[ -n "${FAKE_CURL_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_CURL_FILE}"
+    if [[ -n "${FAKE_N8N_PERSONAL_PROJECT_JSON:-}" ]]; then
+      fake_n8n_response "$FAKE_N8N_PERSONAL_PROJECT_JSON" "${FAKE_N8N_PROJECTS_HTTP:-200}"
+    else
+      fake_n8n_response '{"data":{"id":"personal-project-id","name":"Personal","type":"personal"}}' "${FAKE_N8N_PROJECTS_HTTP:-200}"
+    fi
+    exit 0 ;;
+  *:5678/rest/projects/*/folders/*" -o "*)
+    [[ -n "${FAKE_CURL_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_CURL_FILE}"
+    if [[ "$args" == *"-X POST"* ]]; then
+      [[ -n "${FAKE_N8N_FOLDER_MARKER:-}" ]] && : > "$FAKE_N8N_FOLDER_MARKER"
+      if [[ -n "${FAKE_N8N_FOLDER_CREATE_JSON:-}" ]]; then
+        fake_n8n_response "$FAKE_N8N_FOLDER_CREATE_JSON" "${FAKE_N8N_FOLDER_CREATE_HTTP:-200}"
+      else
+        fake_n8n_response '{"data":{"id":"hermes-folder-id","name":"Hermes","parentFolderId":null}}' "${FAKE_N8N_FOLDER_CREATE_HTTP:-200}"
+      fi
+    elif [[ -n "${FAKE_N8N_FOLDERS_JSON:-}" ]]; then
+      fake_n8n_response "$FAKE_N8N_FOLDERS_JSON" "${FAKE_N8N_FOLDERS_HTTP:-200}"
+    elif [[ -n "${FAKE_N8N_FOLDER_MARKER:-}" && -e "${FAKE_N8N_FOLDER_MARKER}" ]]; then
+      fake_n8n_response '{"count":1,"data":[{"id":"hermes-folder-id","name":"Hermes","parentFolderId":null}]}' "${FAKE_N8N_FOLDERS_HTTP:-200}"
+    else
+      fake_n8n_response '{"count":0,"data":[]}' "${FAKE_N8N_FOLDERS_HTTP:-200}"
+    fi
+    exit 0 ;;
   *:5678/rest/login*)
     if [[ -n "${FAKE_N8N_LOGIN_COUNT_FILE:-}" ]]; then
       login_count=0
@@ -4922,7 +4972,7 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"64/64 checks passed"* ]] &&
+    [[ "$out" == *"65/65 checks passed"* ]] &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
@@ -4946,6 +4996,7 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Vikunja projects are shared with bot-hermes"* ]] &&
     [[ "$out" == *"[x] n8n hardened for private agent workflows"* ]] &&
     [[ "$out" == *"[x] n8n owner/admin ready"* ]] &&
+    [[ "$out" == *"[x] n8n Hermes folder ready in Personal"* ]] &&
     [[ "$out" == *"[x] Tailscale supports selected private access mode"* ]] &&
     [[ "$out" == *"[x] Tailscale Services registered/authorized"* ]] &&
     [[ "$out" == *"[x] Tailscale Serve enabled"* ]] &&
@@ -5017,7 +5068,7 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"65/65 checks passed"* ]] &&
+  [[ "$out" == *"66/66 checks passed"* ]] &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -5068,12 +5119,12 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 64 and
+    .passed == 65 and
     .failed == 0 and
-    .total == 64 and
+    .total == 65 and
     .model == "Org/Alpha" and
     ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Identity & recovery" and .passed == 13 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Identity & recovery" and .passed == 14 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Inference & agent" and .passed == 16 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
@@ -5084,6 +5135,7 @@ test_workspace_doctor_json() {
     ([.checks[] | select(.label == "Hermes output and reasoning limits are configured" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes CLI uses the balanced local-model tool profile" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes reaches Vikunja as bot-hermes" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "n8n Hermes folder ready in Personal" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Tailscale workspace URLs respond" and .ok == true)] | length == 1)
   ' >/dev/null
 }
@@ -6289,7 +6341,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"64/64 checks passed"* ]] &&
+  [[ "$out" == *"65/65 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -6311,7 +6363,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"64/64 checks passed"* ]] &&
+  [[ "$out" == *"65/65 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -6721,6 +6773,69 @@ test_workspace_setup_uses_only_n8n_2x_login_field() {
   env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env" 2>/dev/null || echo "")
   rm -rf "$tmp"
   [[ "$env" == *"N8N_OWNER_SETUP_STATUS=exists"* ]]
+}
+
+test_workspace_n8n_hermes_folder_create_and_reuse() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin config env curl_calls post_count
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  config="${tmp}/home/.config/spark/workspace"
+  mkdir -p "$config"
+  printf '%s\n' 'WORKSPACE_TAILSCALE_MODE=services' > "${config}/secrets.env"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_N8N_FOLDERS=1 FAKE_N8N_FOLDER_MARKER="${tmp}/hermes.folder" \
+    FAKE_CURL_FILE="${tmp}/curl.calls" \
+    bash -c 'source "$1"; workspace_ensure_n8n_hermes_folder owner@example.com correct-password; workspace_ensure_n8n_hermes_folder owner@example.com ""' _ "$SPARK"
+  env=$(cat "${config}/secrets.env")
+  curl_calls=$(cat "${tmp}/curl.calls" 2>/dev/null || true)
+  post_count=$(grep -c -- '-X POST.*:5678/rest/projects/personal-project-id/folders/' <<< "$curl_calls" || true)
+  rm -rf "$tmp"
+  [[ "$env" == *"N8N_HERMES_FOLDER_ID=hermes-folder-id"* ]] &&
+    [[ "$env" == *"N8N_HERMES_FOLDER_STATUS=created"* ]] &&
+    [[ "$post_count" -eq 1 ]]
+}
+
+test_workspace_n8n_hermes_folder_rejects_unsupported_license() {
+  local tmp fake_bin config env curl_calls status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  config="${tmp}/home/.config/spark/workspace"
+  mkdir -p "$config"
+  printf '%s\n' 'WORKSPACE_TAILSCALE_MODE=services' > "${config}/secrets.env"
+  set +e
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_N8N_FOLDERS=0 \
+    FAKE_CURL_FILE="${tmp}/curl.calls" \
+    bash -c 'source "$1"; workspace_ensure_n8n_hermes_folder owner@example.com ""' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  set -e
+  env=$(cat "${config}/secrets.env")
+  curl_calls=$(cat "${tmp}/curl.calls" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$env" == *$'N8N_HERMES_FOLDER_ID=\n'* ]] &&
+    [[ "$env" == *"N8N_HERMES_FOLDER_STATUS=unsupported"* ]] &&
+    [[ "$curl_calls" != *":5678/rest/projects/"* ]]
+}
+
+test_workspace_n8n_hermes_folder_refuses_duplicates() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin config env curl_calls status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  config="${tmp}/home/.config/spark/workspace"
+  mkdir -p "$config"
+  printf '%s\n' 'WORKSPACE_TAILSCALE_MODE=services' > "${config}/secrets.env"
+  set +e
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_N8N_FOLDERS=1 \
+    FAKE_N8N_FOLDERS_JSON='{"count":2,"data":[{"id":"one","name":"Hermes","parentFolderId":null},{"id":"two","name":"Hermes","parentFolderId":null}]}' \
+    FAKE_CURL_FILE="${tmp}/curl.calls" \
+    bash -c 'source "$1"; workspace_ensure_n8n_hermes_folder owner@example.com correct-password' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  set -e
+  env=$(cat "${config}/secrets.env")
+  curl_calls=$(cat "${tmp}/curl.calls" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$env" == *"N8N_HERMES_FOLDER_STATUS=duplicate"* ]] &&
+    [[ "$curl_calls" != *"-X POST"* ]]
 }
 
 # --- Doctor per backend ---
@@ -8509,6 +8624,9 @@ run_test "workspace setup rejects multiline Todoist token" test_workspace_setup_
 run_test "workspace setup rejects removed Vikunja token flag" test_workspace_setup_rejects_removed_vikunja_token_flag
 run_test "workspace setup rerun bootstraps n8n owner" test_workspace_setup_rerun_bootstraps_n8n_owner
 run_test "workspace setup uses only n8n 2.x login field" test_workspace_setup_uses_only_n8n_2x_login_field
+run_test "workspace n8n creates and reuses Hermes folder" test_workspace_n8n_hermes_folder_create_and_reuse
+run_test "workspace n8n rejects unsupported folder license" test_workspace_n8n_hermes_folder_rejects_unsupported_license
+run_test "workspace n8n refuses duplicate Hermes folders" test_workspace_n8n_hermes_folder_refuses_duplicates
 
 if [[ "$test_list_only" == "1" ]]; then
   (( selected > 0 ))
