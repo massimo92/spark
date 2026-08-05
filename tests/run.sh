@@ -410,7 +410,7 @@ case "$args" in
       if [[ -n "${FAKE_LITELLM_MODELS:-}" ]]; then
         printf '%s\n' "$FAKE_LITELLM_MODELS"
       else
-        printf '%s\n' '{"data":[{"id":"vllm/Org/Alpha"}]}'
+        printf '%s\n' '{"data":[{"id":"main"},{"id":"vllm/Org/Alpha"}]}'
       fi
       exit 0
     fi
@@ -762,8 +762,10 @@ Latest maintained version: 0.0.78
 Update available:         no}"; exit "${FAKE_NEMOHERMES_UPDATE_CHECK_EXIT:-0}" ;;
   *"update --yes"*) exit "${FAKE_NEMOHERMES_UPDATE_EXIT:-0}" ;;
   *dashboard-url*) echo "${FAKE_NEMOHERMES_DASHBOARD_URL:-http://127.0.0.1:18789}" ;;
-  *"inference get --json"*) echo "${FAKE_NEMOHERMES_INFERENCE_JSON:-{\"provider\":\"compatible-endpoint\",\"model\":\"vllm/Org/Alpha\"}}" ;;
-  *"inference get"*) echo "${FAKE_NEMOHERMES_INFERENCE_TEXT:-Provider: compatible-endpoint Model: vllm/Org/Alpha}" ;;
+  *"inference get --json"*) echo "${FAKE_NEMOHERMES_INFERENCE_JSON:-{\"provider\":\"compatible-endpoint\",\"model\":\"main\"}}" ;;
+  *"inference get"*) echo "${FAKE_NEMOHERMES_INFERENCE_TEXT:-Provider: compatible-endpoint Model: main}" ;;
+  *"hermes config get --key model.default --format json"*) printf '"%s"\n' "${FAKE_HERMES_CONFIG_MODEL:-main}" ;;
+  *"hermes config get --key _nemoclaw_upstream.model --format json"*) printf '"%s"\n' "${FAKE_HERMES_CONFIG_UPSTREAM_MODEL:-${FAKE_HERMES_CONFIG_MODEL:-main}}" ;;
   *"policy-explain --json"*) echo "${FAKE_NEMOHERMES_POLICY_JSON:-{\"tier\":\"restricted\",\"appliedPresets\":[]}}" ;;
   *"policy-explain"*) echo "${FAKE_NEMOHERMES_POLICY_TEXT:-Policy tier: restricted}" ;;
   *"policy-list"*) echo "${FAKE_NEMOHERMES_POLICY_LIST:-restricted}" ;;
@@ -2376,12 +2378,12 @@ test_port_auto_skips_busy() {
 
 test_gateway_yaml_per_model() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin yaml
+  local tmp fake_bin yaml main_block
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"
   make_fake_bin "$fake_bin"
   mkdir -p "${tmp}/home/.config/spark"
   cat > "${tmp}/home/.config/spark/gateway.json" <<'EOF'
-{ "enabled": true, "port": 4000, "providers": {
+{ "enabled": true, "port": 4000, "main": {"provider":"vllm","model":"org/B"}, "providers": {
   "vllm": { "enabled": true, "port": 8000 }, "openrouter": { "enabled": false },
   "ollama": { "enabled": false }, "zen": { "enabled": false }, "together": { "enabled": false } } }
 EOF
@@ -2390,10 +2392,17 @@ EOF
     FAKE_MANAGED='spark-vllm-a\torg/A\t8000\t40.0\t30.0\t10.0\nspark-vllm-b\torg/B\t8001\t60.0\t55.0\t5.0\n' \
     "$SPARK" gateway start >/dev/null 2>&1 || true
   yaml=$(cat "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || echo "")
+  main_block=$(printf '%s\n' "$yaml" | awk '
+    /model_name: "main"/ { found=1; next }
+    found && /model_name:/ { exit }
+    found { print }
+  ')
   rm -rf "$tmp"
 
   [[ "$yaml" == *'model_name: "vllm/org/A"'* ]] &&
     [[ "$yaml" == *'model_name: "vllm/org/B"'* ]] &&
+    [[ "$main_block" == *'model: "openai/org/B"'* ]] &&
+    [[ "$main_block" == *'api_base: "http://localhost:8001/v1"'* ]] &&
     [[ "$yaml" == *'model_name: "vllm/*"'* ]]
 }
 
@@ -3561,7 +3570,7 @@ test_workspace_setup_writes_compose_names() {
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$env" == *"VIKUNJA_URL=https://tasks.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"HERMES_DASHBOARD_PORT=18789"* ]] &&
-    [[ "$env" == *"HERMES_LITELLM_MODEL=vllm/Org/Alpha"* ]] &&
+    [[ "$env" == *"HERMES_LITELLM_MODEL=main"* ]] &&
     [[ "$env" == *"HERMES_CONTEXT_LENGTH=65536"* ]] &&
     [[ "$env" == *"HERMES_MAX_TOKENS=512"* ]] &&
     [[ "$env" == *"HERMES_REASONING_EFFORT=none"* ]] &&
@@ -4972,7 +4981,7 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"65/65 checks passed"* ]] &&
+    [[ "$out" == *"67/67 checks passed"* ]] &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
@@ -5068,7 +5077,7 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"66/66 checks passed"* ]] &&
+  [[ "$out" == *"68/68 checks passed"* ]] &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -5119,13 +5128,13 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 65 and
+    .passed == 67 and
     .failed == 0 and
-    .total == 65 and
+    .total == 67 and
     .model == "Org/Alpha" and
     ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Identity & recovery" and .passed == 14 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Inference & agent" and .passed == 16 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Inference & agent" and .passed == 18 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM Hermes route completes smoke request" and .ok == true)] | length == 1) and
@@ -6064,6 +6073,57 @@ test_workspace_doctor_flags_wrong_nemohermes_route() {
     [[ "$out" == *"[ ] NemoHermes inference route uses selected LiteLLM model"* ]]
 }
 
+test_workspace_doctor_flags_split_hermes_model_config() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_HERMES_CONFIG_MODEL='vllm/Other' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] Hermes config model matches selected LiteLLM route"* ]]
+}
+
+test_workspace_doctor_flags_wrong_main_target() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status config
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  config="${tmp}/home/.config/spark/gateway.json"
+  jq '.main.model = "Org/Other"' "$config" > "${config}.tmp" && mv "${config}.tmp" "$config"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] LiteLLM main alias targets selected physical model"* ]]
+}
+
 test_workspace_doctor_flags_nemohermes_doctor_failure() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status
@@ -6341,7 +6401,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"65/65 checks passed"* ]] &&
+  [[ "$out" == *"67/67 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -6363,7 +6423,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"65/65 checks passed"* ]] &&
+  [[ "$out" == *"67/67 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -7948,7 +8008,7 @@ WORKSPACE_POSTGRES_IMAGE=postgres:17
 WORKSPACE_VIKUNJA_IMAGE=vikunja/vikunja:latest
 WORKSPACE_N8N_IMAGE=docker.n8n.io/n8nio/n8n:latest
 HERMES_MODEL=Org/Alpha
-HERMES_LITELLM_MODEL=vllm/Org/Alpha
+HERMES_LITELLM_MODEL=main
 HERMES_CONTEXT_LENGTH=65536
 HERMES_MAX_TOKENS=512
 HERMES_REASONING_EFFORT=none
@@ -7984,7 +8044,7 @@ EOF
     [[ "$compose_log" == *"up -d --remove-orphans"* ]] &&
     [[ "$nemo_log" == *"hermes rebuild"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
-    [[ "$nemo_log" == *"NEMOCLAW_MODEL=vllm/Org/Alpha"* ]] &&
+    [[ "$nemo_log" == *"NEMOCLAW_MODEL=main"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_NO_GPU=1"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_SANDBOX_GPU=0"* ]] &&
     [[ "$nemo_log" == *"COMPATIBLE_API_KEY=dummy"* ]]
@@ -8178,7 +8238,7 @@ test_update_nemohermes_rebuild_uses_stored_compatible_key() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   mkdir -p "${tmp}/home/.config/spark/workspace"
   cat > "${tmp}/home/.config/spark/workspace/secrets.env" <<ENV
-HERMES_LITELLM_MODEL=vllm/Org/Alpha
+HERMES_LITELLM_MODEL=main
 HERMES_CONTEXT_LENGTH=65536
 HERMES_MAX_TOKENS=512
 HERMES_REASONING_EFFORT=none
@@ -8594,6 +8654,8 @@ run_test "workspace doctor flags missing Postgres runtime DB" test_workspace_doc
 run_test "workspace doctor flags missing LiteLLM route" test_workspace_doctor_flags_missing_litellm_route
 run_test "workspace doctor flags LiteLLM smoke failure" test_workspace_doctor_flags_litellm_smoke_failure
 run_test "workspace doctor flags wrong NemoHermes route" test_workspace_doctor_flags_wrong_nemohermes_route
+run_test "workspace doctor flags split Hermes model config" test_workspace_doctor_flags_split_hermes_model_config
+run_test "workspace doctor flags wrong LiteLLM main target" test_workspace_doctor_flags_wrong_main_target
 run_test "workspace doctor flags NemoHermes doctor failure" test_workspace_doctor_flags_nemohermes_doctor_failure
 run_test "workspace doctor flags missing Tailscale Service registration" test_workspace_doctor_flags_missing_tailscale_service_registration
 run_test "workspace doctor flags Tailscale Serve disabled" test_workspace_doctor_flags_tailscale_serve_disabled
