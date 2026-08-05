@@ -233,7 +233,7 @@ check_for_updates() {
     local year month next_tag
     year=$(date +%y)
     month=$(date +%m)
-    next_tag="${year}.$(printf '%02d' "$month")-py3"
+    next_tag="${year}.${month}-py3"
     if ngc_vllm_tag_newer_than "$next_tag" "$current_tag"; then
       if docker manifest inspect "nvcr.io/nvidia/vllm:${next_tag}" >/dev/null 2>&1; then
         updates+=("NGC vLLM: ${current_tag} → ${next_tag}")
