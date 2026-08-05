@@ -7998,6 +7998,61 @@ test_config_set_and_show() {
   [[ "$set_out" == *"Auto-update enabled"* ]] && [[ "$show_out" == *"auto-update: true"* ]]
 }
 
+test_update_accepts_zero_padded_august_month() {
+  command -v python3 >/dev/null 2>&1 || { printf "skip - python3 not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  cat > "${fake_bin}/date" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  +%Y-%m-%d) printf '2026-08-05\n' ;;
+  +%y) printf '26\n' ;;
+  +%m) printf '08\n' ;;
+  *) command /bin/date "$@" ;;
+esac
+EOF
+  chmod +x "${fake_bin}/date"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.07-py3" \
+    python3 - "$SPARK" <<'PY'
+import errno
+import os
+import pty
+import subprocess
+import sys
+
+master, slave = pty.openpty()
+process = subprocess.Popen(
+    [sys.argv[1], "help"],
+    stdin=subprocess.DEVNULL,
+    stdout=slave,
+    stderr=slave,
+    env=os.environ,
+)
+os.close(slave)
+chunks = []
+while True:
+    try:
+        data = os.read(master, 4096)
+        if not data:
+            break
+        chunks.append(data)
+    except OSError as exc:
+        if exc.errno == errno.EIO:
+            break
+        raise
+os.close(master)
+sys.stdout.buffer.write(b"".join(chunks))
+raise SystemExit(process.wait())
+PY
+  )
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ "$out" != *"octal"* ]] && [[ "$out" != *"número octal"* ]]
+}
+
 test_update_prompts_workspace_tool_updates_one_by_one() {
   local tmp fake_bin out current_tag compose_log nemo_log
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -8439,6 +8494,7 @@ run_test "rm errors on a model not in cache" test_rm_not_found
 run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
+run_test "update accepts zero-padded August month" test_update_accepts_zero_padded_august_month
 run_test "update prompts workspace tool updates one by one" test_update_prompts_workspace_tool_updates_one_by_one
 run_test "update skips images already at remote digest" test_update_skips_images_already_at_remote_digest
 run_test "update parses human Buildx digest output" test_update_parses_human_buildx_digest_output
