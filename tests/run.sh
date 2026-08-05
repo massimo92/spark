@@ -757,10 +757,20 @@ EOF
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_HERMES_DASHBOARD_HOST=%s\n' "${NEMOCLAW_HERMES_DASHBOARD_HOST:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE=%s\n' "${NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE:-}" >> "${FAKE_NEMOHERMES_FILE}"
 case "$*" in
-  *"update --check"*) echo "${FAKE_NEMOHERMES_UPDATE_CHECK:-Current NemoHermes version: 0.0.55
+  *"update --check"*)
+    if [[ -n "${FAKE_NEMOHERMES_UPDATE_MARKER:-}" && -e "$FAKE_NEMOHERMES_UPDATE_MARKER" ]]; then
+      echo "${FAKE_NEMOHERMES_UPDATE_AFTER_CHECK:-Current NemoHermes version: 0.0.78
 Latest maintained version: 0.0.78
-Update available:         no}"; exit "${FAKE_NEMOHERMES_UPDATE_CHECK_EXIT:-0}" ;;
-  *"update --yes"*) exit "${FAKE_NEMOHERMES_UPDATE_EXIT:-0}" ;;
+Update available:         no}"
+    else
+      echo "${FAKE_NEMOHERMES_UPDATE_CHECK:-Current NemoHermes version: 0.0.55
+Latest maintained version: 0.0.78
+Update available:         no}"
+    fi
+    exit "${FAKE_NEMOHERMES_UPDATE_CHECK_EXIT:-0}" ;;
+  *"update --yes"*)
+    [[ -n "${FAKE_NEMOHERMES_UPDATE_MARKER:-}" ]] && : > "$FAKE_NEMOHERMES_UPDATE_MARKER"
+    exit "${FAKE_NEMOHERMES_UPDATE_EXIT:-0}" ;;
   *dashboard-url*) echo "${FAKE_NEMOHERMES_DASHBOARD_URL:-http://127.0.0.1:18789}" ;;
   *"inference get --json"*) echo "${FAKE_NEMOHERMES_INFERENCE_JSON:-{\"provider\":\"compatible-endpoint\",\"model\":\"main\"}}" ;;
   *"inference get"*) echo "${FAKE_NEMOHERMES_INFERENCE_TEXT:-Provider: compatible-endpoint Model: main}" ;;
@@ -3823,6 +3833,30 @@ test_workspace_setup_stops_when_nemohermes_update_fails() {
     [[ "$nemo_calls" != *"onboard --non-interactive"* ]]
 }
 
+test_workspace_setup_accepts_successful_nemohermes_update_postcondition() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin nemo_calls check_count
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_NEMOHERMES_UPDATE_MARKER="${tmp}/nemohermes.updated" \
+    FAKE_NEMOHERMES_UPDATE_CHECK=$'Current NemoHermes version: 0.0.55\nLatest maintained version: 0.0.78\nUpdate available:         yes' \
+    FAKE_NEMOHERMES_UPDATE_AFTER_CHECK=$'Current NemoHermes version: 0.0.78\nLatest maintained version: 0.0.78\nUpdate available:         no' \
+    FAKE_NEMOHERMES_UPDATE_EXIT=9 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  check_count=$(grep -c '^update --check$' <<< "$nemo_calls" || true)
+  rm -rf "$tmp"
+  [[ "$check_count" -ge 2 ]] &&
+    [[ "$nemo_calls" == *"update --yes"* ]] &&
+    [[ "$nemo_calls" == *"onboard --non-interactive"* ]]
+}
+
 test_workspace_setup_keeps_hermes_dashboard_on_loopback() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin docker_calls nemo_calls
@@ -4676,6 +4710,39 @@ test_workspace_setup_prompts_for_existing_vikunja_password() {
     [[ "$env" == *"VIKUNJA_HERMES_BOT_STATUS=exists"* ]] &&
     [[ "$env" == *"VIKUNJA_HERMES_PROJECT_ACCESS_STATUS=verified"* ]] &&
     [[ "$env" != *"CurrentPassword123"* ]]
+}
+
+test_workspace_setup_prompts_for_existing_n8n_password() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env_file staged out env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=InitialPassword123 \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com SPARK_WORKSPACE_N8N_PASSWORD=secret456 \
+    FAKE_N8N_FOLDER_MARKER="${tmp}/n8n.folder" FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env_file="${tmp}/home/.config/spark/workspace/secrets.env"
+  staged="${env_file}.staged"
+  grep -v -E '^N8N_HERMES_FOLDER_(ID|STATUS)=' "$env_file" > "$staged"
+  printf '%s\n' 'N8N_HERMES_FOLDER_ID=' 'N8N_HERMES_FOLDER_STATUS=manual' >> "$staged"
+  mv "$staged" "$env_file"
+  rm -f "${tmp}/n8n.folder"
+  out=$(printf '%s\n' 'CurrentN8nPassword123' | \
+    HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_ASSUME_INTERACTIVE=1 FAKE_DOCKER_READ_STDIN=0 \
+    FAKE_N8N_FOLDER_DB_MATCH=0 FAKE_N8N_FOLDER_MARKER="${tmp}/n8n.folder" \
+    FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha 2>&1 || true)
+  env=$(cat "$env_file")
+  rm -rf "$tmp"
+  [[ "$out" == *"Current n8n password for m@example.com"* ]] &&
+    [[ "$out" != *"CurrentN8nPassword123"* ]] &&
+    [[ "$env" == *"N8N_HERMES_FOLDER_STATUS=created"* ]] &&
+    [[ "$env" != *"CurrentN8nPassword123"* ]]
 }
 
 test_workspace_credentials_command_removed() {
@@ -8627,6 +8694,7 @@ run_test "workspace setup refuses missing secret with data" test_workspace_setup
 run_test "workspace setup fails when Hermes onboard fails" test_workspace_setup_fails_when_hermes_onboard_fails
 run_test "workspace setup updates stale NemoHermes" test_workspace_setup_updates_stale_nemohermes
 run_test "workspace setup stops when NemoHermes update fails" test_workspace_setup_stops_when_nemohermes_update_fails
+run_test "workspace setup verifies NemoHermes update postcondition" test_workspace_setup_accepts_successful_nemohermes_update_postcondition
 run_test "workspace derives tailnet from Tailscale self DNSName" test_workspace_tailnet_from_self_dnsname
 run_test "workspace setup requires tailnet URLs" test_workspace_setup_requires_tailnet_urls
 run_test "workspace ports mode requires MagicDNS URLs" test_workspace_ports_requires_magicdns_urls
@@ -8659,6 +8727,7 @@ run_test "workspace setup missing required values does not pollute env" test_wor
 run_test "workspace setup generates, prints, and forgets human passwords" test_workspace_setup_generates_prints_and_forgets_passwords
 run_test "workspace setup accepts password flags and files" test_workspace_setup_accepts_password_flags_and_files
 run_test "workspace setup prompts for existing Vikunja password" test_workspace_setup_prompts_for_existing_vikunja_password
+run_test "workspace setup prompts for existing n8n password" test_workspace_setup_prompts_for_existing_n8n_password
 run_test "workspace credentials command is removed" test_workspace_credentials_command_removed
 run_test "workspace setup rejects removed SMTP" test_workspace_setup_rejects_removed_smtp
 run_test "workspace setup removes legacy SMTP" test_workspace_setup_removes_legacy_smtp
