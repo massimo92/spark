@@ -1733,6 +1733,29 @@ test_workspace_task_manager_teardown_covers_services_and_data() {
 }
 
 
+test_workspace_task_manager_teardown_stops_before_data_removal() {
+  local tmp log calls status
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      workspace_cleanup_abandoned_hermes_access() { return 1; }
+      workspace_remove_task_manager_images() { printf "images\n" >> "$SPARK_TEST_LOG"; }
+      workspace_drop_task_manager_database() { printf "database:%s\n" "$1" >> "$SPARK_TEST_LOG"; }
+      workspace_remove_managed_path() { printf "remove:%s\n" "$1" >> "$SPARK_TEST_LOG"; }
+      docker() { printf "docker:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+      ! workspace_teardown_super_productivity
+      ! workspace_teardown_vikunja
+      ! workspace_teardown_todoist
+    ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  calls=$(cat "$log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ -z "$calls" ]]
+}
+
+
 test_workspace_task_manager_teardown_removes_hermes_access() {
   local tmp log calls
   tmp=$(mktemp -d)
@@ -1770,7 +1793,7 @@ test_workspace_task_manager_teardown_removes_hermes_access() {
     [[ "$calls" == *"openshell:provider delete spark-todoist"* ]] &&
     [[ "$calls" == *"nemohermes:hermes skill remove todoist"* ]] &&
     [[ "$calls" == *"remove:${tmp}/home/.config/spark/workspace/hermes-skills/todoist"* ]] &&
-    [[ "$(grep -c '^nemohermes:hermes gateway restart --quiet$' <<<"$calls")" == 3 ]]
+    [[ "$calls" != *"gateway restart"* ]]
 }
 
 
@@ -3169,6 +3192,34 @@ test_workspace_hermes_start_uses_official_lifecycle() {
     printf "%b" "$nemo_calls"
   ' _ "$SPARK")
   [[ "$out" == *"hermes start"* ]] && [[ "$out" == *"hermes recover"* ]]
+}
+
+test_workspace_hermes_start_recovers_stopped_agent_gateway() {
+  local tmp log calls status
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  SPARK_TEST_LOG="$log" bash -c '
+    source "$1"
+    agent_started=0
+    nemohermes() {
+      printf "nemohermes:%s\n" "$*" >> "$SPARK_TEST_LOG"
+      case "$*" in
+        "hermes status")
+          [[ "$agent_started" == 1 ]] && printf "Hermes Agent: running\n"
+          ;;
+        "hermes connect --probe-only") return 1 ;;
+        "hermes exec -- sh -lc "*) agent_started=1 ;;
+      esac
+    }
+    sleep() { :; }
+    workspace_ensure_hermes_agent_gateway
+  ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  calls=$(cat "$log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$calls" == *"nemohermes:hermes connect --probe-only"* ]] &&
+    [[ "$calls" == *"nemohermes:hermes exec -- sh -lc nohup hermes gateway run"* ]]
 }
 
 test_workspace_bridge_waits_for_delayed_readiness() {
@@ -8505,6 +8556,7 @@ run_test "workspace scopes Vikunja secret guard to Vikunja data" test_workspace_
 run_test "workspace selects abandoned task manager for teardown" test_workspace_selects_abandoned_task_manager_for_teardown
 run_test "workspace task manager teardown removes images" test_workspace_task_manager_teardown_removes_images
 run_test "workspace task manager teardown covers services and data" test_workspace_task_manager_teardown_covers_services_and_data
+run_test "workspace task manager teardown stops before data removal" test_workspace_task_manager_teardown_stops_before_data_removal
 run_test "workspace task manager teardown removes Hermes access" test_workspace_task_manager_teardown_removes_hermes_access
 run_test "workspace task manager teardown drops database and role" test_workspace_task_manager_teardown_drops_database_and_role
 run_test "workspace task manager teardown waits and retries" test_workspace_task_manager_teardown_waits_and_retries
@@ -8668,6 +8720,7 @@ run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
 run_test "workspace Hermes start uses official lifecycle" test_workspace_hermes_start_uses_official_lifecycle
+run_test "workspace Hermes start recovers stopped agent gateway" test_workspace_hermes_start_recovers_stopped_agent_gateway
 run_test "workspace bridge waits for delayed readiness" test_workspace_bridge_waits_for_delayed_readiness
 run_test "workspace dashboard proxy rewrites Host on loopback" test_workspace_dashboard_proxy_rewrites_host_on_loopback
 run_test "workspace listener check allows OpenShell gateway bridge" test_workspace_listener_check_allows_only_openshell_gateway_bridge
