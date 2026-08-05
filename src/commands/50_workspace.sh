@@ -2897,11 +2897,16 @@ workspace_ensure_n8n_hermes_folder() {
     info "n8n folder exists: Personal / ${WORKSPACE_N8N_HERMES_FOLDER_NAME}"
     return 0
   fi
-  [[ -n "$email" && -n "$pass" ]] || {
-    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
-    warn "n8n owner password required to create the Hermes folder; rerun with --n8n-password-file"
-    return 1
-  }
+  [[ -n "$email" ]] || return 1
+  if [[ -z "$pass" ]]; then
+    if ! is_interactive; then
+      workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+      warn "n8n owner password required to create the Hermes folder; rerun interactively or with --n8n-password-file"
+      return 1
+    fi
+    pass=$(workspace_prompt SPARK_WORKSPACE_N8N_PASSWORD \
+      "Current n8n password for ${email}" "" 1 text)
+  fi
 
   cookie_jar=$(mktemp "${TMPDIR:-/tmp}/spark-n8n-cookie.XXXXXX") || return 1
   response_file=$(mktemp "${TMPDIR:-/tmp}/spark-n8n-response.XXXXXX") || {
@@ -2959,6 +2964,7 @@ workspace_ensure_n8n_hermes_folder() {
     return 1
   }
 
+  info "Creating Personal / ${WORKSPACE_N8N_HERMES_FOLDER_NAME}; existing n8n content stays unchanged"
   payload=$(printf '{"name":"%s"}' "$(workspace_json_escape "$WORKSPACE_N8N_HERMES_FOLDER_NAME")")
   http=$(workspace_n8n_session_request "$cookie_jar" POST "/rest/projects/${personal_project_id}/folders/" "$response_file" "$payload") || http=000
   if [[ "$http" == "200" || "$http" == "201" ]]; then
@@ -3294,24 +3300,55 @@ workspace_hermes_cli_toolsets_ready() {
 workspace_nemohermes_update_available() {
   local out
   command -v nemohermes >/dev/null 2>&1 || return 1
-  out=$(nemohermes update --check 2>/dev/null || true)
-  [[ "$out" == *"Update available:"*"yes"* || "$out" == *"Update available:         yes"* ]]
+  out=$(nemohermes update --check 2>/dev/null) || return 2
+  if [[ "$out" == *"Update available:"*"yes"* ]]; then
+    return 0
+  fi
+  [[ "$out" == *"Update available:"*"no"* ]] || return 2
+  return 1
 }
 
 workspace_update_nemohermes_if_needed() {
+  local check_rc update_rc
   command -v nemohermes >/dev/null 2>&1 || return 1
-  workspace_nemohermes_update_available || return 0
+  if workspace_nemohermes_update_available; then
+    :
+  else
+    check_rc=$?
+    [[ "$check_rc" -eq 1 ]] && return 0
+    return 1
+  fi
   warn "Updating NemoHermes to the maintained release"
-  NEMOCLAW_AGENT=hermes \
+  if NEMOCLAW_AGENT=hermes \
     NEMOCLAW_NON_INTERACTIVE=1 \
     NEMOCLAW_YES=1 \
     NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE="${NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE:-[\"hermes\"]}" \
-    nemohermes update --yes >/dev/null 2>&1
+    nemohermes update --yes >/dev/null 2>&1; then
+    return 0
+  else
+    update_rc=$?
+  fi
+  if workspace_nemohermes_update_available; then
+    return "$update_rc"
+  else
+    check_rc=$?
+    if [[ "$check_rc" -eq 1 ]]; then
+      warn "NemoHermes update reported an error, but the maintained release is installed"
+      return 0
+    fi
+  fi
+  return "$update_rc"
 }
 
 workspace_nemohermes_maintained_release() {
+  local check_rc
   command -v nemohermes >/dev/null 2>&1 || return 1
-  ! workspace_nemohermes_update_available
+  if workspace_nemohermes_update_available; then
+    return 1
+  else
+    check_rc=$?
+    [[ "$check_rc" -eq 1 ]]
+  fi
 }
 
 workspace_openshell_bridge_ip() {
