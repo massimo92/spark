@@ -359,12 +359,7 @@ workspace_model_context_ready() {
 }
 
 workspace_litellm_model_name() {
-  local model="$1"
-  if [[ "$BACKEND" == "ollama" ]]; then
-    printf 'ollama_chat/%s\n' "$model"
-  else
-    printf 'vllm/%s\n' "$model"
-  fi
+  printf 'main\n'
 }
 
 workspace_model_in_list() {
@@ -428,15 +423,6 @@ workspace_ensure_gateway() {
     gateway_save_config "$gw_json"
     info "Configured LiteLLM gateway"
   fi
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    info "LiteLLM gateway: running"
-  elif [[ "$check_only" == "1" ]]; then
-    setup_fail "LiteLLM gateway not running"
-  elif [[ "$auto_yes" == "1" ]] || confirm "Start the LiteLLM gateway now?"; then
-    gateway_start || setup_fail "Could not start LiteLLM gateway"
-  else
-    setup_fail "LiteLLM gateway required for Hermes"
-  fi
   if [[ -n "$model" ]]; then
     model_state=$(workspace_model_state "$model")
     if [[ "$model_state" == *"running"* ]] \
@@ -458,6 +444,23 @@ workspace_ensure_gateway() {
         setup_fail "Hermes model not started: $model"
       fi
     fi
+  fi
+  if [[ "$check_only" != "1" && -n "$model" ]]; then
+    gateway_set_main_model "$prov" "$model" || setup_fail "Could not select LiteLLM main model"
+  fi
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    if [[ "$check_only" != "1" ]] && ! gateway_rendered_config_ready; then
+      info "Refreshing LiteLLM main route"
+      gateway_restart || setup_fail "Could not refresh LiteLLM gateway"
+    else
+      info "LiteLLM gateway: running"
+    fi
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "LiteLLM gateway not running"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Start the LiteLLM gateway now?"; then
+    gateway_start || setup_fail "Could not start LiteLLM gateway"
+  else
+    setup_fail "LiteLLM gateway required for Hermes"
   fi
 }
 
@@ -3231,6 +3234,7 @@ workspace_hermes_config_ready() {
   workspace_hermes_nemoclaw_configured || return 1
   workspace_hermes_doctor_ready || return 1
   workspace_hermes_inference_route_ready || return 1
+  workspace_hermes_config_model_ready "$litellm_model" || return 1
   workspace_hermes_dashboard_url_ready || return 1
   workspace_hermes_runtime_config_ready || return 1
   workspace_hermes_cli_toolsets_ready || return 1
@@ -4200,10 +4204,13 @@ workspace_setup_hermes() {
       return 0
     fi
     if workspace_hermes_running; then
-      if ! workspace_hermes_inference_route_ready; then
-        NEMOCLAW_SANDBOX_NAME=hermes nemohermes inference set \
+      if ! workspace_hermes_inference_route_ready || ! workspace_hermes_config_model_ready "$litellm_model"; then
+        if ! NEMOCLAW_SANDBOX_NAME=hermes nemohermes inference set \
           --provider compatible-endpoint --model "$litellm_model" \
-          --sandbox hermes --no-verify >/dev/null 2>&1 || true
+          --sandbox hermes --no-verify >/dev/null 2>&1; then
+          setup_fail "Could not synchronize Hermes inference configuration"
+          return 0
+        fi
       fi
       workspace_configure_hermes_runtime || true
     fi
@@ -6162,6 +6169,19 @@ workspace_litellm_model_routed() {
   printf '%s\n' "$out" | grep -Fq "\"${litellm_model}\""
 }
 
+workspace_litellm_main_alias_ready() {
+  local expected_model expected_provider config
+  expected_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  [[ -n "$expected_model" ]] || return 1
+  [[ "$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)" == "main" ]] || return 1
+  expected_provider="vllm"
+  [[ "$BACKEND" == "ollama" ]] && expected_provider="ollama"
+  config=$(gateway_load_config)
+  [[ "$(printf '%s\n' "$config" | jq -r '.main.provider // ""' 2>/dev/null)" == "$expected_provider" ]] &&
+    [[ "$(printf '%s\n' "$config" | jq -r '.main.model // ""' 2>/dev/null)" == "$expected_model" ]] &&
+    gateway_rendered_config_ready
+}
+
 workspace_litellm_model_smoke() {
   local litellm_model escaped_model payload out
   litellm_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
@@ -6876,6 +6896,19 @@ workspace_hermes_inference_route_ready() {
     [[ "$out" == *"compatible"* || "$out" == *"custom"* || "$out" == *"OpenAI"* ]]
 }
 
+workspace_hermes_config_model_ready() {
+  local expected="${1:-}" key out value
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  [[ -n "$expected" ]] || expected=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  [[ -n "$expected" ]] || return 1
+  for key in model.default _nemoclaw_upstream.model; do
+    out=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes config get \
+      --key "$key" --format json 2>/dev/null || true)
+    value=$(printf '%s\n' "$out" | jq -er 'select(type == "string")' 2>/dev/null || true)
+    [[ "$value" == "$expected" ]] || return 1
+  done
+}
+
 workspace_hermes_dashboard_url_ready() {
   local out expected
   command -v nemohermes >/dev/null 2>&1 || return 1
@@ -7092,6 +7125,7 @@ cmd_workspace_doctor() {
 
   workspace_doctor_section "Inference & agent" "spark ws restart"
   workspace_doctor_check "LiteLLM gateway running" workspace_gateway_running
+  workspace_doctor_check "LiteLLM main alias targets selected physical model" workspace_litellm_main_alias_ready
   workspace_doctor_check "LiteLLM exposes Hermes model route" workspace_litellm_model_routed
   workspace_doctor_check "LiteLLM Hermes route completes smoke request" workspace_litellm_model_smoke
   workspace_doctor_check "Hermes model running: ${model:-none}" workspace_model_running "$model"
@@ -7101,6 +7135,7 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Hermes local API is reachable" workspace_hermes_local_api_ready
   workspace_doctor_check "NemoHermes sandbox doctor passes" workspace_hermes_doctor_ready
   workspace_doctor_check "NemoHermes inference route uses selected LiteLLM model" workspace_hermes_inference_route_ready
+  workspace_doctor_check "Hermes config model matches selected LiteLLM route" workspace_hermes_config_model_ready
   workspace_doctor_check "Hermes model supports automatic tool calling" workspace_model_tool_calling_ready "$model"
   workspace_doctor_check "Hermes model context is at least ${WORKSPACE_HERMES_MIN_CONTEXT} tokens" workspace_model_context_ready "$model"
   workspace_doctor_check "Hermes output and reasoning limits are configured" workspace_hermes_runtime_config_ready
