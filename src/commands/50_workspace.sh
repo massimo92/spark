@@ -4152,13 +4152,12 @@ workspace_cleanup_abandoned_hermes_access() {
   if [[ "$failed" == "0" ]]; then
     workspace_remove_managed_path "$skill_dir" || return 1
   fi
-  nemohermes hermes gateway restart --quiet >/dev/null 2>&1 || failed=1
   [[ "$failed" == "0" ]]
 }
 
 workspace_teardown_vikunja() {
   local image_refs_csv="${1:-}" failed=0
-  workspace_cleanup_abandoned_hermes_access vikunja || failed=1
+  workspace_cleanup_abandoned_hermes_access vikunja || return 1
   docker rm -f "$WORKSPACE_VIKUNJA_CONTAINER" >/dev/null 2>&1 || true
   workspace_remove_task_manager_images "$image_refs_csv" || failed=1
   workspace_drop_task_manager_database vikunja || failed=1
@@ -4169,7 +4168,7 @@ workspace_teardown_vikunja() {
 
 workspace_teardown_super_productivity() {
   local image_refs_csv="${1:-}" failed=0
-  workspace_cleanup_abandoned_hermes_access super-productivity || failed=1
+  workspace_cleanup_abandoned_hermes_access super-productivity || return 1
   docker rm -f "$WORKSPACE_SUPERSYNC_CONTAINER" "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_CONTAINER" >/dev/null 2>&1 || true
   workspace_remove_task_manager_images "$image_refs_csv" || failed=1
   workspace_drop_task_manager_database super-productivity || failed=1
@@ -4182,7 +4181,7 @@ workspace_teardown_super_productivity() {
 
 workspace_teardown_todoist() {
   local failed=0
-  workspace_cleanup_abandoned_hermes_access todoist || failed=1
+  workspace_cleanup_abandoned_hermes_access todoist || return 1
   workspace_remove_managed_path "${WORKSPACE_CONFIG_DIR}/hermes-skills/todoist" || failed=1
   [[ "$failed" == "0" ]]
 }
@@ -6836,6 +6835,30 @@ workspace_restore_hermes_container_name() {
   docker rename "$current" "$expected" >/dev/null 2>&1
 }
 
+workspace_hermes_agent_gateway_running() {
+  local out
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  out=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes status 2>/dev/null || true)
+  [[ "$out" == *"Hermes Agent: running"* ]]
+}
+
+workspace_ensure_hermes_agent_gateway() {
+  local attempt
+  workspace_hermes_agent_gateway_running && return 0
+  NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes connect --probe-only >/dev/null 2>&1 || true
+  for ((attempt = 1; attempt <= 5; attempt++)); do
+    workspace_hermes_agent_gateway_running && return 0
+    sleep 1
+  done
+  NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes exec -- sh -lc \
+    'nohup hermes gateway run </dev/null >/tmp/hermes-gateway.log 2>&1 &' >/dev/null 2>&1 || return 1
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    workspace_hermes_agent_gateway_running && return 0
+    sleep 1
+  done
+  return 1
+}
+
 workspace_start_hermes_private_proxy() {
   local attempt
   command -v nemohermes >/dev/null 2>&1 || return 1
@@ -6846,6 +6869,7 @@ workspace_start_hermes_private_proxy() {
   NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes start >/dev/null 2>&1 || true
   NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes recover >/dev/null 2>&1 || \
     NEMOCLAW_SANDBOX_NAME=hermes nemohermes recover >/dev/null 2>&1 || true
+  workspace_hermes_local_api_ready || workspace_ensure_hermes_agent_gateway || true
   if command -v openshell >/dev/null 2>&1; then
     workspace_hermes_private_url_ready || openshell forward start --background "$WORKSPACE_HERMES_PORT" hermes >/dev/null 2>&1 || true
     workspace_hermes_local_api_ready || openshell forward start --background "$WORKSPACE_HERMES_LOCAL_PORT" hermes >/dev/null 2>&1 || true
