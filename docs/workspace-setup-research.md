@@ -92,9 +92,9 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 
 - `spark ws setup --check` must not mutate config/data.
 - `spark ws doctor` must pass before considering the base workspace healthy.
-- Linux setup enables user lingering and a user systemd unit that runs
-  `spark ws repair --yes --boot`; doctor verifies both boot persistence and the
-  two Hermes OpenShell forwards.
+- Recovery is deliberately operator-triggered. Spark installs no periodic repair
+  job, user systemd unit, or `linger`; doctor exposes drift and dead forwards,
+  then `spark ws repair --yes` performs the requested reconciliation.
 - `spark ws repair --yes` treats `HERMES_MCP_CONFIG_DRIFT` as registry/runtime
   divergence and invokes NemoHermes' transactional rebuild before reconciling
   runtime settings and task-manager access. Compose databases, including n8n,

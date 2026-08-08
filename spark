@@ -5897,76 +5897,6 @@ workspace_require_config() {
     die "Workspace not configured" "Run: spark ws setup"
 }
 
-workspace_systemd_user_available() {
-  case "${SPARK_WORKSPACE_SYSTEMD_OVERRIDE:-}" in
-    1) return 0 ;;
-    0) return 1 ;;
-  esac
-  [[ "$SPARK_OS" == "Linux" ]] || return 1
-  [[ -d /run/systemd/system ]] || return 1
-  command -v systemctl >/dev/null 2>&1 && command -v loginctl >/dev/null 2>&1
-}
-
-workspace_user_linger_enabled() {
-  local user
-  case "${SPARK_WORKSPACE_LINGER_OVERRIDE:-}" in
-    1) return 0 ;;
-    0) return 1 ;;
-  esac
-  user="${USER:-$(id -un)}"
-  [[ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null)" == "yes" ]]
-}
-
-workspace_boot_recovery_service_enabled() {
-  systemctl --user is-enabled spark-workspace.service >/dev/null 2>&1
-}
-
-workspace_boot_recovery_ready() {
-  workspace_systemd_user_available || return 0
-  workspace_user_linger_enabled && workspace_boot_recovery_service_enabled
-}
-
-workspace_configure_boot_recovery() {
-  local auto_yes="${1:-0}" spark_path="${2:-}" unit user
-  workspace_systemd_user_available || return 0
-  [[ -n "$spark_path" ]] || spark_path=$(command -v spark 2>/dev/null || true)
-  [[ -n "$spark_path" && "$spark_path" == /* && "$spark_path" != *[[:space:]]* ]] || return 1
-  user="${USER:-$(id -un)}"
-  if ! workspace_user_linger_enabled; then
-    if [[ "$auto_yes" != "1" ]] && is_interactive; then
-      confirm "Allow the Spark workspace to recover before login after a reboot?" || return 1
-    fi
-    if [[ "${EUID:-$(id -u)}" == "0" ]]; then
-      loginctl enable-linger "$user" >/dev/null 2>&1 || return 1
-    else
-      sudo loginctl enable-linger "$user" >/dev/null 2>&1 || return 1
-    fi
-    workspace_user_linger_enabled || return 1
-  fi
-  unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/spark-workspace.service"
-  workspace_install_file "$unit" 600 <<EOF
-[Unit]
-Description=Spark private workspace recovery
-Wants=network-online.target
-After=network-online.target
-StartLimitIntervalSec=0
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=${spark_path} ws repair --yes --boot
-Restart=on-failure
-RestartSec=15
-TimeoutStartSec=20min
-
-[Install]
-WantedBy=default.target
-EOF
-  systemctl --user daemon-reload >/dev/null 2>&1 || return 1
-  systemctl --user enable spark-workspace.service >/dev/null 2>&1 || return 1
-  workspace_boot_recovery_ready
-}
-
 workspace_preflight() {
   local check_only="$1" ok=0
   if ! command -v docker >/dev/null 2>&1; then
@@ -10623,10 +10553,6 @@ workspace_setup() {
   fi
   workspace_finalize_task_manager_teardown "$teardown_task_manager" "$task_manager" \
     || setup_fail "Could not remove the abandoned $(workspace_task_manager_label "$teardown_task_manager") services, images and data"
-  if [[ "${#SETUP_FAILED[@]}" -eq 0 ]]; then
-    workspace_configure_boot_recovery "$auto_yes" \
-      || setup_fail "Could not configure automatic workspace recovery after reboot"
-  fi
   if [[ "$task_manager" == "super-productivity" ]]; then
     if [[ "${#SETUP_FAILED[@]}" -eq 0 ]]; then
       workspace_complete_super_productivity_browser_sync || true
@@ -11033,11 +10959,10 @@ EOF
 }
 
 workspace_repair() {
-  local auto_yes=0 boot=0 force_rebuild=0 remote_spec="" model task_manager
+  local auto_yes=0 force_rebuild=0 remote_spec="" model task_manager
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --yes) auto_yes=1; shift ;;
-      --boot) boot=1; auto_yes=1; shift ;;
       --force-hermes-rebuild) force_rebuild=1; auto_yes=1; shift ;;
       --remote) remote_spec="${2:-}"; [[ -n "$remote_spec" ]] || die "--remote requires user@host"; shift 2 ;;
       -h|--help) cmd_workspace_repair_help; return 0 ;;
@@ -11058,12 +10983,6 @@ workspace_repair() {
   task_manager=$(workspace_task_manager)
 
   printf "\n  ${BOLD}spark ws repair${NC}\n\n"
-  if [[ "$boot" != "1" ]]; then
-    workspace_configure_boot_recovery "$auto_yes" || {
-      err "Could not configure automatic recovery after reboot"
-      return 1
-    }
-  fi
   workspace_compose up -d --remove-orphans >/dev/null 2>&1 || {
     err "Could not start workspace Compose services"
     return 1
@@ -12956,7 +12875,6 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Compose uses private host bindings only" workspace_compose_uses_loopback_ports
 
   workspace_doctor_section "Resilience" "spark ws repair --yes"
-  workspace_doctor_check "Workspace survives reboot without a login" workspace_boot_recovery_ready
   workspace_doctor_check "Hermes MCP configuration matches NemoClaw registry" workspace_hermes_mcp_config_consistent
   workspace_doctor_check "Hermes OpenShell forwards are alive" workspace_hermes_forwards_ready
 

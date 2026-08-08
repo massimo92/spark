@@ -167,12 +167,12 @@ password without questions; Spark shows generated passwords once and never
 stores them.
 
 Use `spark ws doctor --strict` before treating it as production-ready.
-On Linux, successful setup enables a user systemd recovery service and user
-lingering so the workspace returns after a reboot without an interactive login.
-`spark ws doctor` checks that boot recovery, Hermes/NemoClaw MCP state, and both
-OpenShell forwards agree. `spark ws repair --yes` restarts the model and private
-proxies; when MCP state drifted, it uses NemoHermes' transactional rebuild and
-then reapplies the configured task-manager access. It does not delete n8n data.
+Recovery is intentionally manual: Spark does not install a periodic repair job,
+user systemd service, or `linger`. `spark ws doctor` checks Hermes/NemoClaw MCP
+state and both OpenShell forwards. `spark ws repair --yes` restarts the model and
+private proxies; when MCP state drifted, it uses NemoHermes' transactional
+rebuild and then reapplies the configured task-manager access. It does not delete
+n8n data.
 If a broken sandbox cannot be backed up, repair stops rather than lose Hermes
 state. `--force-hermes-rebuild` is the explicit last resort; it can lose
 unrecoverable Hermes state, but still does not recreate n8n or its database.

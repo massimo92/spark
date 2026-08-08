@@ -861,9 +861,11 @@ case "$args" in
   sandbox\ provider\ attach*|policy\ update*)
     exit "${FAKE_OPENSHELL_POLICY_EXIT:-0}" ;;
   "forward list")
-    printf 'SANDBOX BIND PORT PID STATUS\n'
-    printf 'hermes 127.0.0.1 18789 100 running\n'
-    printf 'hermes 127.0.0.1 8642 101 running\n' ;;
+    if [[ "${FAKE_OPENSHELL_FORWARDS_READY:-1}" == "1" ]]; then
+      printf 'SANDBOX BIND PORT PID STATUS\n'
+      printf 'hermes 127.0.0.1 18789 100 running\n'
+      printf 'hermes 127.0.0.1 8642 101 running\n'
+    fi ;;
   *) exit 0 ;;
 esac
 EOF
@@ -3180,51 +3182,8 @@ test_workspace_restart_orders_stop_then_start() {
   [[ "$out" == $'stop\nstart' ]]
 }
 
-test_workspace_boot_recovery_installs_systemd_service() {
-  local tmp log unit calls status
-  tmp=$(mktemp -d)
-  log="${tmp}/calls"
-  HOME="${tmp}/home" SPARK_TEST_LOG="$log" bash -c '
-    source "$1"
-    SPARK_OS=Linux
-    workspace_systemd_user_available() { return 0; }
-    workspace_user_linger_enabled() { [[ -e "$HOME/linger-enabled" ]]; }
-    workspace_spark_executable() { printf "%s\n" "$1"; }
-    sudo() {
-      printf "sudo:%s\n" "$*" >> "$SPARK_TEST_LOG"
-      mkdir -p "$HOME"
-      : > "$HOME/linger-enabled"
-    }
-    systemctl() { printf "systemctl:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
-    workspace_configure_boot_recovery 1 "$1"
-  ' _ "$SPARK"
-  status=$?
-  unit="${tmp}/home/.config/systemd/user/spark-workspace.service"
-  calls=$(cat "$log" 2>/dev/null || true)
-  [[ "$status" -eq 0 ]] &&
-    grep -Fq "ExecStart=${SPARK} ws repair --yes --boot" "$unit" &&
-    grep -Fq "Restart=on-failure" "$unit" &&
-    [[ "$calls" == *"sudo:loginctl enable-linger"* ]] &&
-    [[ "$calls" == *"systemctl:--user enable spark-workspace.service"* ]]
-  status=$?
-  rm -rf "$tmp"
-  return "$status"
-}
-
-test_workspace_boot_recovery_requires_linger_and_enabled_unit() {
-  bash -c '
-    source "$1"
-    SPARK_OS=Linux
-    workspace_systemd_user_available() { return 0; }
-    workspace_user_linger_enabled() { return 1; }
-    workspace_boot_recovery_service_enabled() { return 0; }
-    ! workspace_boot_recovery_ready
-    workspace_user_linger_enabled() { return 0; }
-    workspace_boot_recovery_service_enabled() { return 1; }
-    ! workspace_boot_recovery_ready
-    workspace_boot_recovery_service_enabled() { return 0; }
-    workspace_boot_recovery_ready
-  ' _ "$SPARK"
+test_workspace_repair_is_operator_triggered_only() {
+  ! grep -Eq 'enable-linger|spark-workspace[.]service|ws repair --yes --boot' "$SPARK"
 }
 
 test_workspace_detects_hermes_mcp_config_drift() {
@@ -3253,7 +3212,6 @@ test_workspace_repair_rebuilds_mcp_drift_and_reconciles() {
     workspace_require_config() { :; }
     workspace_migrate_runtime_config() { printf "migrate\n" >> "$SPARK_TEST_LOG"; }
     workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Alpha\n"; }
-    workspace_configure_boot_recovery() { printf "boot:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
     workspace_compose() { printf "compose:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
     workspace_ensure_gateway() { printf "gateway:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
     workspace_start_hermes_gateway_proxy() { printf "inference-proxy\n" >> "$SPARK_TEST_LOG"; }
@@ -3270,7 +3228,6 @@ test_workspace_repair_rebuilds_mcp_drift_and_reconciles() {
   calls=$(cat "$log" 2>/dev/null || true)
   rm -rf "$tmp"
   [[ "$status" -eq 0 ]] &&
-    [[ "$calls" == *"boot:1"* ]] &&
     [[ "$calls" == *"gateway:0 1 Org/Alpha"* ]] &&
     [[ "$calls" == *"rebuild:--yes"* ]] &&
     [[ "$calls" == *$'rebuild:--yes\nstart\nruntime\ntodoist\ndoctor:--verbose'* ]]
@@ -3284,7 +3241,6 @@ test_workspace_repair_force_rebuild_is_explicit() {
     workspace_require_config() { :; }
     workspace_migrate_runtime_config() { :; }
     workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Alpha\n"; }
-    workspace_configure_boot_recovery() { :; }
     workspace_compose() { :; }
     workspace_ensure_gateway() { :; }
     workspace_start_hermes_gateway_proxy() { :; }
@@ -5227,7 +5183,7 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"70/70 checks passed"* ]] &&
+    [[ "$out" == *"69/69 checks passed"* ]] &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
@@ -5323,7 +5279,7 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"71/71 checks passed"* ]] &&
+  [[ "$out" == *"70/70 checks passed"* ]] &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -5374,13 +5330,13 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 70 and
+    .passed == 69 and
     .failed == 0 and
-    .total == 70 and
+    .total == 69 and
     .model == "Org/Alpha" and
     ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Identity & recovery" and .passed == 14 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Resilience" and .passed == 3 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Resilience" and .passed == 2 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Inference & agent" and .passed == 18 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
@@ -6397,7 +6353,7 @@ test_workspace_doctor_flags_nemohermes_doctor_failure() {
     [[ "$out" == *"[ ] NemoHermes sandbox doctor passes"* ]]
 }
 
-test_workspace_doctor_flags_mcp_drift_and_boot_recovery() {
+test_workspace_doctor_flags_mcp_drift_and_dead_forwards() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -6410,7 +6366,7 @@ test_workspace_doctor_flags_mcp_drift_and_boot_recovery() {
     "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
-    SPARK_WORKSPACE_SYSTEMD_OVERRIDE=1 SPARK_WORKSPACE_LINGER_OVERRIDE=0 \
+    FAKE_OPENSHELL_FORWARDS_READY=0 \
     FAKE_DOCKER_LOGS='[SECURITY] HERMES_MCP_CONFIG_DRIFT: rebuild required\n' \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\nopenshell-hermes-test\n' \
     FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
@@ -6420,8 +6376,8 @@ test_workspace_doctor_flags_mcp_drift_and_boot_recovery() {
   set -e
   rm -rf "$tmp"
   [[ "$status" -ne 0 ]] &&
-    [[ "$(jq -r '.checks[] | select(.id == "workspace_survives_reboot_without_a_login") | .ok' <<< "$out")" == false ]] &&
-    [[ "$(jq -r '.checks[] | select(.id == "hermes_mcp_configuration_matches_nemoclaw_registry") | .ok' <<< "$out")" == false ]]
+    [[ "$(jq -r '.checks[] | select(.id == "hermes_mcp_configuration_matches_nemoclaw_registry") | .ok' <<< "$out")" == false ]] &&
+    [[ "$(jq -r '.checks[] | select(.id == "hermes_openshell_forwards_are_alive") | .ok' <<< "$out")" == false ]]
 }
 
 test_workspace_doctor_flags_missing_tailscale_service_registration() {
@@ -6675,7 +6631,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"70/70 checks passed"* ]] &&
+  [[ "$out" == *"69/69 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -6697,7 +6653,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"70/70 checks passed"* ]] &&
+  [[ "$out" == *"69/69 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -8896,8 +8852,7 @@ run_test "help text tracks current CLI" test_help_text_tracks_current_cli
 run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
-run_test "workspace boot recovery installs a systemd service" test_workspace_boot_recovery_installs_systemd_service
-run_test "workspace boot recovery requires linger and enabled unit" test_workspace_boot_recovery_requires_linger_and_enabled_unit
+run_test "workspace repair is operator-triggered only" test_workspace_repair_is_operator_triggered_only
 run_test "workspace detects Hermes MCP config drift" test_workspace_detects_hermes_mcp_config_drift
 run_test "workspace repair rebuilds MCP drift and reconciles" test_workspace_repair_rebuilds_mcp_drift_and_reconciles
 run_test "workspace repair force rebuild is explicit" test_workspace_repair_force_rebuild_is_explicit
@@ -9017,7 +8972,7 @@ run_test "workspace doctor flags wrong NemoHermes route" test_workspace_doctor_f
 run_test "workspace doctor flags split Hermes model config" test_workspace_doctor_flags_split_hermes_model_config
 run_test "workspace doctor flags wrong LiteLLM main target" test_workspace_doctor_flags_wrong_main_target
 run_test "workspace doctor flags NemoHermes doctor failure" test_workspace_doctor_flags_nemohermes_doctor_failure
-run_test "workspace doctor flags MCP drift and boot recovery" test_workspace_doctor_flags_mcp_drift_and_boot_recovery
+run_test "workspace doctor flags MCP drift and dead forwards" test_workspace_doctor_flags_mcp_drift_and_dead_forwards
 run_test "workspace doctor flags missing Tailscale Service registration" test_workspace_doctor_flags_missing_tailscale_service_registration
 run_test "workspace doctor flags Tailscale Serve disabled" test_workspace_doctor_flags_tailscale_serve_disabled
 run_test "workspace doctor flags Tailscale Service host not advertised" test_workspace_doctor_flags_tailscale_service_host_not_advertised
