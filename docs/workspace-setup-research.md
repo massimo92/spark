@@ -92,6 +92,13 @@ Purpose: record the install/security decisions behind `spark ws` so the setup is
 
 - `spark ws setup --check` must not mutate config/data.
 - `spark ws doctor` must pass before considering the base workspace healthy.
+- Linux setup enables user lingering and a user systemd unit that runs
+  `spark ws repair --yes --boot`; doctor verifies both boot persistence and the
+  two Hermes OpenShell forwards.
+- `spark ws repair --yes` treats `HERMES_MCP_CONFIG_DRIFT` as registry/runtime
+  divergence and invokes NemoHermes' transactional rebuild before reconciling
+  runtime settings and task-manager access. Compose databases, including n8n,
+  are not recreated.
 - Doctor calls `/api/v1/user` from inside the Hermes sandbox and requires the response identity to be `bot-hermes`.
 - Doctor rejects a running vLLM model that lacks automatic tool calling or uses the wrong profile parser.
 - Doctor rejects model contexts below 64K and stale Hermes output/reasoning limits.

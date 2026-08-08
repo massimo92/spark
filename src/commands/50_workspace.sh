@@ -226,6 +226,76 @@ workspace_require_config() {
     die "Workspace not configured" "Run: spark ws setup"
 }
 
+workspace_systemd_user_available() {
+  case "${SPARK_WORKSPACE_SYSTEMD_OVERRIDE:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  [[ "$SPARK_OS" == "Linux" ]] || return 1
+  [[ -d /run/systemd/system ]] || return 1
+  command -v systemctl >/dev/null 2>&1 && command -v loginctl >/dev/null 2>&1
+}
+
+workspace_user_linger_enabled() {
+  local user
+  case "${SPARK_WORKSPACE_LINGER_OVERRIDE:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  user="${USER:-$(id -un)}"
+  [[ "$(loginctl show-user "$user" -p Linger --value 2>/dev/null)" == "yes" ]]
+}
+
+workspace_boot_recovery_service_enabled() {
+  systemctl --user is-enabled spark-workspace.service >/dev/null 2>&1
+}
+
+workspace_boot_recovery_ready() {
+  workspace_systemd_user_available || return 0
+  workspace_user_linger_enabled && workspace_boot_recovery_service_enabled
+}
+
+workspace_configure_boot_recovery() {
+  local auto_yes="${1:-0}" spark_path="${2:-}" unit user
+  workspace_systemd_user_available || return 0
+  [[ -n "$spark_path" ]] || spark_path=$(command -v spark 2>/dev/null || true)
+  [[ -n "$spark_path" && "$spark_path" == /* && "$spark_path" != *[[:space:]]* ]] || return 1
+  user="${USER:-$(id -un)}"
+  if ! workspace_user_linger_enabled; then
+    if [[ "$auto_yes" != "1" ]] && is_interactive; then
+      confirm "Allow the Spark workspace to recover before login after a reboot?" || return 1
+    fi
+    if [[ "${EUID:-$(id -u)}" == "0" ]]; then
+      loginctl enable-linger "$user" >/dev/null 2>&1 || return 1
+    else
+      sudo loginctl enable-linger "$user" >/dev/null 2>&1 || return 1
+    fi
+    workspace_user_linger_enabled || return 1
+  fi
+  unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/spark-workspace.service"
+  workspace_install_file "$unit" 600 <<EOF
+[Unit]
+Description=Spark private workspace recovery
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${spark_path} ws repair --yes --boot
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=20min
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload >/dev/null 2>&1 || return 1
+  systemctl --user enable spark-workspace.service >/dev/null 2>&1 || return 1
+  workspace_boot_recovery_ready
+}
+
 workspace_preflight() {
   local check_only="$1" ok=0
   if ! command -v docker >/dev/null 2>&1; then
@@ -4882,6 +4952,10 @@ workspace_setup() {
   fi
   workspace_finalize_task_manager_teardown "$teardown_task_manager" "$task_manager" \
     || setup_fail "Could not remove the abandoned $(workspace_task_manager_label "$teardown_task_manager") services, images and data"
+  if [[ "${#SETUP_FAILED[@]}" -eq 0 ]]; then
+    workspace_configure_boot_recovery "$auto_yes" \
+      || setup_fail "Could not configure automatic workspace recovery after reboot"
+  fi
   if [[ "$task_manager" == "super-productivity" ]]; then
     if [[ "${#SETUP_FAILED[@]}" -eq 0 ]]; then
       workspace_complete_super_productivity_browser_sync || true
@@ -5266,6 +5340,106 @@ workspace_restart() {
   [[ $# -eq 0 ]] || die "Usage: spark ws restart"
   workspace_stop
   workspace_start
+}
+
+cmd_workspace_repair_help() {
+  cat <<EOF
+
+  ${BOLD}Usage:${NC} spark ws repair [--yes] [--force-hermes-rebuild] [--remote user@host]
+
+  Repairs runtime drift without deleting workspace data. Restarts the selected
+  model and private proxies, rebuilds Hermes transactionally when NemoClaw
+  reports MCP config drift, and reapplies the configured task-manager access.
+
+  ${BOLD}Flags:${NC}
+    --yes               Accept transactional Hermes rebuild when required.
+    --force-hermes-rebuild
+                        Recreate an unrecoverable Hermes sandbox even if its
+                        backup is incomplete. May lose Hermes state; never n8n.
+    --remote user@host  Repair a configured remote workspace.
+
+EOF
+}
+
+workspace_repair() {
+  local auto_yes=0 boot=0 force_rebuild=0 remote_spec="" model task_manager
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) auto_yes=1; shift ;;
+      --boot) boot=1; auto_yes=1; shift ;;
+      --force-hermes-rebuild) force_rebuild=1; auto_yes=1; shift ;;
+      --remote) remote_spec="${2:-}"; [[ -n "$remote_spec" ]] || die "--remote requires user@host"; shift 2 ;;
+      -h|--help) cmd_workspace_repair_help; return 0 ;;
+      *) die "Unknown ws repair flag: $1" ;;
+    esac
+  done
+  if [[ -n "$remote_spec" ]]; then
+    local args=(repair)
+    [[ "$auto_yes" == "1" ]] && args+=(--yes)
+    [[ "$force_rebuild" == "1" ]] && args+=(--force-hermes-rebuild)
+    workspace_remote_workspace_cmd "$remote_spec" "${args[@]}"
+    return $?
+  fi
+  workspace_require_config
+  workspace_migrate_runtime_config
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  [[ -n "$model" ]] || die "Hermes model is not configured" "Run: spark ws setup"
+  task_manager=$(workspace_task_manager)
+
+  printf "\n  ${BOLD}spark ws repair${NC}\n\n"
+  if [[ "$boot" != "1" ]]; then
+    workspace_configure_boot_recovery "$auto_yes" || {
+      err "Could not configure automatic recovery after reboot"
+      return 1
+    }
+  fi
+  workspace_compose up -d --remove-orphans >/dev/null 2>&1 || {
+    err "Could not start workspace Compose services"
+    return 1
+  }
+  SETUP_FAILED=()
+  workspace_ensure_gateway 0 1 "$model"
+  [[ "${#SETUP_FAILED[@]}" -eq 0 ]] || return 1
+  workspace_start_hermes_gateway_proxy || {
+    err "Could not expose LiteLLM to OpenShell"
+    return 1
+  }
+  if workspace_hermes_mcp_config_drift_detected; then
+    if [[ "$auto_yes" != "1" ]]; then
+      is_interactive || die "Hermes MCP config drift requires confirmation" "Run: spark ws repair --yes"
+      confirm "Rebuild Hermes from its registered NemoClaw state?" || return 1
+    fi
+    warn "Hermes MCP config drift detected; rebuilding from registered state"
+    local rebuild_args=(--yes)
+    [[ "$force_rebuild" == "1" ]] && rebuild_args+=(--force)
+    nemohermes_rebuild_with_workspace_env "${rebuild_args[@]}" || {
+      if [[ "$force_rebuild" == "1" ]]; then
+        err "Forced Hermes rebuild failed"
+      else
+        err "Hermes transactional rebuild stopped because its backup was incomplete"
+        printf "    If losing unrecoverable Hermes state is acceptable, run:\n"
+        printf "    spark ws repair --yes --force-hermes-rebuild\n"
+        printf "    n8n and its database are not rebuilt by this command.\n"
+      fi
+      return 1
+    }
+  else
+    nemohermes hermes doctor --fix >/dev/null 2>&1 || true
+  fi
+  workspace_start || return 1
+  workspace_configure_hermes_runtime || {
+    err "Could not reconcile Hermes runtime configuration"
+    return 1
+  }
+  case "$task_manager" in
+    super-productivity) workspace_setup_hermes_super_productivity_access ;;
+    todoist) workspace_setup_hermes_todoist_access ;;
+    *) workspace_setup_hermes_vikunja_access ;;
+  esac || {
+    err "Could not reconcile Hermes $(workspace_task_manager_label "$task_manager") access"
+    return 1
+  }
+  cmd_workspace_doctor --verbose
 }
 
 workspace_status_item() {
@@ -6816,6 +6990,27 @@ workspace_hermes_container_name() {
   printf '%s\n' "$containers" | grep -E "^(${WORKSPACE_HERMES_CONTAINER}|openshell-hermes-)" | head -n 1
 }
 
+workspace_hermes_mcp_config_drift_detected() {
+  local container logs
+  command -v docker >/dev/null 2>&1 || return 1
+  container=$(workspace_hermes_container_name 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  logs=$(docker logs --tail 200 "$container" 2>&1 || true)
+  grep -F "HERMES_MCP_CONFIG_DRIFT" <<< "$logs" >/dev/null
+}
+
+workspace_hermes_mcp_config_consistent() {
+  ! workspace_hermes_mcp_config_drift_detected
+}
+
+workspace_hermes_forwards_ready() {
+  local out
+  command -v openshell >/dev/null 2>&1 || return 1
+  out=$(openshell forward list 2>/dev/null || true)
+  grep -E "hermes[[:space:]]+127[.]0[.]0[.]1[[:space:]]+${WORKSPACE_HERMES_PORT}.*running" <<< "$out" >/dev/null &&
+    grep -E "hermes[[:space:]]+127[.]0[.]0[.]1[[:space:]]+${WORKSPACE_HERMES_LOCAL_PORT}.*running" <<< "$out" >/dev/null
+}
+
 workspace_hermes_running_container_name() {
   local container
   container=$(workspace_hermes_container_name 2>/dev/null || true)
@@ -6862,6 +7057,7 @@ workspace_ensure_hermes_agent_gateway() {
 workspace_start_hermes_private_proxy() {
   local attempt
   command -v nemohermes >/dev/null 2>&1 || return 1
+  workspace_hermes_mcp_config_drift_detected && return 1
   if workspace_hermes_private_url_ready && workspace_hermes_local_api_ready; then
     return 0
   fi
@@ -7087,6 +7283,11 @@ cmd_workspace_doctor() {
     workspace_doctor_check "Shared Postgres initializes Vikunja and n8n DBs" workspace_compose_shared_postgres
   fi
   workspace_doctor_check "Compose uses private host bindings only" workspace_compose_uses_loopback_ports
+
+  workspace_doctor_section "Resilience" "spark ws repair --yes"
+  workspace_doctor_check "Workspace survives reboot without a login" workspace_boot_recovery_ready
+  workspace_doctor_check "Hermes MCP configuration matches NemoClaw registry" workspace_hermes_mcp_config_consistent
+  workspace_doctor_check "Hermes OpenShell forwards are alive" workspace_hermes_forwards_ready
 
   workspace_doctor_section "Identity & recovery" "spark ws setup"
   workspace_doctor_check "Interactive service passwords are not stored" workspace_human_password_not_stored
@@ -7584,6 +7785,7 @@ cmd_workspace_help() {
     start       Start the configured workspace runtime
     stop        Stop the workspace runtime and preserve all data
     restart     Stop and start the configured workspace runtime
+    repair      Repair reboot/runtime drift without deleting workspace data
     recover     Reset a Vikunja human or n8n owner password
     status      Show operational workspace state
     containers  Show raw workspace container state
@@ -7628,6 +7830,7 @@ cmd_workspace() {
     start)  workspace_start "$@" ;;
     stop)   workspace_stop "$@" ;;
     restart) workspace_restart "$@" ;;
+    repair) workspace_repair "$@" ;;
     recover) workspace_recover "$@" ;;
     status) cmd_workspace_status "$@" ;;
     containers) cmd_workspace_containers "$@" ;;

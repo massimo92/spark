@@ -130,7 +130,7 @@ nemohermes_rebuild_with_workspace_env() {
   [[ -n "$model" ]] && env_args+=("NEMOCLAW_MODEL=${model}")
   [[ -n "$chat_ui_url" ]] && env_args+=("CHAT_UI_URL=${chat_ui_url}")
 
-  env "${env_args[@]}" nemohermes hermes rebuild
+  env "${env_args[@]}" nemohermes hermes rebuild "$@"
 }
 
 docker_image_update_available() {

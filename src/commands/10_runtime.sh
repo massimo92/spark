@@ -933,8 +933,11 @@ await_startup() {
       oom=$(docker inspect -f '{{.State.OOMKilled}}' "$cname" 2>/dev/null || echo "false")
       logs=$(docker logs --tail 80 "$cname" 2>&1 || true)
       [[ "$oom" == "true" ]] && { printf 'exit:oom\n'; return 0; }
-      n=$(printf '%s' "$logs" | grep -oiE 'max_num_seqs to at most [0-9]+' | grep -oE '[0-9]+' | head -1)
-      if [[ -z "$n" ]] && printf '%s' "$logs" | grep -qiE 'mamba cache blocks|exceeds available .*cache blocks'; then
+      if grep -qiE 'No available memory for (the )?cache blocks|Available KV cache memory:[[:space:]]*-' <<< "$logs"; then
+        printf 'exit:kv-memory\n'; return 0
+      fi
+      n=$(grep -oiE 'max_num_seqs to at most [0-9]+' <<< "$logs" | grep -oE '[0-9]+' | head -1)
+      if [[ -z "$n" ]] && grep -qiE 'mamba cache blocks|exceeds available .*cache blocks' <<< "$logs"; then
         n=64   # pattern matched but no number parsed — conservative fallback
       fi
       [[ -n "$n" ]] && { printf 'exit:mamba:%s\n' "$n"; return 0; }
@@ -1176,7 +1179,8 @@ run_backend_vllm() {
 
   # Supervised adaptive launch: start the container, wait until it serves, and auto-retry
   # recoverable startup failures. Levers: lower $seqs (concurrency) for cache-block errors;
-  # flip $enforce_eager (removes the torch.compile/CUDA-graph startup peak) on a warmup OOM.
+  # raise the vLLM memory fraction when multimodal profiling leaves no KV reservation; flip
+  # $enforce_eager (removes the torch.compile/CUDA-graph startup peak) on a warmup OOM.
   local attempt=0 serve_state="nowait"
   while : ; do
     docker rm -f "$cname" >/dev/null 2>&1 || true
@@ -1221,6 +1225,28 @@ run_backend_vllm() {
         fi
         err "vLLM couldn't start within the concurrency this size allows."
         docker logs --tail 15 "$cname" 2>&1 | sed 's/^/    /'
+        exit 1 ;;
+      exit:kv-memory)
+        local next_util next_need retry_reserved retry_free
+        next_util=$(awk -v u="$GPU_MEM_UTIL" 'BEGIN { n=u+0.15; if(n>0.95)n=0.95; printf "%.2f", n }')
+        next_need=$(awk -v u="$next_util" -v t="$TOTAL_MEM_GB" 'BEGIN { printf "%.1f", u*t }')
+        retry_reserved=$(reserved_budget_gb "$cname")
+        retry_free=$(effective_free_gb "$retry_reserved")
+        if [[ "$attempt" -lt "$STARTUP_MAX_RETRIES" && -z "$mem" && "$next_util" != "$GPU_MEM_UTIL" ]] &&
+            awk -v n="$next_need" -v f="$retry_free" 'BEGIN { exit !(n <= f) }'; then
+          attempt=$((attempt + 1))
+          GPU_MEM_UTIL="$next_util"
+          NEED_GB="$next_need"
+          info "KV cache reservation too small — retrying with --gpu-memory-utilization ${next_util}."
+          build_launch
+          continue
+        fi
+        err "vLLM could not reserve KV cache memory for ${model}."
+        if [[ -n "$mem" ]]; then
+          printf "    Raise --mem above %s, reduce --max-len, or use --text-only.\n" "$GPU_MEM_UTIL"
+        else
+          printf "    Free memory, reduce --max-len, or use --text-only for a multimodal model.\n"
+        fi
         exit 1 ;;
       exit:oom)
         # The startup peak (torch.compile + CUDA-graph capture) overflowed the container cap. The
