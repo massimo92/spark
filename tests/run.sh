@@ -778,6 +778,8 @@ Update available:         no}"
   *"inference get"*) echo "${FAKE_NEMOHERMES_INFERENCE_TEXT:-Provider: compatible-endpoint Model: main}" ;;
   *"hermes config get --key model.default --format json"*) printf '"%s"\n' "${FAKE_HERMES_CONFIG_MODEL:-main}" ;;
   *"hermes config get --key _nemoclaw_upstream.model --format json"*) printf '"%s"\n' "${FAKE_HERMES_CONFIG_UPSTREAM_MODEL:-${FAKE_HERMES_CONFIG_MODEL:-main}}" ;;
+  *"hermes config get --key platform_toolsets.cli --format json"*)
+    printf '%s\n' "${FAKE_HERMES_CLI_TOOLSETS_JSON:-[\"audio\",\"browser\",\"nemoclaw\"]}" ;;
   *"policy-explain --json"*) echo "${FAKE_NEMOHERMES_POLICY_JSON:-{\"tier\":\"restricted\",\"appliedPresets\":[]}}" ;;
   *"policy-explain"*) echo "${FAKE_NEMOHERMES_POLICY_TEXT:-Policy tier: restricted}" ;;
   *"policy-list"*) echo "${FAKE_NEMOHERMES_POLICY_LIST:-restricted}" ;;
@@ -3433,18 +3435,24 @@ test_repair_model_tool_calling_requires_expected_parser() {
   [[ "$wrong" -ne 0 && "$right" -eq 0 ]]
 }
 
-test_workspace_hermes_toolsets_are_balanced() {
+test_workspace_hermes_runtime_uses_supported_config_writes() {
   local tmp fake_bin calls wrong=0
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
-    bash -c 'source "$1"; workspace_configure_hermes_cli_toolsets; workspace_hermes_cli_toolsets_ready' _ "$SPARK"
+    bash -c 'source "$1"; workspace_configure_hermes_runtime; workspace_hermes_cli_toolsets_ready' _ "$SPARK"
   calls=$(cat "${tmp}/nemohermes.log")
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_HERMES_TOOLS_LIST=$'Built-in toolsets (cli):\n  enabled  terminal\n  enabled  browser' \
     bash -c 'source "$1"; workspace_hermes_cli_toolsets_ready' _ "$SPARK" || wrong=$?
   rm -rf "$tmp"
-  [[ "$calls" == *"hermes tools enable --platform cli terminal file web skills memory todo cronjob delegation"* ]] &&
-    [[ "$calls" == *"hermes tools disable --platform cli browser code_execution vision video image_gen video_gen x_search tts context_engine session_search clarify homeassistant spotify yuanbao computer_use"* ]] &&
+  [[ "$calls" == *"hermes config set --key model.max_tokens --value 512"* ]] &&
+    [[ "$calls" == *"hermes config set --key model.context_length --value 65536"* ]] &&
+    [[ "$calls" == *"hermes config set --key agent.reasoning_effort --value none"* ]] &&
+    [[ "$calls" == *"hermes config get --key platform_toolsets.cli --format json"* ]] &&
+    [[ "$calls" == *"hermes config set --key platform_toolsets.cli --value"* ]] &&
+    [[ "$calls" != *"hermes exec --no-tty --timeout 30 -- hermes config set"* ]] &&
+    [[ "$calls" != *"hermes tools enable"* ]] &&
+    [[ "$calls" != *"hermes tools disable"* ]] &&
     [[ "$wrong" -ne 0 ]]
 }
 
@@ -3716,9 +3724,11 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
     [[ "$nemo_calls" == *"hermes skill install "*"/hermes-skills/vikunja"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set model.max_tokens 512"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set model.context_length 65536"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set agent.reasoning_effort none"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --key model.max_tokens --value 512"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --key model.context_length --value 65536"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --key agent.reasoning_effort --value none"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --key platform_toolsets.cli --value"* ]] &&
+    [[ "$nemo_calls" != *"hermes exec --no-tty --timeout 30 -- hermes config set"* ]] &&
     [[ "$nemo_calls" == *"hermes gateway restart --quiet"* ]] &&
     [[ "$docker_calls" == *"--name spark-hermes-litellm-proxy"* ]] &&
     [[ "$docker_calls" == *"172.19.0.1 4000 127.0.0.1 4000"* ]] &&
@@ -8889,7 +8899,7 @@ run_test "repair starts model with requested policy" test_repair_starts_model_wi
 run_test "repair defaults to LiteLLM main model" test_repair_defaults_to_litellm_main_model
 run_test "repair restarts model without tool calling" test_repair_restarts_model_without_tool_calling
 run_test "repair model requires expected tool parser" test_repair_model_tool_calling_requires_expected_parser
-run_test "workspace Hermes uses balanced CLI toolsets" test_workspace_hermes_toolsets_are_balanced
+run_test "workspace Hermes runtime uses supported config writes" test_workspace_hermes_runtime_uses_supported_config_writes
 run_test "workspace status uses Tailscale Services config" test_workspace_status_uses_tailscale_services_config
 run_test "workspace restores OpenShell Hermes container name" test_workspace_restores_openshell_hermes_name
 run_test "workspace setup --check does not write files" test_workspace_check_no_mutation

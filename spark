@@ -9024,18 +9024,23 @@ workspace_configure_hermes_runtime() {
   [[ "$max_tokens" =~ ^[1-9][0-9]*$ ]] || max_tokens="$WORKSPACE_HERMES_MAX_TOKENS_DEFAULT"
   [[ "$context" =~ ^[0-9]+$ && "$context" -ge "$WORKSPACE_HERMES_MIN_CONTEXT" ]] || context="$WORKSPACE_HERMES_MIN_CONTEXT"
   [[ "$reasoning" == "none" ]] || reasoning="$WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT"
-  nemohermes hermes exec --no-tty --timeout 30 -- hermes config set model.max_tokens "$max_tokens" >/dev/null 2>&1 &&
-    nemohermes hermes exec --no-tty --timeout 30 -- hermes config set model.context_length "$context" >/dev/null 2>&1 &&
-    nemohermes hermes exec --no-tty --timeout 30 -- hermes config set agent.reasoning_effort "$reasoning" >/dev/null 2>&1 &&
+  nemohermes hermes config set --key model.max_tokens --value "$max_tokens" >/dev/null 2>&1 &&
+    nemohermes hermes config set --key model.context_length --value "$context" >/dev/null 2>&1 &&
+    nemohermes hermes config set --key agent.reasoning_effort --value "$reasoning" >/dev/null 2>&1 &&
     workspace_configure_hermes_cli_toolsets
 }
 
 workspace_configure_hermes_cli_toolsets() {
-  local -a enabled disabled
-  read -r -a enabled <<< "$WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT"
-  read -r -a disabled <<< "$WORKSPACE_HERMES_CLI_TOOLSETS_DISABLED"
-  nemohermes hermes exec --no-tty --timeout 30 -- hermes tools enable --platform cli "${enabled[@]}" >/dev/null 2>&1 &&
-    nemohermes hermes exec --no-tty --timeout 30 -- hermes tools disable --platform cli "${disabled[@]}" >/dev/null 2>&1
+  local current toolsets
+  current=$(nemohermes hermes config get --key platform_toolsets.cli --format json 2>/dev/null) || return 1
+  toolsets=$(printf '%s\n' "$current" | jq -c \
+    --arg enabled "$WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT" \
+    --arg disabled "$WORKSPACE_HERMES_CLI_TOOLSETS_DISABLED" '
+      ($disabled | split(" ")) as $off
+      | ((. // []) + ($enabled | split(" ")) | unique)
+      | map(. as $tool | select(($off | index($tool)) == null))
+    ' 2>/dev/null) || return 1
+  nemohermes hermes config set --key platform_toolsets.cli --value "$toolsets" >/dev/null 2>&1
 }
 
 workspace_hermes_cli_toolsets_ready() {
