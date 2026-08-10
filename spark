@@ -4708,7 +4708,7 @@ step_tailscale() {
 tailscale_funnel_status_active() {
   command -v tailscale >/dev/null 2>&1 || return 1
   tailscale status >/dev/null 2>&1 || return 1
-  tailscale funnel status 2>/dev/null | grep -qE 'https?://'
+  tailscale funnel status 2>/dev/null | grep -qE '\(Funnel on\)|(^|[[:space:]#])Funnel on:|Available on the internet:'
 }
 
 tailscale_funnel_show_status() {
@@ -4777,13 +4777,13 @@ step_tailscale_funnel() {
   local auto_yes="$1" check_only="$2" action="${3:-}" choice
   tailscale_funnel_action_valid "$action" || die "--funnel-action must be reset or abort"
   ctx_run 'command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1' >/dev/null 2>&1 || return 0
-  ctx_run "tailscale funnel status 2>/dev/null | grep -qE 'https?://'" >/dev/null 2>&1 || return 0
+  ctx_run "tailscale funnel status 2>/dev/null | grep -qE '\\(Funnel on\\)|(^|[[:space:]#])Funnel on:|Available on the internet:'" >/dev/null 2>&1 || return 0
   if [[ "$check_only" == "1" ]]; then
     setup_fail "Tailscale Funnel is active; public internet exposure must be removed"
     return 1
   fi
   if [[ "$action" == "reset" ]]; then
-    if ctx_run 'tailscale funnel reset' && ! ctx_run "tailscale funnel status 2>/dev/null | grep -qE 'https?://'" >/dev/null 2>&1; then
+    if ctx_run 'tailscale funnel reset' && ! ctx_run "tailscale funnel status 2>/dev/null | grep -qE '\\(Funnel on\\)|(^|[[:space:]#])Funnel on:|Available on the internet:'" >/dev/null 2>&1; then
       info "Tailscale Funnel reset"
       return 0
     fi
@@ -4807,7 +4807,7 @@ step_tailscale_funnel() {
     read -r choice || true
     case "$choice" in
       1)
-        if ctx_run 'tailscale funnel reset' && ! ctx_run "tailscale funnel status 2>/dev/null | grep -qE 'https?://'" >/dev/null 2>&1; then
+        if ctx_run 'tailscale funnel reset' && ! ctx_run "tailscale funnel status 2>/dev/null | grep -qE '\\(Funnel on\\)|(^|[[:space:]#])Funnel on:|Available on the internet:'" >/dev/null 2>&1; then
           info "Tailscale Funnel reset"
           return 0
         fi

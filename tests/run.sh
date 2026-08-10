@@ -2021,7 +2021,7 @@ test_setup_check_reports_tailscale_funnel() {
   set +e
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com (Funnel on)\n' \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
     "$SPARK" setup --check </dev/null 2>&1)
   status=$?
@@ -2042,11 +2042,23 @@ test_doctor_reports_tailscale_funnel() {
 
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com (Funnel on)\n' \
     "$SPARK" doctor 2>&1)
   rm -rf "$tmp"
 
   [[ "$output" == *"Tailscale Funnel"* ]] && [[ "$output" == *"active public exposure"* ]]
+}
+
+test_tailscale_funnel_ignores_tailnet_only_services() {
+  local tmp fake_bin
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://hermes.example.ts.net (tailnet only) (svc:hermes)\n' \
+    bash -c 'source "$1"; ! tailscale_funnel_status_active' _ "$SPARK"
+  rm -rf "$tmp"
 }
 
 test_doctor_json_quiet_and_exit_codes() {
@@ -4475,7 +4487,7 @@ test_workspace_setup_blocks_tailscale_funnel() {
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_EXIT=0 FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_EXIT=0 FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com (Funnel on)\n' \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha 2>&1)
@@ -4503,7 +4515,7 @@ test_workspace_setup_resets_tailscale_funnel_with_flag() {
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_EXIT=0 FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_EXIT=0 FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com (Funnel on)\n' \
     FAKE_TAILSCALE_FUNNEL_RESET_MARKER="${tmp}/funnel.reset" \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
@@ -4526,7 +4538,7 @@ test_workspace_setup_check_reports_funnel_without_reset() {
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com (Funnel on)\n' \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" FAKE_NAMES='spark-litellm\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --task-manager vikunja --check --model Org/Alpha 2>&1)
@@ -6586,7 +6598,7 @@ test_workspace_doctor_flags_tailscale_funnel_enabled() {
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_STATUS='https://tasks.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://tasks.example.com (Funnel on)\n' \
     FAKE_NAMES='spark-litellm\n' FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
@@ -8744,6 +8756,7 @@ run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_ca
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "setup --check reports Tailscale Funnel" test_setup_check_reports_tailscale_funnel
 run_test "doctor reports Tailscale Funnel risk" test_doctor_reports_tailscale_funnel
+run_test "Funnel detection ignores tailnet-only services" test_tailscale_funnel_ignores_tailnet_only_services
 run_test "doctor supports JSON, quiet, and failure exit codes" test_doctor_json_quiet_and_exit_codes
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
 run_test "dry-run uses JSON profiles without executing model data" test_dry_run_uses_json_profile_safely
