@@ -3724,9 +3724,11 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
     [[ "$nemo_calls" == *"hermes skill install "*"/hermes-skills/vikunja"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set model.max_tokens 512"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set model.context_length 65536"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set agent.reasoning_effort none"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --key model.max_tokens --value 512"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --key model.context_length --value 65536"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --key agent.reasoning_effort --value none"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --key platform_toolsets.cli --value"* ]] &&
+    [[ "$nemo_calls" != *"hermes exec --no-tty --timeout 30 -- hermes config set"* ]] &&
     [[ "$nemo_calls" == *"hermes gateway restart --quiet"* ]] &&
     [[ "$docker_calls" == *"--name spark-hermes-litellm-proxy"* ]] &&
     [[ "$docker_calls" == *"172.19.0.1 4000 127.0.0.1 4000"* ]] &&
