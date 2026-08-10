@@ -3445,11 +3445,11 @@ test_workspace_hermes_runtime_uses_supported_config_writes() {
     FAKE_HERMES_TOOLS_LIST=$'Built-in toolsets (cli):\n  enabled  terminal\n  enabled  browser' \
     bash -c 'source "$1"; workspace_hermes_cli_toolsets_ready' _ "$SPARK" || wrong=$?
   rm -rf "$tmp"
-  [[ "$calls" == *"hermes config set --key model.max_tokens --value 512"* ]] &&
-    [[ "$calls" == *"hermes config set --key model.context_length --value 65536"* ]] &&
-    [[ "$calls" == *"hermes config set --key agent.reasoning_effort --value none"* ]] &&
+  [[ "$calls" == *"hermes config set --config-accept-new-path --key model.max_tokens --value 512"* ]] &&
+    [[ "$calls" == *"hermes config set --config-accept-new-path --key model.context_length --value 65536"* ]] &&
+    [[ "$calls" == *"hermes config set --config-accept-new-path --key agent.reasoning_effort --value none"* ]] &&
     [[ "$calls" == *"hermes config get --key platform_toolsets.cli --format json"* ]] &&
-    [[ "$calls" == *"hermes config set --key platform_toolsets.cli --value"* ]] &&
+    [[ "$calls" == *"hermes config set --config-accept-new-path --key platform_toolsets.cli --value"* ]] &&
     [[ "$calls" != *"hermes exec --no-tty --timeout 30 -- hermes config set"* ]] &&
     [[ "$calls" != *"hermes tools enable"* ]] &&
     [[ "$calls" != *"hermes tools disable"* ]] &&
@@ -3724,10 +3724,10 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
     [[ "$nemo_calls" == *"hermes skill install "*"/hermes-skills/vikunja"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set --key model.max_tokens --value 512"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set --key model.context_length --value 65536"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set --key agent.reasoning_effort --value none"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set --key platform_toolsets.cli --value"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key model.max_tokens --value 512"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key model.context_length --value 65536"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key agent.reasoning_effort --value none"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key platform_toolsets.cli --value"* ]] &&
     [[ "$nemo_calls" != *"hermes exec --no-tty --timeout 30 -- hermes config set"* ]] &&
     [[ "$nemo_calls" == *"hermes gateway restart --quiet"* ]] &&
     [[ "$docker_calls" == *"--name spark-hermes-litellm-proxy"* ]] &&

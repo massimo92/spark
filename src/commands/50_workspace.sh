@@ -3171,9 +3171,9 @@ workspace_configure_hermes_runtime() {
   [[ "$max_tokens" =~ ^[1-9][0-9]*$ ]] || max_tokens="$WORKSPACE_HERMES_MAX_TOKENS_DEFAULT"
   [[ "$context" =~ ^[0-9]+$ && "$context" -ge "$WORKSPACE_HERMES_MIN_CONTEXT" ]] || context="$WORKSPACE_HERMES_MIN_CONTEXT"
   [[ "$reasoning" == "none" ]] || reasoning="$WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT"
-  nemohermes hermes config set --key model.max_tokens --value "$max_tokens" >/dev/null 2>&1 &&
-    nemohermes hermes config set --key model.context_length --value "$context" >/dev/null 2>&1 &&
-    nemohermes hermes config set --key agent.reasoning_effort --value "$reasoning" >/dev/null 2>&1 &&
+  nemohermes hermes config set --config-accept-new-path --key model.max_tokens --value "$max_tokens" >/dev/null 2>&1 &&
+    nemohermes hermes config set --config-accept-new-path --key model.context_length --value "$context" >/dev/null 2>&1 &&
+    nemohermes hermes config set --config-accept-new-path --key agent.reasoning_effort --value "$reasoning" >/dev/null 2>&1 &&
     workspace_configure_hermes_cli_toolsets
 }
 
@@ -3187,7 +3187,7 @@ workspace_configure_hermes_cli_toolsets() {
       | ((. // []) + ($enabled | split(" ")) | unique)
       | map(. as $tool | select(($off | index($tool)) == null))
     ' 2>/dev/null) || return 1
-  nemohermes hermes config set --key platform_toolsets.cli --value "$toolsets" >/dev/null 2>&1
+  nemohermes hermes config set --config-accept-new-path --key platform_toolsets.cli --value "$toolsets" >/dev/null 2>&1
 }
 
 workspace_hermes_cli_toolsets_ready() {
