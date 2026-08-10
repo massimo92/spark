@@ -3179,12 +3179,12 @@ workspace_configure_hermes_runtime() {
 
 workspace_configure_hermes_cli_toolsets() {
   local current toolsets
-  current=$(nemohermes hermes config get --key platform_toolsets.cli --format json 2>/dev/null) || return 1
+  current=$(nemohermes hermes config get --format json 2>/dev/null) || return 1
   toolsets=$(printf '%s\n' "$current" | jq -c \
     --arg enabled "$WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT" \
     --arg disabled "$WORKSPACE_HERMES_CLI_TOOLSETS_DISABLED" '
       ($disabled | split(" ")) as $off
-      | ((. // []) + ($enabled | split(" ")) | unique)
+      | ((.platform_toolsets.cli // []) + ($enabled | split(" ")) | unique)
       | map(. as $tool | select(($off | index($tool)) == null))
     ' 2>/dev/null) || return 1
   nemohermes hermes config set --config-accept-new-path --key platform_toolsets.cli --value "$toolsets" >/dev/null 2>&1

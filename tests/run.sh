@@ -778,8 +778,12 @@ Update available:         no}"
   *"inference get"*) echo "${FAKE_NEMOHERMES_INFERENCE_TEXT:-Provider: compatible-endpoint Model: main}" ;;
   *"hermes config get --key model.default --format json"*) printf '"%s"\n' "${FAKE_HERMES_CONFIG_MODEL:-main}" ;;
   *"hermes config get --key _nemoclaw_upstream.model --format json"*) printf '"%s"\n' "${FAKE_HERMES_CONFIG_UPSTREAM_MODEL:-${FAKE_HERMES_CONFIG_MODEL:-main}}" ;;
-  *"hermes config get --key platform_toolsets.cli --format json"*)
-    printf '%s\n' "${FAKE_HERMES_CLI_TOOLSETS_JSON:-[\"audio\",\"browser\",\"nemoclaw\"]}" ;;
+  *"hermes config get --format json"*)
+    if [[ -n "${FAKE_HERMES_CONFIG_JSON:-}" ]]; then
+      printf '%s\n' "$FAKE_HERMES_CONFIG_JSON"
+    else
+      printf '%s\n' '{"platform_toolsets":{"cli":["audio","browser","nemoclaw"]}}'
+    fi ;;
   *"policy-explain --json"*) echo "${FAKE_NEMOHERMES_POLICY_JSON:-{\"tier\":\"restricted\",\"appliedPresets\":[]}}" ;;
   *"policy-explain"*) echo "${FAKE_NEMOHERMES_POLICY_TEXT:-Policy tier: restricted}" ;;
   *"policy-list"*) echo "${FAKE_NEMOHERMES_POLICY_LIST:-restricted}" ;;
@@ -3439,6 +3443,7 @@ test_workspace_hermes_runtime_uses_supported_config_writes() {
   local tmp fake_bin calls wrong=0
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_HERMES_CONFIG_JSON='{}' \
     bash -c 'source "$1"; workspace_configure_hermes_runtime; workspace_hermes_cli_toolsets_ready' _ "$SPARK"
   calls=$(cat "${tmp}/nemohermes.log")
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
@@ -3448,7 +3453,7 @@ test_workspace_hermes_runtime_uses_supported_config_writes() {
   [[ "$calls" == *"hermes config set --config-accept-new-path --key model.max_tokens --value 512"* ]] &&
     [[ "$calls" == *"hermes config set --config-accept-new-path --key model.context_length --value 65536"* ]] &&
     [[ "$calls" == *"hermes config set --config-accept-new-path --key agent.reasoning_effort --value none"* ]] &&
-    [[ "$calls" == *"hermes config get --key platform_toolsets.cli --format json"* ]] &&
+    [[ "$calls" == *"hermes config get --format json"* ]] &&
     [[ "$calls" == *"hermes config set --config-accept-new-path --key platform_toolsets.cli --value"* ]] &&
     [[ "$calls" != *"hermes exec --no-tty --timeout 30 -- hermes config set"* ]] &&
     [[ "$calls" != *"hermes tools enable"* ]] &&
