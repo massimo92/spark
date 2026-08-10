@@ -357,7 +357,8 @@ workspace_select_model() {
 }
 
 workspace_repair_model_server() {
-  local check_only="$1" auto_yes="$2" model="$3" args=(--model "$model" --tools --max-len "$WORKSPACE_HERMES_MIN_CONTEXT" --no-mtp)
+  local check_only="$1" auto_yes="$2" model="$3"
+  local args=(--model "$model" --tools --max-len "$WORKSPACE_HERMES_MIN_CONTEXT" --no-mtp)
   [[ "$check_only" == "1" ]] && args+=(--check)
   [[ "$auto_yes" == "1" ]] && args+=(--yes)
   cmd_repair "${args[@]}"
