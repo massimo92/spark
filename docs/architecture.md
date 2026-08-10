@@ -8,6 +8,7 @@ Project: spark by Massimo Angelini - https://github.com/massimo92/spark
 - The root `spark` file is a generated single-file release artifact.
 - This release artifact is still the product boundary: `install.sh`, `spark update`, and remote setup copy or download one file.
 - Main runtime domains are platform detection, model profiling, vLLM, Ollama, setup, workspace, gateway, and CLI dispatch.
+- `spark repair` owns model and LiteLLM recovery for the model server. `spark ws repair` owns only the agent workspace and delegates that base recovery.
 - `tests/run.sh` is also monolithic, but it gives broad fake-bin integration coverage across Docker, Tailscale, Ollama, n8n, Vikunja, Hermes, and shell edge cases.
 - CI already runs syntax, ShellCheck, and full tests on Linux and macOS.
 

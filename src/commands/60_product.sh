@@ -661,7 +661,8 @@ cmd_architecture() {
     profile       read model metadata, compute weights/KV/need, cache JSON
     vllm          Docker launch, capacity admission, startup supervision
     ollama        native Ollama launch/pull/status path
-    setup         local/remote install through ctx_* target abstraction
+    setup         local/remote model-server install through ctx_* target abstraction
+    repair        explicit model+LiteLLM reconciliation for the model server
     workspace     Task manager+n8n+Postgres+Hermes lifecycle and doctor
     gateway       LiteLLM provider config, YAML generation, container runtime
     product       dashboard, status, recommendations, uninstall/reinstall
@@ -671,6 +672,7 @@ cmd_architecture() {
     run_backend_* reads cmd_run locals via Bash dynamic scope.
     build_launch reads run_backend_vllm locals and rebuilds docker args.
     setup steps must use ctx_* helpers so local and remote stay equivalent.
+    workspace repair delegates model and LiteLLM recovery to spark repair.
     workspace setup --check and doctor must stay read-only.
     gateway config is JSON; generated LiteLLM YAML is derived state.
 
@@ -698,6 +700,7 @@ cmd_help() {
 
   ${BOLD}Commands:${NC}
     setup            Set up a model server — this machine or a remote one over SSH
+    repair           Repair the model server (model + LiteLLM main route)
     dashboard        Web dashboard, with an optional terminal view
     status           One-shot health and runtime snapshot
     ws               Set up a private agent workspace (task manager + n8n + Hermes)
@@ -773,6 +776,8 @@ cmd_help() {
     spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4   # second model, co-resident
     spark run --dry-run Qwen/Qwen3-30B-A3B
     spark status
+    spark repair --yes
+    spark ws repair --yes
     spark stop RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark gateway start
     spark reinstall --yes

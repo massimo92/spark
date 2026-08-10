@@ -3067,12 +3067,13 @@ make_min_workspace_config() {
 }
 
 test_help_text_tracks_current_cli() {
-  local top dashboard gateway config models reinstall uninstall ws recover setup_error status
+  local top dashboard gateway config models repair reinstall uninstall ws recover setup_error status
   top=$("$SPARK" help 2>&1)
   dashboard=$("$SPARK" dashboard --help 2>&1)
   gateway=$("$SPARK" gateway --help 2>&1)
   config=$("$SPARK" config --help 2>&1)
   models=$("$SPARK" models --help 2>&1)
+  repair=$("$SPARK" repair --help 2>&1)
   reinstall=$("$SPARK" reinstall --help 2>&1)
   uninstall=$("$SPARK" uninstall --help 2>&1)
   ws=$("$SPARK" ws --help 2>&1)
@@ -3094,6 +3095,8 @@ test_help_text_tracks_current_cli() {
     [[ "$gateway" == *"start|stop|status|logs|add|remove"* ]] &&
     [[ "$config" == *"auto-update on|off"* ]] &&
     [[ "$models" == *"recommend [--json]"* ]] &&
+    [[ "$top" == *"repair           Repair the model server"* ]] &&
+    [[ "$repair" == *"selected model, LiteLLM"* ]] &&
     [[ "$reinstall" == *"--purge-models|--keep-models"* ]] &&
     [[ "$uninstall" == *"-y|--yes"* ]] &&
     [[ "$ws" == *"Reset a Vikunja human or n8n owner password"* ]] &&
@@ -3127,7 +3130,7 @@ test_workspace_lifecycle_commands() {
     workspace_migrate_runtime_config() { printf "migrate\n" >> "$CALLS"; }
     workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Model\n"; }
     workspace_compose() { printf "compose %s\n" "$*" >> "$CALLS"; }
-    workspace_ensure_gateway() { printf "gateway %s\n" "$*" >> "$CALLS"; }
+    cmd_repair() { printf "repair %s\n" "$*" >> "$CALLS"; }
     workspace_tailscale_services_configured() { return 0; }
     workspace_start_hermes_gateway_proxy() { printf "bridge start\n" >> "$CALLS"; }
     workspace_stop_hermes_gateway_proxy() { printf "bridge stop\n" >> "$CALLS"; }
@@ -3154,7 +3157,7 @@ test_workspace_lifecycle_commands() {
   rm -rf "$tmp"
   [[ "$calls" == *"migrate"* ]] &&
     [[ "$calls" == *"compose up -d --remove-orphans"* ]] &&
-    [[ "$calls" == *"gateway 0 1 Org/Model"* ]] &&
+    [[ "$calls" == *"repair --model Org/Model --tools --max-len 65536 --no-mtp --yes"* ]] &&
     [[ "$calls" == *"bridge start"* ]] &&
     [[ "$calls" == *"tasks bridge start"* ]] &&
     [[ "$calls" == *"dashboard proxy start"* ]] &&
@@ -3213,7 +3216,7 @@ test_workspace_repair_rebuilds_mcp_drift_and_reconciles() {
     workspace_migrate_runtime_config() { printf "migrate\n" >> "$SPARK_TEST_LOG"; }
     workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Alpha\n"; }
     workspace_compose() { printf "compose:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
-    workspace_ensure_gateway() { printf "gateway:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+    cmd_repair() { printf "base-repair:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
     workspace_start_hermes_gateway_proxy() { printf "inference-proxy\n" >> "$SPARK_TEST_LOG"; }
     workspace_hermes_mcp_config_drift_detected() { return 0; }
     nemohermes_rebuild_with_workspace_env() { printf "rebuild:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
@@ -3228,7 +3231,7 @@ test_workspace_repair_rebuilds_mcp_drift_and_reconciles() {
   calls=$(cat "$log" 2>/dev/null || true)
   rm -rf "$tmp"
   [[ "$status" -eq 0 ]] &&
-    [[ "$calls" == *"gateway:0 1 Org/Alpha"* ]] &&
+    [[ "$calls" == *"base-repair:--model Org/Alpha --tools --max-len 65536 --no-mtp --yes"* ]] &&
     [[ "$calls" == *"rebuild:--yes"* ]] &&
     [[ "$calls" == *$'rebuild:--yes\nstart\nruntime\ntodoist\ndoctor:--verbose'* ]]
 }
@@ -3242,7 +3245,7 @@ test_workspace_repair_force_rebuild_is_explicit() {
     workspace_migrate_runtime_config() { :; }
     workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Alpha\n"; }
     workspace_compose() { :; }
-    workspace_ensure_gateway() { :; }
+    cmd_repair() { :; }
     workspace_start_hermes_gateway_proxy() { :; }
     workspace_hermes_mcp_config_drift_detected() { return 0; }
     nemohermes_rebuild_with_workspace_env() { printf "%s\n" "$*" >> "$SPARK_TEST_LOG"; }
@@ -3358,7 +3361,7 @@ test_workspace_listener_check_allows_only_openshell_gateway_bridge() {
   ' _ "$SPARK"
 }
 
-test_workspace_model_start_disables_mtp_for_reliable_recovery() {
+test_repair_starts_model_with_requested_policy() {
   local tmp out
   tmp=$(mktemp -d)
   mkdir -p "${tmp}/home/.config/spark"
@@ -3366,15 +3369,32 @@ test_workspace_model_start_disables_mtp_for_reliable_recovery() {
   out=$(HOME="${tmp}/home" bash -c '
     source "$1"
     docker() { [[ "$*" == *"ps --format"* ]] && printf "%s\n" "$GATEWAY_CONTAINER"; }
-    workspace_model_state() { printf "stopped\n"; }
+    model_server_state() { printf "stopped\n"; }
+    model_server_ensure_gateway_config() { :; }
+    gateway_set_main_model() { :; }
+    gateway_rendered_config_ready() { return 0; }
     cmd_run() { printf "%s\n" "$*"; }
-    workspace_ensure_gateway 0 1 Org/Model
+    cmd_repair --model Org/Model --yes --tools --max-len 65536 --no-mtp
   ' _ "$SPARK")
   rm -rf "$tmp"
   [[ "$out" == *"Org/Model --no-mtp --tools --max-len 65536"* ]] && [[ "$out" != *"--no-wait"* ]]
 }
 
-test_workspace_model_restarts_without_tool_calling() {
+test_repair_defaults_to_litellm_main_model() {
+  local tmp out
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"main":{"provider":"vllm","model":"Org/Main"}}' > "${tmp}/home/.config/spark/gateway.json"
+  out=$(HOME="${tmp}/home" bash -c '
+    source "$1"
+    model_server_repair() { printf "%s\n" "$*"; }
+    cmd_repair --yes
+  ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$out" == *"0 1 Org/Main 0  0"* ]]
+}
+
+test_repair_restarts_model_without_tool_calling() {
   local tmp out
   tmp=$(mktemp -d)
   mkdir -p "${tmp}/home/.config/spark"
@@ -3382,16 +3402,20 @@ test_workspace_model_restarts_without_tool_calling() {
   out=$(HOME="${tmp}/home" bash -c '
     source "$1"
     docker() { [[ "$*" == *"ps --format"* ]] && printf "%s\n" "$GATEWAY_CONTAINER"; }
-    workspace_model_state() { printf "running+routed\n"; }
-    workspace_model_tool_calling_ready() { return 1; }
+    model_server_state() { printf "running+routed\n"; }
+    model_server_tool_calling_ready() { return 1; }
+    model_server_context_ready() { return 0; }
+    model_server_ensure_gateway_config() { :; }
+    gateway_set_main_model() { :; }
+    gateway_rendered_config_ready() { return 0; }
     cmd_run() { printf "%s\n" "$*"; }
-    workspace_ensure_gateway 0 1 Org/Model
+    cmd_repair --model Org/Model --yes --tools --max-len 65536 --no-mtp
   ' _ "$SPARK")
   rm -rf "$tmp"
   [[ "$out" == *"Org/Model --no-mtp --tools --max-len 65536 --force"* ]]
 }
 
-test_workspace_model_tool_calling_requires_expected_parser() {
+test_repair_model_tool_calling_requires_expected_parser() {
   local tmp fake_bin wrong=0 right=0 profile
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   mkdir -p "${tmp}/home/.config/spark/profiles"
@@ -3400,11 +3424,11 @@ test_workspace_model_tool_calling_requires_expected_parser() {
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
     FAKE_DOCKER_CMD_JSON='["Org/Model","--enable-auto-tool-choice","--tool-call-parser","qwen3_xml"]' \
-    bash -c 'source "$1"; workspace_model_tool_calling_ready Org/Model' _ "$SPARK" || wrong=$?
+    bash -c 'source "$1"; model_server_tool_calling_ready Org/Model' _ "$SPARK" || wrong=$?
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
     FAKE_DOCKER_CMD_JSON='["Org/Model","--enable-auto-tool-choice","--tool-call-parser","qwen3_coder"]' \
-    bash -c 'source "$1"; workspace_model_tool_calling_ready Org/Model' _ "$SPARK" || right=$?
+    bash -c 'source "$1"; model_server_tool_calling_ready Org/Model' _ "$SPARK" || right=$?
   rm -rf "$tmp"
   [[ "$wrong" -ne 0 && "$right" -eq 0 ]]
 }
@@ -8861,9 +8885,10 @@ run_test "workspace Hermes start recovers stopped agent gateway" test_workspace_
 run_test "workspace bridge waits for delayed readiness" test_workspace_bridge_waits_for_delayed_readiness
 run_test "workspace dashboard proxy rewrites Host on loopback" test_workspace_dashboard_proxy_rewrites_host_on_loopback
 run_test "workspace listener check allows OpenShell gateway bridge" test_workspace_listener_check_allows_only_openshell_gateway_bridge
-run_test "workspace model recovery disables MTP" test_workspace_model_start_disables_mtp_for_reliable_recovery
-run_test "workspace model recovery enables tool calling" test_workspace_model_restarts_without_tool_calling
-run_test "workspace model requires expected tool parser" test_workspace_model_tool_calling_requires_expected_parser
+run_test "repair starts model with requested policy" test_repair_starts_model_with_requested_policy
+run_test "repair defaults to LiteLLM main model" test_repair_defaults_to_litellm_main_model
+run_test "repair restarts model without tool calling" test_repair_restarts_model_without_tool_calling
+run_test "repair model requires expected tool parser" test_repair_model_tool_calling_requires_expected_parser
 run_test "workspace Hermes uses balanced CLI toolsets" test_workspace_hermes_toolsets_are_balanced
 run_test "workspace status uses Tailscale Services config" test_workspace_status_uses_tailscale_services_config
 run_test "workspace restores OpenShell Hermes container name" test_workspace_restores_openshell_hermes_name
