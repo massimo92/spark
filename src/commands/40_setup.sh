@@ -1093,6 +1093,188 @@ setup_summary() {
   fi
 }
 
+model_server_state() {
+  local model="$1" name m rest running=0 route_ok=0
+  while IFS=$'\t' read -r name m rest; do
+    [[ "$m" == "$model" ]] && running=1
+  done < <(list_managed_containers)
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    route_ok=1
+  fi
+  if [[ "$running" == "1" && "$route_ok" == "1" ]]; then printf 'running+routed'
+  elif [[ "$running" == "1" ]]; then printf 'running'
+  else printf 'stopped'; fi
+}
+
+model_server_tool_calling_ready() {
+  local model="$1" container args parser profile_file expected=""
+  [[ "$BACKEND" == "vllm" ]] || return 0
+  [[ -n "$model" ]] || return 1
+  container=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  args=$(docker inspect -f '{{json .Config.Cmd}}' "$container" 2>/dev/null || true)
+  parser=$(printf '%s\n' "$args" | jq -er '
+    if type == "array" and index("--enable-auto-tool-choice") != null then
+      index("--tool-call-parser") as $i |
+      if $i != null and ($i + 1) < length then .[$i + 1] else empty end
+    else empty end
+  ' 2>/dev/null) || return 1
+  [[ -n "$parser" ]] || return 1
+  profile_file="${PROFILES_DIR}/$(printf '%s' "$model" | sed 's/\//--/g').json"
+  if [[ -f "$profile_file" ]]; then
+    expected=$(jq -r '
+      if .hf.raw.model_type == "qwen3_5" then "qwen3_coder"
+      else (.tool_call_parser // "") end
+    ' "$profile_file" 2>/dev/null || true)
+  fi
+  [[ -z "$expected" || "$parser" == "$expected" ]]
+}
+
+model_server_context_ready() {
+  local model="$1" minimum="$2" container max_len
+  [[ "$BACKEND" == "vllm" ]] || return 0
+  container=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  max_len=$(docker inspect -f '{{index .Config.Labels "spark.max_model_len"}}' "$container" 2>/dev/null || true)
+  [[ "$max_len" =~ ^[0-9]+$ && "$max_len" -ge "$minimum" ]]
+}
+
+model_server_ensure_gateway_config() {
+  local check_only="$1" provider="$2" gw_json
+  [[ -f "$GATEWAY_CONFIG" ]] && return 0
+  if [[ "$check_only" == "1" ]]; then
+    err "LiteLLM gateway is not configured"
+    printf "    Run: spark setup\n"
+    return 1
+  fi
+  gw_json=$(jq -n --argjson port "$GATEWAY_PORT" \
+    --argjson vllm_en "$( [[ "$provider" == "vllm" ]] && echo true || echo false )" \
+    --argjson ollama_en "$( [[ "$provider" == "ollama" ]] && echo true || echo false )" \
+    '{enabled:true, port:$port, providers:{
+      vllm:{enabled:$vllm_en, port:8000},
+      ollama:{enabled:$ollama_en},
+      openrouter:{enabled:false, api_key:""},
+      zen:{enabled:false, api_key:""},
+      together:{enabled:false, api_key:""}
+    }}') || return 1
+  gateway_save_config "$gw_json"
+  info "Configured LiteLLM gateway"
+}
+
+model_server_resolve_repair_model() {
+  local requested="${1:-}" configured="" name model port rest count=0 only=""
+  [[ -n "$requested" ]] && { printf '%s\n' "$requested"; return 0; }
+  if [[ -f "$GATEWAY_CONFIG" ]]; then
+    configured=$(jq -r '.main.model // ""' "$GATEWAY_CONFIG" 2>/dev/null || true)
+  fi
+  [[ -n "$configured" ]] && { printf '%s\n' "$configured"; return 0; }
+  while IFS=$'\t' read -r name model port rest; do
+    [[ -n "$model" ]] || continue
+    count=$((count + 1)); only="$model"
+  done < <(list_managed_containers)
+  [[ "$count" -eq 1 ]] && printf '%s\n' "$only"
+}
+
+model_server_repair() {
+  local check_only="$1" auto_yes="$2" model="$3" require_tools="$4" minimum_context="$5" disable_mtp="$6"
+  local provider="vllm" state restart=0 configured_provider configured_model args=("$model")
+  [[ "$BACKEND" == "ollama" ]] && provider="ollama"
+  model_server_ensure_gateway_config "$check_only" "$provider" || return 1
+  state=$(model_server_state "$model")
+  [[ "$disable_mtp" == "1" ]] && args+=(--no-mtp)
+  [[ "$require_tools" == "1" ]] && args+=(--tools)
+  [[ -n "$minimum_context" ]] && args+=(--max-len "$minimum_context")
+
+  if [[ "$state" == *"running"* ]]; then
+    [[ "$require_tools" == "1" ]] && ! model_server_tool_calling_ready "$model" && restart=1
+    [[ -n "$minimum_context" ]] && ! model_server_context_ready "$model" "$minimum_context" && restart=1
+    if [[ "$restart" == "1" ]]; then
+      if [[ "$check_only" == "1" ]]; then
+        err "Running model does not satisfy the requested repair policy: ${model}"
+        return 1
+      fi
+      info "Restarting ${model} with the requested model-server policy"
+      cmd_run "${args[@]}" --force
+    fi
+  else
+    if [[ "$check_only" == "1" ]]; then
+      err "Model is not running: ${model}"
+      return 1
+    fi
+    if [[ "$auto_yes" != "1" ]] && ! confirm "Start ${model} now?"; then
+      return 1
+    fi
+    cmd_run "${args[@]}"
+  fi
+
+  if [[ "$check_only" == "1" ]]; then
+    configured_provider=$(jq -r '.main.provider // ""' "$GATEWAY_CONFIG" 2>/dev/null || true)
+    configured_model=$(jq -r '.main.model // ""' "$GATEWAY_CONFIG" 2>/dev/null || true)
+    [[ "$configured_provider" == "$provider" && "$configured_model" == "$model" ]] || {
+      err "LiteLLM main does not target ${provider}/${model}"
+      return 1
+    }
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$" || {
+      err "LiteLLM gateway is not running"
+      return 1
+    }
+    gateway_rendered_config_ready || {
+      err "LiteLLM rendered configuration is stale"
+      return 1
+    }
+    return 0
+  fi
+
+  gateway_set_main_model "$provider" "$model" || {
+    err "Could not select LiteLLM main model"
+    return 1
+  }
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    if ! gateway_rendered_config_ready; then
+      info "Refreshing LiteLLM main route"
+      gateway_restart || { err "Could not refresh LiteLLM gateway"; return 1; }
+    else
+      info "LiteLLM gateway: running"
+    fi
+  else
+    if [[ "$auto_yes" != "1" ]] && ! confirm "Start the LiteLLM gateway now?"; then
+      return 1
+    fi
+    gateway_start || { err "Could not start LiteLLM gateway"; return 1; }
+  fi
+}
+
+cmd_repair_help() {
+  cat <<EOF
+
+  ${BOLD}Usage:${NC} spark repair [--model MODEL] [--yes] [--check] [--tools] [--max-len TOKENS] [--no-mtp]
+
+  Repairs the model server created by spark setup: the selected model, LiteLLM,
+  and the static main route. It never repairs the agent workspace.
+
+EOF
+}
+
+cmd_repair() {
+  local auto_yes=0 check_only=0 model="" require_tools=0 minimum_context="" disable_mtp=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) auto_yes=1; shift ;;
+      --check) check_only=1; shift ;;
+      --model) model="${2:-}"; [[ -n "$model" ]] || die "--model requires a value"; shift 2 ;;
+      --tools) require_tools=1; shift ;;
+      --max-len) minimum_context="${2:-}"; is_positive_int "$minimum_context" || die "--max-len requires a positive integer"; shift 2 ;;
+      --no-mtp) disable_mtp=1; shift ;;
+      -h|--help) cmd_repair_help; return 0 ;;
+      *) die "Unknown repair flag: $1" ;;
+    esac
+  done
+  model=$(model_server_resolve_repair_model "$model")
+  [[ -n "$model" ]] || die "No model selected for repair" "Use: spark repair --model ORG/MODEL"
+  printf "\n  ${BOLD}spark repair${NC} — model server\n\n"
+  model_server_repair "$check_only" "$auto_yes" "$model" "$require_tools" "$minimum_context" "$disable_mtp"
+}
+
 cmd_setup_help() {
   cat <<EOF
 

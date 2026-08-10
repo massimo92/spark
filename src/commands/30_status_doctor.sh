@@ -444,7 +444,7 @@ cmd_doctor() {
       if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
         doctor_pass "Gateway" "LiteLLM" "running as ${GATEWAY_CONTAINER}"
       else
-        doctor_fail "Gateway" "LiteLLM" "configured but not running" "spark gateway start"
+        doctor_fail "Gateway" "LiteLLM" "configured but not running" "spark repair --yes"
       fi
     else
       doctor_skip "Gateway" "LiteLLM" "disabled"

@@ -206,7 +206,8 @@ CALIBRATE_CUDAGRAPH="${SPARK_CALIBRATE_CUDAGRAPH:-1}"
 # --max-num-seqs when you need more concurrency (uses more memory).
 MAX_NUM_SEQS_DEFAULT="${SPARK_MAX_NUM_SEQS:-5}"
 # Adaptive startup supervision: wait until the model serves; auto-retry recoverable startup failures
-# (concurrency too high for the cache → lower --max-num-seqs; warmup OOM → --enforce-eager).
+# (concurrency too high for the cache → lower --max-num-seqs; insufficient KV
+# reservation → raise the memory fraction; warmup OOM → --enforce-eager).
 STARTUP_TIMEOUT="${SPARK_STARTUP_TIMEOUT:-600}"          # seconds to wait for the API to come up
 STARTUP_MAX_RETRIES="${SPARK_STARTUP_MAX_RETRIES:-2}"    # auto-retries on a recoverable failure
 # earlyoom's emergency floor: kill the hog when free RAM drops below this %. The last-resort backstop

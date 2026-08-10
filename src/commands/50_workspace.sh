@@ -312,52 +312,6 @@ workspace_url_for() {
   fi
 }
 
-workspace_model_state() {
-  local model="$1" name m rest running=0 route_ok=0
-  while IFS=$'\t' read -r name m rest; do
-    [[ "$m" == "$model" ]] && running=1
-  done < <(list_managed_containers)
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    route_ok=1
-  fi
-  if [[ "$running" == "1" && "$route_ok" == "1" ]]; then printf 'running+routed'
-  elif [[ "$running" == "1" ]]; then printf 'running'
-  else printf 'downloaded'; fi
-}
-
-workspace_model_tool_calling_ready() {
-  local model="$1" container args parser profile_file expected=""
-  [[ "$BACKEND" == "vllm" ]] || return 0
-  [[ -n "$model" ]] || return 1
-  container=$(container_for_ref "$model" 2>/dev/null || true)
-  [[ -n "$container" ]] || return 1
-  args=$(docker inspect -f '{{json .Config.Cmd}}' "$container" 2>/dev/null || true)
-  parser=$(printf '%s\n' "$args" | jq -er '
-    if type == "array" and index("--enable-auto-tool-choice") != null then
-      index("--tool-call-parser") as $i |
-      if $i != null and ($i + 1) < length then .[$i + 1] else empty end
-    else empty end
-  ' 2>/dev/null) || return 1
-  [[ -n "$parser" ]] || return 1
-  profile_file="${PROFILES_DIR}/$(printf '%s' "$model" | sed 's/\//--/g').json"
-  if [[ -f "$profile_file" ]]; then
-    expected=$(jq -r '
-      if .hf.raw.model_type == "qwen3_5" then "qwen3_coder"
-      else (.tool_call_parser // "") end
-    ' "$profile_file" 2>/dev/null || true)
-  fi
-  [[ -z "$expected" || "$parser" == "$expected" ]]
-}
-
-workspace_model_context_ready() {
-  local model="$1" container max_len
-  [[ "$BACKEND" == "vllm" ]] || return 0
-  container=$(container_for_ref "$model" 2>/dev/null || true)
-  [[ -n "$container" ]] || return 1
-  max_len=$(docker inspect -f '{{index .Config.Labels "spark.max_model_len"}}' "$container" 2>/dev/null || true)
-  [[ "$max_len" =~ ^[0-9]+$ && "$max_len" -ge "$WORKSPACE_HERMES_MIN_CONTEXT" ]]
-}
-
 workspace_litellm_model_name() {
   printf 'main\n'
 }
@@ -387,7 +341,7 @@ workspace_select_model() {
   is_interactive || die "Choose a model with --model in non-interactive mode"
   printf "\n  ${BOLD}Choose the model Hermes will use:${NC}\n\n" >&2
   for i in "${!MODEL_LIST_MODELS[@]}"; do
-    state=$(workspace_model_state "${MODEL_LIST_MODELS[$i]}")
+    state=$(model_server_state "${MODEL_LIST_MODELS[$i]}")
     [[ "${MODEL_LIST_STATUS[$i]:-complete}" == "partial" ]] && state="partial"
     printf "    [%d] %-45s %-10s %s\n" "$((i + 1))" "${MODEL_LIST_MODELS[$i]}" "${MODEL_LIST_SIZES[$i]}" "$state" >&2
   done
@@ -402,66 +356,12 @@ workspace_select_model() {
   done
 }
 
-workspace_ensure_gateway() {
-  local check_only="$1" auto_yes="$2" model="$3" prov="vllm" model_state=""
-  [[ "$BACKEND" == "ollama" ]] && prov="ollama"
-  if [[ ! -f "$GATEWAY_CONFIG" ]]; then
-    if [[ "$check_only" == "1" ]]; then
-      setup_fail "LiteLLM gateway not configured"; return 0
-    fi
-    local gw_json
-    gw_json=$(jq -n --argjson port "$GATEWAY_PORT" \
-      --argjson vllm_en "$( [[ "$prov" == "vllm" ]] && echo true || echo false )" \
-      --argjson ollama_en "$( [[ "$prov" == "ollama" ]] && echo true || echo false )" \
-      '{enabled:true, port:$port, providers:{
-        vllm:{enabled:$vllm_en, port:8000},
-        ollama:{enabled:$ollama_en},
-        openrouter:{enabled:false, api_key:""},
-        zen:{enabled:false, api_key:""},
-        together:{enabled:false, api_key:""}
-      }}')
-    gateway_save_config "$gw_json"
-    info "Configured LiteLLM gateway"
-  fi
-  if [[ -n "$model" ]]; then
-    model_state=$(workspace_model_state "$model")
-    if [[ "$model_state" == *"running"* ]] \
-        && { ! workspace_model_tool_calling_ready "$model" || ! workspace_model_context_ready "$model"; }; then
-      if [[ "$check_only" == "1" ]]; then
-        setup_fail "Hermes model needs automatic tool calling and at least ${WORKSPACE_HERMES_MIN_CONTEXT} context: $model"
-      else
-        info "Restarting ${model} with Hermes tool calling and ${WORKSPACE_HERMES_MIN_CONTEXT} context"
-        cmd_run "$model" --no-mtp --tools --max-len "$WORKSPACE_HERMES_MIN_CONTEXT" --force
-      fi
-    elif [[ "$model_state" != *"running"* ]]; then
-      if [[ "$check_only" == "1" ]]; then
-        setup_fail "Model not running for Hermes: $model"
-      elif [[ "$auto_yes" == "1" ]] || confirm "Start ${model} now with spark run?"; then
-        # Workspace recovery favors a reliable full-context launch. MTP can add enough
-        # runtime headroom to exceed unified-memory hosts even when the base model fits.
-        cmd_run "$model" --no-mtp --tools --max-len "$WORKSPACE_HERMES_MIN_CONTEXT"
-      else
-        setup_fail "Hermes model not started: $model"
-      fi
-    fi
-  fi
-  if [[ "$check_only" != "1" && -n "$model" ]]; then
-    gateway_set_main_model "$prov" "$model" || setup_fail "Could not select LiteLLM main model"
-  fi
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    if [[ "$check_only" != "1" ]] && ! gateway_rendered_config_ready; then
-      info "Refreshing LiteLLM main route"
-      gateway_restart || setup_fail "Could not refresh LiteLLM gateway"
-    else
-      info "LiteLLM gateway: running"
-    fi
-  elif [[ "$check_only" == "1" ]]; then
-    setup_fail "LiteLLM gateway not running"
-  elif [[ "$auto_yes" == "1" ]] || confirm "Start the LiteLLM gateway now?"; then
-    gateway_start || setup_fail "Could not start LiteLLM gateway"
-  else
-    setup_fail "LiteLLM gateway required for Hermes"
-  fi
+workspace_repair_model_server() {
+  local check_only="$1" auto_yes="$2" model="$3"
+  local args=(--model "$model" --tools --max-len "$WORKSPACE_HERMES_MIN_CONTEXT" --no-mtp)
+  [[ "$check_only" == "1" ]] && args+=(--check)
+  [[ "$auto_yes" == "1" ]] && args+=(--yes)
+  cmd_repair "${args[@]}"
 }
 
 workspace_prepare_data_dirs() {
@@ -4751,7 +4651,10 @@ workspace_setup() {
       return $?
     }
   fi
-  workspace_ensure_gateway "$check_only" "$auto_yes" "$model"
+  if [[ -n "$model" ]]; then
+    workspace_repair_model_server "$check_only" "$auto_yes" "$model" \
+      || setup_fail "Could not reconcile the Spark model server"
+  fi
   [[ "$check_only" == "1" ]] && workspace_configure_tailscale "$tailnet" "$check_only" "$funnel_action" "$auto_yes"
   if [[ "$check_only" == "1" ]]; then
     if [[ -n "$model" ]]; then
@@ -5169,10 +5072,8 @@ workspace_start() {
     && info "Workspace Compose project started" \
     || { err "Could not start workspace Compose project"; rc=1; }
 
-  SETUP_FAILED=()
-  workspace_ensure_gateway 0 1 "$model"
-  if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
-    rc=1
+  if [[ "${SPARK_WORKSPACE_MODEL_SERVER_READY:-0}" != "1" ]]; then
+    workspace_repair_model_server 0 1 "$model" || rc=1
   fi
 
   workspace_start_hermes_gateway_proxy \
@@ -5266,6 +5167,97 @@ workspace_restart() {
   [[ $# -eq 0 ]] || die "Usage: spark ws restart"
   workspace_stop
   workspace_start
+}
+
+cmd_workspace_repair_help() {
+  cat <<EOF
+
+  ${BOLD}Usage:${NC} spark ws repair [--yes] [--force-hermes-rebuild] [--remote user@host]
+
+  Repairs runtime drift without deleting workspace data. Delegates model and
+  LiteLLM recovery to spark repair, restores private proxies, rebuilds Hermes
+  transactionally on MCP drift, and reapplies task-manager access.
+
+  ${BOLD}Flags:${NC}
+    --yes               Accept transactional Hermes rebuild when required.
+    --force-hermes-rebuild
+                        Recreate an unrecoverable Hermes sandbox even if its
+                        backup is incomplete. May lose Hermes state; never n8n.
+    --remote user@host  Repair a configured remote workspace.
+
+EOF
+}
+
+workspace_repair() {
+  local auto_yes=0 force_rebuild=0 remote_spec="" model task_manager
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) auto_yes=1; shift ;;
+      --force-hermes-rebuild) force_rebuild=1; auto_yes=1; shift ;;
+      --remote) remote_spec="${2:-}"; [[ -n "$remote_spec" ]] || die "--remote requires user@host"; shift 2 ;;
+      -h|--help) cmd_workspace_repair_help; return 0 ;;
+      *) die "Unknown ws repair flag: $1" ;;
+    esac
+  done
+  if [[ -n "$remote_spec" ]]; then
+    local args=(repair)
+    [[ "$auto_yes" == "1" ]] && args+=(--yes)
+    [[ "$force_rebuild" == "1" ]] && args+=(--force-hermes-rebuild)
+    workspace_remote_workspace_cmd "$remote_spec" "${args[@]}"
+    return $?
+  fi
+  workspace_require_config
+  workspace_migrate_runtime_config
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  [[ -n "$model" ]] || die "Hermes model is not configured" "Run: spark ws setup"
+  task_manager=$(workspace_task_manager)
+
+  printf "\n  ${BOLD}spark ws repair${NC}\n\n"
+  workspace_compose up -d --remove-orphans >/dev/null 2>&1 || {
+    err "Could not start workspace Compose services"
+    return 1
+  }
+  workspace_repair_model_server 0 "$auto_yes" "$model" || return 1
+  workspace_start_hermes_gateway_proxy || {
+    err "Could not expose LiteLLM to OpenShell"
+    return 1
+  }
+  if workspace_hermes_mcp_config_drift_detected; then
+    if [[ "$auto_yes" != "1" ]]; then
+      is_interactive || die "Hermes MCP config drift requires confirmation" "Run: spark ws repair --yes"
+      confirm "Rebuild Hermes from its registered NemoClaw state?" || return 1
+    fi
+    warn "Hermes MCP config drift detected; rebuilding from registered state"
+    local rebuild_args=(--yes)
+    [[ "$force_rebuild" == "1" ]] && rebuild_args+=(--force)
+    nemohermes_rebuild_with_workspace_env "${rebuild_args[@]}" || {
+      if [[ "$force_rebuild" == "1" ]]; then
+        err "Forced Hermes rebuild failed"
+      else
+        err "Hermes transactional rebuild stopped because its backup was incomplete"
+        printf "    If losing unrecoverable Hermes state is acceptable, run:\n"
+        printf "    spark ws repair --yes --force-hermes-rebuild\n"
+        printf "    n8n and its database are not rebuilt by this command.\n"
+      fi
+      return 1
+    }
+  else
+    nemohermes hermes doctor --fix >/dev/null 2>&1 || true
+  fi
+  SPARK_WORKSPACE_MODEL_SERVER_READY=1 workspace_start || return 1
+  workspace_configure_hermes_runtime || {
+    err "Could not reconcile Hermes runtime configuration"
+    return 1
+  }
+  case "$task_manager" in
+    super-productivity) workspace_setup_hermes_super_productivity_access ;;
+    todoist) workspace_setup_hermes_todoist_access ;;
+    *) workspace_setup_hermes_vikunja_access ;;
+  esac || {
+    err "Could not reconcile Hermes $(workspace_task_manager_label "$task_manager") access"
+    return 1
+  }
+  cmd_workspace_doctor --verbose
 }
 
 workspace_status_item() {
@@ -6816,6 +6808,27 @@ workspace_hermes_container_name() {
   printf '%s\n' "$containers" | grep -E "^(${WORKSPACE_HERMES_CONTAINER}|openshell-hermes-)" | head -n 1
 }
 
+workspace_hermes_mcp_config_drift_detected() {
+  local container logs
+  command -v docker >/dev/null 2>&1 || return 1
+  container=$(workspace_hermes_container_name 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  logs=$(docker logs --tail 200 "$container" 2>&1 || true)
+  grep -F "HERMES_MCP_CONFIG_DRIFT" <<< "$logs" >/dev/null
+}
+
+workspace_hermes_mcp_config_consistent() {
+  ! workspace_hermes_mcp_config_drift_detected
+}
+
+workspace_hermes_forwards_ready() {
+  local out
+  command -v openshell >/dev/null 2>&1 || return 1
+  out=$(openshell forward list 2>/dev/null || true)
+  grep -E "hermes[[:space:]]+127[.]0[.]0[.]1[[:space:]]+${WORKSPACE_HERMES_PORT}.*running" <<< "$out" >/dev/null &&
+    grep -E "hermes[[:space:]]+127[.]0[.]0[.]1[[:space:]]+${WORKSPACE_HERMES_LOCAL_PORT}.*running" <<< "$out" >/dev/null
+}
+
 workspace_hermes_running_container_name() {
   local container
   container=$(workspace_hermes_container_name 2>/dev/null || true)
@@ -6862,6 +6875,7 @@ workspace_ensure_hermes_agent_gateway() {
 workspace_start_hermes_private_proxy() {
   local attempt
   command -v nemohermes >/dev/null 2>&1 || return 1
+  workspace_hermes_mcp_config_drift_detected && return 1
   if workspace_hermes_private_url_ready && workspace_hermes_local_api_ready; then
     return 0
   fi
@@ -6923,7 +6937,7 @@ workspace_hermes_vikunja_proxy_running() {
 workspace_model_running() {
   local model="$1"
   [[ -n "$model" ]] || return 1
-  [[ "$(workspace_model_state "$model")" == *"running"* ]]
+  [[ "$(model_server_state "$model")" == *"running"* ]]
 }
 
 workspace_hermes_running() {
@@ -7088,6 +7102,10 @@ cmd_workspace_doctor() {
   fi
   workspace_doctor_check "Compose uses private host bindings only" workspace_compose_uses_loopback_ports
 
+  workspace_doctor_section "Resilience" "spark ws repair --yes"
+  workspace_doctor_check "Hermes MCP configuration matches NemoClaw registry" workspace_hermes_mcp_config_consistent
+  workspace_doctor_check "Hermes OpenShell forwards are alive" workspace_hermes_forwards_ready
+
   workspace_doctor_section "Identity & recovery" "spark ws setup"
   workspace_doctor_check "Interactive service passwords are not stored" workspace_human_password_not_stored
   if [[ "$task_manager" == "super-productivity" ]]; then
@@ -7184,7 +7202,7 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Tailscale mode is Services or ports" workspace_tailscale_services_mode
   workspace_doctor_check "Tailscale workspace URLs respond" workspace_tailscale_https_urls_ready
 
-  workspace_doctor_section "Inference & agent" "spark ws restart"
+  workspace_doctor_section "Inference & agent" "spark ws repair --yes"
   workspace_doctor_check "LiteLLM gateway running" workspace_gateway_running
   workspace_doctor_check "LiteLLM main alias targets selected physical model" workspace_litellm_main_alias_ready
   workspace_doctor_check "LiteLLM exposes Hermes model route" workspace_litellm_model_routed
@@ -7197,8 +7215,8 @@ cmd_workspace_doctor() {
   workspace_doctor_check "NemoHermes sandbox doctor passes" workspace_hermes_doctor_ready
   workspace_doctor_check "NemoHermes inference route uses selected LiteLLM model" workspace_hermes_inference_route_ready
   workspace_doctor_check "Hermes config model matches selected LiteLLM route" workspace_hermes_config_model_ready
-  workspace_doctor_check "Hermes model supports automatic tool calling" workspace_model_tool_calling_ready "$model"
-  workspace_doctor_check "Hermes model context is at least ${WORKSPACE_HERMES_MIN_CONTEXT} tokens" workspace_model_context_ready "$model"
+  workspace_doctor_check "Hermes model supports automatic tool calling" model_server_tool_calling_ready "$model"
+  workspace_doctor_check "Hermes model context is at least ${WORKSPACE_HERMES_MIN_CONTEXT} tokens" model_server_context_ready "$model" "$WORKSPACE_HERMES_MIN_CONTEXT"
   workspace_doctor_check "Hermes output and reasoning limits are configured" workspace_hermes_runtime_config_ready
   workspace_doctor_check "Hermes CLI uses the balanced local-model tool profile" workspace_hermes_cli_toolsets_ready
   if [[ "$task_manager" == "super-productivity" ]]; then
@@ -7584,6 +7602,7 @@ cmd_workspace_help() {
     start       Start the configured workspace runtime
     stop        Stop the workspace runtime and preserve all data
     restart     Stop and start the configured workspace runtime
+    repair      Repair reboot/runtime drift without deleting workspace data
     recover     Reset a Vikunja human or n8n owner password
     status      Show operational workspace state
     containers  Show raw workspace container state
@@ -7628,6 +7647,7 @@ cmd_workspace() {
     start)  workspace_start "$@" ;;
     stop)   workspace_stop "$@" ;;
     restart) workspace_restart "$@" ;;
+    repair) workspace_repair "$@" ;;
     recover) workspace_recover "$@" ;;
     status) cmd_workspace_status "$@" ;;
     containers) cmd_workspace_containers "$@" ;;
