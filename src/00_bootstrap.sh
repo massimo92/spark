@@ -9,7 +9,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.1.96"
+VERSION="0.1.97"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
