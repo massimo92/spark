@@ -213,10 +213,10 @@ STARTUP_MAX_RETRIES="${SPARK_STARTUP_MAX_RETRIES:-2}"    # auto-retries on a rec
 # earlyoom's emergency floor: kill the hog when free RAM drops below this %. The last-resort backstop
 # (the cgroup cap + admission keep normal operation far from it). spark setup configures earlyoom here.
 EARLYOOM_MIN_FREE_PCT="${SPARK_EARLYOOM_MIN_FREE_PCT:-5}"
-# earlyoom only fires when BOTH free RAM < -m AND free swap < -s. Keeping this LOW (not 100) is what
-# lets a legitimate model LOAD borrow swap for its transient peak without being killed — earlyoom
-# only acts when swap is also nearly exhausted (a real runaway, not a load spike).
-EARLYOOM_MIN_SWAP_PCT="${SPARK_EARLYOOM_MIN_SWAP_PCT:-10}"
+# earlyoom requires BOTH free RAM < -m and free swap < -s. At 100, swap never gates the RAM-pressure
+# trigger. This matters on unified-memory GPUs: their allocations may be unreclaimable even with
+# nearly all swap free.
+EARLYOOM_MIN_SWAP_PCT="${SPARK_EARLYOOM_MIN_SWAP_PCT:-100}"
 # Swap is KEPT ON (not disabled): it absorbs the one-time load-time peak of large models (the loader
 # transiently needs ~2x the weights) and is a cushion before the OOM killer. Runtime thrash is avoided
 # by a LOW swappiness + admission (one model fits in RAM), not by removing swap. If the box has no
