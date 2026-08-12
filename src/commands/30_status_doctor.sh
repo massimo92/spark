@@ -256,6 +256,51 @@ doctor_print_human() {
 }
 
 # vLLM/NVIDIA health checks.
+doctor_check_vllm_cgroup_limits() {
+  local id inspect rows name memory managed count=0
+  local -a ids=() unlimited=()
+  while IFS= read -r id; do
+    [[ "$id" =~ ^[a-fA-F0-9]+$ ]] && ids+=("$id")
+  done < <(docker ps -q 2>/dev/null || true)
+  if [[ ${#ids[@]} -eq 0 ]]; then
+    doctor_skip "Host safety" "vLLM cgroup limits" "no running containers"
+    return 0
+  fi
+
+  inspect=$(docker inspect "${ids[@]}" 2>/dev/null || true)
+  if [[ -z "$inspect" ]] || ! rows=$(jq -r '
+      .[]
+      | select(.State.Running == true)
+      | ((.Config.Image // "") + " " + (.Path // "") + " " + ((.Args // []) | join(" "))) as $runtime
+      | select($runtime | test("vllm"; "i"))
+      | [((.Name // "unknown") | ltrimstr("/")), ((.HostConfig.Memory // 0) | tostring),
+         (.Config.Labels["spark.managed"] // "")]
+      | @tsv
+    ' <<<"$inspect" 2>/dev/null); then
+    doctor_fail "Host safety" "vLLM cgroup limits" "could not inspect running containers" \
+      "check Docker access, then rerun spark doctor"
+    return 0
+  fi
+
+  while IFS=$'\t' read -r name memory managed; do
+    [[ -n "$name" ]] || continue
+    count=$((count + 1))
+    if [[ "$memory" == "0" ]]; then
+      [[ "$managed" == "1" ]] || name+=" (unmanaged)"
+      unlimited+=("$name")
+    fi
+  done <<<"$rows"
+
+  if [[ ${#unlimited[@]} -gt 0 ]]; then
+    doctor_fail "Host safety" "vLLM cgroup limits" \
+      "unlimited: ${unlimited[*]}" "stop each container, then relaunch it with spark run <model>"
+  elif [[ "$count" -gt 0 ]]; then
+    doctor_pass "Host safety" "vLLM cgroup limits" "${count} running container(s) limited"
+  else
+    doctor_skip "Host safety" "vLLM cgroup limits" "no running vLLM containers"
+  fi
+}
+
 doctor_checks_vllm() {
   local gpu_info hf_ver bad_cache_path ngc_image model_count=0
   if gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null) && [[ -n "$gpu_info" ]]; then
@@ -317,6 +362,8 @@ doctor_checks_vllm() {
       doctor_fail "Model assets" "Downloaded models" "HF cache not found at ${HF_CACHE_DIR}" "spark pull <model>"
     fi
   fi
+
+  doctor_check_vllm_cgroup_limits
 }
 
 # Ollama health checks. Updates cmd_doctor's passed/total via dynamic scope.
@@ -348,7 +395,7 @@ doctor_checks_ollama() {
 # Report host hardening drift (Linux + systemd).
 doctor_checks_hardening() {
   { [[ "$SPARK_OS" == "Linux" ]] && command -v systemctl >/dev/null 2>&1; } || return 0
-  local sw_mib sw_source sw_diag swp target_mib oom_ssh oom_dbus
+  local sw_mib sw_source sw_diag swp target_mib oom_ssh oom_dbus earlyoom_file earlyoom_m earlyoom_s earlyoom_lines
   swap_read_total sw_mib sw_source sw_diag
   target_mib=$(( SWAP_PROVISION_GB * 1024 ))
   swp="$(sysctl -n vm.swappiness 2>/dev/null || true)"
@@ -359,10 +406,22 @@ doctor_checks_hardening() {
     doctor_fail "Host safety" "Swap and swappiness" \
       "${sw_mib} MiB $(swap_total_context "$sw_source" "$sw_diag"); target ≥${target_mib} MiB; swappiness ${swp:-unknown}" "spark setup"
   fi
-  if systemctl is-active --quiet earlyoom 2>/dev/null; then
-    doctor_pass "Host safety" "early-OOM" "active"
+  earlyoom_file="${EARLYOOM_DEFAULT_FILE:-/etc/default/earlyoom}"
+  earlyoom_m="$(grep -oE -- '-m[ =][0-9]+' "$earlyoom_file" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)"
+  earlyoom_s="$(grep -oE -- '-s[ =][0-9]+' "$earlyoom_file" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)"
+  earlyoom_lines="$(awk 'END {print NR}' "$earlyoom_file" 2>/dev/null | tr -d '[:space:]' || true)"
+  if systemctl is-active --quiet earlyoom 2>/dev/null &&
+      [[ "$earlyoom_m" == "$EARLYOOM_MIN_FREE_PCT" && "$earlyoom_s" == "$EARLYOOM_MIN_SWAP_PCT" && "$earlyoom_lines" == "1" ]]; then
+    doctor_pass "Host safety" "early-OOM" "active (-m ${earlyoom_m}% -s ${earlyoom_s}%)"
   else
-    doctor_fail "Host safety" "early-OOM" "not active" "spark setup"
+    doctor_fail "Host safety" "early-OOM" \
+      "inactive or unsafe config (-m ${earlyoom_m:-?}% -s ${earlyoom_s:-?}%)" "spark setup"
+  fi
+  if systemctl is-failed --quiet systemd-sysctl.service 2>/dev/null; then
+    doctor_fail "Host safety" "systemd-sysctl" "failed; kernel settings may not be applied" \
+      "systemctl status systemd-sysctl.service; spark setup"
+  else
+    doctor_pass "Host safety" "systemd-sysctl" "not failed"
   fi
   oom_ssh="$(systemctl show -p OOMScoreAdjust --value ssh.service 2>/dev/null)"
   oom_dbus="$(systemctl show -p OOMScoreAdjust --value dbus.service 2>/dev/null)"

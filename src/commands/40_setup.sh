@@ -4,17 +4,26 @@
 # remote one over SSH); every step below runs against the chosen target via ctx_*, so a
 # server receives the exact same software whether it is configured locally or remotely.
 
-# Write controller stdin to a root-owned file on the target.
+# Write controller stdin to a root-owned file on the target. Stage the content first so sudo
+# authentication and file content never share stdin: a cached sudo ticket may not consume the
+# password line, which would otherwise make tee write that password into the destination.
 ctx_sudo_write() {  # $1 = path; reads file content from stdin
-  ensure_sudo_pw
-  if [[ -z "$SUDO_PW" ]]; then
-    if [[ "$SETUP_TARGET" == "remote" ]]; then remote_in "sudo -n tee $1 >/dev/null"; else sudo -n tee "$1" >/dev/null; fi
-  elif [[ "$SETUP_TARGET" == "remote" ]]; then
-    # sudo -S eats the first stdin line (the password); tee gets the rest (the content).
-    { printf '%s\n' "$SUDO_PW"; cat; } | remote_in "sudo -S -p '' tee $1 >/dev/null"
+  local path="$1" tmp q_tmp q_path rc=0
+  tmp=$(ctx_run 'umask 077; mktemp /tmp/spark-sudo-write.XXXXXX') || return 1
+  [[ "$tmp" == /tmp/spark-sudo-write.* && "$tmp" != *$'\n'* ]] || return 1
+  printf -v q_tmp '%q' "$tmp"
+  printf -v q_path '%q' "$path"
+
+  if [[ "$SETUP_TARGET" == "remote" ]]; then
+    remote_in "umask 077; cat > $q_tmp" || rc=1
   else
-    { printf '%s\n' "$SUDO_PW"; cat; } | sudo -S -p '' tee "$1" >/dev/null
+    cat > "$tmp" || rc=1
   fi
+  if [[ "$rc" -eq 0 ]]; then
+    ctx_sudo "install -o root -g root -m 0644 -- $q_tmp $q_path" || rc=1
+  fi
+  ctx_run "rm -f -- $q_tmp" >/dev/null 2>&1 || true
+  return "$rc"
 }
 
 # --- Install steps (shared across local/remote) ---
@@ -476,19 +485,18 @@ step_gateway() {
 #   2) early-OOM (earlyoom) kills the offending model early, before the kernel OOM-cascade.
 #   3) control-plane protection: MemoryMin + OOMScoreAdjust=-1000 on sshd/dbus/tailscaled/logind/
 #      resolved so the OOM killer can only hit the model, never the services you need to recover.
-# earlyoom is the emergency backstop. Declarative: reconciles to '-m $EARLYOOM_MIN_FREE_PCT
-# -s $EARLYOOM_MIN_SWAP_PCT' regardless of any old/divergent config (e.g. a -m 8 / -s 100 left from
-# experiments). The -s threshold is LOW on purpose: earlyoom kills only when free RAM AND free swap
-# are both nearly gone — so a legitimate load can borrow swap for its peak without being killed,
-# while a true runaway (RAM + swap exhausted) still gets killed early.
+# earlyoom is the emergency backstop. It requires BOTH the RAM and swap thresholds. Setting -s 100
+# makes the swap condition always eligible, so -m is an effective RAM-pressure trigger even when
+# unified-memory GPU allocations cannot be reclaimed into otherwise-empty swap.
 step_earlyoom() {
-  local auto_yes="$1" check_only="$2" want="$EARLYOOM_MIN_FREE_PCT" wsw="$EARLYOOM_MIN_SWAP_PCT" installed=0 active=0 cur_m cur_s
+  local auto_yes="$1" check_only="$2" want="$EARLYOOM_MIN_FREE_PCT" wsw="$EARLYOOM_MIN_SWAP_PCT" installed=0 active=0 cur_m cur_s config_lines
   local ef="${EARLYOOM_DEFAULT_FILE:-/etc/default/earlyoom}"
   ctx_run 'command -v earlyoom >/dev/null 2>&1' && installed=1
   ctx_run 'systemctl is-active --quiet earlyoom' && active=1
   cur_m="$(ctx_run "grep -oE -- '-m[ =][0-9]+' '$ef' 2>/dev/null | grep -oE '[0-9]+' | head -1")"
   cur_s="$(ctx_run "grep -oE -- '-s[ =][0-9]+' '$ef' 2>/dev/null | grep -oE '[0-9]+' | head -1")"
-  if [[ "$installed" == "1" && "$active" == "1" && "$cur_m" == "$want" && "$cur_s" == "$wsw" ]]; then
+  config_lines="$(ctx_run "awk 'END {print NR}' '$ef' 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "$installed" == "1" && "$active" == "1" && "$cur_m" == "$want" && "$cur_s" == "$wsw" && "$config_lines" == "1" ]]; then
     info "early-OOM: earlyoom active (-m ${want}% -s ${wsw}%, reclaim-protected backstop)"
     return 0
   fi
@@ -499,8 +507,8 @@ step_earlyoom() {
   fi
   printf "    ${DIM}What: install/configure 'earlyoom' (-m ${want}%% -s ${wsw}%%): kill the memory hog when RAM is low.\n"
   printf "    Why: it kills the offending model EARLY, before the machine bogs down and locks you out.\n"
-  printf "    The low -s lets a legitimate model LOAD borrow swap for its peak without being killed; it\n"
-  printf "    only fires when RAM and swap are both nearly gone (a real runaway).${NC}\n"
+  printf "    Swap does not gate this backstop: unified-memory GPU allocations may not be reclaimable\n"
+  printf "    even while most swap is free.${NC}\n"
   if [[ "$auto_yes" == "1" ]] || confirm "Install/repair earlyoom at -m ${want}% -s ${wsw}%?"; then
     if [[ "$installed" != "1" ]] && ! ctx_sudo 'apt-get update >/dev/null 2>&1 && apt-get install -y earlyoom >/dev/null 2>&1'; then
       setup_fail "Could not install earlyoom (apt)"; return 0
@@ -710,11 +718,12 @@ swap_activate_existing_file() {
 
 step_swap_ensure() {
   local auto_yes="$1" check_only="$2" sf="/swapfile.spark"
-  local cur_sw total_mib total_source total_diag target_mib size_mib used_mib active gap_mib desired_mib next_action
+  local cur_sw total_mib total_source total_diag target_mib size_mib used_mib active gap_mib desired_mib next_action sysctl_failed=0
   cur_sw="$(swap_cur_swappiness)"
+  ctx_run 'systemctl is-failed --quiet systemd-sysctl.service 2>/dev/null' && sysctl_failed=1
   swap_read_total total_mib total_source total_diag
   target_mib="$(swap_target_mib)"
-  if swap_total_satisfies_target "$total_mib" "$target_mib" && [[ "$cur_sw" == "$SWAPPINESS" ]]; then
+  if swap_total_satisfies_target "$total_mib" "$target_mib" && [[ "$cur_sw" == "$SWAPPINESS" && "$sysctl_failed" == "0" ]]; then
     info "Swap: on (${total_mib}MiB total) $(swap_total_context "$total_source" "$total_diag") + swappiness=${SWAPPINESS} (absorbs load peaks; runtime stays in RAM)"
     return 0
   fi
@@ -722,7 +731,12 @@ step_swap_ensure() {
     if ! swap_total_satisfies_target "$total_mib" "$target_mib"; then
       setup_fail "Swap too small (${total_mib}MiB $(swap_total_context "$total_source" "$total_diag"), want ≥${target_mib}MiB) — large-model loads need it for their transient peak"
     fi
-    [[ "$cur_sw" != "$SWAPPINESS" ]] && setup_fail "vm.swappiness=${cur_sw:-?} (want ${SWAPPINESS}) — runtime may swap the working set"
+    if [[ "$cur_sw" != "$SWAPPINESS" ]]; then
+      setup_fail "vm.swappiness=${cur_sw:-?} (want ${SWAPPINESS}) — runtime may swap the working set"
+    fi
+    if [[ "$sysctl_failed" == "1" ]]; then
+      setup_fail "systemd-sysctl failed — rewrite /etc/sysctl.d/99-spark.conf and reload kernel settings"
+    fi
     return 0
   fi
   printf "    ${DIM}What: ensure ≥${SWAP_PROVISION_GB}G of swap (top up with ${sf} if needed) + vm.swappiness=${SWAPPINESS}.\n"
@@ -761,9 +775,9 @@ step_swap_ensure() {
         return 0
       fi
     fi
-    if [[ "$cur_sw" != "$SWAPPINESS" ]]; then
+    if [[ "$cur_sw" != "$SWAPPINESS" || "$sysctl_failed" == "1" ]]; then
       printf 'vm.swappiness=%s\n' "$SWAPPINESS" | ctx_sudo_write /etc/sysctl.d/99-spark.conf
-      if ! ctx_sudo "sysctl --system >/dev/null 2>&1 || sysctl -w vm.swappiness=${SWAPPINESS} >/dev/null"; then
+      if ! ctx_sudo "systemctl restart systemd-sysctl.service >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || sysctl -w vm.swappiness=${SWAPPINESS} >/dev/null"; then
         swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "apply vm.swappiness=${SWAPPINESS}" "$total_source" "$total_diag"
         return 0
       fi

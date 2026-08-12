@@ -154,6 +154,8 @@ ${stdin_payload}"
     # Managed-container listing (TSV rows via FAKE_MANAGED); plain name listing otherwise.
     if [[ "$args" == *"label=spark.managed=1"* ]]; then
       [[ -n "${FAKE_MANAGED:-}" ]] && printf '%b' "${FAKE_MANAGED}"
+    elif [[ "$args" == *"-q"* ]]; then
+      [[ -n "${FAKE_DOCKER_IDS:-}" ]] && printf '%b' "${FAKE_DOCKER_IDS}"
     elif [[ "$args" == *'{{.Ports}}'* ]]; then
       [[ -n "${FAKE_DOCKER_PORTS:-}" ]] && printf '%b' "${FAKE_DOCKER_PORTS}"
     elif [[ "$args" == *'{{.Names}}'* ]]; then
@@ -178,6 +180,10 @@ ${stdin_payload}"
     exit "${FAKE_DOCKER_STOP_EXIT:-0}"
     ;;
   inspect)
+    if [[ -n "${FAKE_DOCKER_INSPECT_ALL_JSON:-}" && "$args" != *"{{"* ]]; then
+      printf '%s\n' "$FAKE_DOCKER_INSPECT_ALL_JSON"
+      exit 0
+    fi
     if [[ -n "${FAKE_CONTAINER_INSPECT_JSON:-}" && "$args" != *"{{"* ]]; then
       printf '%s\n' "$FAKE_CONTAINER_INSPECT_JSON"
       exit 0
@@ -448,6 +454,7 @@ EOF
 args="$*"
 case "$args" in
   *is-active*earlyoom*)        exit "${FAKE_EARLYOOM_ACTIVE:-1}" ;;
+  *is-failed*systemd-sysctl*)  exit "${FAKE_SYSTEMD_SYSCTL_FAILED:-1}" ;;
   *list-unit-files*)
     for u in ssh.service dbus.service tailscaled.service systemd-logind.service systemd-resolved.service; do
       case "$args" in *"${u}"*) echo "${u} enabled enabled"; break ;; esac
@@ -479,6 +486,7 @@ write_value() {
   local file_name="$1" value="$2" file_path=""
   file_path="${!file_name:-}"
   [[ -n "$file_path" ]] && printf '%s\n' "$value" > "$file_path"
+  return 0
 }
 
 swap_total_mib() {
@@ -539,7 +547,16 @@ fi
 if [[ "${args[0]:-}" == "bash" && "${args[1]:-}" == "-c" ]]; then
   cmd="${args[2]:-}"
   record "$cmd"
-  if [[ "$cmd" == *"/swapfile.spark"* && "$cmd" == *"fallocate -l "* ]]; then
+  if [[ "$cmd" == install\ -o\ root\ -g\ root\ -m\ 0644\ --\ * ]]; then
+    read -r -a install_args <<< "$cmd"
+    source_path="${install_args[${#install_args[@]}-2]}"
+    target="${install_args[${#install_args[@]}-1]}"
+    content="$(cat "$source_path")"
+    record "install ${target}: ${content}"
+    if [[ "$target" == "/etc/sysctl.d/99-spark.conf" && "$content" =~ vm.swappiness=([0-9]+) ]]; then
+      write_value FAKE_SWAPPINESS_FILE "${BASH_REMATCH[1]}"
+    fi
+  elif [[ "$cmd" == *"/swapfile.spark"* && "$cmd" == *"fallocate -l "* ]]; then
     desired="$(sed -n 's/.*fallocate -l \([0-9][0-9]*\)M .*/\1/p' <<<"$cmd")"
     total="$(swap_total_mib)"
     size="$(swap_size_mib)"
@@ -2011,6 +2028,38 @@ test_setup_check_reports_incomplete() {
     [[ "$output" != *"Setup complete"* ]]
 }
 
+test_ctx_sudo_write_separates_password_from_content() {
+  local tmp target content status=0
+  tmp=$(mktemp -d)
+  target="${tmp}/target.conf"
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cuda-unified SPARK_BACKEND=vllm bash -c '
+      source "$1"
+      sudo() {
+        while [[ $# -gt 0 ]]; do
+          case "$1" in -S|-n) shift ;; -p) shift 2 ;; *) break ;; esac
+        done
+        if [[ "${1:-}" == "bash" && "${2:-}" == "-c" && "${3:-}" == install\ * ]]; then
+          local -a install_args=()
+          read -r -a install_args <<< "$3"
+          command cp "${install_args[${#install_args[@]}-2]}" "${install_args[${#install_args[@]}-1]}"
+          return
+        fi
+        "$@"
+      }
+      SUDO_READY=1
+      SUDO_PW="sentinel-sudo-secret"
+      SETUP_TARGET=local
+      printf "%s\n" "EARLYOOM_ARGS=expected" | ctx_sudo_write "$2"
+    ' _ "$SPARK" "$target" || status=$?
+  content=$(cat "$target" 2>/dev/null || true)
+  rm -rf "$tmp"
+
+  [[ "$status" -eq 0 ]] &&
+    [[ "$content" == "EARLYOOM_ARGS=expected" ]] &&
+    [[ "$content" != *"sentinel-sudo-secret"* ]]
+}
+
 test_setup_check_reports_tailscale_funnel() {
   local tmp fake_bin output status tailscale_calls
   tmp=$(mktemp -d)
@@ -2047,6 +2096,54 @@ test_doctor_reports_tailscale_funnel() {
   rm -rf "$tmp"
 
   [[ "$output" == *"Tailscale Funnel"* ]] && [[ "$output" == *"active public exposure"* ]]
+}
+
+test_doctor_reports_failed_systemd_sysctl() {
+  local tmp fake_bin output
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_OVERRIDE=Linux \
+    FAKE_SYSTEMD_SYSCTL_FAILED=0 "$SPARK" doctor --verbose 2>&1 || true)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"systemd-sysctl"* ]] &&
+    [[ "$output" == *"failed"* ]]
+}
+
+test_doctor_rejects_swap_gated_earlyoom() {
+  local tmp fake_bin output
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  printf 'EARLYOOM_ARGS="-m 5 -s 10"\n' > "${tmp}/earlyoom.conf"
+
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_OVERRIDE=Linux \
+    FAKE_EARLYOOM_ACTIVE=0 EARLYOOM_DEFAULT_FILE="${tmp}/earlyoom.conf" \
+    "$SPARK" doctor --verbose 2>&1 || true)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"early-OOM"* ]] &&
+    [[ "$output" == *"unsafe config (-m 5% -s 10%)"* ]]
+}
+
+test_doctor_reports_unbounded_vllm_container() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output inspect
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  inspect='[{"Name":"/unsafe-vllm","State":{"Running":true},"Config":{"Image":"nvcr.io/nvidia/vllm:26.06-py3","Labels":{}},"Path":"vllm","Args":["serve","google/gemma"],"HostConfig":{"Memory":0}}]'
+
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_OVERRIDE=Linux \
+    FAKE_DOCKER_INFO_EXIT=0 FAKE_DOCKER_IDS=$'deadbeef\n' \
+    FAKE_DOCKER_INSPECT_ALL_JSON="$inspect" "$SPARK" doctor --verbose 2>&1 || true)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"vLLM cgroup limits"* ]] &&
+    [[ "$output" == *"unsafe-vllm"* ]] &&
+    [[ "$output" == *"unlimited"* ]]
 }
 
 test_tailscale_funnel_ignores_tailnet_only_services() {
@@ -2264,9 +2361,24 @@ test_alias_capture_replays_image_env_and_operational_overrides() {
   [[ "$out" != *"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa vllm serve"* ]] || ok=1
   [[ "$out" == *"VLLM_MARLIN_USE_ATOMIC_ADD=1"* ]] || ok=1
   [[ "$out" == *"--port 8001"* && "$out" != *"--port 8000"* && "$out" != *"--port=9000"* ]] || ok=1
+  [[ "$out" == *"--label spark.managed=1"* ]] || ok=1
+  [[ "$out" == *"--memory "* && "$out" == *"--memory-swap "* ]] || ok=1
+  [[ "$out" == *"--network host"* && "$out" == *"--ipc=host"* ]] || ok=1
   [[ ! -s "$stop_file" && ! -s "$run_file" ]] || ok=1
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
+}
+
+test_vllm_launch_paths_are_centralized() {
+  local runtime dashboard docker_builds
+  runtime="${ROOT_DIR}/src/commands/10_runtime.sh"
+  dashboard="${ROOT_DIR}/src/commands/20_dashboard.sh"
+  docker_builds=$(grep -c 'docker_cmd=(docker run -d' "$runtime")
+
+  [[ "$docker_builds" -eq 1 ]] &&
+    grep -A320 '^run_backend_vllm()' "$runtime" | grep -q 'build_launch' &&
+    grep -A80 '^cmd_alias_run()' "$runtime" | grep -q 'run_backend_vllm' &&
+    ! grep -q 'docker run' "$dashboard"
 }
 
 test_alias_capture_rejects_secret_flags() {
@@ -2820,7 +2932,7 @@ test_host_check_vllm_no_gpu() {
     [[ "$out" == *"incomplete"* ]]
 }
 
-# --- Host OS hardening (swap-off + earlyoom -m5 + sshd MemoryMin/OOMScoreAdjust) ---
+# --- Host OS hardening (swap + earlyoom RAM-pressure trigger + control-plane protection) ---
 test_host_check_hardening_missing() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -2833,7 +2945,7 @@ test_host_check_hardening_missing() {
 test_host_check_hardening_present() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  printf 'EARLYOOM_ARGS="-m 5 -s 10"\n' > "${tmp}/earlyoom.conf"
+  printf 'EARLYOOM_ARGS="-m 5 -s 100"\n' > "${tmp}/earlyoom.conf"
   printf '#!/usr/bin/env bash\nexit 0\n' > "${fake_bin}/earlyoom"; chmod +x "${fake_bin}/earlyoom"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
     SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SWAP_TOTAL_GB=64 FAKE_SWAPPINESS=10 \
@@ -2841,9 +2953,41 @@ test_host_check_hardening_present() {
     EARLYOOM_DEFAULT_FILE="${tmp}/earlyoom.conf" \
     "$SPARK" setup --check </dev/null 2>&1) || true
   rm -rf "$tmp"
-  [[ "$out" == *"earlyoom active (-m 5% -s 10%"* ]] && [[ "$out" == *"control-plane: OOM-protected"* ]] &&
+  [[ "$out" == *"earlyoom active (-m 5% -s 100%"* ]] && [[ "$out" == *"control-plane: OOM-protected"* ]] &&
     [[ "$out" == *"swappiness=10"* ]] && [[ "$out" != *"early-OOM not active"* ]] &&
     [[ "$out" != *"not fully protected"* ]] && [[ "$out" != *"Swap too small"* ]]
+}
+
+test_earlyoom_rejects_swap_gated_configuration() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  printf 'EARLYOOM_ARGS="-m 5 -s 10"\n' > "${tmp}/earlyoom.conf"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${fake_bin}/earlyoom"; chmod +x "${fake_bin}/earlyoom"
+
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 EARLYOOM_DEFAULT_FILE="${tmp}/earlyoom.conf" \
+    "$SPARK" setup --check </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+
+  [[ "$out" == *"earlyoom not at -m 5% -s 100%"* ]] &&
+    [[ "$out" == *"found '-m 5 -s 10'"* ]]
+}
+
+test_swap_repairs_failed_systemd_sysctl() {
+  local tmp fake_bin sudo_log output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  sudo_log="${tmp}/sudo.log"
+
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_SWAP_TOTAL_GB=64 FAKE_SWAPPINESS=10 \
+    FAKE_SYSTEMD_SYSCTL_FAILED=0 FAKE_SUDO_LOG="$sudo_log" \
+    bash -c 'source "$1"; SETUP_TARGET=local; step_swap_ensure 1 0' _ "$SPARK" 2>&1)
+  sudo_log=$(cat "$sudo_log" 2>/dev/null || true)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"Swap: on"* ]] &&
+    [[ "$sudo_log" == *"install /etc/sysctl.d/99-spark.conf: vm.swappiness=10"* ]] &&
+    [[ "$sudo_log" == *"systemctl restart systemd-sysctl.service"* ]]
 }
 
 # Swap is reconciled by TOTAL active swap: ≥ target → no-op (no extra file); < target → flags it.
@@ -8750,12 +8894,17 @@ run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vll
 run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wins
 run_test "alias create preserves dash-prefixed arguments" test_alias_create_preserves_dash_prefixed_args
 run_test "captured alias pins image/env and accepts safe overrides" test_alias_capture_replays_image_env_and_operational_overrides
+run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_centralized
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
 run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
+run_test "sudo file writes separate authentication from content" test_ctx_sudo_write_separates_password_from_content
 run_test "setup --check reports Tailscale Funnel" test_setup_check_reports_tailscale_funnel
 run_test "doctor reports Tailscale Funnel risk" test_doctor_reports_tailscale_funnel
+run_test "doctor reports failed systemd-sysctl" test_doctor_reports_failed_systemd_sysctl
+run_test "doctor rejects swap-gated earlyoom" test_doctor_rejects_swap_gated_earlyoom
+run_test "doctor reports unbounded vLLM containers" test_doctor_reports_unbounded_vllm_container
 run_test "Funnel detection ignores tailnet-only services" test_tailscale_funnel_ignores_tailnet_only_services
 run_test "doctor supports JSON, quiet, and failure exit codes" test_doctor_json_quiet_and_exit_codes
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
@@ -8885,6 +9034,8 @@ run_test "setup --host (ollama) reports ready" test_host_check_ollama_ready
 run_test "setup --host (vllm) flags a missing GPU" test_host_check_vllm_no_gpu
 run_test "setup --host flags missing OS hardening" test_host_check_hardening_missing
 run_test "setup --host passes with hardening present" test_host_check_hardening_present
+run_test "setup rejects swap-gated earlyoom configuration" test_earlyoom_rejects_swap_gated_configuration
+run_test "setup repairs failed systemd-sysctl" test_swap_repairs_failed_systemd_sysctl
 run_test "swap reconciled by total active swap" test_swap_reconcile_by_total
 run_test "swap ready state is a no-op" test_swap_ready_no_mutation
 run_test "swap trusts swapon when free reports zero" test_swap_swapon_wins_when_free_reports_zero
