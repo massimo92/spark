@@ -2828,6 +2828,27 @@ EOF
     [[ "$rm_out" == *"Disabled ollama"* ]] && [[ "$disabled" == "false" ]]
 }
 
+test_run_main_publishes_alias_target() {
+  local tmp fake_bin output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"fast":{"kind":"guided","backend":"ollama","model":"qwen3:30b","run_args":[]}}' \
+    > "${tmp}/home/.config/spark/aliases.json"
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_ACCEL=cpu \
+    FAKE_NAMES='spark-litellm\n' bash -c '
+      source "$1"
+      gateway_load_config() { printf "%s\n" "{\"enabled\":true}"; }
+      run_backend_ollama() { printf "run:%s\n" "$model"; }
+      gateway_set_main_model() { printf "main:%s:%s\n" "$1" "$2"; }
+      gateway_restart() { printf "restart\n"; }
+      cmd_run fast --main
+    ' _ "$SPARK" 2>&1)
+  rm -rf "$tmp"
+  [[ "$output" == *"run:qwen3:30b"* ]] &&
+    [[ "$output" == *"main:ollama:qwen3:30b"* ]] &&
+    [[ "$output" == *"restart"* ]]
+}
+
 # --- Platform / accelerator detection ---
 test_detect_metal_on_apple_silicon() {
   local tmp fake_bin out
@@ -9006,6 +9027,7 @@ run_test "status supports JSON, quiet, and operational exit codes" test_status_j
 run_test "dashboard web writes product UI" test_dashboard_web_once_writes_product_ui
 run_test "dashboard terminal renders product snapshot" test_dashboard_terminal_still_renders_snapshot
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
+run_test "spark run --main publishes an alias target" test_run_main_publishes_alias_target
 run_test "pull (vllm) reports ready" test_pull_vllm_ready
 run_test "pull routes to Ollama on the ollama backend" test_pull_ollama_routes
 run_test "list shows downloaded models" test_list_shows_models
