@@ -3367,6 +3367,27 @@ test_workspace_restart_captures_launch_before_stop_and_discards_it() {
     [[ "$out" != *"after:captured-launch"* ]]
 }
 
+test_workspace_migrates_hermes_model_env_to_main() {
+  local tmp fake_bin env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf '%s\n' \
+    'HERMES_MODEL=Org/Alpha' \
+    'HERMES_LITELLM_MODEL=main' \
+    > "${tmp}/home/.config/spark/workspace/secrets.env"
+  printf '%s\n' \
+    '{"enabled":true,"port":4000,"main":{"provider":"vllm","model":"Org/Alpha"}}' \
+    > "${tmp}/home/.config/spark/gateway.json"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm bash -c '
+    source "$1"
+    workspace_migrate_runtime_config
+  ' _ "$SPARK"
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  rm -rf "$tmp"
+  [[ "$env" == *$'HERMES_MODEL=main\n'* || "$env" == *$'HERMES_MODEL=main' ]] &&
+    [[ "$env" != *"HERMES_LITELLM_MODEL="* ]]
+}
+
 test_captured_vllm_launch_defaults_omitted_kv_to_auto() {
   local out definition
   definition='{"kind":"captured-vllm","backend":"vllm","model":"Org/Model","image":"eugr/spark-vllm:latest","image_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vllm_entrypoint":true,"env":{},"vllm_args":["vllm","serve","Org/Model","--port","8000"]}'
@@ -3962,7 +3983,8 @@ test_workspace_setup_writes_compose_names() {
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$env" == *"VIKUNJA_URL=https://tasks.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"HERMES_DASHBOARD_PORT=18789"* ]] &&
-    [[ "$env" == *"HERMES_LITELLM_MODEL=main"* ]] &&
+    [[ "$env" == *"HERMES_MODEL=main"* ]] &&
+    [[ "$env" != *"HERMES_LITELLM_MODEL="* ]] &&
     [[ "$env" == *"HERMES_CONTEXT_LENGTH=65536"* ]] &&
     [[ "$env" == *"HERMES_MAX_TOKENS=512"* ]] &&
     [[ "$env" == *"HERMES_REASONING_EFFORT=none"* ]] &&
@@ -8559,8 +8581,7 @@ test_update_prompts_workspace_tool_updates_one_by_one() {
 WORKSPACE_POSTGRES_IMAGE=postgres:17
 WORKSPACE_VIKUNJA_IMAGE=vikunja/vikunja:latest
 WORKSPACE_N8N_IMAGE=docker.n8n.io/n8nio/n8n:latest
-HERMES_MODEL=Org/Alpha
-HERMES_LITELLM_MODEL=main
+HERMES_MODEL=main
 HERMES_CONTEXT_LENGTH=65536
 HERMES_MAX_TOKENS=512
 HERMES_REASONING_EFFORT=none
@@ -8569,13 +8590,14 @@ HERMES_DASHBOARD_PORT=18789
 HERMES_POLICY_TIER=restricted
 HERMES_URL=https://hermes.test-tailnet.ts.net
 ENV
+  printf '%s\n' '{"enabled":true,"port":4000,"main":{"provider":"vllm","model":"Org/Alpha"},"providers":{"vllm":{"enabled":true,"port":8000}}}' > "${tmp}/home/.config/spark/gateway.json"
   : > "${tmp}/home/.config/spark/workspace/docker-compose.yml"
   cat > "${fake_bin}/curl" <<EOF
 #!/usr/bin/env bash
 printf 'VERSION="%s"\\n' "$SPARK_VERSION"
 EOF
   chmod +x "${fake_bin}/curl"
-  out=$(printf 'y\ny\ny\ny\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+  out=$(printf 'y\ny\ny\ny\ny\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:${current_tag}" \
     FAKE_COMPOSE_FILE="${tmp}/compose.log" \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
@@ -8790,7 +8812,7 @@ test_update_nemohermes_rebuild_uses_stored_compatible_key() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   mkdir -p "${tmp}/home/.config/spark/workspace"
   cat > "${tmp}/home/.config/spark/workspace/secrets.env" <<ENV
-HERMES_LITELLM_MODEL=main
+HERMES_MODEL=main
 HERMES_CONTEXT_LENGTH=65536
 HERMES_MAX_TOKENS=512
 HERMES_REASONING_EFFORT=none
@@ -9108,6 +9130,7 @@ run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
 run_test "workspace restart captures and discards the vLLM launch" test_workspace_restart_captures_launch_before_stop_and_discards_it
+run_test "workspace migrates the Hermes model env to main" test_workspace_migrates_hermes_model_env_to_main
 run_test "captured vLLM launch treats omitted KV mode as auto" test_captured_vllm_launch_defaults_omitted_kv_to_auto
 run_test "model repair reuses the workspace restart snapshot" test_repair_uses_workspace_restart_snapshot
 run_test "workspace repair is operator-triggered only" test_workspace_repair_is_operator_triggered_only

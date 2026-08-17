@@ -97,11 +97,7 @@ nemohermes_rebuild_with_workspace_env() {
     workspace_start_hermes_gateway_proxy || return 1
   fi
 
-  model="${NEMOCLAW_MODEL:-$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)}"
-  if [[ -z "$model" ]]; then
-    configured_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
-    [[ -n "$configured_model" ]] && model=$(workspace_litellm_model_name "$configured_model")
-  fi
+  model="${NEMOCLAW_MODEL:-$(workspace_read_env HERMES_MODEL 2>/dev/null || true)}"
 
   dashboard_port="${NEMOCLAW_DASHBOARD_PORT:-$(workspace_read_env HERMES_DASHBOARD_PORT 2>/dev/null || true)}"
   [[ -n "$dashboard_port" ]] || dashboard_port="$WORKSPACE_HERMES_PORT"
@@ -159,7 +155,7 @@ super_productivity_latest_version() {
 workspace_update_super_productivity_release() {
   local version="$1" tag model human_user human_email n8n_email
   tag="${version#v}"
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   human_user=$(workspace_read_env N8N_OWNER_FIRST_NAME 2>/dev/null || true)
   human_email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
   n8n_email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)

@@ -2211,7 +2211,7 @@ print_workspace_overview() {
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   dashboard_row ok "workspace" "configured (${mode:-unknown} mode)"
   dashboard_row ok "Hermes model" "${model:-unset}"
   dashboard_row ok "$(workspace_task_manager_label "$task_manager")" "${task_url:-unset}"
