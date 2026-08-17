@@ -391,6 +391,61 @@ cmd_alias_capture() {
   info "Captured '${name}' from ${cname}"
 }
 
+run_captured_vllm_definition() {
+  local definition="$1" label="${2:-captured launch}"
+  shift 2 || true
+  local -a overrides=("$@")
+  local model port mem max_len kv_dtype tools=0 text_only=0 no_reasoning=0 dry_run=0 explain=0 tail_logs=0
+  local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto"
+  local ALIAS_VLLM_ARGS_JSON ALIAS_VLLM_IMAGE ALIAS_VLLM_IMAGE_ID ALIAS_VLLM_ENTRYPOINT ALIAS_VLLM_ENV_JSON override_port=""
+
+  alias_validate_definition "$definition" || die "${label} has an invalid or unsafe vLLM definition"
+  [[ "$(jq -r '.kind' <<<"$definition")" == "captured-vllm" ]] \
+    || die "${label} is not a captured vLLM definition"
+  [[ "$(jq -r '.backend' <<<"$definition")" == "vllm" ]] \
+    || die "${label} does not target vLLM"
+
+  ALIAS_VLLM_ARGS_JSON=$(jq -c '.vllm_args' <<<"$definition")
+  ALIAS_VLLM_IMAGE=$(jq -r '.image // empty' <<<"$definition")
+  ALIAS_VLLM_IMAGE_ID=$(jq -r '.image_id // empty' <<<"$definition")
+  ALIAS_VLLM_ENTRYPOINT=$(jq -r 'if has("vllm_entrypoint") then .vllm_entrypoint else empty end' <<<"$definition")
+  ALIAS_VLLM_ENV_JSON=$(jq -c '.env // {}' <<<"$definition")
+  [[ -n "$ALIAS_VLLM_IMAGE" ]] || warn "${label} has no captured image; resolving the current vLLM image."
+  model=$(jq -r '.model' <<<"$definition")
+  mem=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --gpu-memory-utilization)
+  max_len=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-model-len)
+  max_num_seqs=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-num-seqs)
+  port=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --port)
+  kv_dtype=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --kv-cache-dtype)
+  # An omitted KV flag means vLLM's auto mode. Treat it as explicit here so a
+  # restart never asks an interactive question about a launch we are replaying.
+  [[ -n "$kv_dtype" ]] || kv_dtype="auto"
+  alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enforce-eager && enforce_eager_flag=1
+  alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --speculative-config && mtp_flag=1
+  alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enable-auto-tool-choice && tools=1
+  alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --limit-mm-per-prompt && text_only=1
+
+  set -- "${overrides[@]}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --explain) explain=1; dry_run=1; shift ;;
+      --force) force=1; shift ;;
+      --port) [[ $# -ge 2 ]] || die "Missing value for --port"; override_port="$2"; shift 2 ;;
+      --tail) tail_logs=1; shift ;;
+      --no-wait) no_wait=1; shift ;;
+      *) die "Unsupported captured-launch override: $1" ;;
+    esac
+  done
+  if [[ -n "$override_port" ]]; then
+    port="$override_port"
+    ALIAS_VLLM_ARGS_JSON=$(alias_vllm_set_value_json "$ALIAS_VLLM_ARGS_JSON" --port "$port") \
+      || die "Captured launch has an invalid --port argument"
+  fi
+  validate_model_ref_for_backend "$model"
+  run_backend_vllm
+}
+
 cmd_alias_run() {
   local name="$1" definition backend kind
   shift
@@ -414,44 +469,8 @@ cmd_alias_run() {
     captured-vllm)
       [[ "$BACKEND" == "vllm" ]] || die "Alias '${name}' captures a vLLM launch; this machine uses ${BACKEND}" \
         "Create or edit an alias for this backend: spark alias edit ${name}"
-      local model port mem max_len kv_dtype tools=0 text_only=0 no_reasoning=0 dry_run=0 explain=0 tail_logs=0
-      local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto"
-      local ALIAS_VLLM_ARGS_JSON ALIAS_VLLM_IMAGE ALIAS_VLLM_IMAGE_ID ALIAS_VLLM_ENTRYPOINT ALIAS_VLLM_ENV_JSON override_port=""
-      ALIAS_VLLM_ARGS_JSON=$(jq -c '.vllm_args' <<<"$definition")
-      ALIAS_VLLM_IMAGE=$(jq -r '.image // empty' <<<"$definition")
-      ALIAS_VLLM_IMAGE_ID=$(jq -r '.image_id // empty' <<<"$definition")
-      ALIAS_VLLM_ENTRYPOINT=$(jq -r 'if has("vllm_entrypoint") then .vllm_entrypoint else empty end' <<<"$definition")
-      ALIAS_VLLM_ENV_JSON=$(jq -c '.env // {}' <<<"$definition")
-      [[ -n "$ALIAS_VLLM_IMAGE" ]] || warn "Alias '${name}' predates image capture; resolving the current vLLM image."
-      model=$(jq -r '.model' <<<"$definition")
-      mem=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --gpu-memory-utilization)
-      max_len=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-model-len)
-      max_num_seqs=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-num-seqs)
-      port=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --port)
-      kv_dtype=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --kv-cache-dtype)
-      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enforce-eager && enforce_eager_flag=1
-      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --speculative-config && mtp_flag=1
-      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enable-auto-tool-choice && tools=1
-      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --limit-mm-per-prompt && text_only=1
-      set -- "${overrides[@]}"
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --dry-run) dry_run=1; shift ;;
-          --explain) explain=1; dry_run=1; shift ;;
-          --force) force=1; shift ;;
-          --port) [[ $# -ge 2 ]] || die "Missing value for --port"; override_port="$2"; shift 2 ;;
-          --tail) tail_logs=1; shift ;;
-          --no-wait) no_wait=1; shift ;;
-          *) die "Unsupported alias override: $1" ;;
-        esac
-      done
-      if [[ -n "$override_port" ]]; then
-        port="$override_port"
-        ALIAS_VLLM_ARGS_JSON=$(alias_vllm_set_value_json "$ALIAS_VLLM_ARGS_JSON" --port "$port") \
-          || die "Captured alias has an invalid --port argument"
-      fi
-      validate_model_ref_for_backend "$model"
-      run_backend_vllm
+      # The captured path shares the same centralized run_backend_vllm launcher.
+      run_captured_vllm_definition "$definition" "Alias '${name}'" "${overrides[@]}"
       ;;
     *) die "Alias '${name}' has an unsupported kind: ${kind}" ;;
   esac

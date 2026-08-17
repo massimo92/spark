@@ -1218,7 +1218,13 @@ model_server_repair() {
     if [[ "$auto_yes" != "1" ]] && ! confirm "Start ${model} now?"; then
       return 1
     fi
-    cmd_run "${args[@]}"
+    if [[ "${SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL:-}" == "$model" && \
+          -n "${SPARK_WORKSPACE_RESTART_VLLM_DEFINITION:-}" ]]; then
+      run_captured_vllm_definition "$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION" \
+        "workspace restart" --force
+    else
+      cmd_run "${args[@]}"
+    fi
   fi
 
   if [[ "$check_only" == "1" ]]; then
