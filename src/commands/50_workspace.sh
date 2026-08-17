@@ -3266,6 +3266,8 @@ async def handle(client_reader, client_writer):
             lower = line.lower()
             if lower.startswith(b"host:"):
                 line = f"Host: 127.0.0.1:{sys.argv[2]}".encode()
+            elif lower.startswith(b"origin:"):
+                line = f"Origin: http://127.0.0.1:{sys.argv[2]}".encode()
             elif lower.startswith(b"connection:"):
                 saw_connection = True
                 if not websocket:
