@@ -3507,7 +3507,8 @@ test_workspace_dashboard_proxy_rewrites_host_on_loopback() {
   [[ "$docker_args" == *"--network host"* ]] &&
     [[ "$docker_args" == *"hermes-dashboard-proxy.py 18790 18789"* ]] &&
     grep -Fq 'asyncio.start_server(handle, "127.0.0.1"' "$proxy_script" &&
-    grep -Fq 'Host: 127.0.0.1:' "$proxy_script"
+    grep -Fq 'Host: 127.0.0.1:' "$proxy_script" &&
+    grep -Fq 'Origin: http://127.0.0.1:' "$proxy_script"
   local status=$?
   rm -rf "$tmp"
   return "$status"
