@@ -1446,6 +1446,7 @@ cmd_run_help() {
     --max-num-seqs <int>   Max concurrent requests; higher uses more memory.
     --mtp                  Enable MTP speculative decoding when supported.
     --no-mtp               Disable MTP speculative decoding.
+    --main                 Publish this model as LiteLLM main after it is ready.
     --enforce-eager        Disable CUDA graphs; lower startup peak, slower inference.
     --no-enforce-eager     Force CUDA graphs on.
     --port <int>           Direct model API port; default auto-selects from 8000.
@@ -1461,7 +1462,7 @@ cmd_run_help() {
     --regen-profile        Recompute cached model memory profile.
 
   Aliases keep model settings frozen and accept operational overrides only:
-  --dry-run, --explain, --force, --port, --tail, --no-wait.
+  --dry-run, --explain, --force, --port, --tail, --no-wait, --main.
 
 EOF
 }
@@ -1470,6 +1471,7 @@ cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" alias_frozen_flags=0
+  local publish_main=0
   local ALIAS_VLLM_ARGS_JSON="" ALIAS_VLLM_IMAGE="" ALIAS_VLLM_IMAGE_ID="" ALIAS_VLLM_ENTRYPOINT="" ALIAS_VLLM_ENV_JSON=""
   local -a alias_override_args=()
 
@@ -1490,6 +1492,7 @@ cmd_run() {
       --text-only) text_only=1; alias_frozen_flags=1; shift ;;
       --no-reasoning) no_reasoning=1; alias_frozen_flags=1; shift ;;
       --no-pull)   no_pull=1; alias_frozen_flags=1; shift ;;
+      --main)      publish_main=1; alias_override_args+=(--main); shift ;;
       --dry-run)   dry_run=1; alias_override_args+=(--dry-run); shift ;;
       --explain)   explain=1; dry_run=1; alias_override_args+=(--explain); shift ;;
       --tail)      tail_logs=1; alias_override_args+=(--tail); shift ;;
@@ -1502,9 +1505,18 @@ cmd_run() {
   done
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
+  if [[ "$publish_main" == "1" ]]; then
+    [[ "$dry_run" == "0" ]] || die "Cannot combine --main with --dry-run/--explain"
+    [[ "$no_wait" == "0" ]] || die "Cannot combine --main with --no-wait"
+    [[ "$tail_logs" == "0" ]] || die "Cannot combine --main with --tail"
+    local gateway_config
+    gateway_config=$(gateway_load_config)
+    [[ "$gateway_config" != "{}" && "$(printf '%s\n' "$gateway_config" | jq -r '.enabled // false')" == "true" ]] || \
+      die "Cannot use --main: LiteLLM gateway is not configured" "Run 'spark setup' first"
+  fi
   if [[ "${SPARK_ALIAS_BYPASS:-0}" != "1" ]] && alias_exists "$model"; then
     [[ "$alias_frozen_flags" == "0" ]] || die "Alias model settings are frozen" \
-      "Allowed overrides: --dry-run, --explain, --force, --port, --tail, --no-wait"
+      "Allowed overrides: --dry-run, --explain, --force, --port, --tail, --no-wait, --main"
     cmd_alias_run "$model" "${alias_override_args[@]}"
     return 0
   fi
@@ -1513,10 +1525,52 @@ cmd_run() {
   # Pick the engine from the detected hardware (vLLM on NVIDIA, Ollama elsewhere).
   # cmd_run's flag locals are visible to the backend functions via dynamic scoping.
   case "$BACKEND" in
-    vllm)   run_backend_vllm ;;
-    ollama) run_backend_ollama ;;
+    vllm)
+      if [[ "$publish_main" == "1" ]]; then
+        SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm
+        run_publish_main "$model"
+      else
+        run_backend_vllm
+      fi
+      ;;
+    ollama)
+      if [[ "$publish_main" == "1" ]]; then
+        SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_ollama
+        run_publish_main "$model"
+      else
+        run_backend_ollama
+      fi
+      ;;
     *)      die "Unknown backend: $BACKEND" "Set SPARK_BACKEND to 'vllm' or 'ollama'" ;;
   esac
+}
+
+run_publish_main() {
+  local model="$1" config old_config port name running rest
+  config=$(gateway_load_config)
+  old_config="$config"
+
+  if [[ "$BACKEND" == "vllm" ]]; then
+    port=""
+    while IFS=$'\t' read -r name running port rest; do
+      [[ "$running" == "$model" ]] && break
+      port=""
+    done < <(list_managed_containers)
+    [[ "$port" =~ ^[0-9]+$ ]] && model_api_ready "$port" || \
+      die "Cannot publish ${model} as main: model API is not ready"
+  fi
+
+  gateway_set_main_model "$BACKEND" "$model" || \
+    die "Could not update LiteLLM main to ${model}"
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    if ! (gateway_restart); then
+      gateway_save_config "$old_config"
+      (gateway_restart) >/dev/null 2>&1 || true
+      die "Could not restart LiteLLM after publishing ${model} as main"
+    fi
+  fi
+  info "LiteLLM main now targets ${BACKEND}/${model}"
 }
 
 # --- Launch aliases ---
@@ -1829,7 +1883,7 @@ run_captured_vllm_definition() {
   shift 2 || true
   local -a overrides=("$@")
   local model port mem max_len kv_dtype tools=0 text_only=0 no_reasoning=0 dry_run=0 explain=0 tail_logs=0
-  local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto"
+  local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" publish_main=0
   local ALIAS_VLLM_ARGS_JSON ALIAS_VLLM_IMAGE ALIAS_VLLM_IMAGE_ID ALIAS_VLLM_ENTRYPOINT ALIAS_VLLM_ENV_JSON override_port=""
 
   alias_validate_definition "$definition" || die "${label} has an invalid or unsafe vLLM definition"
@@ -1867,6 +1921,7 @@ run_captured_vllm_definition() {
       --port) [[ $# -ge 2 ]] || die "Missing value for --port"; override_port="$2"; shift 2 ;;
       --tail) tail_logs=1; shift ;;
       --no-wait) no_wait=1; shift ;;
+      --main) publish_main=1; shift ;;
       *) die "Unsupported captured-launch override: $1" ;;
     esac
   done
@@ -1876,7 +1931,12 @@ run_captured_vllm_definition() {
       || die "Captured launch has an invalid --port argument"
   fi
   validate_model_ref_for_backend "$model"
-  run_backend_vllm
+  if [[ "$publish_main" == "1" ]]; then
+    SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm
+    run_publish_main "$model"
+  else
+    run_backend_vllm
+  fi
 }
 
 cmd_alias_run() {
@@ -2738,7 +2798,8 @@ run_backend_vllm() {
   esac
 
   # Auto-restart gateway if running so it picks up the new model
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != "1" ]] && \
+      docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     gateway_restart
   fi
 
@@ -2981,7 +3042,8 @@ gateway_enable_ollama() {
   config=$(gateway_load_config)
   config=$(printf '%s' "$config" | jq '.providers.ollama.enabled = true' 2>/dev/null) || return 0
   gateway_save_config "$config"
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != "1" ]] && \
+      docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     gateway_restart
   fi
 }
@@ -3644,7 +3706,7 @@ print_workspace_overview() {
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   dashboard_row ok "workspace" "configured (${mode:-unknown} mode)"
   dashboard_row ok "Hermes model" "${model:-unset}"
   dashboard_row ok "$(workspace_task_manager_label "$task_manager")" "${task_url:-unset}"
@@ -3820,7 +3882,7 @@ dashboard_workspace_html() {
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   dashboard_row_html ok "Workspace" "configured (${mode:-unknown} mode)"
   dashboard_row_html ok "Hermes model" "${model:-unset}"
   dashboard_row_html ok "$task_label" "${task_url:-unset}"
@@ -6267,6 +6329,20 @@ workspace_litellm_model_name() {
   printf 'main\n'
 }
 
+workspace_main_model() {
+  local config model legacy_model
+  config=$(gateway_load_config 2>/dev/null || true)
+  model=$(printf '%s\n' "$config" | jq -r '.main.model // empty' 2>/dev/null || true)
+  if [[ -n "$model" && "$model" != "null" ]]; then
+    printf '%s\n' "$model"
+    return 0
+  fi
+  # Read legacy installations during migration only; new state is sourced from LiteLLM.
+  legacy_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  [[ -n "$legacy_model" && "$legacy_model" != "main" ]] || return 1
+  printf '%s\n' "$legacy_model"
+}
+
 workspace_model_in_list() {
   local model="$1" i
   collect_downloaded_models
@@ -6323,7 +6399,7 @@ workspace_capture_restart_model() {
   SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
   SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
   [[ "$BACKEND" == "vllm" ]] || return 0
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   [[ -n "$model" ]] || return 0
   cname=$(container_for_ref "$model" 2>/dev/null || true)
   [[ -n "$cname" ]] || cname=$(container_name_for_model "$model" 2>/dev/null || true)
@@ -6694,7 +6770,7 @@ workspace_postgres_volume_target() {
 
 workspace_write_files_vikunja() {
   local tailnet="$1" human_user="$2" human_email="$3" human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
-  local vikunja_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
+  local vikunja_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie
   local tailscale_bind_addr tailscale_dns_name
   local postgres_pass vikunja_db_pass vikunja_secret n8n_db_pass n8n_key mention_secret
   local n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status vikunja_token tailscale_mode
@@ -6734,7 +6810,6 @@ workspace_write_files_vikunja() {
       hermes_url=
     fi
   fi
-  litellm_model=$(workspace_litellm_model_name "$model")
   workspace_backup_invalid_env_file "$WORKSPACE_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_POSTGRES_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_VIKUNJA_ENV_FILE"
@@ -6850,8 +6925,7 @@ TASK_MANAGER_URL=${vikunja_url}
 N8N_URL=${n8n_url}
 HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
-HERMES_MODEL=${model}
-HERMES_LITELLM_MODEL=${litellm_model}
+HERMES_MODEL=$(workspace_litellm_model_name "$model")
 HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
 HERMES_CONTEXT_LENGTH=${WORKSPACE_HERMES_MIN_CONTEXT}
 HERMES_MAX_TOKENS=${WORKSPACE_HERMES_MAX_TOKENS_DEFAULT}
@@ -7025,7 +7099,7 @@ EOF
 
 workspace_write_files_super_productivity() {
   local tailnet="$1" human_user="$2" human_email="$3" _human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
-  local task_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
+  local task_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
   local postgres_pass postgres_volume_target supersync_db_pass supersync_jwt supersync_token supersync_encryption n8n_db_pass n8n_key mention_secret
   local n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status browser_sync_status browser_sync_url postgres_image supersync_image electron_version electron_commit electron_image n8n_image rp_id old_umask
@@ -7062,7 +7136,6 @@ workspace_write_files_super_productivity() {
     hermes_url=""
   fi
 
-  litellm_model=$(workspace_litellm_model_name "$model")
   workspace_backup_invalid_env_file "$WORKSPACE_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_POSTGRES_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE"
@@ -7184,8 +7257,7 @@ SUPER_PRODUCTIVITY_URL=${task_url}
 N8N_URL=${n8n_url}
 HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
-HERMES_MODEL=${model}
-HERMES_LITELLM_MODEL=${litellm_model}
+HERMES_MODEL=$(workspace_litellm_model_name "$model")
 HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
 HERMES_CONTEXT_LENGTH=${WORKSPACE_HERMES_MIN_CONTEXT}
 HERMES_MAX_TOKENS=${WORKSPACE_HERMES_MAX_TOKENS_DEFAULT}
@@ -7387,7 +7459,7 @@ EOF
 
 workspace_write_files_todoist() {
   local tailnet="$1" human_user="$2" human_email="$3" _human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
-  local task_url="$WORKSPACE_TODOIST_APP_URL" n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
+  local task_url="$WORKSPACE_TODOIST_APP_URL" n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
   local postgres_pass postgres_volume_target n8n_db_pass n8n_key n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status mention_secret
   local postgres_image n8n_image todoist_token old_todoist_token todoist_status old_umask
@@ -7420,7 +7492,6 @@ workspace_write_files_todoist() {
     hermes_url=""
   fi
 
-  litellm_model=$(workspace_litellm_model_name "$model")
   workspace_backup_invalid_env_file "$WORKSPACE_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_POSTGRES_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_N8N_ENV_FILE"
@@ -7504,8 +7575,7 @@ TASK_MANAGER_URL=${task_url}
 N8N_URL=${n8n_url}
 HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
-HERMES_MODEL=${model}
-HERMES_LITELLM_MODEL=${litellm_model}
+HERMES_MODEL=$(workspace_litellm_model_name "$model")
 HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
 HERMES_CONTEXT_LENGTH=${WORKSPACE_HERMES_MIN_CONTEXT}
 HERMES_MAX_TOKENS=${WORKSPACE_HERMES_MAX_TOKENS_DEFAULT}
@@ -9105,7 +9175,7 @@ workspace_configure_tailscale() {
 
 workspace_hermes_config_ready() {
   local litellm_model="$1" configured_model="" onboard_status=""
-  configured_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  configured_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   onboard_status=$(workspace_read_env HERMES_ONBOARD_STATUS 2>/dev/null || true)
   [[ "$configured_model" == "$litellm_model" ]] || return 1
   [[ "$onboard_status" == "configured" || "$onboard_status" == "manual" ]] || return 1
@@ -10585,7 +10655,11 @@ workspace_setup() {
   WORKSPACE_SETUP_RESUME_HINT=""
   printf "\n  ${BOLD}spark ws setup${NC} — %s + n8n + Hermes\n\n" "$(workspace_task_manager_label "$task_manager")"
   workspace_preflight "$check_only" || true
-  existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  existing_model=$(workspace_main_model 2>/dev/null || true)
+  [[ -n "$existing_model" ]] || {
+    existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+    [[ "$existing_model" == "main" ]] && existing_model=""
+  }
   existing_tail_mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   effective_tail_mode="${requested_tail_mode:-services}"
   if [[ -n "$teardown_task_manager" || -n "$requested_model" || -n "$postgres_image" || -n "$vikunja_image" || -n "$super_productivity_image" || -n "$supersync_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
@@ -10896,7 +10970,7 @@ workspace_print_status_summary() {
   hermes_state=$(workspace_hermes_runtime_state || true)
   access_state=$(workspace_access_runtime_state || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   task_url=$(workspace_task_manager_url)
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
@@ -10946,7 +11020,7 @@ workspace_status_json() {
   hermes_state=$(workspace_hermes_runtime_state || true)
   access_state=$(workspace_access_runtime_state || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   task_url=$(workspace_task_manager_url)
   case "$task_manager" in
     super-productivity)
@@ -11019,6 +11093,27 @@ cmd_workspace_status() {
 }
 
 workspace_migrate_runtime_config() {
+  local current_model legacy_model physical_model provider
+  [[ -f "$WORKSPACE_ENV_FILE" ]] || {
+    workspace_remove_legacy_human_passwords
+    workspace_remove_legacy_smtp
+    workspace_remove_transient_n8n_owner_config
+    return 0
+  }
+  current_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  legacy_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  physical_model=$(workspace_main_model 2>/dev/null || true)
+  if [[ -z "$physical_model" && -n "$current_model" && "$current_model" != "main" ]]; then
+    provider=$(gateway_load_config | jq -r '.main.provider // empty' 2>/dev/null || true)
+    [[ -n "$provider" ]] || { [[ "$BACKEND" == "ollama" ]] && provider=ollama || provider=vllm; }
+    gateway_set_main_model "$provider" "$current_model" || \
+      warn "Could not migrate the physical Hermes model into LiteLLM main"
+  fi
+  if [[ "$current_model" != "main" || -n "$legacy_model" ]]; then
+    workspace_set_env_key HERMES_MODEL main
+    workspace_remove_env_file_key "$WORKSPACE_ENV_FILE" HERMES_LITELLM_MODEL
+    info "Migrated Hermes model configuration to HERMES_MODEL=main"
+  fi
   workspace_remove_legacy_human_passwords
   workspace_remove_legacy_smtp
   workspace_remove_transient_n8n_owner_config
@@ -11046,7 +11141,7 @@ workspace_start() {
   printf "\n  ${BOLD}spark ws start${NC}\n\n"
   workspace_configured || die "Workspace not configured" "Run: spark ws setup"
   workspace_migrate_runtime_config
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   [[ -n "$model" ]] || die "Hermes model is not configured" "Run: spark ws setup"
 
   workspace_compose up -d --remove-orphans >/dev/null 2>&1 \
@@ -11108,7 +11203,7 @@ workspace_stop() {
 
   printf "\n  ${BOLD}spark ws stop${NC}\n\n"
   workspace_configured || die "Workspace not configured" "Run: spark ws setup"
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
 
   hermes_container=$(workspace_hermes_running_container_name 2>/dev/null || true)
   if [[ -n "$hermes_container" ]]; then
@@ -11192,7 +11287,7 @@ workspace_repair() {
   fi
   workspace_require_config
   workspace_migrate_runtime_config
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   [[ -n "$model" ]] || die "Hermes model is not configured" "Run: spark ws setup"
   task_manager=$(workspace_task_manager)
 
@@ -11256,7 +11351,7 @@ workspace_status_item() {
 
 cmd_workspace_health() {
   local model task_manager
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   task_manager=$(workspace_task_manager)
   printf "\n  ${BOLD}Workspace health${NC}\n"
   workspace_status_item "Compose postgres" workspace_compose_service_running postgres
@@ -12174,7 +12269,7 @@ workspace_n8n_http_ready() {
 
 workspace_litellm_model_routed() {
   local litellm_model out
-  litellm_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  litellm_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   [[ -n "$litellm_model" ]] || return 1
   command -v curl >/dev/null 2>&1 || return 1
   out=$(curl -fsS --max-time 5 "http://127.0.0.1:${GATEWAY_PORT}/v1/models" 2>/dev/null) || return 1
@@ -12182,10 +12277,10 @@ workspace_litellm_model_routed() {
 }
 
 workspace_litellm_main_alias_ready() {
-  local expected_model expected_provider config
-  expected_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  local expected_model="${1:-}" expected_provider config
+  [[ -n "$expected_model" ]] || expected_model=$(workspace_main_model 2>/dev/null || true)
   [[ -n "$expected_model" ]] || return 1
-  [[ "$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)" == "main" ]] || return 1
+  [[ "$(workspace_read_env HERMES_MODEL 2>/dev/null || true)" == "main" ]] || return 1
   expected_provider="vllm"
   [[ "$BACKEND" == "ollama" ]] && expected_provider="ollama"
   config=$(gateway_load_config)
@@ -12196,7 +12291,7 @@ workspace_litellm_main_alias_ready() {
 
 workspace_litellm_model_smoke() {
   local litellm_model escaped_model payload out
-  litellm_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  litellm_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   [[ -n "$litellm_model" ]] || return 1
   command -v curl >/dev/null 2>&1 || return 1
   escaped_model=$(printf '%s' "$litellm_model" | sed 's/\\/\\\\/g; s/"/\\"/g')
@@ -12664,7 +12759,7 @@ workspace_tailscale_ports_fallback() {
   human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
   human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
   n8n_email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   bind_addr=$(workspace_tailscale_ipv4 2>/dev/null || true)
   dns_name=$(workspace_tailscale_dns_name 2>/dev/null || true)
   [[ -n "$human_user" && -n "$human_email" && -n "$n8n_email" && -n "$model" ]] || return 1
@@ -12947,7 +13042,7 @@ workspace_hermes_doctor_ready() {
 workspace_hermes_inference_route_ready() {
   local litellm_model out
   command -v nemohermes >/dev/null 2>&1 || return 1
-  litellm_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  litellm_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   [[ -n "$litellm_model" ]] || return 1
   out=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes inference get --json 2>/dev/null || \
     NEMOCLAW_SANDBOX_NAME=hermes nemohermes inference get 2>/dev/null || true)
@@ -12958,7 +13053,7 @@ workspace_hermes_inference_route_ready() {
 workspace_hermes_config_model_ready() {
   local expected="${1:-}" key out value
   command -v nemohermes >/dev/null 2>&1 || return 1
-  [[ -n "$expected" ]] || expected=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  [[ -n "$expected" ]] || expected=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   [[ -n "$expected" ]] || return 1
   for key in model.default _nemoclaw_upstream.model; do
     out=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes config get \
@@ -13038,7 +13133,7 @@ cmd_workspace_doctor() {
   WORKSPACE_DOCTOR_ACTIONS=()
   WORKSPACE_DOCTOR_SECTIONS=()
   model="$requested_model"
-  [[ -n "$model" ]] || model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  [[ -n "$model" ]] || model=$(workspace_main_model 2>/dev/null || true)
   task_manager=$(workspace_task_manager)
 
   if ! workspace_configured; then
@@ -13122,21 +13217,21 @@ cmd_workspace_doctor() {
       SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS SUPER_PRODUCTIVITY_BROWSER_SYNC_URL \
       WORKSPACE_SUPER_PRODUCTIVITY_VERSION WORKSPACE_SUPER_PRODUCTIVITY_COMMIT \
       DB_POSTGRESDB_PASSWORD N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET N8N_BASIC_AUTH_USER \
-      N8N_OWNER_SETUP_STATUS HERMES_MODEL HERMES_LITELLM_MODEL HERMES_CONTEXT_LENGTH \
+      N8N_OWNER_SETUP_STATUS HERMES_MODEL HERMES_CONTEXT_LENGTH \
       HERMES_MAX_TOKENS HERMES_REASONING_EFFORT HERMES_LITELLM_BASE_URL TASK_MANAGER_URL \
       SUPER_PRODUCTIVITY_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE
   elif [[ "$task_manager" == "todoist" ]]; then
     workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
       WORKSPACE_TASK_MANAGER POSTGRES_PASSWORD DB_POSTGRESDB_PASSWORD N8N_ENCRYPTION_KEY \
       WORKSPACE_MENTION_SECRET N8N_BASIC_AUTH_USER N8N_OWNER_SETUP_STATUS TODOIST_API_URL \
-      TODOIST_URL TODOIST_API_TOKEN TODOIST_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
+      TODOIST_URL TODOIST_API_TOKEN TODOIST_API_STATUS HERMES_MODEL \
       HERMES_CONTEXT_LENGTH HERMES_MAX_TOKENS HERMES_REASONING_EFFORT \
       HERMES_LITELLM_BASE_URL TASK_MANAGER_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE
   else
     workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
       POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD VIKUNJA_SERVICE_SECRET DB_POSTGRESDB_PASSWORD \
       N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HUMAN_USER_ID N8N_BASIC_AUTH_USER \
-      N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
+      N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL \
       HERMES_CONTEXT_LENGTH HERMES_MAX_TOKENS HERMES_REASONING_EFFORT \
       HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
       VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_BOT_USERNAME VIKUNJA_HERMES_BOT_ID \
@@ -13188,7 +13283,7 @@ cmd_workspace_doctor() {
 
   workspace_doctor_section "Inference & agent" "spark ws repair --yes"
   workspace_doctor_check "LiteLLM gateway running" workspace_gateway_running
-  workspace_doctor_check "LiteLLM main alias targets selected physical model" workspace_litellm_main_alias_ready
+  workspace_doctor_check "LiteLLM main alias targets selected physical model" workspace_litellm_main_alias_ready "$model"
   workspace_doctor_check "LiteLLM exposes Hermes model route" workspace_litellm_model_routed
   workspace_doctor_check "LiteLLM Hermes route completes smoke request" workspace_litellm_model_smoke
   workspace_doctor_check "Hermes model running: ${model:-none}" workspace_model_running "$model"
@@ -13741,11 +13836,7 @@ nemohermes_rebuild_with_workspace_env() {
     workspace_start_hermes_gateway_proxy || return 1
   fi
 
-  model="${NEMOCLAW_MODEL:-$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)}"
-  if [[ -z "$model" ]]; then
-    configured_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
-    [[ -n "$configured_model" ]] && model=$(workspace_litellm_model_name "$configured_model")
-  fi
+  model="${NEMOCLAW_MODEL:-$(workspace_read_env HERMES_MODEL 2>/dev/null || true)}"
 
   dashboard_port="${NEMOCLAW_DASHBOARD_PORT:-$(workspace_read_env HERMES_DASHBOARD_PORT 2>/dev/null || true)}"
   [[ -n "$dashboard_port" ]] || dashboard_port="$WORKSPACE_HERMES_PORT"
@@ -13803,7 +13894,7 @@ super_productivity_latest_version() {
 workspace_update_super_productivity_release() {
   local version="$1" tag model human_user human_email n8n_email
   tag="${version#v}"
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   human_user=$(workspace_read_env N8N_OWNER_FIRST_NAME 2>/dev/null || true)
   human_email=$(workspace_read_env SUPER_PRODUCTIVITY_USER_EMAIL 2>/dev/null || true)
   n8n_email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
