@@ -3340,11 +3340,62 @@ test_workspace_restart_orders_stop_then_start() {
   local out
   out=$(bash -c '
     source "$1"
+    workspace_capture_restart_model() { :; }
     workspace_stop() { printf "stop\n"; }
     workspace_start() { printf "start\n"; }
     workspace_restart
   ' _ "$SPARK")
   [[ "$out" == $'stop\nstart' ]]
+}
+
+test_workspace_restart_captures_launch_before_stop_and_discards_it() {
+  local out
+  out=$(bash -c '
+    source "$1"
+    BACKEND=vllm
+    workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Model\n"; }
+    container_for_ref() { printf "spark-vllm-model\n"; }
+    alias_capture_definition() { printf "captured-launch\n"; }
+    workspace_stop() { printf "stop:%s\n" "$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION"; }
+    workspace_start() { printf "start:%s\n" "$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION"; }
+    workspace_restart
+    printf "after:%s\n" "$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION"
+  ' _ "$SPARK")
+  [[ "$out" == *"stop:captured-launch"* ]] &&
+    [[ "$out" == *"start:captured-launch"* ]] &&
+    [[ "$out" == *"after:"* ]] &&
+    [[ "$out" != *"after:captured-launch"* ]]
+}
+
+test_captured_vllm_launch_defaults_omitted_kv_to_auto() {
+  local out definition
+  definition='{"kind":"captured-vllm","backend":"vllm","model":"Org/Model","image":"eugr/spark-vllm:latest","image_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vllm_entrypoint":true,"env":{},"vllm_args":["vllm","serve","Org/Model","--port","8000"]}'
+  out=$(bash -c '
+    source "$1"
+    run_backend_vllm() { printf "kv=%s force=%s\nargs=%s\n" "$kv_dtype" "$force" "$ALIAS_VLLM_ARGS_JSON"; }
+    run_captured_vllm_definition "$2" "workspace restart" --force
+  ' _ "$SPARK" "$definition")
+  [[ "$out" == *"kv=auto force=1"* ]] && [[ "$out" == *'"--port","8000"'* ]]
+}
+
+test_repair_uses_workspace_restart_snapshot() {
+  local out definition
+  definition='captured-launch'
+  out=$(bash -c '
+    source "$1"
+    SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=Org/Model
+    SPARK_WORKSPACE_RESTART_VLLM_DEFINITION="$2"
+    model_server_state() { printf "stopped\n"; }
+    model_server_ensure_gateway_config() { :; }
+    run_captured_vllm_definition() { printf "captured:%s\n" "$*"; }
+    cmd_run() { printf "generic:%s\n" "$*"; }
+    gateway_set_main_model() { :; }
+    gateway_rendered_config_ready() { return 0; }
+    docker() { [[ "$*" == *"ps --format"* ]] && printf "%s\n" "$GATEWAY_CONTAINER"; }
+    model_server_repair 0 1 Org/Model 1 65536 1
+  ' _ "$SPARK" "$definition")
+  [[ "$out" == *"captured:captured-launch workspace restart --force"* ]] &&
+    [[ "$out" != *"generic:"* ]]
 }
 
 test_workspace_repair_is_operator_triggered_only() {
@@ -9056,6 +9107,9 @@ run_test "help text tracks current CLI" test_help_text_tracks_current_cli
 run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
+run_test "workspace restart captures and discards the vLLM launch" test_workspace_restart_captures_launch_before_stop_and_discards_it
+run_test "captured vLLM launch treats omitted KV mode as auto" test_captured_vllm_launch_defaults_omitted_kv_to_auto
+run_test "model repair reuses the workspace restart snapshot" test_repair_uses_workspace_restart_snapshot
 run_test "workspace repair is operator-triggered only" test_workspace_repair_is_operator_triggered_only
 run_test "workspace detects Hermes MCP config drift" test_workspace_detects_hermes_mcp_config_drift
 run_test "workspace repair rebuilds MCP drift and reconciles" test_workspace_repair_rebuilds_mcp_drift_and_reconciles

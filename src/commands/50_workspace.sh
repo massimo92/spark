@@ -364,6 +364,29 @@ workspace_repair_model_server() {
   cmd_repair "${args[@]}"
 }
 
+SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
+SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
+
+workspace_capture_restart_model() {
+  local model cname definition
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
+  [[ "$BACKEND" == "vllm" ]] || return 0
+  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  [[ -n "$model" ]] || return 0
+  cname=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -n "$cname" ]] || cname=$(container_name_for_model "$model" 2>/dev/null || true)
+  [[ -n "$cname" ]] || return 0
+  definition=$(alias_capture_definition "$cname" "$model" 2>/dev/null || true)
+  [[ -n "$definition" ]] || {
+    warn "Could not capture the running vLLM launch; restart will use the workspace defaults"
+    return 0
+  }
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION="$definition"
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL="$model"
+  info "Captured the running vLLM launch for this workspace restart"
+}
+
 workspace_prepare_data_dirs() {
   local dir os owner group
   os=$(uname -s 2>/dev/null || true)
@@ -5172,8 +5195,11 @@ workspace_stop() {
 
 workspace_restart() {
   [[ $# -eq 0 ]] || die "Usage: spark ws restart"
+  workspace_capture_restart_model
   workspace_stop
   workspace_start
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
 }
 
 cmd_workspace_repair_help() {
