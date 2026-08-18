@@ -1609,7 +1609,9 @@ run_main_replacement_vllm() {
 
     old_definition=$(alias_capture_definition "$old_name" "$old_model") || \
       die "Cannot capture the current main model before stopping it"
-    stop_one_container "$old_name" || die "Could not stop current main model '${old_model}'"
+    info "Stopping current LiteLLM main '${old_model}' before checking capacity for '${target_model}'"
+    SPARK_SKIP_GATEWAY_REFRESH=1 stop_one_container "$old_name" || \
+      die "Could not stop current main model '${old_model}'"
   fi
 
   if [[ -z "$old_definition" ]]; then
