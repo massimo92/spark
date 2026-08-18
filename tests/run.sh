@@ -2871,6 +2871,30 @@ test_run_main_replaces_current_vllm_main() {
     [[ "$out" != *"Rollback"* ]]
 }
 
+test_run_main_checks_capacity_after_stopping_current_main() {
+  local out
+  out=$(bash -c '
+    source "$1"
+    BACKEND=vllm
+    GATEWAY_CONTAINER=spark-litellm
+    sequence=""
+    gateway_load_config() { printf "%s\n" '\''{"enabled":true,"main":{"provider":"vllm","model":"Org/Old"}}'\''; }
+    docker() { [[ "$*" == "ps --format {{.Names}}" ]] && printf "spark-litellm\n"; }
+    list_managed_containers() { printf "spark-old\tOrg/Old\t8000\t80\n"; }
+    alias_capture_definition() { printf "captured-old\n"; }
+    stop_one_container() { sequence="${sequence}stop "; }
+    run_backend_vllm() {
+      [[ "$sequence" == "stop " ]] || { printf "capacity-before-stop\n"; return 1; }
+      sequence="${sequence}capacity "
+      printf "capacity-after-stop\n"
+    }
+    run_publish_main() { printf "publish:%s\n" "$1"; }
+    run_main_replacement_vllm Org/New
+  ' _ "$SPARK")
+  [[ "$out" == *"capacity-after-stop"* ]] &&
+    [[ "$out" != *"capacity-before-stop"* ]]
+}
+
 test_run_main_failure_offers_and_accepts_rollback() {
   local out status
   set +e
@@ -9139,6 +9163,7 @@ run_test "dashboard terminal renders product snapshot" test_dashboard_terminal_s
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
 run_test "spark run --main publishes an alias target" test_run_main_publishes_alias_target
 run_test "spark run --main replaces the current vLLM main" test_run_main_replaces_current_vllm_main
+run_test "spark run --main checks capacity after stopping current main" test_run_main_checks_capacity_after_stopping_current_main
 run_test "spark run --main offers rollback after failure" test_run_main_failure_offers_and_accepts_rollback
 run_test "spark run --main can decline rollback" test_run_main_failure_can_decline_rollback
 run_test "pull (vllm) reports ready" test_pull_vllm_ready
