@@ -5,6 +5,12 @@ WORKSPACE_TASK_MANAGER_SERVICE="${WORKSPACE_TASK_MANAGER_SERVICE:-tasks}"
 WORKSPACE_HERMES_VIKUNJA_API_URL="${WORKSPACE_HERMES_VIKUNJA_API_URL:-http://host.openshell.internal:3456/api/v1}"
 WORKSPACE_HERMES_SUPER_PRODUCTIVITY_API_URL="${WORKSPACE_HERMES_SUPER_PRODUCTIVITY_API_URL:-http://host.openshell.internal:3877}"
 
+workspace_hermes_stop_timeout() {
+  local timeout="${SPARK_WORKSPACE_HERMES_STOP_TIMEOUT:-60}"
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=60
+  printf '%s\n' "$timeout"
+}
+
 workspace_task_manager_valid() {
   case "${1:-}" in
     vikunja|super-productivity|todoist) return 0 ;;
@@ -6962,7 +6968,16 @@ workspace_start_hermes_private_proxy() {
 }
 
 workspace_pause_hermes_private_proxy() {
+  local container timeout
   command -v nemohermes >/dev/null 2>&1 || return 1
+  container=$(workspace_hermes_running_container_name 2>/dev/null || true)
+  if [[ -n "$container" ]]; then
+    timeout=$(workspace_hermes_stop_timeout)
+    docker update --stop-timeout "$timeout" "$container" >/dev/null 2>&1 || {
+      err "Could not configure Hermes stop timeout (${timeout}s)"
+      return 1
+    }
+  fi
   NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes stop >/dev/null 2>&1
 }
 

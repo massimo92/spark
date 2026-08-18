@@ -3345,6 +3345,7 @@ test_workspace_lifecycle_commands() {
     [[ "$calls" == *"tasks bridge start"* ]] &&
     [[ "$calls" == *"dashboard proxy start"* ]] &&
     [[ "$calls" == *"hermes start"* ]] &&
+    [[ "$calls" == *"docker update --stop-timeout 60 workspace-hermes"* ]] &&
     [[ "$calls" == *"nemohermes hermes stop"* ]] &&
     [[ "$calls" == *"gateway stop"* ]] &&
     [[ "$calls" == *"bridge stop"* ]] &&
@@ -3355,6 +3356,39 @@ test_workspace_lifecycle_commands() {
     [[ "$out" == *"start"* && "$out" == *"stop"* && "$out" == *"restart"* ]] &&
     [[ "$out" != *"down       Stop"* ]] &&
     [[ "$status" -ne 0 ]] && [[ "$down" == *"Unknown ws command: down"* ]]
+}
+
+test_workspace_hermes_stop_timeout_is_configurable() {
+  local tmp out
+  tmp=$(mktemp)
+  TRACE="$tmp" SPARK_WORKSPACE_HERMES_STOP_TIMEOUT=45 bash -c '
+    source "$1"
+    workspace_hermes_running_container_name() { printf "hermes-container\n"; }
+    docker() { printf "docker %s\n" "$*" >> "$TRACE"; }
+    nemohermes() { printf "nemohermes %s\n" "$*" >> "$TRACE"; }
+    workspace_pause_hermes_private_proxy
+  ' _ "$SPARK"
+  out=$(cat "$tmp")
+  rm -f "$tmp"
+  [[ "$out" == *"docker update --stop-timeout 45 hermes-container"* ]] &&
+    [[ "$out" == *"nemohermes hermes stop"* ]]
+}
+
+test_workspace_hermes_stop_timeout_failure_aborts_stop() {
+  local out status
+  set +e
+  out=$(bash -c '
+    source "$1"
+    workspace_hermes_running_container_name() { printf "hermes-container\n"; }
+    docker() { return 1; }
+    nemohermes() { printf "nemohermes %s\n" "$*"; }
+    workspace_pause_hermes_private_proxy
+  ' _ "$SPARK" 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Could not configure Hermes stop timeout"* ]] &&
+    [[ "$out" != *"nemohermes hermes stop"* ]]
 }
 
 test_workspace_restart_orders_stop_then_start() {
@@ -9151,6 +9185,8 @@ run_test "help text tracks current CLI" test_help_text_tracks_current_cli
 run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
+run_test "Hermes stop timeout is configurable" test_workspace_hermes_stop_timeout_is_configurable
+run_test "Hermes stop timeout failure aborts stop" test_workspace_hermes_stop_timeout_failure_aborts_stop
 run_test "workspace restart captures and discards the vLLM launch" test_workspace_restart_captures_launch_before_stop_and_discards_it
 run_test "workspace migrates the Hermes model env to main" test_workspace_migrates_hermes_model_env_to_main
 run_test "captured vLLM launch treats omitted KV mode as auto" test_captured_vllm_launch_defaults_omitted_kv_to_auto
