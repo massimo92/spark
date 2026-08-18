@@ -2894,7 +2894,6 @@ test_run_main_checks_capacity_after_stopping_current_main() {
   [[ "$out" == *"capacity-after-stop"* ]] &&
     [[ "$out" != *"capacity-before-stop"* ]]
 }
-
 test_run_main_failure_offers_and_accepts_rollback() {
   local out status
   set +e
