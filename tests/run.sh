@@ -2849,6 +2849,82 @@ test_run_main_publishes_alias_target() {
     [[ "$output" == *"restart"* ]]
 }
 
+test_run_main_replaces_current_vllm_main() {
+  local out
+  out=$(bash -c '
+    source "$1"
+    BACKEND=vllm
+    model=Org/New
+    GATEWAY_CONTAINER=spark-litellm
+    gateway_load_config() { printf "%s\n" '"'"'{"enabled":true,"main":{"provider":"vllm","model":"Org/Old"}}'"'"'; }
+    docker() { [[ "$*" == "ps --format {{.Names}}" ]] && printf "spark-litellm\n"; }
+    list_managed_containers() { printf "spark-old\tOrg/Old\t8000\t80\n"; }
+    alias_capture_definition() { printf "captured-old\n"; }
+    stop_one_container() { printf "stop:%s\n" "$1"; }
+    run_backend_vllm() { printf "launch:%s\n" "$model"; }
+    run_publish_main() { printf "publish:%s\n" "$1"; }
+    run_main_replacement_vllm Org/New
+  ' _ "$SPARK")
+  [[ "$out" == *"stop:spark-old"* ]] &&
+    [[ "$out" == *"launch:Org/New"* ]] &&
+    [[ "$out" == *"publish:Org/New"* ]] &&
+    [[ "$out" != *"Rollback"* ]]
+}
+
+test_run_main_failure_offers_and_accepts_rollback() {
+  local out status
+  set +e
+  out=$(bash -c '
+    source "$1"
+    BACKEND=vllm
+    GATEWAY_CONTAINER=spark-litellm
+    gateway_load_config() { printf "%s\n" '"'"'{"enabled":true,"main":{"provider":"vllm","model":"Org/Old"}}'"'"'; }
+    docker() { [[ "$*" == "ps --format {{.Names}}" ]] && printf "spark-litellm\n"; }
+    list_managed_containers() { printf "spark-old\tOrg/Old\t8000\t80\n"; }
+    alias_capture_definition() { printf "captured-old\n"; }
+    stop_one_container() { printf "stop:%s\n" "$1"; }
+    run_backend_vllm() { printf "launch-new\n"; return 1; }
+    run_captured_vllm_definition() { printf "rollback:%s\n" "$2"; }
+    gateway_save_config() { printf "restore-config\n"; }
+    gateway_restart() { printf "gateway-restart\n"; }
+    is_interactive() { return 0; }
+    confirm_rollback_main() { printf "Rollback previous main model? [Y/n]\n"; return 0; }
+    run_main_replacement_vllm Org/New
+  ' _ "$SPARK" 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Rollback previous main model? [Y/n]"* ]] &&
+    [[ "$out" == *"rollback:main rollback"* ]] &&
+    [[ "$out" == *"restore-config"* ]] &&
+    [[ "$out" == *"The previous main model was restored"* ]]
+}
+
+test_run_main_failure_can_decline_rollback() {
+  local out status
+  set +e
+  out=$(bash -c '
+    source "$1"
+    BACKEND=vllm
+    GATEWAY_CONTAINER=spark-litellm
+    gateway_load_config() { printf "%s\n" '"'"'{"enabled":true,"main":{"provider":"vllm","model":"Org/Old"}}'"'"'; }
+    docker() { [[ "$*" == "ps --format {{.Names}}" ]] && printf "spark-litellm\n"; }
+    list_managed_containers() { printf "spark-old\tOrg/Old\t8000\t80\n"; }
+    alias_capture_definition() { printf "captured-old\n"; }
+    stop_one_container() { printf "stop:%s\n" "$1"; }
+    run_backend_vllm() { return 1; }
+    run_captured_vllm_definition() { printf "unexpected-rollback\n"; }
+    is_interactive() { return 0; }
+    confirm_rollback_main() { return 1; }
+    run_main_replacement_vllm Org/New
+  ' _ "$SPARK" 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"remains stopped"* ]] &&
+    [[ "$out" != *"unexpected-rollback"* ]]
+}
+
 # --- Platform / accelerator detection ---
 test_detect_metal_on_apple_silicon() {
   local tmp fake_bin out
@@ -9062,6 +9138,9 @@ run_test "dashboard web writes product UI" test_dashboard_web_once_writes_produc
 run_test "dashboard terminal renders product snapshot" test_dashboard_terminal_still_renders_snapshot
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
 run_test "spark run --main publishes an alias target" test_run_main_publishes_alias_target
+run_test "spark run --main replaces the current vLLM main" test_run_main_replaces_current_vllm_main
+run_test "spark run --main offers rollback after failure" test_run_main_failure_offers_and_accepts_rollback
+run_test "spark run --main can decline rollback" test_run_main_failure_can_decline_rollback
 run_test "pull (vllm) reports ready" test_pull_vllm_ready
 run_test "pull routes to Ollama on the ollama backend" test_pull_ollama_routes
 run_test "list shows downloaded models" test_list_shows_models

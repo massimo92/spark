@@ -13,7 +13,7 @@ cmd_run_help() {
     --max-num-seqs <int>   Max concurrent requests; higher uses more memory.
     --mtp                  Enable MTP speculative decoding when supported.
     --no-mtp               Disable MTP speculative decoding.
-    --main                 Publish this model as LiteLLM main after it is ready.
+    --main                 Replace LiteLLM main after readiness; rollback if startup fails.
     --enforce-eager        Disable CUDA graphs; lower startup peak, slower inference.
     --no-enforce-eager     Force CUDA graphs on.
     --port <int>           Direct model API port; default auto-selects from 8000.
@@ -94,8 +94,7 @@ cmd_run() {
   case "$BACKEND" in
     vllm)
       if [[ "$publish_main" == "1" ]]; then
-        SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm
-        run_publish_main "$model"
+        run_main_replacement_vllm "$model"
       else
         run_backend_vllm
       fi
@@ -110,6 +109,94 @@ cmd_run() {
       ;;
     *)      die "Unknown backend: $BACKEND" "Set SPARK_BACKEND to 'vllm' or 'ollama'" ;;
   esac
+}
+
+confirm_rollback_main() {
+  local answer=""
+  printf "  Rollback previous main model? [Y/n] "
+  read -r answer || true
+  [[ -z "$answer" || "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+rollback_main_vllm() {
+  local definition="$1" model="$2" old_config="$3" gateway_was_running="$4"
+
+  if is_interactive; then
+    confirm_rollback_main || {
+      warn "Rollback declined; previous main model '${model}' remains stopped"
+      return 1
+    }
+  else
+    warn "Non-interactive run: rolling back the previous main model automatically"
+  fi
+
+  if ! (SPARK_SKIP_GATEWAY_REFRESH=1 run_captured_vllm_definition "$definition" "main rollback" --force); then
+    err "Rollback failed: could not restart previous main model '${model}'"
+    return 1
+  fi
+
+  gateway_save_config "$old_config"
+  if [[ "$gateway_was_running" == "1" ]] && ! gateway_restart; then
+    err "Rollback incomplete: previous model restarted but LiteLLM could not be restarted"
+    return 1
+  fi
+  info "Rolled back LiteLLM main to vllm/${model}"
+  return 0
+}
+
+run_main_replacement_vllm() {
+  local target_model="$1" config old_config old_provider old_model
+  local old_name="" old_definition="" gateway_was_running=0
+  local name scan_model port rest
+
+  config=$(gateway_load_config)
+  old_config="$config"
+  old_provider=$(jq -r '.main.provider // empty' <<<"$config" 2>/dev/null || true)
+  old_model=$(jq -r '.main.model // empty' <<<"$config" 2>/dev/null || true)
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    gateway_was_running=1
+  fi
+
+  # A vLLM main target is replaceable only when it maps to a live, managed
+  # container. Refuse to stop anything when the route is stale or unmanaged.
+  if [[ "$old_provider" == "vllm" && -n "$old_model" ]]; then
+    while IFS=$'\t' read -r name scan_model port rest; do
+      if [[ "$scan_model" == "$old_model" ]]; then
+        old_name="$name"
+        break
+      fi
+    done < <(list_managed_containers)
+    [[ -n "$old_name" ]] || die "Cannot replace LiteLLM main safely" \
+      "Current main vllm/${old_model} has no live managed container"
+
+    if [[ "$old_model" == "$target_model" && "${force:-0}" != "1" ]]; then
+      run_publish_main "$target_model"
+      return 0
+    fi
+
+    old_definition=$(alias_capture_definition "$old_name" "$old_model") || \
+      die "Cannot capture the current main model before stopping it"
+    stop_one_container "$old_name" || die "Could not stop current main model '${old_model}'"
+  fi
+
+  if [[ -z "$old_definition" ]]; then
+    SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm
+    run_publish_main "$target_model"
+    return 0
+  fi
+
+  # Run in a subshell because backend failures call die/exit. This lets the
+  # parent restore the captured launch without losing the original shell.
+  if (SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm && run_publish_main "$target_model"); then
+    return 0
+  fi
+
+  if rollback_main_vllm "$old_definition" "$old_model" "$old_config" "$gateway_was_running"; then
+    die "Could not replace LiteLLM main with ${target_model}" \
+      "The previous main model was restored."
+  fi
+  die "Could not replace LiteLLM main with ${target_model}" \
+    "The previous main model is unavailable; start it with: spark run ${old_model} --main"
 }
 
 run_publish_main() {
@@ -499,8 +586,7 @@ run_captured_vllm_definition() {
   fi
   validate_model_ref_for_backend "$model"
   if [[ "$publish_main" == "1" ]]; then
-    SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm
-    run_publish_main "$model"
+    run_main_replacement_vllm "$model"
   else
     run_backend_vllm
   fi
