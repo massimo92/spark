@@ -5,6 +5,12 @@ WORKSPACE_TASK_MANAGER_SERVICE="${WORKSPACE_TASK_MANAGER_SERVICE:-tasks}"
 WORKSPACE_HERMES_VIKUNJA_API_URL="${WORKSPACE_HERMES_VIKUNJA_API_URL:-http://host.openshell.internal:3456/api/v1}"
 WORKSPACE_HERMES_SUPER_PRODUCTIVITY_API_URL="${WORKSPACE_HERMES_SUPER_PRODUCTIVITY_API_URL:-http://host.openshell.internal:3877}"
 
+workspace_hermes_stop_timeout() {
+  local timeout="${SPARK_WORKSPACE_HERMES_STOP_TIMEOUT:-60}"
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=60
+  printf '%s\n' "$timeout"
+}
+
 workspace_task_manager_valid() {
   case "${1:-}" in
     vikunja|super-productivity|todoist) return 0 ;;
@@ -435,12 +441,21 @@ workspace_model_context_ready() {
 }
 
 workspace_litellm_model_name() {
-  local model="$1"
-  if [[ "$BACKEND" == "ollama" ]]; then
-    printf 'ollama_chat/%s\n' "$model"
-  else
-    printf 'vllm/%s\n' "$model"
+  printf 'main\n'
+}
+
+workspace_main_model() {
+  local config model legacy_model
+  config=$(gateway_load_config 2>/dev/null || true)
+  model=$(printf '%s\n' "$config" | jq -r '.main.model // empty' 2>/dev/null || true)
+  if [[ -n "$model" && "$model" != "null" ]]; then
+    printf '%s\n' "$model"
+    return 0
   fi
+  # Read legacy installations during migration only; new state is sourced from LiteLLM.
+  legacy_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  [[ -n "$legacy_model" && "$legacy_model" != "main" ]] || return 1
+  printf '%s\n' "$legacy_model"
 }
 
 workspace_model_in_list() {
@@ -468,7 +483,7 @@ workspace_select_model() {
   is_interactive || die "Choose a model with --model in non-interactive mode"
   printf "\n  ${BOLD}Choose the model Hermes will use:${NC}\n\n" >&2
   for i in "${!MODEL_LIST_MODELS[@]}"; do
-    state=$(workspace_model_state "${MODEL_LIST_MODELS[$i]}")
+    state=$(model_server_state "${MODEL_LIST_MODELS[$i]}")
     [[ "${MODEL_LIST_STATUS[$i]:-complete}" == "partial" ]] && state="partial"
     printf "    [%d] %-45s %-10s %s\n" "$((i + 1))" "${MODEL_LIST_MODELS[$i]}" "${MODEL_LIST_SIZES[$i]}" "$state" >&2
   done
@@ -534,6 +549,38 @@ workspace_ensure_gateway() {
       fi
     fi
   fi
+}
+
+workspace_repair_model_server() {
+  local check_only="$1" auto_yes="$2" model="$3"
+  # Preserve the vLLM launch policy; Hermes validates against its effective context.
+  local args=(--model "$model" --tools --no-mtp)
+  [[ "$check_only" == "1" ]] && args+=(--check)
+  [[ "$auto_yes" == "1" ]] && args+=(--yes)
+  cmd_repair "${args[@]}"
+}
+
+SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
+SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
+
+workspace_capture_restart_model() {
+  local model cname definition
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
+  [[ "$BACKEND" == "vllm" ]] || return 0
+  model=$(workspace_main_model 2>/dev/null || true)
+  [[ -n "$model" ]] || return 0
+  cname=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -n "$cname" ]] || cname=$(container_name_for_model "$model" 2>/dev/null || true)
+  [[ -n "$cname" ]] || return 0
+  definition=$(alias_capture_definition "$cname" "$model" 2>/dev/null || true)
+  [[ -n "$definition" ]] || {
+    warn "Could not capture the running vLLM launch; restart will use the workspace defaults"
+    return 0
+  }
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION="$definition"
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL="$model"
+  info "Captured the running vLLM launch for this workspace restart"
 }
 
 workspace_prepare_data_dirs() {
@@ -896,7 +943,7 @@ workspace_write_files_vikunja() {
   local hermes_context hermes_context_mode
   local tailscale_bind_addr tailscale_dns_name
   local postgres_pass vikunja_db_pass vikunja_secret n8n_db_pass n8n_key mention_secret
-  local n8n_owner_status vikunja_token tailscale_mode
+  local n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status vikunja_token tailscale_mode
   local vikunja_api_status vikunja_human_id vikunja_bot_id vikunja_project_access_status
   local vikunja_human_status vikunja_bot_status vikunja_human_admin_status
   local postgres_image postgres_volume_target vikunja_image n8n_image old_umask
@@ -952,6 +999,8 @@ workspace_write_files_vikunja() {
   n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
     || { setup_fail "Missing n8n encryption key (N8N_ENCRYPTION_KEY) while existing workspace data is present; restore it before rerun"; return 1; }
   n8n_owner_status=$(workspace_env_or_value N8N_OWNER_SETUP_STATUS pending)
+  n8n_hermes_folder_id=$(workspace_read_env N8N_HERMES_FOLDER_ID 2>/dev/null || true)
+  n8n_hermes_folder_status=$(workspace_env_or_value N8N_HERMES_FOLDER_STATUS pending)
   mention_secret=$(workspace_env_or_generated WORKSPACE_MENTION_SECRET)
   vikunja_token=$(workspace_read_env VIKUNJA_HERMES_API_TOKEN 2>/dev/null || true)
   vikunja_api_status=$(workspace_env_or_value VIKUNJA_HERMES_API_STATUS pending)
@@ -1025,6 +1074,8 @@ N8N_BASIC_AUTH_USER=${n8n_email}
 N8N_OWNER_FIRST_NAME=${human_user}
 N8N_OWNER_LAST_NAME=Spark
 N8N_OWNER_SETUP_STATUS=${n8n_owner_status}
+N8N_HERMES_FOLDER_ID=${n8n_hermes_folder_id}
+N8N_HERMES_FOLDER_STATUS=${n8n_hermes_folder_status}
 N8N_HOST=${n8n_host}
 N8N_PROTOCOL=${n8n_protocol}
 N8N_SECURE_COOKIE=${n8n_secure_cookie}
@@ -1050,8 +1101,7 @@ TASK_MANAGER_URL=${vikunja_url}
 N8N_URL=${n8n_url}
 HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
-HERMES_MODEL=${model}
-HERMES_LITELLM_MODEL=${litellm_model}
+HERMES_MODEL=$(workspace_litellm_model_name "$model")
 HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
 HERMES_CONTEXT_MODE=${hermes_context_mode}
 HERMES_CONTEXT_LENGTH=${hermes_context}
@@ -1231,7 +1281,7 @@ workspace_write_files_super_productivity() {
   local hermes_context hermes_context_mode
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
   local postgres_pass postgres_volume_target supersync_db_pass supersync_jwt supersync_token supersync_encryption n8n_db_pass n8n_key mention_secret
-  local n8n_owner_status browser_sync_status browser_sync_url postgres_image supersync_image electron_version electron_commit electron_image n8n_image rp_id old_umask
+  local n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status browser_sync_status browser_sync_url postgres_image supersync_image electron_version electron_commit electron_image n8n_image rp_id old_umask
 
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
   tailscale_bind_addr=$(workspace_env_or_value WORKSPACE_TAILSCALE_BIND_ADDR 127.0.0.1)
@@ -1287,6 +1337,8 @@ workspace_write_files_super_productivity() {
   n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
     || { setup_fail "Missing n8n encryption key while existing workspace data is present; restore it before rerun"; return 1; }
   n8n_owner_status=$(workspace_env_or_value N8N_OWNER_SETUP_STATUS pending)
+  n8n_hermes_folder_id=$(workspace_read_env N8N_HERMES_FOLDER_ID 2>/dev/null || true)
+  n8n_hermes_folder_status=$(workspace_env_or_value N8N_HERMES_FOLDER_STATUS pending)
   browser_sync_status=$(workspace_env_or_value SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS pending)
   browser_sync_url=$(workspace_env_or_value SUPER_PRODUCTIVITY_BROWSER_SYNC_URL "")
   mention_secret=$(workspace_env_or_generated WORKSPACE_MENTION_SECRET)
@@ -1364,6 +1416,8 @@ N8N_BASIC_AUTH_USER=${n8n_email}
 N8N_OWNER_FIRST_NAME=${human_user}
 N8N_OWNER_LAST_NAME=Spark
 N8N_OWNER_SETUP_STATUS=${n8n_owner_status}
+N8N_HERMES_FOLDER_ID=${n8n_hermes_folder_id}
+N8N_HERMES_FOLDER_STATUS=${n8n_hermes_folder_status}
 N8N_HOST=${n8n_host}
 N8N_PROTOCOL=${n8n_protocol}
 N8N_SECURE_COOKIE=${n8n_secure_cookie}
@@ -1388,8 +1442,7 @@ SUPER_PRODUCTIVITY_URL=${task_url}
 N8N_URL=${n8n_url}
 HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
-HERMES_MODEL=${model}
-HERMES_LITELLM_MODEL=${litellm_model}
+HERMES_MODEL=$(workspace_litellm_model_name "$model")
 HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
 HERMES_CONTEXT_MODE=${hermes_context_mode}
 HERMES_CONTEXT_LENGTH=${hermes_context}
@@ -1596,7 +1649,7 @@ workspace_write_files_todoist() {
   local task_url="$WORKSPACE_TODOIST_APP_URL" n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
   local hermes_context hermes_context_mode
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
-  local postgres_pass postgres_volume_target n8n_db_pass n8n_key n8n_owner_status mention_secret
+  local postgres_pass postgres_volume_target n8n_db_pass n8n_key n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status mention_secret
   local postgres_image n8n_image todoist_token old_todoist_token todoist_status old_umask
 
   tailscale_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_env_or_value WORKSPACE_TAILSCALE_MODE pending)}"
@@ -1642,6 +1695,8 @@ workspace_write_files_todoist() {
   n8n_key=$(workspace_env_or_generated_guarded N8N_ENCRYPTION_KEY "${WORKSPACE_DATA_DIR}/postgres" "${WORKSPACE_DATA_DIR}/n8n") \
     || { setup_fail "Missing n8n encryption key while existing workspace data is present; restore it before rerun"; return 1; }
   n8n_owner_status=$(workspace_env_or_value N8N_OWNER_SETUP_STATUS pending)
+  n8n_hermes_folder_id=$(workspace_read_env N8N_HERMES_FOLDER_ID 2>/dev/null || true)
+  n8n_hermes_folder_status=$(workspace_env_or_value N8N_HERMES_FOLDER_STATUS pending)
   mention_secret=$(workspace_env_or_generated WORKSPACE_MENTION_SECRET)
   postgres_image="${SPARK_WORKSPACE_POSTGRES_IMAGE:-$(workspace_env_or_value WORKSPACE_POSTGRES_IMAGE "$WORKSPACE_POSTGRES_IMAGE_DEFAULT")}"
   n8n_image="${SPARK_WORKSPACE_N8N_IMAGE:-$(workspace_env_or_value WORKSPACE_N8N_IMAGE "$WORKSPACE_N8N_IMAGE_DEFAULT")}"
@@ -1689,6 +1744,8 @@ N8N_BASIC_AUTH_USER=${n8n_email}
 N8N_OWNER_FIRST_NAME=${human_user}
 N8N_OWNER_LAST_NAME=Spark
 N8N_OWNER_SETUP_STATUS=${n8n_owner_status}
+N8N_HERMES_FOLDER_ID=${n8n_hermes_folder_id}
+N8N_HERMES_FOLDER_STATUS=${n8n_hermes_folder_status}
 N8N_HOST=${n8n_host}
 N8N_PROTOCOL=${n8n_protocol}
 N8N_SECURE_COOKIE=${n8n_secure_cookie}
@@ -1712,8 +1769,7 @@ TASK_MANAGER_URL=${task_url}
 N8N_URL=${n8n_url}
 HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
-HERMES_MODEL=${model}
-HERMES_LITELLM_MODEL=${litellm_model}
+HERMES_MODEL=$(workspace_litellm_model_name "$model")
 HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
 HERMES_CONTEXT_MODE=${hermes_context_mode}
 HERMES_CONTEXT_LENGTH=${hermes_context}
@@ -2905,6 +2961,171 @@ workspace_create_n8n_owner() {
   return 1
 }
 
+workspace_n8n_folders_supported() {
+  local license_info
+  license_info=$(workspace_compose exec -T n8n n8n license:info 2>/dev/null) || return 2
+  grep -Eq '"feat:folders"[[:space:]]*:[[:space:]]*true' <<< "$license_info"
+}
+
+workspace_n8n_login_session() {
+  local email="$1" pass="$2" cookie_jar="$3" payload base_url
+  [[ -n "$email" && -n "$pass" && -n "$cookie_jar" ]] || return 1
+  base_url=$(workspace_n8n_base_url) || return 1
+  payload=$(printf '{"emailOrLdapLoginId":"%s","password":"%s"}' \
+    "$(workspace_json_escape "$email")" "$(workspace_json_escape "$pass")")
+  printf '%s' "$payload" | curl -fsS --max-time 10 \
+    --cookie-jar "$cookie_jar" --cookie "$cookie_jar" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json' \
+    -X POST "${base_url}/rest/login" --data-binary @- >/dev/null 2>&1
+}
+
+workspace_n8n_session_request() {
+  local cookie_jar="$1" method="$2" path="$3" response_file="$4" payload="${5:-}" base_url
+  base_url=$(workspace_n8n_base_url) || return 1
+  if [[ -n "$payload" ]]; then
+    printf '%s' "$payload" | curl -sS --max-time 10 \
+      --cookie "$cookie_jar" --cookie-jar "$cookie_jar" \
+      -H 'Content-Type: application/json' -H 'Accept: application/json' \
+      -X "$method" "${base_url}${path}" --data-binary @- \
+      -o "$response_file" -w '%{http_code}' 2>/dev/null
+  else
+    curl -sS --max-time 10 \
+      --cookie "$cookie_jar" --cookie-jar "$cookie_jar" \
+      -H 'Accept: application/json' -X "$method" "${base_url}${path}" \
+      -o "$response_file" -w '%{http_code}' 2>/dev/null
+  fi
+}
+
+workspace_n8n_personal_project_id() {
+  jq -r 'if ((.data.type // .type) == "personal") then (.data.id // .id // empty) else empty end' "$1" 2>/dev/null
+}
+
+workspace_n8n_folder_matches() {
+  jq -r --arg name "$WORKSPACE_N8N_HERMES_FOLDER_NAME" '
+    (if (.data | type) == "array" then .data
+     elif (.data.data | type) == "array" then .data.data
+     elif type == "array" then .
+     else [] end)
+    | [.[] | select(.name == $name and ((.parentFolderId // .parentFolder.id // null) == null))]
+    | "\(length)\t\(.[0].id // "")"
+  ' "$1" 2>/dev/null
+}
+
+workspace_ensure_n8n_hermes_folder() {
+  local email="$1" pass="$2" support_rc cookie_jar response_file http personal_project_id matches count folder_id payload
+  command -v jq >/dev/null 2>&1 || {
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "jq missing; cannot reconcile the n8n Hermes folder"
+    return 1
+  }
+  if workspace_n8n_folders_supported; then
+    :
+  else
+    support_rc=$?
+    if [[ "$support_rc" -eq 1 ]]; then
+      workspace_set_env_key N8N_HERMES_FOLDER_ID ""
+      workspace_set_env_key N8N_HERMES_FOLDER_STATUS unsupported
+      warn "n8n folders are not available with the active license"
+      return 1
+    fi
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Could not inspect n8n folder capabilities"
+    return 1
+  fi
+
+  if workspace_n8n_hermes_folder_ready; then
+    info "n8n folder exists: Personal / ${WORKSPACE_N8N_HERMES_FOLDER_NAME}"
+    return 0
+  fi
+  [[ -n "$email" ]] || return 1
+  if [[ -z "$pass" ]]; then
+    if ! is_interactive; then
+      workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+      warn "n8n owner password required to create the Hermes folder; rerun interactively or with --n8n-password-file"
+      return 1
+    fi
+    pass=$(workspace_prompt SPARK_WORKSPACE_N8N_PASSWORD \
+      "Current n8n password for ${email}" "" 1 text)
+  fi
+
+  cookie_jar=$(mktemp "${TMPDIR:-/tmp}/spark-n8n-cookie.XXXXXX") || return 1
+  response_file=$(mktemp "${TMPDIR:-/tmp}/spark-n8n-response.XXXXXX") || {
+    rm -f "$cookie_jar"
+    return 1
+  }
+  chmod 600 "$cookie_jar" "$response_file"
+  if ! workspace_n8n_login_session "$email" "$pass" "$cookie_jar"; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Could not authenticate the n8n owner to reconcile the Hermes folder"
+    return 1
+  fi
+  http=$(workspace_n8n_session_request "$cookie_jar" GET '/rest/projects/personal' "$response_file") || http=000
+  if [[ "$http" != "200" ]]; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Could not read the n8n Personal project (HTTP ${http})"
+    return 1
+  fi
+  personal_project_id=$(workspace_n8n_personal_project_id "$response_file") || personal_project_id=""
+  if [[ ! "$personal_project_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Could not identify the n8n Personal project"
+    return 1
+  fi
+  http=$(workspace_n8n_session_request "$cookie_jar" GET "/rest/projects/${personal_project_id}/folders/" "$response_file") || http=000
+  if [[ "$http" != "200" ]]; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Could not list folders in the n8n Personal project (HTTP ${http})"
+    return 1
+  fi
+  matches=$(workspace_n8n_folder_matches "$response_file") || matches=""
+  IFS=$'\t' read -r count folder_id <<< "$matches"
+  if [[ "$count" == "1" && "$folder_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_ID "$folder_id"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS exists
+    info "n8n folder exists: Personal / ${WORKSPACE_N8N_HERMES_FOLDER_NAME}"
+    return 0
+  fi
+  if [[ "$count" =~ ^[2-9][0-9]*$ ]]; then
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_ID ""
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS duplicate
+    warn "Multiple root folders named Hermes exist in n8n Personal; refusing to choose or create another"
+    return 1
+  fi
+  [[ "$count" == "0" ]] || {
+    rm -f "$cookie_jar" "$response_file"
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "Unexpected n8n folder-list response"
+    return 1
+  }
+
+  info "Creating Personal / ${WORKSPACE_N8N_HERMES_FOLDER_NAME}; existing n8n content stays unchanged"
+  payload=$(printf '{"name":"%s"}' "$(workspace_json_escape "$WORKSPACE_N8N_HERMES_FOLDER_NAME")")
+  http=$(workspace_n8n_session_request "$cookie_jar" POST "/rest/projects/${personal_project_id}/folders/" "$response_file" "$payload") || http=000
+  if [[ "$http" == "200" || "$http" == "201" ]]; then
+    folder_id=$(jq -r '.data.id // .id // empty' "$response_file" 2>/dev/null | head -1)
+    rm -f "$cookie_jar" "$response_file"
+    if [[ "$folder_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+      workspace_set_env_key N8N_HERMES_FOLDER_ID "$folder_id"
+      workspace_set_env_key N8N_HERMES_FOLDER_STATUS created
+      info "n8n folder created: Personal / ${WORKSPACE_N8N_HERMES_FOLDER_NAME}"
+      return 0
+    fi
+    workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+    warn "n8n created the Hermes folder but returned no valid folder ID"
+    return 1
+  fi
+  rm -f "$cookie_jar" "$response_file"
+  workspace_set_env_key N8N_HERMES_FOLDER_STATUS manual
+  warn "Could not create the n8n Hermes folder (HTTP ${http})"
+  return 1
+}
+
 workspace_configure_tailscale() {
   local tailnet="$1" check_only="$2" funnel_action="${3:-}" auto_yes="${4:-0}" requested_mode bind_addr dns_name json missing missing_summary
   requested_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)}"
@@ -3149,16 +3370,18 @@ workspace_configure_tailscale() {
 }
 
 workspace_hermes_config_ready() {
-  local litellm_model="$1" configured_model="" onboard_status=""
-  configured_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  local litellm_model="$1" configured_model="" expected_model="" onboard_status=""
+  configured_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  expected_model=$(workspace_litellm_model_name "$litellm_model")
   onboard_status=$(workspace_read_env HERMES_ONBOARD_STATUS 2>/dev/null || true)
-  [[ "$configured_model" == "$litellm_model" ]] || return 1
+  [[ "$configured_model" == "$expected_model" ]] || return 1
   [[ "$onboard_status" == "configured" || "$onboard_status" == "manual" ]] || return 1
   workspace_hermes_running || return 1
   workspace_start_hermes_private_proxy || return 1
   workspace_hermes_nemoclaw_configured || return 1
   workspace_hermes_doctor_ready || return 1
   workspace_hermes_inference_route_ready || return 1
+  workspace_hermes_config_model_ready "$litellm_model" || return 1
   workspace_hermes_dashboard_url_ready || return 1
   workspace_hermes_runtime_config_ready || return 1
   workspace_hermes_cli_toolsets_ready || return 1
@@ -3175,6 +3398,7 @@ workspace_hermes_runtime_config_ready() {
   [[ "$context" =~ ^[1-9][0-9]*$ ]] || return 1
   if [[ "$BACKEND" == "vllm" ]]; then
     model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+    [[ "$model" == "main" ]] && model=$(workspace_main_model 2>/dev/null || true)
     max_len=$(workspace_model_context_limit "$model" 2>/dev/null || true)
     [[ "$max_len" =~ ^[1-9][0-9]*$ && "$context" -le "$max_len" ]] || return 1
   fi
@@ -3188,13 +3412,15 @@ workspace_hermes_runtime_config_ready() {
 }
 
 workspace_configure_hermes_runtime() {
-  local max_tokens context reasoning model expected_context
+  local physical_model="${1:-}" max_tokens context reasoning model expected_context
   max_tokens=$(workspace_read_env HERMES_MAX_TOKENS 2>/dev/null || true)
   context=$(workspace_read_env HERMES_CONTEXT_LENGTH 2>/dev/null || true)
   reasoning=$(workspace_read_env HERMES_REASONING_EFFORT 2>/dev/null || true)
   [[ "$max_tokens" =~ ^[1-9][0-9]*$ ]] || max_tokens="$WORKSPACE_HERMES_MAX_TOKENS_DEFAULT"
   if [[ "$BACKEND" == "vllm" ]]; then
-    model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+    model="$physical_model"
+    [[ -n "$model" ]] || model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+    [[ "$model" == "main" ]] && model=$(workspace_main_model 2>/dev/null || true)
     expected_context=$(workspace_hermes_context_for_model "$model" 2>/dev/null || true)
     [[ "$expected_context" =~ ^[1-9][0-9]*$ ]] || return 1
     context="$expected_context"
@@ -3202,9 +3428,9 @@ workspace_configure_hermes_runtime() {
     [[ "$context" =~ ^[1-9][0-9]*$ ]] || context="$WORKSPACE_HERMES_CONTEXT_DEFAULT"
   fi
   [[ "$reasoning" == "none" ]] || reasoning="$WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT"
-  nemohermes hermes exec --no-tty --timeout 30 -- hermes config set model.max_tokens "$max_tokens" >/dev/null 2>&1 &&
-    nemohermes hermes exec --no-tty --timeout 30 -- hermes config set model.context_length "$context" >/dev/null 2>&1 &&
-    nemohermes hermes exec --no-tty --timeout 30 -- hermes config set agent.reasoning_effort "$reasoning" >/dev/null 2>&1 &&
+  nemohermes hermes config set --config-accept-new-path --key model.max_tokens --value "$max_tokens" >/dev/null 2>&1 &&
+    nemohermes hermes config set --config-accept-new-path --key model.context_length --value "$context" >/dev/null 2>&1 &&
+    nemohermes hermes config set --config-accept-new-path --key agent.reasoning_effort --value "$reasoning" >/dev/null 2>&1 &&
     workspace_configure_hermes_cli_toolsets
 }
 
@@ -3252,11 +3478,16 @@ workspace_configure_hermes_web() {
 }
 
 workspace_configure_hermes_cli_toolsets() {
-  local -a enabled disabled
-  read -r -a enabled <<< "$WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT"
-  read -r -a disabled <<< "$WORKSPACE_HERMES_CLI_TOOLSETS_DISABLED"
-  nemohermes hermes exec --no-tty --timeout 30 -- hermes tools enable --platform cli "${enabled[@]}" >/dev/null 2>&1 &&
-    nemohermes hermes exec --no-tty --timeout 30 -- hermes tools disable --platform cli "${disabled[@]}" >/dev/null 2>&1
+  local current toolsets
+  current=$(nemohermes hermes config get --format json 2>/dev/null) || return 1
+  toolsets=$(printf '%s\n' "$current" | jq -c \
+    --arg enabled "$WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT" \
+    --arg disabled "$WORKSPACE_HERMES_CLI_TOOLSETS_DISABLED" '
+      ($disabled | split(" ")) as $off
+      | ((.platform_toolsets.cli // []) + ($enabled | split(" ")) | unique)
+      | map(. as $tool | select(($off | index($tool)) == null))
+    ' 2>/dev/null) || return 1
+  nemohermes hermes config set --config-accept-new-path --key platform_toolsets.cli --value "$toolsets" >/dev/null 2>&1
 }
 
 workspace_hermes_cli_toolsets_ready() {
@@ -3274,24 +3505,55 @@ workspace_hermes_cli_toolsets_ready() {
 workspace_nemohermes_update_available() {
   local out
   command -v nemohermes >/dev/null 2>&1 || return 1
-  out=$(nemohermes update --check 2>/dev/null || true)
-  [[ "$out" == *"Update available:"*"yes"* || "$out" == *"Update available:         yes"* ]]
+  out=$(nemohermes update --check 2>/dev/null) || return 2
+  if [[ "$out" == *"Update available:"*"yes"* ]]; then
+    return 0
+  fi
+  [[ "$out" == *"Update available:"*"no"* ]] || return 2
+  return 1
 }
 
 workspace_update_nemohermes_if_needed() {
+  local check_rc update_rc
   command -v nemohermes >/dev/null 2>&1 || return 1
-  workspace_nemohermes_update_available || return 0
+  if workspace_nemohermes_update_available; then
+    :
+  else
+    check_rc=$?
+    [[ "$check_rc" -eq 1 ]] && return 0
+    return 1
+  fi
   warn "Updating NemoHermes to the maintained release"
-  NEMOCLAW_AGENT=hermes \
+  if NEMOCLAW_AGENT=hermes \
     NEMOCLAW_NON_INTERACTIVE=1 \
     NEMOCLAW_YES=1 \
     NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE="${NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE:-[\"hermes\"]}" \
-    nemohermes update --yes >/dev/null 2>&1
+    nemohermes update --yes >/dev/null 2>&1; then
+    return 0
+  else
+    update_rc=$?
+  fi
+  if workspace_nemohermes_update_available; then
+    return "$update_rc"
+  else
+    check_rc=$?
+    if [[ "$check_rc" -eq 1 ]]; then
+      warn "NemoHermes update reported an error, but the maintained release is installed"
+      return 0
+    fi
+  fi
+  return "$update_rc"
 }
 
 workspace_nemohermes_maintained_release() {
+  local check_rc
   command -v nemohermes >/dev/null 2>&1 || return 1
-  ! workspace_nemohermes_update_available
+  if workspace_nemohermes_update_available; then
+    return 1
+  else
+    check_rc=$?
+    [[ "$check_rc" -eq 1 ]]
+  fi
 }
 
 workspace_openshell_bridge_ip() {
@@ -4097,13 +4359,12 @@ workspace_cleanup_abandoned_hermes_access() {
   if [[ "$failed" == "0" ]]; then
     workspace_remove_managed_path "$skill_dir" || return 1
   fi
-  nemohermes hermes gateway restart --quiet >/dev/null 2>&1 || failed=1
   [[ "$failed" == "0" ]]
 }
 
 workspace_teardown_vikunja() {
   local image_refs_csv="${1:-}" failed=0
-  workspace_cleanup_abandoned_hermes_access vikunja || failed=1
+  workspace_cleanup_abandoned_hermes_access vikunja || return 1
   docker rm -f "$WORKSPACE_VIKUNJA_CONTAINER" >/dev/null 2>&1 || true
   workspace_remove_task_manager_images "$image_refs_csv" || failed=1
   workspace_drop_task_manager_database vikunja || failed=1
@@ -4114,7 +4375,7 @@ workspace_teardown_vikunja() {
 
 workspace_teardown_super_productivity() {
   local image_refs_csv="${1:-}" failed=0
-  workspace_cleanup_abandoned_hermes_access super-productivity || failed=1
+  workspace_cleanup_abandoned_hermes_access super-productivity || return 1
   docker rm -f "$WORKSPACE_SUPERSYNC_CONTAINER" "$WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_CONTAINER" >/dev/null 2>&1 || true
   workspace_remove_task_manager_images "$image_refs_csv" || failed=1
   workspace_drop_task_manager_database super-productivity || failed=1
@@ -4127,7 +4388,7 @@ workspace_teardown_super_productivity() {
 
 workspace_teardown_todoist() {
   local failed=0
-  workspace_cleanup_abandoned_hermes_access todoist || failed=1
+  workspace_cleanup_abandoned_hermes_access todoist || return 1
   workspace_remove_managed_path "${WORKSPACE_CONFIG_DIR}/hermes-skills/todoist" || failed=1
   [[ "$failed" == "0" ]]
 }
@@ -4186,12 +4447,15 @@ workspace_setup_hermes() {
       return 0
     fi
     if workspace_hermes_running; then
-      if ! workspace_hermes_inference_route_ready; then
-        NEMOCLAW_SANDBOX_NAME=hermes nemohermes inference set \
+      if ! workspace_hermes_inference_route_ready || ! workspace_hermes_config_model_ready "$litellm_model"; then
+        if ! NEMOCLAW_SANDBOX_NAME=hermes nemohermes inference set \
           --provider compatible-endpoint --model "$litellm_model" \
-          --sandbox hermes --no-verify >/dev/null 2>&1 || true
+          --sandbox hermes --no-verify >/dev/null 2>&1; then
+          setup_fail "Could not synchronize Hermes inference configuration"
+          return 0
+        fi
       fi
-      workspace_configure_hermes_runtime || true
+      workspace_configure_hermes_runtime "$model" || true
       workspace_configure_hermes_web || true
     fi
     if workspace_hermes_config_ready "$litellm_model"; then
@@ -4223,7 +4487,7 @@ workspace_setup_hermes() {
         --no-gpu \
         --control-ui-port "$WORKSPACE_HERMES_PORT" >/dev/null 2>&1 \
       && workspace_start_hermes_private_proxy \
-      && workspace_configure_hermes_runtime \
+      && workspace_configure_hermes_runtime "$model" \
       && workspace_configure_hermes_web \
       && { workspace_set_env_key HERMES_ONBOARD_STATUS configured; info "Hermes onboarded with ${litellm_model}"; } \
       || { workspace_set_env_key HERMES_ONBOARD_STATUS manual; setup_fail "Hermes onboarding failed; run nemohermes onboard manually"; }
@@ -4649,7 +4913,11 @@ workspace_setup() {
   WORKSPACE_SETUP_RESUME_HINT=""
   printf "\n  ${BOLD}spark ws setup${NC} — %s + n8n + Hermes\n\n" "$(workspace_task_manager_label "$task_manager")"
   workspace_preflight "$check_only" || true
-  existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  existing_model=$(workspace_main_model 2>/dev/null || true)
+  [[ -n "$existing_model" ]] || {
+    existing_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+    [[ "$existing_model" == "main" ]] && existing_model=""
+  }
   existing_tail_mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
   effective_tail_mode="${requested_tail_mode:-services}"
   if [[ -n "$teardown_task_manager" || -n "$requested_model" || -n "$postgres_image" || -n "$vikunja_image" || -n "$super_productivity_image" || -n "$supersync_image" || -n "$n8n_image" || -n "$funnel_action" || -n "$vikunja_username" || -n "$vikunja_email" || -n "$vikunja_password" || -n "$token" || -n "$n8n_email_arg" || -n "$n8n_password_arg" || "$effective_tail_mode" != "$existing_tail_mode" ]]; then
@@ -4696,7 +4964,10 @@ workspace_setup() {
       return $?
     }
   fi
-  workspace_ensure_gateway "$check_only" "$auto_yes" "$model"
+  if [[ -n "$model" ]]; then
+    workspace_repair_model_server "$check_only" "$auto_yes" "$model" \
+      || setup_fail "Could not reconcile the Spark model server"
+  fi
   [[ "$check_only" == "1" ]] && workspace_configure_tailscale "$tailnet" "$check_only" "$funnel_action" "$auto_yes"
   if [[ "$check_only" == "1" ]]; then
     if [[ -n "$model" ]]; then
@@ -4709,7 +4980,7 @@ workspace_setup() {
     return $?
   fi
   workspace_migrate_runtime_config
-  local human_user human_email human_pass n8n_email n8n_pass vikunja_previous_status n8n_previous_status setup_rc
+  local human_user human_email human_pass n8n_email n8n_pass n8n_folder_pass vikunja_previous_status n8n_previous_status setup_rc
   local existing_human_user existing_human_email existing_n8n_email
   if [[ "$task_manager" == "super-productivity" ]]; then
     existing_human_user=$(workspace_existing_prompt_value N8N_OWNER_FIRST_NAME "workspace username" username || true)
@@ -4808,10 +5079,14 @@ workspace_setup() {
   esac
   if [[ "$n8n_previous_status" =~ ^(created|exists)$ ]]; then
     info "n8n owner already configured: ${n8n_email}"
+    n8n_folder_pass="${SPARK_WORKSPACE_N8N_PASSWORD:-}"
   else
     workspace_create_n8n_owner "$n8n_email" "$n8n_pass" || true
     [[ "$(workspace_read_env N8N_OWNER_SETUP_STATUS 2>/dev/null || true)" == "created" ]] && WORKSPACE_SHOW_N8N_PASSWORD=1
+    n8n_folder_pass="$n8n_pass"
   fi
+  workspace_ensure_n8n_hermes_folder "$n8n_email" "$n8n_folder_pass" \
+    || setup_fail "Could not reconcile the n8n Hermes folder"
   if workspace_tailscale_services_mode && workspace_tailscale_service_host_advertised; then
     if workspace_tailscale_urls_ready_after_setup; then
       workspace_tailscale_clear_error
@@ -4953,7 +5228,7 @@ workspace_print_status_summary() {
   hermes_state=$(workspace_hermes_runtime_state || true)
   access_state=$(workspace_access_runtime_state || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   task_url=$(workspace_task_manager_url)
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
@@ -5003,7 +5278,7 @@ workspace_status_json() {
   hermes_state=$(workspace_hermes_runtime_state || true)
   access_state=$(workspace_access_runtime_state || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   task_url=$(workspace_task_manager_url)
   case "$task_manager" in
     super-productivity)
@@ -5076,6 +5351,27 @@ cmd_workspace_status() {
 }
 
 workspace_migrate_runtime_config() {
+  local current_model legacy_model physical_model provider
+  [[ -f "$WORKSPACE_ENV_FILE" ]] || {
+    workspace_remove_legacy_human_passwords
+    workspace_remove_legacy_smtp
+    workspace_remove_transient_n8n_owner_config
+    return 0
+  }
+  current_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  legacy_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  physical_model=$(workspace_main_model 2>/dev/null || true)
+  if [[ -z "$physical_model" && -n "$current_model" && "$current_model" != "main" ]]; then
+    provider=$(gateway_load_config | jq -r '.main.provider // empty' 2>/dev/null || true)
+    [[ -n "$provider" ]] || { [[ "$BACKEND" == "ollama" ]] && provider=ollama || provider=vllm; }
+    gateway_set_main_model "$provider" "$current_model" || \
+      warn "Could not migrate the physical Hermes model into LiteLLM main"
+  fi
+  if [[ "$current_model" != "main" || -n "$legacy_model" ]]; then
+    workspace_set_env_key HERMES_MODEL main
+    workspace_remove_env_file_key "$WORKSPACE_ENV_FILE" HERMES_LITELLM_MODEL
+    info "Migrated Hermes model configuration to HERMES_MODEL=main"
+  fi
   workspace_remove_legacy_human_passwords
   workspace_remove_legacy_smtp
   workspace_remove_transient_n8n_owner_config
@@ -5103,17 +5399,15 @@ workspace_start() {
   printf "\n  ${BOLD}spark ws start${NC}\n\n"
   workspace_configured || die "Workspace not configured" "Run: spark ws setup"
   workspace_migrate_runtime_config
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   [[ -n "$model" ]] || die "Hermes model is not configured" "Run: spark ws setup"
 
   workspace_compose up -d --remove-orphans >/dev/null 2>&1 \
     && info "Workspace Compose project started" \
     || { err "Could not start workspace Compose project"; rc=1; }
 
-  SETUP_FAILED=()
-  workspace_ensure_gateway 0 1 "$model"
-  if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
-    rc=1
+  if [[ "${SPARK_WORKSPACE_MODEL_SERVER_READY:-0}" != "1" ]]; then
+    workspace_repair_model_server 0 1 "$model" || rc=1
   fi
 
   workspace_start_hermes_gateway_proxy \
@@ -5167,7 +5461,7 @@ workspace_stop() {
 
   printf "\n  ${BOLD}spark ws stop${NC}\n\n"
   workspace_configured || die "Workspace not configured" "Run: spark ws setup"
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
 
   hermes_container=$(workspace_hermes_running_container_name 2>/dev/null || true)
   if [[ -n "$hermes_container" ]]; then
@@ -5205,8 +5499,102 @@ workspace_stop() {
 
 workspace_restart() {
   [[ $# -eq 0 ]] || die "Usage: spark ws restart"
+  workspace_capture_restart_model
   workspace_stop
   workspace_start
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
+}
+
+cmd_workspace_repair_help() {
+  cat <<EOF
+
+  ${BOLD}Usage:${NC} spark ws repair [--yes] [--force-hermes-rebuild] [--remote user@host]
+
+  Repairs runtime drift without deleting workspace data. Delegates model and
+  LiteLLM recovery to spark repair, restores private proxies, rebuilds Hermes
+  transactionally on MCP drift, and reapplies task-manager access.
+
+  ${BOLD}Flags:${NC}
+    --yes               Accept transactional Hermes rebuild when required.
+    --force-hermes-rebuild
+                        Recreate an unrecoverable Hermes sandbox even if its
+                        backup is incomplete. May lose Hermes state; never n8n.
+    --remote user@host  Repair a configured remote workspace.
+
+EOF
+}
+
+workspace_repair() {
+  local auto_yes=0 force_rebuild=0 remote_spec="" model task_manager
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) auto_yes=1; shift ;;
+      --force-hermes-rebuild) force_rebuild=1; auto_yes=1; shift ;;
+      --remote) remote_spec="${2:-}"; [[ -n "$remote_spec" ]] || die "--remote requires user@host"; shift 2 ;;
+      -h|--help) cmd_workspace_repair_help; return 0 ;;
+      *) die "Unknown ws repair flag: $1" ;;
+    esac
+  done
+  if [[ -n "$remote_spec" ]]; then
+    local args=(repair)
+    [[ "$auto_yes" == "1" ]] && args+=(--yes)
+    [[ "$force_rebuild" == "1" ]] && args+=(--force-hermes-rebuild)
+    workspace_remote_workspace_cmd "$remote_spec" "${args[@]}"
+    return $?
+  fi
+  workspace_require_config
+  workspace_migrate_runtime_config
+  model=$(workspace_main_model 2>/dev/null || true)
+  [[ -n "$model" ]] || die "Hermes model is not configured" "Run: spark ws setup"
+  task_manager=$(workspace_task_manager)
+
+  printf "\n  ${BOLD}spark ws repair${NC}\n\n"
+  workspace_compose up -d --remove-orphans >/dev/null 2>&1 || {
+    err "Could not start workspace Compose services"
+    return 1
+  }
+  workspace_repair_model_server 0 "$auto_yes" "$model" || return 1
+  workspace_start_hermes_gateway_proxy || {
+    err "Could not expose LiteLLM to OpenShell"
+    return 1
+  }
+  if workspace_hermes_mcp_config_drift_detected; then
+    if [[ "$auto_yes" != "1" ]]; then
+      is_interactive || die "Hermes MCP config drift requires confirmation" "Run: spark ws repair --yes"
+      confirm "Rebuild Hermes from its registered NemoClaw state?" || return 1
+    fi
+    warn "Hermes MCP config drift detected; rebuilding from registered state"
+    local rebuild_args=(--yes)
+    [[ "$force_rebuild" == "1" ]] && rebuild_args+=(--force)
+    nemohermes_rebuild_with_workspace_env "${rebuild_args[@]}" || {
+      if [[ "$force_rebuild" == "1" ]]; then
+        err "Forced Hermes rebuild failed"
+      else
+        err "Hermes transactional rebuild stopped because its backup was incomplete"
+        printf "    If losing unrecoverable Hermes state is acceptable, run:\n"
+        printf "    spark ws repair --yes --force-hermes-rebuild\n"
+        printf "    n8n and its database are not rebuilt by this command.\n"
+      fi
+      return 1
+    }
+  else
+    nemohermes hermes doctor --fix >/dev/null 2>&1 || true
+  fi
+  SPARK_WORKSPACE_MODEL_SERVER_READY=1 workspace_start || return 1
+  workspace_configure_hermes_runtime || {
+    err "Could not reconcile Hermes runtime configuration"
+    return 1
+  }
+  case "$task_manager" in
+    super-productivity) workspace_setup_hermes_super_productivity_access ;;
+    todoist) workspace_setup_hermes_todoist_access ;;
+    *) workspace_setup_hermes_vikunja_access ;;
+  esac || {
+    err "Could not reconcile Hermes $(workspace_task_manager_label "$task_manager") access"
+    return 1
+  }
+  cmd_workspace_doctor --verbose
 }
 
 workspace_status_item() {
@@ -5221,7 +5609,7 @@ workspace_status_item() {
 
 cmd_workspace_health() {
   local model task_manager
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   task_manager=$(workspace_task_manager)
   printf "\n  ${BOLD}Workspace health${NC}\n"
   workspace_status_item "Compose postgres" workspace_compose_service_running postgres
@@ -5914,6 +6302,17 @@ workspace_n8n_owner_ready() {
   [[ "$status" =~ ^(created|exists)$ ]] && workspace_n8n_http_ready
 }
 
+workspace_n8n_hermes_folder_ready() {
+  local status folder_id matches
+  status=$(workspace_read_env N8N_HERMES_FOLDER_STATUS 2>/dev/null || true)
+  folder_id=$(workspace_read_env N8N_HERMES_FOLDER_ID 2>/dev/null || true)
+  [[ "$status" =~ ^(created|exists)$ && "$folder_id" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  matches=$(workspace_compose exec -T postgres psql -U n8n -d n8n -Atqc \
+    "SELECT (SELECT count(*) FROM folder f JOIN project p ON p.id=f.\"projectId\" WHERE f.name='Hermes' AND f.\"parentFolderId\" IS NULL AND p.type='personal'), (SELECT count(*) FROM folder f JOIN project p ON p.id=f.\"projectId\" WHERE f.id='${folder_id}' AND f.name='Hermes' AND f.\"parentFolderId\" IS NULL AND p.type='personal');" \
+    2>/dev/null | tail -1 | tr -d '[:space:]')
+  [[ "$matches" == "1|1" ]]
+}
+
 workspace_vikunja_user_ready() {
   local username="$1" email="$2" status_key="$3" status rc
   workspace_vikunja_user_exists "$username" "$email" >/dev/null 2>&1 && return 0
@@ -6128,16 +6527,29 @@ workspace_n8n_http_ready() {
 
 workspace_litellm_model_routed() {
   local litellm_model out
-  litellm_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  litellm_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   [[ -n "$litellm_model" ]] || return 1
   command -v curl >/dev/null 2>&1 || return 1
   out=$(curl -fsS --max-time 5 "http://127.0.0.1:${GATEWAY_PORT}/v1/models" 2>/dev/null) || return 1
   printf '%s\n' "$out" | grep -Fq "\"${litellm_model}\""
 }
 
+workspace_litellm_main_alias_ready() {
+  local expected_model="${1:-}" expected_provider config
+  [[ -n "$expected_model" ]] || expected_model=$(workspace_main_model 2>/dev/null || true)
+  [[ -n "$expected_model" ]] || return 1
+  [[ "$(workspace_read_env HERMES_MODEL 2>/dev/null || true)" == "main" ]] || return 1
+  expected_provider="vllm"
+  [[ "$BACKEND" == "ollama" ]] && expected_provider="ollama"
+  config=$(gateway_load_config)
+  [[ "$(printf '%s\n' "$config" | jq -r '.main.provider // ""' 2>/dev/null)" == "$expected_provider" ]] &&
+    [[ "$(printf '%s\n' "$config" | jq -r '.main.model // ""' 2>/dev/null)" == "$expected_model" ]] &&
+    gateway_rendered_config_ready
+}
+
 workspace_litellm_model_smoke() {
   local litellm_model escaped_model payload out
-  litellm_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  litellm_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   [[ -n "$litellm_model" ]] || return 1
   command -v curl >/dev/null 2>&1 || return 1
   escaped_model=$(printf '%s' "$litellm_model" | sed 's/\\/\\\\/g; s/"/\\"/g')
@@ -6605,7 +7017,7 @@ workspace_tailscale_ports_fallback() {
   human_user=$(workspace_read_env VIKUNJA_HUMAN_USERNAME 2>/dev/null || true)
   human_email=$(workspace_read_env VIKUNJA_HUMAN_EMAIL 2>/dev/null || true)
   n8n_email=$(workspace_read_env N8N_BASIC_AUTH_USER 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   bind_addr=$(workspace_tailscale_ipv4 2>/dev/null || true)
   dns_name=$(workspace_tailscale_dns_name 2>/dev/null || true)
   [[ -n "$human_user" && -n "$human_email" && -n "$n8n_email" && -n "$model" ]] || return 1
@@ -6733,6 +7145,27 @@ workspace_hermes_container_name() {
   printf '%s\n' "$containers" | grep -E "^(${WORKSPACE_HERMES_CONTAINER}|openshell-hermes-)" | head -n 1
 }
 
+workspace_hermes_mcp_config_drift_detected() {
+  local container logs
+  command -v docker >/dev/null 2>&1 || return 1
+  container=$(workspace_hermes_container_name 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  logs=$(docker logs --tail 200 "$container" 2>&1 || true)
+  grep -F "HERMES_MCP_CONFIG_DRIFT" <<< "$logs" >/dev/null
+}
+
+workspace_hermes_mcp_config_consistent() {
+  ! workspace_hermes_mcp_config_drift_detected
+}
+
+workspace_hermes_forwards_ready() {
+  local out
+  command -v openshell >/dev/null 2>&1 || return 1
+  out=$(openshell forward list 2>/dev/null || true)
+  grep -E "hermes[[:space:]]+127[.]0[.]0[.]1[[:space:]]+${WORKSPACE_HERMES_PORT}.*running" <<< "$out" >/dev/null &&
+    grep -E "hermes[[:space:]]+127[.]0[.]0[.]1[[:space:]]+${WORKSPACE_HERMES_LOCAL_PORT}.*running" <<< "$out" >/dev/null
+}
+
 workspace_hermes_running_container_name() {
   local container
   container=$(workspace_hermes_container_name 2>/dev/null || true)
@@ -6752,9 +7185,34 @@ workspace_restore_hermes_container_name() {
   docker rename "$current" "$expected" >/dev/null 2>&1
 }
 
+workspace_hermes_agent_gateway_running() {
+  local out
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  out=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes status 2>/dev/null || true)
+  [[ "$out" == *"Hermes Agent: running"* ]]
+}
+
+workspace_ensure_hermes_agent_gateway() {
+  local attempt
+  workspace_hermes_agent_gateway_running && return 0
+  NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes connect --probe-only >/dev/null 2>&1 || true
+  for ((attempt = 1; attempt <= 5; attempt++)); do
+    workspace_hermes_agent_gateway_running && return 0
+    sleep 1
+  done
+  NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes exec -- sh -lc \
+    'nohup hermes gateway run </dev/null >/tmp/hermes-gateway.log 2>&1 &' >/dev/null 2>&1 || return 1
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    workspace_hermes_agent_gateway_running && return 0
+    sleep 1
+  done
+  return 1
+}
+
 workspace_start_hermes_private_proxy() {
   local attempt
   command -v nemohermes >/dev/null 2>&1 || return 1
+  workspace_hermes_mcp_config_drift_detected && return 1
   if workspace_hermes_private_url_ready && workspace_hermes_local_api_ready; then
     return 0
   fi
@@ -6762,6 +7220,7 @@ workspace_start_hermes_private_proxy() {
   NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes start >/dev/null 2>&1 || true
   NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes recover >/dev/null 2>&1 || \
     NEMOCLAW_SANDBOX_NAME=hermes nemohermes recover >/dev/null 2>&1 || true
+  workspace_hermes_local_api_ready || workspace_ensure_hermes_agent_gateway || true
   if command -v openshell >/dev/null 2>&1; then
     workspace_hermes_private_url_ready || openshell forward start --background "$WORKSPACE_HERMES_PORT" hermes >/dev/null 2>&1 || true
     workspace_hermes_local_api_ready || openshell forward start --background "$WORKSPACE_HERMES_LOCAL_PORT" hermes >/dev/null 2>&1 || true
@@ -6774,7 +7233,16 @@ workspace_start_hermes_private_proxy() {
 }
 
 workspace_pause_hermes_private_proxy() {
+  local container timeout
   command -v nemohermes >/dev/null 2>&1 || return 1
+  container=$(workspace_hermes_running_container_name 2>/dev/null || true)
+  if [[ -n "$container" ]]; then
+    timeout=$(workspace_hermes_stop_timeout)
+    docker update --stop-timeout "$timeout" "$container" >/dev/null 2>&1 || {
+      err "Could not configure Hermes stop timeout (${timeout}s)"
+      return 1
+    }
+  fi
   NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes stop >/dev/null 2>&1
 }
 
@@ -6815,7 +7283,7 @@ workspace_hermes_vikunja_proxy_running() {
 workspace_model_running() {
   local model="$1"
   [[ -n "$model" ]] || return 1
-  [[ "$(workspace_model_state "$model")" == *"running"* ]]
+  [[ "$(model_server_state "$model")" == *"running"* ]]
 }
 
 workspace_hermes_running() {
@@ -6841,12 +7309,25 @@ workspace_hermes_doctor_ready() {
 workspace_hermes_inference_route_ready() {
   local litellm_model out
   command -v nemohermes >/dev/null 2>&1 || return 1
-  litellm_model=$(workspace_read_env HERMES_LITELLM_MODEL 2>/dev/null || true)
+  litellm_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   [[ -n "$litellm_model" ]] || return 1
   out=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes inference get --json 2>/dev/null || \
     NEMOCLAW_SANDBOX_NAME=hermes nemohermes inference get 2>/dev/null || true)
   [[ "$out" == *"$litellm_model"* ]] &&
     [[ "$out" == *"compatible"* || "$out" == *"custom"* || "$out" == *"OpenAI"* ]]
+}
+
+workspace_hermes_config_model_ready() {
+  local expected="${1:-}" key out value
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  [[ -n "$expected" ]] || expected=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  [[ -n "$expected" ]] || return 1
+  for key in model.default _nemoclaw_upstream.model; do
+    out=$(NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes config get \
+      --key "$key" --format json 2>/dev/null || true)
+    value=$(printf '%s\n' "$out" | jq -er 'select(type == "string")' 2>/dev/null || true)
+    [[ "$value" == "$expected" ]] || return 1
+  done
 }
 
 workspace_hermes_dashboard_url_ready() {
@@ -6919,7 +7400,7 @@ cmd_workspace_doctor() {
   WORKSPACE_DOCTOR_ACTIONS=()
   WORKSPACE_DOCTOR_SECTIONS=()
   model="$requested_model"
-  [[ -n "$model" ]] || model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  [[ -n "$model" ]] || model=$(workspace_main_model 2>/dev/null || true)
   task_manager=$(workspace_task_manager)
 
   if ! workspace_configured; then
@@ -6967,6 +7448,10 @@ cmd_workspace_doctor() {
   fi
   workspace_doctor_check "Compose uses private host bindings only" workspace_compose_uses_loopback_ports
 
+  workspace_doctor_section "Resilience" "spark ws repair --yes"
+  workspace_doctor_check "Hermes MCP configuration matches NemoClaw registry" workspace_hermes_mcp_config_consistent
+  workspace_doctor_check "Hermes OpenShell forwards are alive" workspace_hermes_forwards_ready
+
   workspace_doctor_section "Identity & recovery" "spark ws setup"
   workspace_doctor_check "Interactive service passwords are not stored" workspace_human_password_not_stored
   if [[ "$task_manager" == "super-productivity" ]]; then
@@ -6989,6 +7474,7 @@ cmd_workspace_doctor() {
   fi
   workspace_doctor_check "n8n hardened for private agent workflows" workspace_n8n_hardened
   workspace_doctor_check "n8n owner/admin ready" workspace_n8n_owner_ready
+  workspace_doctor_check "n8n Hermes folder ready in Personal" workspace_n8n_hermes_folder_ready
   workspace_doctor_check "No legacy or temporary password recovery configuration is stored" workspace_no_legacy_recovery_config
   workspace_doctor_check "Workspace URLs configured" workspace_urls_configured
   if [[ "$task_manager" == "super-productivity" ]]; then
@@ -6998,21 +7484,21 @@ cmd_workspace_doctor() {
       SUPER_PRODUCTIVITY_BROWSER_SYNC_STATUS SUPER_PRODUCTIVITY_BROWSER_SYNC_URL \
       WORKSPACE_SUPER_PRODUCTIVITY_VERSION WORKSPACE_SUPER_PRODUCTIVITY_COMMIT \
       DB_POSTGRESDB_PASSWORD N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET N8N_BASIC_AUTH_USER \
-      N8N_OWNER_SETUP_STATUS HERMES_MODEL HERMES_LITELLM_MODEL HERMES_CONTEXT_LENGTH \
+      N8N_OWNER_SETUP_STATUS HERMES_MODEL HERMES_CONTEXT_LENGTH \
       HERMES_MAX_TOKENS HERMES_REASONING_EFFORT HERMES_LITELLM_BASE_URL TASK_MANAGER_URL \
       SUPER_PRODUCTIVITY_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE
   elif [[ "$task_manager" == "todoist" ]]; then
     workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
       WORKSPACE_TASK_MANAGER POSTGRES_PASSWORD DB_POSTGRESDB_PASSWORD N8N_ENCRYPTION_KEY \
       WORKSPACE_MENTION_SECRET N8N_BASIC_AUTH_USER N8N_OWNER_SETUP_STATUS TODOIST_API_URL \
-      TODOIST_URL TODOIST_API_TOKEN TODOIST_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
+      TODOIST_URL TODOIST_API_TOKEN TODOIST_API_STATUS HERMES_MODEL \
       HERMES_CONTEXT_LENGTH HERMES_MAX_TOKENS HERMES_REASONING_EFFORT \
       HERMES_LITELLM_BASE_URL TASK_MANAGER_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE
   else
     workspace_doctor_check "Workspace technical secrets and service identity are complete" workspace_env_has \
       POSTGRES_PASSWORD VIKUNJA_DATABASE_PASSWORD VIKUNJA_SERVICE_SECRET DB_POSTGRESDB_PASSWORD \
       N8N_ENCRYPTION_KEY WORKSPACE_MENTION_SECRET VIKUNJA_HUMAN_USERNAME VIKUNJA_HUMAN_EMAIL VIKUNJA_HUMAN_USER_ID N8N_BASIC_AUTH_USER \
-      N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL HERMES_LITELLM_MODEL \
+      N8N_OWNER_SETUP_STATUS VIKUNJA_HERMES_API_TOKEN VIKUNJA_HERMES_API_STATUS HERMES_MODEL \
       HERMES_CONTEXT_LENGTH HERMES_MAX_TOKENS HERMES_REASONING_EFFORT \
       HERMES_LITELLM_BASE_URL VIKUNJA_URL N8N_URL HERMES_URL WORKSPACE_TAILSCALE_MODE \
       VIKUNJA_HUMAN_USER_STATUS VIKUNJA_HERMES_BOT_USERNAME VIKUNJA_HERMES_BOT_ID \
@@ -7062,8 +7548,9 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Tailscale mode is Services or ports" workspace_tailscale_services_mode
   workspace_doctor_check "Tailscale workspace URLs respond" workspace_tailscale_https_urls_ready
 
-  workspace_doctor_section "Inference & agent" "spark ws restart"
+  workspace_doctor_section "Inference & agent" "spark ws repair --yes"
   workspace_doctor_check "LiteLLM gateway running" workspace_gateway_running
+  workspace_doctor_check "LiteLLM main alias targets selected physical model" workspace_litellm_main_alias_ready "$model"
   workspace_doctor_check "LiteLLM exposes Hermes model route" workspace_litellm_model_routed
   workspace_doctor_check "LiteLLM Hermes route completes smoke request" workspace_litellm_model_smoke
   workspace_doctor_check "Hermes model running: ${model:-none}" workspace_model_running "$model"
@@ -7073,7 +7560,8 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Hermes local API is reachable" workspace_hermes_local_api_ready
   workspace_doctor_check "NemoHermes sandbox doctor passes" workspace_hermes_doctor_ready
   workspace_doctor_check "NemoHermes inference route uses selected LiteLLM model" workspace_hermes_inference_route_ready
-  workspace_doctor_check "Hermes model supports automatic tool calling" workspace_model_tool_calling_ready "$model"
+  workspace_doctor_check "Hermes config model matches selected LiteLLM route" workspace_hermes_config_model_ready
+  workspace_doctor_check "Hermes model supports automatic tool calling" model_server_tool_calling_ready "$model"
   workspace_doctor_check "Hermes context fits the effective vLLM context" workspace_model_context_ready "$model"
   workspace_doctor_check "Hermes output and reasoning limits are configured" workspace_hermes_runtime_config_ready
   workspace_doctor_check "Hermes CLI uses the balanced local-model tool profile" workspace_hermes_cli_toolsets_ready
@@ -7461,6 +7949,7 @@ cmd_workspace_help() {
     start       Start the configured workspace runtime
     stop        Stop the workspace runtime and preserve all data
     restart     Stop and start the configured workspace runtime
+    repair      Repair reboot/runtime drift without deleting workspace data
     recover     Reset a Vikunja human or n8n owner password
     status      Show operational workspace state
     containers  Show raw workspace container state
@@ -7505,6 +7994,7 @@ cmd_workspace() {
     start)  workspace_start "$@" ;;
     stop)   workspace_stop "$@" ;;
     restart) workspace_restart "$@" ;;
+    repair) workspace_repair "$@" ;;
     recover) workspace_recover "$@" ;;
     status) cmd_workspace_status "$@" ;;
     containers) cmd_workspace_containers "$@" ;;

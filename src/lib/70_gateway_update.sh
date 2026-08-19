@@ -53,6 +53,22 @@ gateway_save_config() {
   umask "$old_umask"
 }
 
+gateway_set_main_model() {
+  local provider="$1" model="$2" config updated
+  config=$(gateway_load_config)
+  updated=$(printf '%s\n' "$config" | jq --arg provider "$provider" --arg model "$model" \
+    '.main = {provider: $provider, model: $model}') || return 1
+  [[ "$updated" == "$config" ]] || gateway_save_config "$updated"
+}
+
+gateway_rendered_config_ready() {
+  local path="${SPARK_CONFIG_DIR}/litellm_config.yaml" expected current
+  [[ -f "$path" ]] || return 1
+  expected=$(gateway_generate_litellm_yaml) || return 1
+  current=$(cat "$path" 2>/dev/null || true)
+  [[ -n "$expected" && "$current" == "$expected" ]]
+}
+
 gateway_provider_enabled() {
   local provider="$1"
   local config
@@ -70,8 +86,10 @@ gateway_get_api_key() {
 gateway_generate_litellm_yaml() {
   local config
   config=$(gateway_load_config)
-  local vllm_port
+  local vllm_port main_provider main_model main_added=0
   vllm_port=$(echo "$config" | jq -r '.providers.vllm.port // 8000' 2>/dev/null)
+  main_provider=$(echo "$config" | jq -r '.main.provider // ""' 2>/dev/null)
+  main_model=$(echo "$config" | jq -r '.main.model // ""' 2>/dev/null)
 
   local yaml="model_list:"
   local has_models=0
@@ -79,7 +97,7 @@ gateway_generate_litellm_yaml() {
   # vLLM — one explicit entry per running model (routes to its own port),
   # plus the wildcard passthrough for backwards compatibility.
   if [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]]; then
-    local primary_port="" name model port rest
+    local primary_port="" primary_model="" main_match=0 name model port rest
     while IFS=$'\t' read -r name model port rest; do
       [[ -z "$model" ]] && continue
       yaml+="
@@ -89,10 +107,31 @@ gateway_generate_litellm_yaml() {
       api_base: \"http://localhost:${port}/v1\"
       api_key: \"dummy\""
       has_models=1
-      [[ -z "$primary_port" ]] && primary_port="$port"   # first model
-      [[ "$port" == "$vllm_port" ]] && primary_port="$port"  # prefer the default port
+      if [[ -z "$primary_port" ]]; then
+        primary_port="$port"
+        primary_model="$model"
+      fi
+      if [[ "$port" == "$vllm_port" && "$main_match" == "0" ]]; then
+        primary_port="$port"
+        primary_model="$model"
+      fi
+      if [[ "$main_provider" == "vllm" && "$model" == "$main_model" ]]; then
+        primary_port="$port"
+        primary_model="$model"
+        main_match=1
+      fi
     done < <(list_managed_containers)
     [[ -z "$primary_port" ]] && primary_port="$vllm_port"
+
+    if [[ -n "$primary_model" ]]; then
+      yaml+="
+  - model_name: \"main\"
+    litellm_params:
+      model: \"openai/${primary_model}\"
+      api_base: \"http://localhost:${primary_port}/v1\"
+      api_key: \"dummy\""
+      main_added=1
+    fi
 
     yaml+="
   - model_name: \"vllm/*\"
@@ -125,6 +164,14 @@ gateway_generate_litellm_yaml() {
       model: \"ollama_chat/*\"
       api_base: \"http://${ollama_host}:11434\""
     has_models=1
+    if [[ "$main_added" == "0" && "$main_provider" == "ollama" && -n "$main_model" ]]; then
+      yaml+="
+  - model_name: \"main\"
+    litellm_params:
+      model: \"ollama_chat/${main_model}\"
+      api_base: \"http://${ollama_host}:11434\""
+      main_added=1
+    fi
   fi
 
   # Zen (OpenCode)
@@ -202,7 +249,7 @@ check_for_updates() {
     local year month next_tag
     year=$(date +%y)
     month=$(date +%m)
-    next_tag="${year}.$(printf '%02d' "$month")-py3"
+    next_tag="${year}.${month}-py3"
     if ngc_vllm_tag_newer_than "$next_tag" "$current_tag"; then
       if docker manifest inspect "nvcr.io/nvidia/vllm:${next_tag}" >/dev/null 2>&1; then
         updates+=("NGC vLLM: ${current_tag} → ${next_tag}")

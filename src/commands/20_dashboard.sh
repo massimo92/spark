@@ -166,7 +166,7 @@ dashboard_workspace_html() {
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   dashboard_row_html ok "Workspace" "configured (${mode:-unknown} mode)"
   dashboard_row_html ok "Hermes model" "${model:-unset}"
   dashboard_row_html ok "$task_label" "${task_url:-unset}"

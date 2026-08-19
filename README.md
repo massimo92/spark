@@ -114,10 +114,12 @@ cron jobs, and delegation.
 
 ```bash
 spark setup --full
+spark repair --yes
 spark ws setup
 spark ws start
 spark ws stop
 spark ws restart
+spark ws repair --yes
 spark ws recover vikunja
 spark ws recover n8n
 spark ws status
@@ -166,12 +168,23 @@ password without questions; Spark shows generated passwords once and never
 stores them.
 
 Use `spark ws doctor --strict` before treating it as production-ready.
+Recovery is intentionally manual: Spark does not install a periodic repair job,
+user systemd service, or `linger`. `spark ws doctor` checks Hermes/NemoClaw MCP
+state and both OpenShell forwards. `spark repair --yes` repairs the model server
+(selected model, LiteLLM, and `main`). `spark ws repair --yes` calls that base
+repair, then repairs Hermes and the workspace proxies; when MCP state drifted,
+it uses NemoHermes' transactional rebuild and reapplies the configured
+task-manager access. It does not delete n8n data.
+If a broken sandbox cannot be backed up, repair stops rather than lose Hermes
+state. `--force-hermes-rebuild` is the explicit last resort; it can lose
+unrecoverable Hermes state, but still does not recreate n8n or its database.
 
 ## Recovery
 
 ```bash
 spark doctor                 # find what is broken
-spark gateway start          # restart API gateway
+spark repair --yes           # restore selected model + LiteLLM main route
+spark ws repair --yes        # then restore the optional agent workspace
 spark reinstall --yes        # clean reinstall: removes state/models, then setup
 spark reinstall --yes --keep-models
 spark uninstall --yes        # remove spark-managed runtime/config/data
