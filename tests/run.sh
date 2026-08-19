@@ -829,6 +829,12 @@ Update available:         no}"
   disabled  spotify
   disabled  yuanbao
   disabled  computer_use}" ;;
+  *"hermes exec"*"sh -lc"*"command -v python3"*) echo "${FAKE_HERMES_PYTHON_BINARY:-/usr/bin/python3}" ;;
+  *"hermes exec"*"import ddgs"*) exit "${FAKE_HERMES_DDGS_IMPORT_EXIT:-0}" ;;
+  *"hermes exec"*"hermes plugins list --plain --no-bundled"*)
+    printf '%b\n' "${FAKE_HERMES_PLUGINS_LIST:-enabled user 0.1.0 web-ddgs}" ;;
+  *"hermes exec"*"hermes config get --key web.backend --format json"*) printf '"%s"\n' "${FAKE_HERMES_WEB_CONFIG_BACKEND:-ddgs}" ;;
+  *"hermes exec"*"hermes config get --key web.search_backend --format json"*) printf '"%s"\n' "${FAKE_HERMES_WEB_CONFIG_SEARCH:-ddgs}" ;;
   *"channels status --channel whatsapp --json"*) echo "${FAKE_WHATSAPP_STATUS_JSON:-{\"verdict\":\"healthy\"}}" ;;
   *"hermes exec"*"-X POST"*"/labels"*)
     [[ "${FAKE_HERMES_TODOIST_LABEL_CREATE_EXIT:-0}" == "0" ]] || exit "${FAKE_HERMES_TODOIST_LABEL_CREATE_EXIT}"
@@ -3439,7 +3445,7 @@ test_workspace_lifecycle_commands() {
   rm -rf "$tmp"
   [[ "$calls" == *"migrate"* ]] &&
     [[ "$calls" == *"compose up -d --remove-orphans"* ]] &&
-    [[ "$calls" == *"repair --model Org/Model --tools --max-len 65536 --no-mtp --yes"* ]] &&
+    [[ "$calls" == *"repair --model Org/Model --tools --no-mtp --yes"* ]] &&
     [[ "$calls" == *"bridge start"* ]] &&
     [[ "$calls" == *"tasks bridge start"* ]] &&
     [[ "$calls" == *"dashboard proxy start"* ]] &&
@@ -3619,7 +3625,7 @@ test_workspace_repair_rebuilds_mcp_drift_and_reconciles() {
   calls=$(cat "$log" 2>/dev/null || true)
   rm -rf "$tmp"
   [[ "$status" -eq 0 ]] &&
-    [[ "$calls" == *"base-repair:--model Org/Alpha --tools --max-len 65536 --no-mtp --yes"* ]] &&
+    [[ "$calls" == *"base-repair:--model Org/Alpha --tools --no-mtp --yes"* ]] &&
     [[ "$calls" == *"rebuild:--yes"* ]] &&
     [[ "$calls" == *$'rebuild:--yes\nstart\nruntime\ntodoist\ndoctor:--verbose'* ]]
 }
@@ -3734,7 +3740,7 @@ test_workspace_dashboard_proxy_rewrites_host_on_loopback() {
     [[ "$docker_args" == *"hermes-dashboard-proxy.py 18790 18789"* ]] &&
     grep -Fq 'asyncio.start_server(handle, "127.0.0.1"' "$proxy_script" &&
     grep -Fq 'Host: 127.0.0.1:' "$proxy_script" &&
-    grep -Fq 'Origin: http://127.0.0.1:' "$proxy_script"
+    grep -Fq 'elif lower.startswith(b"origin:") and websocket:' "$proxy_script"
   local status=$?
   rm -rf "$tmp"
   return "$status"
@@ -3825,11 +3831,11 @@ test_repair_model_tool_calling_requires_expected_parser() {
 test_workspace_hermes_runtime_uses_supported_config_writes() {
   local tmp fake_bin calls wrong=0
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_HERMES_CONFIG_JSON='{}' \
     bash -c 'source "$1"; workspace_configure_hermes_runtime; workspace_hermes_cli_toolsets_ready' _ "$SPARK"
   calls=$(cat "${tmp}/nemohermes.log")
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
     FAKE_HERMES_TOOLS_LIST=$'Built-in toolsets (cli):\n  enabled  terminal\n  enabled  browser' \
     bash -c 'source "$1"; workspace_hermes_cli_toolsets_ready' _ "$SPARK" || wrong=$?
   rm -rf "$tmp"
@@ -4116,7 +4122,8 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key model.context_length --value 65536"* ]] &&
     [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key agent.reasoning_effort --value none"* ]] &&
     [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key platform_toolsets.cli --value"* ]] &&
-    [[ "$nemo_calls" != *"hermes exec --no-tty --timeout 30 -- hermes config set"* ]] &&
+    [[ "$nemo_calls" == *"hermes exec --no-tty --timeout 30 -- hermes config set web.backend ddgs"* ]] &&
+    [[ "$nemo_calls" == *"hermes exec --no-tty --timeout 30 -- hermes config set web.search_backend ddgs"* ]] &&
     [[ "$nemo_calls" == *"hermes gateway restart --quiet"* ]] &&
     [[ "$docker_calls" == *"--name spark-hermes-litellm-proxy"* ]] &&
     [[ "$docker_calls" == *"172.19.0.1 4000 127.0.0.1 4000"* ]] &&
@@ -4139,7 +4146,9 @@ test_workspace_setup_writes_compose_names() {
     [[ "$env" == *"HERMES_DASHBOARD_PORT=18789"* ]] &&
     [[ "$env" == *"HERMES_MODEL=main"* ]] &&
     [[ "$env" != *"HERMES_LITELLM_MODEL="* ]] &&
+    [[ "$env" == *"HERMES_CONTEXT_MODE=custom"* ]] &&
     [[ "$env" == *"HERMES_CONTEXT_LENGTH=65536"* ]] &&
+    [[ "$env" == *"HERMES_WEB_PROVIDER=ddgs"* ]] &&
     [[ "$env" == *"HERMES_MAX_TOKENS=512"* ]] &&
     [[ "$env" == *"HERMES_REASONING_EFFORT=none"* ]] &&
     [[ "$env" == *"HERMES_POLICY_TIER=restricted"* ]] &&
@@ -5606,7 +5615,7 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"69/69 checks passed"* ]] &&
+    [[ "$out" == *"70/70 checks passed"* ]] &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
@@ -5650,7 +5659,7 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] NemoHermes sandbox doctor passes"* ]] &&
     [[ "$out" == *"[x] NemoHermes inference route uses selected LiteLLM model"* ]] &&
     [[ "$out" == *"[x] Hermes model supports automatic tool calling"* ]] &&
-    [[ "$out" == *"[x] Hermes model context is at least 65536 tokens"* ]] &&
+    [[ "$out" == *"[x] Hermes context fits the effective vLLM context"* ]] &&
     [[ "$out" == *"[x] Hermes output and reasoning limits are configured"* ]] &&
     [[ "$out" == *"[x] Hermes CLI uses the balanced local-model tool profile"* ]] &&
     [[ "$out" == *"[x] Hermes reaches Vikunja as bot-hermes"* ]] &&
@@ -5702,7 +5711,7 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"70/70 checks passed"* ]] &&
+  [[ "$out" == *"71/71 checks passed"* ]] &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -5753,20 +5762,20 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 69 and
+    .passed == 70 and
     .failed == 0 and
-    .total == 69 and
+    .total == 70 and
     .model == "Org/Alpha" and
     ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Identity & recovery" and .passed == 14 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Resilience" and .passed == 2 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Inference & agent" and .passed == 18 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Inference & agent" and .passed == 19 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM Hermes route completes smoke request" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "NemoHermes inference route uses selected LiteLLM model" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes model supports automatic tool calling" and .ok == true)] | length == 1) and
-    ([.checks[] | select(.label == "Hermes model context is at least 65536 tokens" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "Hermes context fits the effective vLLM context" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes output and reasoning limits are configured" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes CLI uses the balanced local-model tool profile" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes reaches Vikunja as bot-hermes" and .ok == true)] | length == 1) and
@@ -7054,7 +7063,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"69/69 checks passed"* ]] &&
+  [[ "$out" == *"70/70 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -7076,7 +7085,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"69/69 checks passed"* ]] &&
+  [[ "$out" == *"70/70 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -8665,10 +8674,59 @@ test_config_set_and_show() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin set_out show_out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  set_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config auto-update on 2>&1)
-  show_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config 2>&1)
+  set_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config --auto-update on 2>&1)
+  show_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config --show 2>&1)
   rm -rf "$tmp"
   [[ "$set_out" == *"Auto-update enabled"* ]] && [[ "$show_out" == *"auto-update: true"* ]]
+}
+
+test_config_sets_hermes_context() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out settings
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config --hermes-ctx 131072 2>&1)
+  settings=$(cat "${tmp}/home/.config/spark/hermes.json" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Hermes context: custom (131072)"* ]] &&
+    [[ "$settings" == *'"mode": "custom"'* ]] &&
+    [[ "$settings" == *'"length": 131072'* ]]
+}
+
+test_hermes_context_modes_follow_vllm_limit() {
+  local tmp fake_bin max_ctx custom_ctx status=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  max_ctx=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
+    FAKE_DOCKER_MAX_MODEL_LEN=262144 \
+    bash -c 'source "$1"; workspace_set_env_key HERMES_CONTEXT_MODE max; workspace_hermes_context_for_model Org/Model' _ "$SPARK")
+  custom_ctx=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
+    FAKE_DOCKER_MAX_MODEL_LEN=32768 \
+    bash -c 'source "$1"; workspace_hermes_context_for_model Org/Model' _ "$SPARK")
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
+    FAKE_DOCKER_MAX_MODEL_LEN=65536 \
+    bash -c 'source "$1"; workspace_set_env_key HERMES_CONTEXT_MODE custom; workspace_set_env_key HERMES_CONTEXT_LENGTH 131072; workspace_hermes_context_for_model Org/Model' _ "$SPARK" >/dev/null 2>&1 || status=$?
+  rm -rf "$tmp"
+  [[ "$max_ctx" == "262144" ]] && [[ "$custom_ctx" == "32768" ]] && [[ "$status" -ne 0 ]]
+}
+
+test_hermes_web_provider_is_ddgs() {
+  local tmp fake_bin calls wrong=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NEMOHERMES_FILE="${tmp}/nemo.log" FAKE_HERMES_DDGS_IMPORT_EXIT=1 \
+    bash -c 'source "$1"; workspace_configure_hermes_web' _ "$SPARK"
+  calls=$(cat "${tmp}/nemo.log" 2>/dev/null || true)
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_HERMES_PLUGINS_LIST='enabled user 0.1.0 web-ddgs' \
+    FAKE_HERMES_WEB_CONFIG_BACKEND=ddgs FAKE_HERMES_WEB_CONFIG_SEARCH=ddgs \
+    bash -c 'source "$1"; workspace_hermes_web_ready' _ "$SPARK" || wrong=$?
+  rm -rf "$tmp"
+  [[ "$calls" == *"/usr/bin/python3 -m pip install --user ddgs"* ]] &&
+    [[ "$calls" == *"hermes plugins enable web-ddgs"* ]] &&
+    [[ "$calls" == *"hermes config set web.backend ddgs"* ]] &&
+  [[ "$calls" == *"hermes config set web.search_backend ddgs"* ]] &&
+    [[ "$wrong" -eq 0 ]]
 }
 
 test_update_accepts_zero_padded_august_month() {
@@ -9179,6 +9237,7 @@ run_test "rm errors on a model not in cache" test_rm_not_found
 run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
+run_test "config sets Hermes context" test_config_sets_hermes_context
 run_test "update accepts zero-padded August month" test_update_accepts_zero_padded_august_month
 run_test "update prompts workspace tool updates one by one" test_update_prompts_workspace_tool_updates_one_by_one
 run_test "update skips images already at remote digest" test_update_skips_images_already_at_remote_digest
@@ -9302,6 +9361,8 @@ run_test "workspace Hermes start uses official lifecycle" test_workspace_hermes_
 run_test "workspace Hermes start recovers stopped agent gateway" test_workspace_hermes_start_recovers_stopped_agent_gateway
 run_test "workspace bridge waits for delayed readiness" test_workspace_bridge_waits_for_delayed_readiness
 run_test "workspace dashboard proxy rewrites Host on loopback" test_workspace_dashboard_proxy_rewrites_host_on_loopback
+run_test "Hermes context modes follow vLLM limit" test_hermes_context_modes_follow_vllm_limit
+run_test "Hermes web provider is DDG" test_hermes_web_provider_is_ddgs
 run_test "workspace listener check allows OpenShell gateway bridge" test_workspace_listener_check_allows_only_openshell_gateway_bridge
 run_test "repair starts model with requested policy" test_repair_starts_model_with_requested_policy
 run_test "repair defaults to LiteLLM main model" test_repair_defaults_to_litellm_main_model

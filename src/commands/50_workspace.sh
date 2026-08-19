@@ -318,6 +318,128 @@ workspace_url_for() {
   fi
 }
 
+workspace_model_state() {
+  local model="$1" name m rest running=0 route_ok=0
+  while IFS=$'\t' read -r name m rest; do
+    [[ "$m" == "$model" ]] && running=1
+  done < <(list_managed_containers)
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    route_ok=1
+  fi
+  if [[ "$running" == "1" && "$route_ok" == "1" ]]; then printf 'running+routed'
+  elif [[ "$running" == "1" ]]; then printf 'running'
+  else printf 'downloaded'; fi
+}
+
+workspace_model_tool_calling_ready() {
+  local model="$1" container args parser profile_file expected=""
+  [[ "$BACKEND" == "vllm" ]] || return 0
+  [[ -n "$model" ]] || return 1
+  container=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  args=$(docker inspect -f '{{json .Config.Cmd}}' "$container" 2>/dev/null || true)
+  parser=$(printf '%s\n' "$args" | jq -er '
+    if type == "array" and index("--enable-auto-tool-choice") != null then
+      index("--tool-call-parser") as $i |
+      if $i != null and ($i + 1) < length then .[$i + 1] else empty end
+    else empty end
+  ' 2>/dev/null) || return 1
+  [[ -n "$parser" ]] || return 1
+  profile_file="${PROFILES_DIR}/$(printf '%s' "$model" | sed 's/\//--/g').json"
+  if [[ -f "$profile_file" ]]; then
+    expected=$(jq -r '
+      if .hf.raw.model_type == "qwen3_5" then "qwen3_coder"
+      else (.tool_call_parser // "") end
+    ' "$profile_file" 2>/dev/null || true)
+  fi
+  [[ -z "$expected" || "$parser" == "$expected" ]]
+}
+
+workspace_hermes_setting() {
+  local key="$1" fallback="${2:-}"
+  if [[ -f "$HERMES_SETTINGS_FILE" ]] && command -v jq >/dev/null 2>&1; then
+    jq -r --arg key "$key" --arg fallback "$fallback" '.[$key] // $fallback' \
+      "$HERMES_SETTINGS_FILE" 2>/dev/null || printf '%s\n' "$fallback"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+workspace_model_context_limit() {
+  local model="$1" container max_len
+  [[ "$BACKEND" == "vllm" ]] || return 1
+  container=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  max_len=$(docker inspect -f '{{index .Config.Labels "spark.max_model_len"}}' "$container" 2>/dev/null || true)
+  [[ "$max_len" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf '%s\n' "$max_len"
+}
+
+workspace_hermes_context_mode() {
+  local mode
+  if [[ -f "$HERMES_SETTINGS_FILE" ]] && command -v jq >/dev/null 2>&1 \
+      && jq -e 'has("mode")' "$HERMES_SETTINGS_FILE" >/dev/null 2>&1; then
+    mode=$(workspace_hermes_setting mode "$WORKSPACE_HERMES_CONTEXT_MODE_DEFAULT")
+  else
+    mode=$(workspace_read_env HERMES_CONTEXT_MODE 2>/dev/null || true)
+    [[ -n "$mode" ]] || mode="$WORKSPACE_HERMES_CONTEXT_MODE_DEFAULT"
+  fi
+  printf '%s\n' "$mode"
+}
+
+workspace_hermes_context_for_model() {
+  local model="$1" mode requested max_len context
+  mode=$(workspace_hermes_context_mode)
+  if [[ "$BACKEND" != "vllm" ]]; then
+    [[ "$mode" == "custom" || "$mode" == "max" ]] || return 1
+    if [[ -f "$HERMES_SETTINGS_FILE" ]] && command -v jq >/dev/null 2>&1 \
+        && jq -e 'has("length")' "$HERMES_SETTINGS_FILE" >/dev/null 2>&1; then
+      requested=$(workspace_hermes_setting length "")
+    else
+      requested=$(workspace_read_env HERMES_CONTEXT_LENGTH 2>/dev/null || true)
+    fi
+    [[ -n "$requested" ]] || requested="$WORKSPACE_HERMES_CONTEXT_DEFAULT"
+    [[ "$requested" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s\n' "$requested"
+    return 0
+  fi
+  max_len=$(workspace_model_context_limit "$model" 2>/dev/null || true)
+  [[ "$max_len" =~ ^[1-9][0-9]*$ ]] || return 1
+  case "$mode" in
+    max)
+      printf '%s\n' "$max_len"
+      ;;
+    custom)
+      if [[ -f "$HERMES_SETTINGS_FILE" ]] && command -v jq >/dev/null 2>&1 \
+          && jq -e 'has("length")' "$HERMES_SETTINGS_FILE" >/dev/null 2>&1; then
+        requested=$(workspace_hermes_setting length "")
+      else
+        requested=$(workspace_read_env HERMES_CONTEXT_LENGTH 2>/dev/null || true)
+      fi
+      if [[ -n "$requested" ]]; then
+        [[ "$requested" =~ ^[1-9][0-9]*$ ]] || return 1
+        context="$requested"
+      else
+        context="$WORKSPACE_HERMES_CONTEXT_DEFAULT"
+        (( context > max_len )) && context="$max_len"
+      fi
+      (( context <= max_len )) || return 1
+      printf '%s\n' "$context"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+workspace_model_context_ready() {
+  local model="$1" max_len context
+  [[ "$BACKEND" == "vllm" ]] || return 0
+  max_len=$(workspace_model_context_limit "$model" 2>/dev/null || true)
+  context=$(workspace_hermes_context_for_model "$model" 2>/dev/null || true)
+  [[ "$max_len" =~ ^[1-9][0-9]*$ && "$context" =~ ^[1-9][0-9]*$ && "$context" -le "$max_len" ]]
+}
+
 workspace_litellm_model_name() {
   printf 'main\n'
 }
@@ -376,9 +498,63 @@ workspace_select_model() {
   done
 }
 
+workspace_ensure_gateway() {
+  local check_only="$1" auto_yes="$2" model="$3" prov="vllm" model_state=""
+  [[ "$BACKEND" == "ollama" ]] && prov="ollama"
+  if [[ ! -f "$GATEWAY_CONFIG" ]]; then
+    if [[ "$check_only" == "1" ]]; then
+      setup_fail "LiteLLM gateway not configured"; return 0
+    fi
+    local gw_json
+    gw_json=$(jq -n --argjson port "$GATEWAY_PORT" \
+      --argjson vllm_en "$( [[ "$prov" == "vllm" ]] && echo true || echo false )" \
+      --argjson ollama_en "$( [[ "$prov" == "ollama" ]] && echo true || echo false )" \
+      '{enabled:true, port:$port, providers:{
+        vllm:{enabled:$vllm_en, port:8000},
+        ollama:{enabled:$ollama_en},
+        openrouter:{enabled:false, api_key:""},
+        zen:{enabled:false, api_key:""},
+        together:{enabled:false, api_key:""}
+      }}')
+    gateway_save_config "$gw_json"
+    info "Configured LiteLLM gateway"
+  fi
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    info "LiteLLM gateway: running"
+  elif [[ "$check_only" == "1" ]]; then
+    setup_fail "LiteLLM gateway not running"
+  elif [[ "$auto_yes" == "1" ]] || confirm "Start the LiteLLM gateway now?"; then
+    gateway_start || setup_fail "Could not start LiteLLM gateway"
+  else
+    setup_fail "LiteLLM gateway required for Hermes"
+  fi
+  if [[ -n "$model" ]]; then
+    model_state=$(workspace_model_state "$model")
+    if [[ "$model_state" == *"running"* ]] \
+        && { ! workspace_model_tool_calling_ready "$model" || ! workspace_model_context_ready "$model"; }; then
+      if [[ "$check_only" == "1" ]]; then
+        setup_fail "Hermes model needs automatic tool calling and enough vLLM context for Hermes: $model"
+      else
+        info "Restarting ${model} with Hermes tool calling"
+        cmd_run "$model" --no-mtp --tools --force
+      fi
+    elif [[ "$model_state" != *"running"* ]]; then
+      if [[ "$check_only" == "1" ]]; then
+        setup_fail "Model not running for Hermes: $model"
+      elif [[ "$auto_yes" == "1" ]] || confirm "Start ${model} now with spark run?"; then
+        # Let spark run choose the vLLM context. Hermes validates against that effective value.
+        cmd_run "$model" --no-mtp --tools
+      else
+        setup_fail "Hermes model not started: $model"
+      fi
+    fi
+  fi
+}
+
 workspace_repair_model_server() {
   local check_only="$1" auto_yes="$2" model="$3"
-  local args=(--model "$model" --tools --max-len "$WORKSPACE_HERMES_MIN_CONTEXT" --no-mtp)
+  # Preserve the vLLM launch policy; Hermes validates against its effective context.
+  local args=(--model "$model" --tools --no-mtp)
   [[ "$check_only" == "1" ]] && args+=(--check)
   [[ "$auto_yes" == "1" ]] && args+=(--yes)
   cmd_repair "${args[@]}"
@@ -763,7 +939,8 @@ workspace_postgres_volume_target() {
 
 workspace_write_files_vikunja() {
   local tailnet="$1" human_user="$2" human_email="$3" human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
-  local vikunja_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie
+  local vikunja_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
+  local hermes_context hermes_context_mode
   local tailscale_bind_addr tailscale_dns_name
   local postgres_pass vikunja_db_pass vikunja_secret n8n_db_pass n8n_key mention_secret
   local n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status vikunja_token tailscale_mode
@@ -803,6 +980,12 @@ workspace_write_files_vikunja() {
       hermes_url=
     fi
   fi
+  litellm_model=$(workspace_litellm_model_name "$model")
+  hermes_context_mode=$(workspace_hermes_context_mode)
+  hermes_context=$(workspace_hermes_context_for_model "$model") || {
+    setup_fail "Hermes context exceeds the effective vLLM context for $model"
+    return 1
+  }
   workspace_backup_invalid_env_file "$WORKSPACE_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_POSTGRES_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_VIKUNJA_ENV_FILE"
@@ -920,7 +1103,9 @@ HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
 HERMES_MODEL=$(workspace_litellm_model_name "$model")
 HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
-HERMES_CONTEXT_LENGTH=${WORKSPACE_HERMES_MIN_CONTEXT}
+HERMES_CONTEXT_MODE=${hermes_context_mode}
+HERMES_CONTEXT_LENGTH=${hermes_context}
+HERMES_WEB_PROVIDER=${WORKSPACE_HERMES_WEB_PROVIDER}
 HERMES_MAX_TOKENS=${WORKSPACE_HERMES_MAX_TOKENS_DEFAULT}
 HERMES_REASONING_EFFORT=${WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT}
 HERMES_POLICY_TIER=restricted
@@ -1092,7 +1277,8 @@ EOF
 
 workspace_write_files_super_productivity() {
   local tailnet="$1" human_user="$2" human_email="$3" _human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
-  local task_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie
+  local task_url n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
+  local hermes_context hermes_context_mode
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
   local postgres_pass postgres_volume_target supersync_db_pass supersync_jwt supersync_token supersync_encryption n8n_db_pass n8n_key mention_secret
   local n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status browser_sync_status browser_sync_url postgres_image supersync_image electron_version electron_commit electron_image n8n_image rp_id old_umask
@@ -1129,6 +1315,12 @@ workspace_write_files_super_productivity() {
     hermes_url=""
   fi
 
+  litellm_model=$(workspace_litellm_model_name "$model")
+  hermes_context_mode=$(workspace_hermes_context_mode)
+  hermes_context=$(workspace_hermes_context_for_model "$model") || {
+    setup_fail "Hermes context exceeds the effective vLLM context for $model"
+    return 1
+  }
   workspace_backup_invalid_env_file "$WORKSPACE_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_POSTGRES_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_SUPER_PRODUCTIVITY_ENV_FILE"
@@ -1252,7 +1444,9 @@ HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
 HERMES_MODEL=$(workspace_litellm_model_name "$model")
 HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
-HERMES_CONTEXT_LENGTH=${WORKSPACE_HERMES_MIN_CONTEXT}
+HERMES_CONTEXT_MODE=${hermes_context_mode}
+HERMES_CONTEXT_LENGTH=${hermes_context}
+HERMES_WEB_PROVIDER=${WORKSPACE_HERMES_WEB_PROVIDER}
 HERMES_MAX_TOKENS=${WORKSPACE_HERMES_MAX_TOKENS_DEFAULT}
 HERMES_REASONING_EFFORT=${WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT}
 HERMES_POLICY_TIER=restricted
@@ -1452,7 +1646,8 @@ EOF
 
 workspace_write_files_todoist() {
   local tailnet="$1" human_user="$2" human_email="$3" _human_pass="$4" n8n_email="$5" n8n_pass="$6" model="$7"
-  local task_url="$WORKSPACE_TODOIST_APP_URL" n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie
+  local task_url="$WORKSPACE_TODOIST_APP_URL" n8n_url hermes_url n8n_host n8n_protocol n8n_secure_cookie litellm_model
+  local hermes_context hermes_context_mode
   local tailscale_bind_addr tailscale_dns_name tailscale_mode
   local postgres_pass postgres_volume_target n8n_db_pass n8n_key n8n_owner_status n8n_hermes_folder_id n8n_hermes_folder_status mention_secret
   local postgres_image n8n_image todoist_token old_todoist_token todoist_status old_umask
@@ -1485,6 +1680,12 @@ workspace_write_files_todoist() {
     hermes_url=""
   fi
 
+  litellm_model=$(workspace_litellm_model_name "$model")
+  hermes_context_mode=$(workspace_hermes_context_mode)
+  hermes_context=$(workspace_hermes_context_for_model "$model") || {
+    setup_fail "Hermes context exceeds the effective vLLM context for $model"
+    return 1
+  }
   workspace_backup_invalid_env_file "$WORKSPACE_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_POSTGRES_ENV_FILE"
   workspace_backup_invalid_env_file "$WORKSPACE_N8N_ENV_FILE"
@@ -1570,7 +1771,9 @@ HERMES_URL=${hermes_url}
 HERMES_DASHBOARD_PORT=${WORKSPACE_HERMES_PORT}
 HERMES_MODEL=$(workspace_litellm_model_name "$model")
 HERMES_LITELLM_BASE_URL=http://host.openshell.internal:${GATEWAY_PORT}/v1
-HERMES_CONTEXT_LENGTH=${WORKSPACE_HERMES_MIN_CONTEXT}
+HERMES_CONTEXT_MODE=${hermes_context_mode}
+HERMES_CONTEXT_LENGTH=${hermes_context}
+HERMES_WEB_PROVIDER=${WORKSPACE_HERMES_WEB_PROVIDER}
 HERMES_MAX_TOKENS=${WORKSPACE_HERMES_MAX_TOKENS_DEFAULT}
 HERMES_REASONING_EFFORT=${WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT}
 HERMES_POLICY_TIER=restricted
@@ -3167,10 +3370,11 @@ workspace_configure_tailscale() {
 }
 
 workspace_hermes_config_ready() {
-  local litellm_model="$1" configured_model="" onboard_status=""
+  local litellm_model="$1" configured_model="" expected_model="" onboard_status=""
   configured_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  expected_model=$(workspace_litellm_model_name "$litellm_model")
   onboard_status=$(workspace_read_env HERMES_ONBOARD_STATUS 2>/dev/null || true)
-  [[ "$configured_model" == "$litellm_model" ]] || return 1
+  [[ "$configured_model" == "$expected_model" ]] || return 1
   [[ "$onboard_status" == "configured" || "$onboard_status" == "manual" ]] || return 1
   workspace_hermes_running || return 1
   workspace_start_hermes_private_proxy || return 1
@@ -3181,16 +3385,23 @@ workspace_hermes_config_ready() {
   workspace_hermes_dashboard_url_ready || return 1
   workspace_hermes_runtime_config_ready || return 1
   workspace_hermes_cli_toolsets_ready || return 1
+  workspace_hermes_web_ready || return 1
 }
 
 workspace_hermes_runtime_config_ready() {
-  local max_tokens context reasoning
+  local max_tokens context reasoning model max_len
   command -v nemohermes >/dev/null 2>&1 || return 1
   max_tokens=$(workspace_read_env HERMES_MAX_TOKENS 2>/dev/null || true)
   context=$(workspace_read_env HERMES_CONTEXT_LENGTH 2>/dev/null || true)
   reasoning=$(workspace_read_env HERMES_REASONING_EFFORT 2>/dev/null || true)
   [[ "$max_tokens" =~ ^[1-9][0-9]*$ ]] || return 1
-  [[ "$context" =~ ^[0-9]+$ && "$context" -ge "$WORKSPACE_HERMES_MIN_CONTEXT" ]] || return 1
+  [[ "$context" =~ ^[1-9][0-9]*$ ]] || return 1
+  if [[ "$BACKEND" == "vllm" ]]; then
+    model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+    [[ "$model" == "main" ]] && model=$(workspace_main_model 2>/dev/null || true)
+    max_len=$(workspace_model_context_limit "$model" 2>/dev/null || true)
+    [[ "$max_len" =~ ^[1-9][0-9]*$ && "$context" -le "$max_len" ]] || return 1
+  fi
   [[ "$reasoning" == "none" ]] || return 1
   nemohermes hermes exec --no-tty --timeout 20 -- sh -lc '
     file=/sandbox/.hermes/config.yaml max="$1" context="$2" reasoning="$3"
@@ -3201,17 +3412,69 @@ workspace_hermes_runtime_config_ready() {
 }
 
 workspace_configure_hermes_runtime() {
-  local max_tokens context reasoning
+  local physical_model="${1:-}" max_tokens context reasoning model expected_context
   max_tokens=$(workspace_read_env HERMES_MAX_TOKENS 2>/dev/null || true)
   context=$(workspace_read_env HERMES_CONTEXT_LENGTH 2>/dev/null || true)
   reasoning=$(workspace_read_env HERMES_REASONING_EFFORT 2>/dev/null || true)
   [[ "$max_tokens" =~ ^[1-9][0-9]*$ ]] || max_tokens="$WORKSPACE_HERMES_MAX_TOKENS_DEFAULT"
-  [[ "$context" =~ ^[0-9]+$ && "$context" -ge "$WORKSPACE_HERMES_MIN_CONTEXT" ]] || context="$WORKSPACE_HERMES_MIN_CONTEXT"
+  if [[ "$BACKEND" == "vllm" ]]; then
+    model="$physical_model"
+    [[ -n "$model" ]] || model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+    [[ "$model" == "main" ]] && model=$(workspace_main_model 2>/dev/null || true)
+    expected_context=$(workspace_hermes_context_for_model "$model" 2>/dev/null || true)
+    [[ "$expected_context" =~ ^[1-9][0-9]*$ ]] || return 1
+    context="$expected_context"
+  else
+    [[ "$context" =~ ^[1-9][0-9]*$ ]] || context="$WORKSPACE_HERMES_CONTEXT_DEFAULT"
+  fi
   [[ "$reasoning" == "none" ]] || reasoning="$WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT"
   nemohermes hermes config set --config-accept-new-path --key model.max_tokens --value "$max_tokens" >/dev/null 2>&1 &&
     nemohermes hermes config set --config-accept-new-path --key model.context_length --value "$context" >/dev/null 2>&1 &&
     nemohermes hermes config set --config-accept-new-path --key agent.reasoning_effort --value "$reasoning" >/dev/null 2>&1 &&
     workspace_configure_hermes_cli_toolsets
+}
+
+workspace_hermes_python_binary() {
+  local binary
+  binary=$(nemohermes hermes exec --no-tty --timeout 20 -- sh -lc 'command -v python3 || command -v python' 2>/dev/null | tail -n 1 || true)
+  [[ "$binary" == /* ]] || return 1
+  printf '%s\n' "$binary"
+}
+
+workspace_hermes_web_plugin_ready() {
+  local plugins
+  plugins=$(NO_COLOR=1 nemohermes hermes exec --no-tty --timeout 20 -- \
+    hermes plugins list --plain --no-bundled 2>/dev/null || true)
+  [[ "$plugins" == *enabled*web-ddgs* ]] || [[ "$plugins" == *web-ddgs*enabled* ]]
+}
+
+workspace_hermes_web_config_ready() {
+  local backend search
+  backend=$(nemohermes hermes exec --no-tty --timeout 20 -- \
+    hermes config get --key web.backend --format json 2>/dev/null || true)
+  search=$(nemohermes hermes exec --no-tty --timeout 20 -- \
+    hermes config get --key web.search_backend --format json 2>/dev/null || true)
+  [[ "$backend" == '"ddgs"' || "$backend" == "ddgs" ]] &&
+    [[ "$search" == '"ddgs"' || "$search" == "ddgs" ]]
+}
+
+workspace_hermes_web_ready() {
+  command -v nemohermes >/dev/null 2>&1 || return 1
+  workspace_hermes_web_plugin_ready || return 1
+  workspace_hermes_cli_toolsets_ready || return 1
+  workspace_hermes_web_config_ready
+}
+
+workspace_configure_hermes_web() {
+  local binary
+  binary=$(workspace_hermes_python_binary) || return 1
+  if ! nemohermes hermes exec --no-tty --timeout 20 -- "$binary" -c 'import ddgs' >/dev/null 2>&1; then
+    nemohermes hermes exec --no-tty --timeout 120 -- "$binary" -m pip install --user ddgs >/dev/null 2>&1 || return 1
+  fi
+  nemohermes hermes exec --no-tty --timeout 30 -- hermes plugins enable web-ddgs >/dev/null 2>&1 &&
+    nemohermes hermes exec --no-tty --timeout 30 -- hermes config set web.backend ddgs >/dev/null 2>&1 &&
+    nemohermes hermes exec --no-tty --timeout 30 -- hermes config set web.search_backend ddgs >/dev/null 2>&1 &&
+    nemohermes hermes exec --no-tty --timeout 30 -- hermes tools enable --platform cli web >/dev/null 2>&1
 }
 
 workspace_configure_hermes_cli_toolsets() {
@@ -3420,7 +3683,7 @@ async def handle(client_reader, client_writer):
             lower = line.lower()
             if lower.startswith(b"host:"):
                 line = f"Host: 127.0.0.1:{sys.argv[2]}".encode()
-            elif lower.startswith(b"origin:"):
+            elif lower.startswith(b"origin:") and websocket:
                 line = f"Origin: http://127.0.0.1:{sys.argv[2]}".encode()
             elif lower.startswith(b"connection:"):
                 saw_connection = True
@@ -4192,7 +4455,8 @@ workspace_setup_hermes() {
           return 0
         fi
       fi
-      workspace_configure_hermes_runtime || true
+      workspace_configure_hermes_runtime "$model" || true
+      workspace_configure_hermes_web || true
     fi
     if workspace_hermes_config_ready "$litellm_model"; then
       workspace_set_env_key HERMES_ONBOARD_STATUS configured
@@ -4223,7 +4487,8 @@ workspace_setup_hermes() {
         --no-gpu \
         --control-ui-port "$WORKSPACE_HERMES_PORT" >/dev/null 2>&1 \
       && workspace_start_hermes_private_proxy \
-      && workspace_configure_hermes_runtime \
+      && workspace_configure_hermes_runtime "$model" \
+      && workspace_configure_hermes_web \
       && { workspace_set_env_key HERMES_ONBOARD_STATUS configured; info "Hermes onboarded with ${litellm_model}"; } \
       || { workspace_set_env_key HERMES_ONBOARD_STATUS manual; setup_fail "Hermes onboarding failed; run nemohermes onboard manually"; }
   elif [[ "$check_only" == "1" ]]; then
@@ -7297,9 +7562,10 @@ cmd_workspace_doctor() {
   workspace_doctor_check "NemoHermes inference route uses selected LiteLLM model" workspace_hermes_inference_route_ready
   workspace_doctor_check "Hermes config model matches selected LiteLLM route" workspace_hermes_config_model_ready
   workspace_doctor_check "Hermes model supports automatic tool calling" model_server_tool_calling_ready "$model"
-  workspace_doctor_check "Hermes model context is at least ${WORKSPACE_HERMES_MIN_CONTEXT} tokens" model_server_context_ready "$model" "$WORKSPACE_HERMES_MIN_CONTEXT"
+  workspace_doctor_check "Hermes context fits the effective vLLM context" workspace_model_context_ready "$model"
   workspace_doctor_check "Hermes output and reasoning limits are configured" workspace_hermes_runtime_config_ready
   workspace_doctor_check "Hermes CLI uses the balanced local-model tool profile" workspace_hermes_cli_toolsets_ready
+  workspace_doctor_check "Hermes web search uses DuckDuckGo" workspace_hermes_web_ready
   if [[ "$task_manager" == "super-productivity" ]]; then
     workspace_doctor_check "Hermes reaches the Super Productivity API" workspace_hermes_super_productivity_api_ready
   elif [[ "$task_manager" == "todoist" ]]; then
