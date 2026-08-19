@@ -716,7 +716,7 @@ cmd_help() {
     reinstall        Remove Spark state and run setup again
     uninstall        Remove Spark-managed runtime/config/data
     update [targets] Check and apply only real Spark, model, gateway, workspace, and NemoHermes updates
-    config           Configure Spark settings (e.g. auto-update)
+    config           Configure Spark settings (TUI or direct flags)
     architecture     Show developer architecture map and invariants
     version          Show the installed Spark version
 
