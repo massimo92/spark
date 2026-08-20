@@ -10469,6 +10469,7 @@ workspace_hermes_config_ready() {
   workspace_hermes_runtime_config_ready || return 1
   workspace_hermes_cli_toolsets_ready || return 1
   workspace_hermes_web_ready || return 1
+  workspace_hermes_session_delete_ready || return 1
 }
 
 workspace_hermes_runtime_config_ready() {
@@ -10524,40 +10525,231 @@ workspace_hermes_python_binary() {
   printf '%s\n' "$binary"
 }
 
+workspace_hermes_sandbox_policy_ready() {
+  local policy
+  command -v jq >/dev/null 2>&1 || return 1
+  command -v openshell >/dev/null 2>&1 || return 1
+  policy=$(openshell policy get hermes --base -o json 2>/dev/null) || return 1
+  printf '%s\n' "$policy" | jq -e '
+    ((.policy.filesystem_policy.read_write // []) | index("/var/tmp")) != null and
+    ((.policy.network_policies["spark-hermes-ddg"].binaries // []) |
+      any(.path == "/usr/bin/python3*")) and
+    ((.policy.network_policies["spark-hermes-ddg"].binaries // []) |
+      any(.path == "/opt/hermes/.venv/bin/python*")) and
+    ((.policy.network_policies["spark-hermes-ddg"].endpoints // []) |
+      any(.host == "html.duckduckgo.com" and .port == 443 and .protocol == "rest")) and
+    ((.policy.network_policies["spark-hermes-pypi"].binaries // []) |
+      any(.path == "/usr/local/bin/uv")) and
+    ((.policy.network_policies["spark-hermes-pypi"].endpoints // []) |
+      any(.host == "pypi.org" and .port == 443 and .protocol == "rest")) and
+    ((.policy.network_policies["spark-hermes-pypi"].endpoints // []) |
+      any(.host == "files.pythonhosted.org" and .port == 443 and .protocol == "rest"))
+  ' >/dev/null 2>&1
+}
+
+workspace_reconcile_hermes_sandbox_policy() {
+  local policy_file rc=0
+  command -v jq >/dev/null 2>&1 || return 1
+  command -v openshell >/dev/null 2>&1 || return 1
+  workspace_hermes_sandbox_policy_ready && return 0
+  policy_file=$(mktemp "${TMPDIR:-/tmp}/spark-hermes-policy.XXXXXX") || return 1
+  if ! openshell policy get hermes --base -o json 2>/dev/null | jq '
+    .policy
+    | .filesystem_policy.read_write =
+        (((.filesystem_policy.read_write // []) + ["/var/tmp"]) | unique)
+    | .network_policies = (.network_policies // {})
+    | .network_policies["spark-hermes-ddg"] = {
+        name: "spark-hermes-ddg",
+        binaries: [
+          {path: "/usr/bin/python3*"},
+          {path: "/opt/hermes/.venv/bin/python*"}
+        ],
+        endpoints: [{
+          host: "html.duckduckgo.com",
+          port: 443,
+          protocol: "rest",
+          enforcement: "enforce",
+          rules: [
+            {allow: {method: "POST", path: "/html/"}},
+            {allow: {method: "POST", path: "/html/**"}}
+          ]
+        }]
+      }
+    | .network_policies["spark-hermes-pypi"] = {
+        name: "spark-hermes-pypi",
+        binaries: [{path: "/usr/local/bin/uv"}],
+        endpoints: [
+          {
+            host: "pypi.org",
+            port: 443,
+            protocol: "rest",
+            enforcement: "enforce",
+            rules: [{allow: {method: "GET", path: "/simple/**"}}]
+          },
+          {
+            host: "files.pythonhosted.org",
+            port: 443,
+            protocol: "rest",
+            enforcement: "enforce",
+            rules: [{allow: {method: "GET", path: "/**"}}]
+          }
+        ]
+      }
+  ' > "$policy_file"; then
+    rc=1
+  elif ! openshell policy set hermes --policy "$policy_file" --wait >/dev/null 2>&1; then
+    rc=1
+  fi
+  rm -f "$policy_file"
+  [[ "$rc" -eq 0 ]] && workspace_hermes_sandbox_policy_ready
+}
+
+workspace_hermes_ddg_package_ready() {
+  local binary
+  binary=$(workspace_hermes_python_binary) || return 1
+  nemohermes hermes exec --no-tty --timeout 20 -- "$binary" -c '
+import sys
+sys.path.insert(0, "/sandbox/.hermes/plugins/web-spark-ddgs/vendor")
+import ddgs
+  ' >/dev/null 2>&1
+}
+
+workspace_install_hermes_ddg_plugin() {
+  local plugin_dir="/sandbox/.hermes/plugins/web-spark-ddgs" plugin_code plugin_manifest
+  plugin_code='from pathlib import Path
+import sys
+
+vendor = str(Path(__file__).parent / "vendor")
+if vendor not in sys.path:
+    sys.path.insert(0, vendor)
+
+from ddgs import DDGS
+import plugins.web.ddgs.provider as upstream
+
+
+def _duckduckgo_search(query, safe_limit):
+    results = []
+    with DDGS(timeout=10) as client:
+        for index, hit in enumerate(
+            client.text(query, max_results=safe_limit, backend="duckduckgo")
+        ):
+            if index >= safe_limit:
+                break
+            results.append({
+                "title": str(hit.get("title", "")),
+                "url": str(hit.get("href") or hit.get("url") or ""),
+                "description": str(hit.get("body", "")),
+                "position": index + 1,
+            })
+    return results
+
+
+def register(ctx):
+    upstream._run_ddgs_search = _duckduckgo_search
+    ctx.register_web_search_provider(upstream.DDGSWebSearchProvider())'
+  plugin_manifest='name: web-spark-ddgs
+version: 1.0.0
+description: Spark-managed DuckDuckGo provider for NemoClaw
+author: Spark
+manifest_version: 1
+kind: backend
+provides_web_providers:
+  - ddgs'
+  nemohermes hermes exec --no-tty --timeout 20 -- sh -c '
+    set -eu
+    mkdir -p "$1"
+    printf "%s\n" "$2" > "$1/__init__.py"
+    printf "%s\n" "$3" > "$1/plugin.yaml"
+  ' spark-hermes-ddg-plugin "$plugin_dir" "$plugin_code" "$plugin_manifest" >/dev/null 2>&1 || return 1
+  if ! workspace_hermes_ddg_package_ready; then
+    nemohermes hermes exec --no-tty --timeout 300 -- \
+      /usr/local/bin/uv pip install --link-mode copy \
+        --target "${plugin_dir}/vendor" --upgrade ddgs >/dev/null 2>&1 || return 1
+  fi
+  workspace_hermes_ddg_package_ready
+}
+
+workspace_hermes_ddg_search_ready() {
+  local binary
+  binary=$(workspace_hermes_python_binary) || return 1
+  nemohermes hermes exec --no-tty --timeout 30 -- "$binary" -c '
+import sys
+sys.path.insert(0, "/sandbox/.hermes/plugins/web-spark-ddgs/vendor")
+from ddgs import DDGS
+results = DDGS(timeout=10).text(
+    "Spark web search readiness",
+    max_results=1,
+    backend="duckduckgo",
+)
+raise SystemExit(0 if results else 1)
+  ' >/dev/null 2>&1
+}
+
+workspace_hermes_session_delete_ready() {
+  local binary
+  binary=$(workspace_hermes_python_binary) || return 1
+  nemohermes hermes exec --no-tty --timeout 20 -- "$binary" -c '
+import sqlite3
+import time
+import uuid
+
+probe = "spark-doctor-delete-probe-" + uuid.uuid4().hex
+conn = sqlite3.connect("/sandbox/.hermes/state.db", isolation_level=None, timeout=5)
+conn.execute("PRAGMA foreign_keys=ON")
+try:
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO sessions(id, source, started_at) VALUES (?, ?, ?)",
+        (probe, "spark-doctor", time.time()),
+    )
+    conn.execute("DELETE FROM sessions WHERE id = ?", (probe,))
+finally:
+    conn.rollback()
+    conn.close()
+  ' >/dev/null 2>&1
+}
+
 workspace_hermes_web_plugin_ready() {
   local plugins
   plugins=$(NO_COLOR=1 nemohermes hermes exec --no-tty --timeout 20 -- \
     hermes plugins list --plain --no-bundled 2>/dev/null || true)
-  [[ "$plugins" == *enabled*web-ddgs* ]] || [[ "$plugins" == *web-ddgs*enabled* ]]
+  [[ "$plugins" == *enabled*web-spark-ddgs* ]] || [[ "$plugins" == *web-spark-ddgs*enabled* ]]
 }
 
 workspace_hermes_web_config_ready() {
   local backend search
-  backend=$(nemohermes hermes exec --no-tty --timeout 20 -- \
-    hermes config get --key web.backend --format json 2>/dev/null || true)
-  search=$(nemohermes hermes exec --no-tty --timeout 20 -- \
-    hermes config get --key web.search_backend --format json 2>/dev/null || true)
+  backend=$(nemohermes hermes config get --key web.backend --format json 2>/dev/null || true)
+  search=$(nemohermes hermes config get --key web.search_backend --format json 2>/dev/null || true)
   [[ "$backend" == '"ddgs"' || "$backend" == "ddgs" ]] &&
     [[ "$search" == '"ddgs"' || "$search" == "ddgs" ]]
 }
 
 workspace_hermes_web_ready() {
   command -v nemohermes >/dev/null 2>&1 || return 1
+  workspace_hermes_sandbox_policy_ready || return 1
   workspace_hermes_web_plugin_ready || return 1
   workspace_hermes_cli_toolsets_ready || return 1
-  workspace_hermes_web_config_ready
+  workspace_hermes_web_config_ready || return 1
+  workspace_hermes_ddg_search_ready
 }
 
 workspace_configure_hermes_web() {
-  local binary
-  binary=$(workspace_hermes_python_binary) || return 1
-  if ! nemohermes hermes exec --no-tty --timeout 20 -- "$binary" -c 'import ddgs' >/dev/null 2>&1; then
-    nemohermes hermes exec --no-tty --timeout 120 -- "$binary" -m pip install --user ddgs >/dev/null 2>&1 || return 1
-  fi
-  nemohermes hermes exec --no-tty --timeout 30 -- hermes plugins enable web-ddgs >/dev/null 2>&1 &&
-    nemohermes hermes exec --no-tty --timeout 30 -- hermes config set web.backend ddgs >/dev/null 2>&1 &&
-    nemohermes hermes exec --no-tty --timeout 30 -- hermes config set web.search_backend ddgs >/dev/null 2>&1 &&
-    nemohermes hermes exec --no-tty --timeout 30 -- hermes tools enable --platform cli web >/dev/null 2>&1
+  local current enabled disabled entries
+  workspace_reconcile_hermes_sandbox_policy || return 1
+  workspace_install_hermes_ddg_plugin || return 1
+  current=$(nemohermes hermes config get --format json 2>/dev/null) || return 1
+  enabled=$(printf '%s\n' "$current" | jq -c '((.plugins.enabled // []) + ["web-spark-ddgs"]) | unique') || return 1
+  disabled=$(printf '%s\n' "$current" | jq -c '((.plugins.disabled // []) + ["web/ddgs"]) | unique') || return 1
+  entries=$(printf '%s\n' "$current" | jq -c '(.plugins.entries // {}) + {"web-spark-ddgs": {"allow_tool_override": false}}') || return 1
+  nemohermes hermes config set --config-accept-new-path --key plugins.enabled --value "$enabled" >/dev/null 2>&1 &&
+    nemohermes hermes config set --config-accept-new-path --key plugins.disabled --value "$disabled" >/dev/null 2>&1 &&
+    nemohermes hermes config set --config-accept-new-path --key plugins.entries --value "$entries" >/dev/null 2>&1 &&
+    nemohermes hermes config set --config-accept-new-path --key web.backend --value ddgs >/dev/null 2>&1 &&
+    nemohermes hermes config set --config-accept-new-path --key web.search_backend --value ddgs >/dev/null 2>&1 &&
+    workspace_configure_hermes_cli_toolsets &&
+    nemohermes hermes gateway restart --quiet >/dev/null 2>&1 &&
+    NEMOCLAW_SANDBOX_NAME=hermes nemohermes hermes connect --probe-only >/dev/null 2>&1 &&
+    workspace_hermes_ddg_search_ready
 }
 
 workspace_configure_hermes_cli_toolsets() {
@@ -11538,15 +11730,26 @@ workspace_setup_hermes() {
           return 0
         fi
       fi
-      workspace_configure_hermes_runtime "$model" || true
-      workspace_configure_hermes_web || true
+      if ! workspace_configure_hermes_runtime "$model"; then
+        setup_fail "Could not synchronize Hermes runtime configuration"
+        return 0
+      fi
+      if ! workspace_configure_hermes_web; then
+        setup_fail "Could not configure Hermes DuckDuckGo web search"
+        return 0
+      fi
+      if ! workspace_hermes_session_delete_ready; then
+        setup_fail "Hermes session store does not support deletion"
+        return 0
+      fi
     fi
     if workspace_hermes_config_ready "$litellm_model"; then
       workspace_set_env_key HERMES_ONBOARD_STATUS configured
       info "Hermes already configured with ${litellm_model}"
       return 0
     fi
-    NEMOCLAW_AGENT=hermes \
+    TMPDIR=/tmp \
+      NEMOCLAW_AGENT=hermes \
       NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1 \
       NEMOCLAW_NON_INTERACTIVE=1 \
       NEMOCLAW_YES=1 \
@@ -11572,13 +11775,15 @@ workspace_setup_hermes() {
       && workspace_start_hermes_private_proxy \
       && workspace_configure_hermes_runtime "$model" \
       && workspace_configure_hermes_web \
+      && workspace_hermes_session_delete_ready \
       && { workspace_set_env_key HERMES_ONBOARD_STATUS configured; info "Hermes onboarded with ${litellm_model}"; } \
       || { workspace_set_env_key HERMES_ONBOARD_STATUS manual; setup_fail "Hermes onboarding failed; run nemohermes onboard manually"; }
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "NemoHermes not installed"
   else
     warn "Installing NemoClaw/Hermes"
-    NEMOCLAW_AGENT=hermes \
+    TMPDIR=/tmp \
+      NEMOCLAW_AGENT=hermes \
       NEMOCLAW_NON_INTERACTIVE=1 \
       NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1 \
       NEMOCLAW_YES=1 \
@@ -12642,12 +12847,16 @@ workspace_repair() {
     err "Could not expose LiteLLM to OpenShell"
     return 1
   }
-  if workspace_hermes_mcp_config_drift_detected; then
+  if [[ "$force_rebuild" == "1" ]] || workspace_hermes_mcp_config_drift_detected; then
     if [[ "$auto_yes" != "1" ]]; then
       is_interactive || die "Hermes MCP config drift requires confirmation" "Run: spark ws repair --yes"
       confirm "Rebuild Hermes from its registered NemoClaw state?" || return 1
     fi
-    warn "Hermes MCP config drift detected; rebuilding from registered state"
+    if [[ "$force_rebuild" == "1" ]]; then
+      warn "Forced Hermes rebuild requested; rebuilding from registered state"
+    else
+      warn "Hermes MCP config drift detected; rebuilding from registered state"
+    fi
     local rebuild_args=(--yes)
     [[ "$force_rebuild" == "1" ]] && rebuild_args+=(--force)
     nemohermes_rebuild_with_workspace_env "${rebuild_args[@]}" || {
@@ -14649,6 +14858,7 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Hermes output and reasoning limits are configured" workspace_hermes_runtime_config_ready
   workspace_doctor_check "Hermes CLI uses the balanced local-model tool profile" workspace_hermes_cli_toolsets_ready
   workspace_doctor_check "Hermes web search uses DuckDuckGo" workspace_hermes_web_ready
+  workspace_doctor_check "Hermes session store supports deletion" workspace_hermes_session_delete_ready
   if [[ "$task_manager" == "super-productivity" ]]; then
     workspace_doctor_check "Hermes reaches the Super Productivity API" workspace_hermes_super_productivity_api_ready
   elif [[ "$task_manager" == "todoist" ]]; then
@@ -16285,10 +16495,14 @@ EOF
     printf "\n  ${BOLD}Configuration:${NC}\n"
     printf "    auto-update: %s\n\n" "$(get_update_config "auto_update" "false")"
     if [[ -f "$HERMES_SETTINGS_FILE" ]] && command -v jq >/dev/null 2>&1; then
-      printf "    hermes-context: %s" "$(jq -r '.mode // "custom"' "$HERMES_SETTINGS_FILE" 2>/dev/null || echo custom)"
-      local hermes_length
-      hermes_length=$(jq -r 'if .length == null then "min(65536, vLLM)" else (.length|tostring) end' "$HERMES_SETTINGS_FILE" 2>/dev/null || echo 'min(65536, vLLM)')
-      printf " (%s)\n\n" "$hermes_length"
+      local hermes_mode hermes_length
+      hermes_mode=$(jq -r '.mode // "custom"' "$HERMES_SETTINGS_FILE" 2>/dev/null || echo custom)
+      if [[ "$hermes_mode" == "max" ]]; then
+        printf "    hermes-context: max (vLLM effective context)\n\n"
+      else
+        hermes_length=$(jq -r 'if .length == null then "min(65536, vLLM)" else (.length|tostring) end' "$HERMES_SETTINGS_FILE" 2>/dev/null || echo 'min(65536, vLLM)')
+        printf "    hermes-context: custom (%s)\n\n" "$hermes_length"
+      fi
     else
       printf "    hermes-context: custom (min(65536, vLLM))\n\n"
     fi

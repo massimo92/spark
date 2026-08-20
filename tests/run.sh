@@ -792,6 +792,12 @@ EOF
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'CHAT_UI_URL=%s\n' "${CHAT_UI_URL:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_HERMES_DASHBOARD_HOST=%s\n' "${NEMOCLAW_HERMES_DASHBOARD_HOST:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE=%s\n' "${NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE:-}" >> "${FAKE_NEMOHERMES_FILE}"
+[[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'TMPDIR=%s\n' "${TMPDIR:-}" >> "${FAKE_NEMOHERMES_FILE}"
+if [[ "${FAKE_HERMES_STRICT_CONFIG:-0}" == "1" && "$*" == *"hermes exec"* && "$*" == *"hermes config"* ]]; then
+  case "$*" in
+    *"--key"*|*"--value"*|*"--format"*|*"--config-accept-new-path"*) exit 64 ;;
+  esac
+fi
 case "$*" in
   *"update --check"*)
     if [[ -n "${FAKE_NEMOHERMES_UPDATE_MARKER:-}" && -e "$FAKE_NEMOHERMES_UPDATE_MARKER" ]]; then
@@ -812,6 +818,8 @@ Update available:         no}"
   *"inference get"*) echo "${FAKE_NEMOHERMES_INFERENCE_TEXT:-Provider: compatible-endpoint Model: main}" ;;
   *"hermes config get --key model.default --format json"*) printf '"%s"\n' "${FAKE_HERMES_CONFIG_MODEL:-main}" ;;
   *"hermes config get --key _nemoclaw_upstream.model --format json"*) printf '"%s"\n' "${FAKE_HERMES_CONFIG_UPSTREAM_MODEL:-${FAKE_HERMES_CONFIG_MODEL:-main}}" ;;
+  *"hermes config get --key web.backend --format json"*) printf '"%s"\n' "${FAKE_HERMES_WEB_CONFIG_BACKEND:-ddgs}" ;;
+  *"hermes config get --key web.search_backend --format json"*) printf '"%s"\n' "${FAKE_HERMES_WEB_CONFIG_SEARCH:-ddgs}" ;;
   *"hermes config get --format json"*)
     if [[ -n "${FAKE_HERMES_CONFIG_JSON:-}" ]]; then
       printf '%s\n' "$FAKE_HERMES_CONFIG_JSON"
@@ -846,12 +854,19 @@ Update available:         no}"
   disabled  spotify
   disabled  yuanbao
   disabled  computer_use}" ;;
-  *"hermes exec"*"sh -lc"*"command -v python3"*) echo "${FAKE_HERMES_PYTHON_BINARY:-/usr/bin/python3}" ;;
-  *"hermes exec"*"import ddgs"*) exit "${FAKE_HERMES_DDGS_IMPORT_EXIT:-0}" ;;
+  *"hermes exec"*"sh -lc"*"command -v python3"*) echo "${FAKE_HERMES_PYTHON_BINARY:-/opt/hermes/.venv/bin/python3}" ;;
+  *"hermes exec"*"uv pip install"*"--target"*"ddgs"*)
+    [[ -n "${FAKE_HERMES_DDGS_INSTALL_MARKER:-}" ]] && : > "$FAKE_HERMES_DDGS_INSTALL_MARKER"
+    exit "${FAKE_HERMES_DDGS_INSTALL_EXIT:-0}" ;;
+  *"hermes exec"*"import ddgs"*)
+    [[ -n "${FAKE_HERMES_DDGS_INSTALL_MARKER:-}" && -e "$FAKE_HERMES_DDGS_INSTALL_MARKER" ]] && exit 0
+    exit "${FAKE_HERMES_DDGS_IMPORT_EXIT:-0}" ;;
+  *"hermes exec"*"backend=\"duckduckgo\""*) exit "${FAKE_HERMES_DDGS_SEARCH_EXIT:-0}" ;;
+  *"hermes exec"*"spark-doctor-delete-probe"*) exit "${FAKE_HERMES_SESSION_DELETE_EXIT:-0}" ;;
   *"hermes exec"*"hermes plugins list --plain --no-bundled"*)
-    printf '%b\n' "${FAKE_HERMES_PLUGINS_LIST:-enabled user 0.1.0 web-ddgs}" ;;
-  *"hermes exec"*"hermes config get --key web.backend --format json"*) printf '"%s"\n' "${FAKE_HERMES_WEB_CONFIG_BACKEND:-ddgs}" ;;
-  *"hermes exec"*"hermes config get --key web.search_backend --format json"*) printf '"%s"\n' "${FAKE_HERMES_WEB_CONFIG_SEARCH:-ddgs}" ;;
+    printf '%b\n' "${FAKE_HERMES_PLUGINS_LIST:-enabled user 1.0.0 web-spark-ddgs}" ;;
+  *"hermes exec"*"hermes config get web.backend --json"*) printf '"%s"\n' "${FAKE_HERMES_WEB_CONFIG_BACKEND:-ddgs}" ;;
+  *"hermes exec"*"hermes config get web.search_backend --json"*) printf '"%s"\n' "${FAKE_HERMES_WEB_CONFIG_SEARCH:-ddgs}" ;;
   *"channels status --channel whatsapp --json"*) echo "${FAKE_WHATSAPP_STATUS_JSON:-{\"verdict\":\"healthy\"}}" ;;
   *"hermes exec"*"-X POST"*"/labels"*)
     [[ "${FAKE_HERMES_TODOIST_LABEL_CREATE_EXIT:-0}" == "0" ]] || exit "${FAKE_HERMES_TODOIST_LABEL_CREATE_EXIT}"
@@ -886,6 +901,7 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 args="$*"
+policy_state="${FAKE_OPENSHELL_POLICY_BODY_FILE:-${HOME:-/tmp}/.fake-openshell-policy.json}"
 [[ -n "${FAKE_OPENSHELL_FILE:-}" ]] && printf '%s\n' "$args" >> "$FAKE_OPENSHELL_FILE"
 case "$args" in
   "settings get --global --json")
@@ -904,6 +920,26 @@ case "$args" in
     if [[ "${FAKE_OPENSHELL_PROVIDER_ATTACHED:-1}" == "1" ]]; then
       printf 'spark-vikunja  generic  1  0\n'
     fi ;;
+  "policy get hermes --base -o json")
+    if [[ -s "$policy_state" ]]; then
+      printf '{"policy":'
+      cat "$policy_state"
+      printf '}\n'
+    else
+      printf '%s\n' "${FAKE_OPENSHELL_BASE_POLICY_JSON:-{\"policy\":{\"version\":1,\"filesystem_policy\":{\"include_workdir\":true,\"read_only\":[\"/usr\"],\"read_write\":[\"/sandbox\",\"/tmp\"]},\"process\":{\"run_as_user\":\"sandbox\",\"run_as_group\":\"sandbox\"},\"network_policies\":{}}}}"
+    fi ;;
+  policy\ set\ hermes\ --policy*)
+    policy_file=""
+    previous=""
+    for arg in "$@"; do
+      [[ "$previous" == "--policy" ]] && policy_file="$arg"
+      previous="$arg"
+    done
+    if [[ -n "$policy_file" ]]; then
+      mkdir -p "$(dirname "$policy_state")"
+      cp "$policy_file" "$policy_state"
+    fi
+    exit "${FAKE_OPENSHELL_POLICY_EXIT:-0}" ;;
   sandbox\ provider\ attach*|policy\ update*)
     exit "${FAKE_OPENSHELL_POLICY_EXIT:-0}" ;;
   "forward list")
@@ -3948,7 +3984,7 @@ test_workspace_repair_force_rebuild_is_explicit() {
     workspace_compose() { :; }
     cmd_repair() { :; }
     workspace_start_hermes_gateway_proxy() { :; }
-    workspace_hermes_mcp_config_drift_detected() { return 0; }
+    workspace_hermes_mcp_config_drift_detected() { return 1; }
     nemohermes_rebuild_with_workspace_env() { printf "%s\n" "$*" >> "$SPARK_TEST_LOG"; }
     workspace_start() { :; }
     workspace_configure_hermes_runtime() { :; }
@@ -4422,6 +4458,7 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"NEMOCLAW_SANDBOX_READY_TIMEOUT=600"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_NO_GPU=1"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_SANDBOX_GPU=0"* ]] &&
+    [[ "$nemo_calls" == *"TMPDIR=/tmp"* ]] &&
     [[ "$nemo_calls" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
     [[ "$nemo_calls" == *"hermes skill install "*"/hermes-skills/vikunja"* ]] &&
@@ -4429,8 +4466,9 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key model.context_length --value 65536"* ]] &&
     [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key agent.reasoning_effort --value none"* ]] &&
     [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key platform_toolsets.cli --value"* ]] &&
-    [[ "$nemo_calls" == *"hermes exec --no-tty --timeout 30 -- hermes config set web.backend ddgs"* ]] &&
-    [[ "$nemo_calls" == *"hermes exec --no-tty --timeout 30 -- hermes config set web.search_backend ddgs"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key web.backend --value ddgs"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key web.search_backend --value ddgs"* ]] &&
+    [[ "$nemo_calls" == *"spark-doctor-delete-probe"* ]] &&
     [[ "$nemo_calls" == *"hermes gateway restart --quiet"* ]] &&
     [[ "$docker_calls" == *"--name spark-hermes-litellm-proxy"* ]] &&
     [[ "$docker_calls" == *"172.19.0.1 4000 127.0.0.1 4000"* ]] &&
@@ -4659,6 +4697,27 @@ test_workspace_setup_fails_when_hermes_onboard_fails() {
     [[ "$out" == *"Hermes onboarding failed"* ]] &&
     [[ "$out" == *"Workspace incomplete"* ]] &&
     [[ "$env" == *"HERMES_ONBOARD_STATUS=manual"* ]]
+}
+
+test_workspace_setup_fails_when_session_deletion_is_broken() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_HERMES_SESSION_DELETE_EXIT=1 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Hermes session store does not support deletion"* ]] &&
+    [[ "$out" == *"Workspace incomplete"* ]]
 }
 
 test_workspace_setup_updates_stale_nemohermes() {
@@ -5922,7 +5981,7 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"70/70 checks passed"* ]] &&
+    [[ "$out" == *"71/71 checks passed"* ]] &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
@@ -6018,7 +6077,7 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"71/71 checks passed"* ]] &&
+  [[ "$out" == *"72/72 checks passed"* ]] &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -6069,14 +6128,14 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 70 and
+    .passed == 71 and
     .failed == 0 and
-    .total == 70 and
+    .total == 71 and
     .model == "Org/Alpha" and
     ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Identity & recovery" and .passed == 14 and .failed == 0)] | length == 1) and
     ([.areas[] | select(.name == "Resilience" and .passed == 2 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Inference & agent" and .passed == 19 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Inference & agent" and .passed == 20 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM Hermes route completes smoke request" and .ok == true)] | length == 1) and
@@ -6085,6 +6144,7 @@ test_workspace_doctor_json() {
     ([.checks[] | select(.label == "Hermes context fits the effective vLLM context" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes output and reasoning limits are configured" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes CLI uses the balanced local-model tool profile" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "Hermes session store supports deletion" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes reaches Vikunja as bot-hermes" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "n8n Hermes folder ready in Personal" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Tailscale workspace URLs respond" and .ok == true)] | length == 1)
@@ -7370,7 +7430,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"70/70 checks passed"* ]] &&
+  [[ "$out" == *"71/71 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -7392,7 +7452,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"70/70 checks passed"* ]] &&
+  [[ "$out" == *"71/71 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -9050,14 +9110,19 @@ test_config_set_and_show() {
 
 test_config_sets_hermes_context() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin out settings
+  local tmp fake_bin out settings max_out show_out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config --hermes-ctx 131072 2>&1)
   settings=$(cat "${tmp}/home/.config/spark/hermes.json" 2>/dev/null || true)
+  max_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config --hermes-ctx max 2>&1)
+  show_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config --show 2>&1)
   rm -rf "$tmp"
   [[ "$out" == *"Hermes context: custom (131072)"* ]] &&
     [[ "$settings" == *'"mode": "custom"'* ]] &&
-    [[ "$settings" == *'"length": 131072'* ]]
+    [[ "$settings" == *'"length": 131072'* ]] &&
+    [[ "$max_out" == *"Hermes context: max (vLLM effective context)"* ]] &&
+    [[ "$show_out" == *"hermes-context: max (vLLM effective context)"* ]] &&
+    [[ "$show_out" != *"hermes-context: max (min("* ]]
 }
 
 test_hermes_context_modes_follow_vllm_limit() {
@@ -9080,21 +9145,48 @@ test_hermes_context_modes_follow_vllm_limit() {
 }
 
 test_hermes_web_provider_is_ddgs() {
-  local tmp fake_bin calls wrong=0
+  local tmp fake_bin calls policy wrong=0
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NEMOHERMES_FILE="${tmp}/nemo.log" FAKE_HERMES_DDGS_IMPORT_EXIT=1 \
+    FAKE_HERMES_DDGS_INSTALL_MARKER="${tmp}/ddgs-installed" \
+    FAKE_OPENSHELL_POLICY_BODY_FILE="${tmp}/policy.json" \
     bash -c 'source "$1"; workspace_configure_hermes_web' _ "$SPARK"
   calls=$(cat "${tmp}/nemo.log" 2>/dev/null || true)
+  policy=$(cat "${tmp}/policy.json" 2>/dev/null || true)
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
-    FAKE_HERMES_PLUGINS_LIST='enabled user 0.1.0 web-ddgs' \
+    FAKE_HERMES_STRICT_CONFIG=1 \
+    FAKE_OPENSHELL_POLICY_BODY_FILE="${tmp}/policy.json" \
+    FAKE_HERMES_PLUGINS_LIST='enabled user 1.0.0 web-spark-ddgs' \
     FAKE_HERMES_WEB_CONFIG_BACKEND=ddgs FAKE_HERMES_WEB_CONFIG_SEARCH=ddgs \
     bash -c 'source "$1"; workspace_hermes_web_ready' _ "$SPARK" || wrong=$?
   rm -rf "$tmp"
-  [[ "$calls" == *"/usr/bin/python3 -m pip install --user ddgs"* ]] &&
-    [[ "$calls" == *"hermes plugins enable web-ddgs"* ]] &&
-    [[ "$calls" == *"hermes config set web.backend ddgs"* ]] &&
-  [[ "$calls" == *"hermes config set web.search_backend ddgs"* ]] &&
+  [[ "$calls" == *"uv pip install --link-mode copy --target /sandbox/.hermes/plugins/web-spark-ddgs/vendor --upgrade ddgs"* ]] &&
+    [[ "$calls" == *"/sandbox/.hermes/plugins/web-spark-ddgs"* ]] &&
+    [[ "$calls" == *"plugin.yaml"* ]] &&
+    [[ "$calls" == *"hermes config set --config-accept-new-path --key plugins.enabled --value"*"web-spark-ddgs"* ]] &&
+    [[ "$calls" == *"hermes config set --config-accept-new-path --key web.backend --value ddgs"* ]] &&
+    [[ "$calls" == *"hermes config set --config-accept-new-path --key web.search_backend --value ddgs"* ]] &&
+    ! grep -q 'hermes exec.*hermes config set' <<< "$calls" &&
+    [[ "$calls" == *'backend="duckduckgo"'* ]] &&
+    [[ "$policy" == *'"/var/tmp"'* ]] &&
+    [[ "$policy" == *'"html.duckduckgo.com"'* ]] &&
+    [[ "$policy" == *'"pypi.org"'* ]] &&
+    [[ "$policy" == *'"files.pythonhosted.org"'* ]] &&
     [[ "$wrong" -eq 0 ]]
+}
+
+test_hermes_session_delete_probe_is_rollback_safe() {
+  local tmp fake_bin calls failed=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NEMOHERMES_FILE="${tmp}/nemo.log" \
+    bash -c 'source "$1"; workspace_hermes_session_delete_ready' _ "$SPARK"
+  calls=$(cat "${tmp}/nemo.log" 2>/dev/null || true)
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_HERMES_SESSION_DELETE_EXIT=1 \
+    bash -c 'source "$1"; workspace_hermes_session_delete_ready' _ "$SPARK" >/dev/null 2>&1 || failed=$?
+  rm -rf "$tmp"
+  [[ "$calls" == *"spark-doctor-delete-probe"* ]] &&
+    [[ "$calls" == *"rollback"* ]] &&
+    [[ "$failed" -ne 0 ]]
 }
 
 test_update_accepts_zero_padded_august_month() {
@@ -9744,6 +9836,7 @@ run_test "workspace bridge waits for delayed readiness" test_workspace_bridge_wa
 run_test "workspace dashboard proxy rewrites Host on loopback" test_workspace_dashboard_proxy_rewrites_host_on_loopback
 run_test "Hermes context modes follow vLLM limit" test_hermes_context_modes_follow_vllm_limit
 run_test "Hermes web provider is DDG" test_hermes_web_provider_is_ddgs
+run_test "Hermes session delete probe rolls back" test_hermes_session_delete_probe_is_rollback_safe
 run_test "workspace listener check allows OpenShell gateway bridge" test_workspace_listener_check_allows_only_openshell_gateway_bridge
 run_test "repair starts model with requested policy" test_repair_starts_model_with_requested_policy
 run_test "repair defaults to LiteLLM main model" test_repair_defaults_to_litellm_main_model
@@ -9767,6 +9860,7 @@ run_test "workspace setup repairs compose drift without Hermes onboard" test_wor
 run_test "workspace setup backs up and normalizes invalid env" test_workspace_setup_backs_up_and_normalizes_invalid_env
 run_test "workspace setup refuses missing secret with data" test_workspace_setup_refuses_missing_secret_with_data
 run_test "workspace setup fails when Hermes onboard fails" test_workspace_setup_fails_when_hermes_onboard_fails
+run_test "workspace setup fails when Hermes cannot delete sessions" test_workspace_setup_fails_when_session_deletion_is_broken
 run_test "workspace setup updates stale NemoHermes" test_workspace_setup_updates_stale_nemohermes
 run_test "workspace setup stops when NemoHermes update fails" test_workspace_setup_stops_when_nemohermes_update_fails
 run_test "workspace setup verifies NemoHermes update postcondition" test_workspace_setup_accepts_successful_nemohermes_update_postcondition

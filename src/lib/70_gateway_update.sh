@@ -399,10 +399,14 @@ EOF
     printf "\n  ${BOLD}Configuration:${NC}\n"
     printf "    auto-update: %s\n\n" "$(get_update_config "auto_update" "false")"
     if [[ -f "$HERMES_SETTINGS_FILE" ]] && command -v jq >/dev/null 2>&1; then
-      printf "    hermes-context: %s" "$(jq -r '.mode // "custom"' "$HERMES_SETTINGS_FILE" 2>/dev/null || echo custom)"
-      local hermes_length
-      hermes_length=$(jq -r 'if .length == null then "min(65536, vLLM)" else (.length|tostring) end' "$HERMES_SETTINGS_FILE" 2>/dev/null || echo 'min(65536, vLLM)')
-      printf " (%s)\n\n" "$hermes_length"
+      local hermes_mode hermes_length
+      hermes_mode=$(jq -r '.mode // "custom"' "$HERMES_SETTINGS_FILE" 2>/dev/null || echo custom)
+      if [[ "$hermes_mode" == "max" ]]; then
+        printf "    hermes-context: max (vLLM effective context)\n\n"
+      else
+        hermes_length=$(jq -r 'if .length == null then "min(65536, vLLM)" else (.length|tostring) end' "$HERMES_SETTINGS_FILE" 2>/dev/null || echo 'min(65536, vLLM)')
+        printf "    hermes-context: custom (%s)\n\n" "$hermes_length"
+      fi
     else
       printf "    hermes-context: custom (min(65536, vLLM))\n\n"
     fi
