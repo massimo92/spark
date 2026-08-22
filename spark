@@ -1661,7 +1661,8 @@ bundle_prepare_run() {
   BUNDLE_PATH="$path" BUNDLE_HASH="$hash"
   bundle_ensure_image "$name" "$dry_run"
   image="$BUNDLE_BUILT_IMAGE"
-  id=$(bundle_image_id "$image")
+  id=$(bundle_image_id "$image" || true)
+  [[ -n "$id" ]] || id="$image"
   ALIAS_VLLM_ARGS_JSON="$vllm_json"
   ALIAS_VLLM_IMAGE="$image"
   ALIAS_VLLM_IMAGE_ID="$id"

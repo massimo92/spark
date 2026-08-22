@@ -2252,7 +2252,7 @@ test_bundle_imports_external_folder_and_builds_by_hash() {
 
 test_bundle_run_resolves_defaults_and_dynamic_options() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin output
+  local tmp fake_bin output unbuilt_output
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
@@ -2264,6 +2264,10 @@ test_bundle_run_resolves_defaults_and_dynamic_options() {
   [[ "$output" == *"VLLM_DFLASH2_LOOKUP=0"* ]] || ok=1
   [[ "$output" == *"spark.bundle.name=qwen38-dflash2-lookup"* ]] || ok=1
   [[ "$output" != *"VLLM_SPEC_DECODE_ATTN"* ]] || ok=1
+  unbuilt_output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_IMAGE_EXISTS=0 "$SPARK" run qwen38-dflash2-lookup --dry-run 2>&1) || ok=1
+  [[ "$unbuilt_output" == *"spark/vllm-qwen38-dflash2-lookup:"* ]] || ok=1
+  [[ "$unbuilt_output" == *"Docker command that would be executed"* ]] || ok=1
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
 }
