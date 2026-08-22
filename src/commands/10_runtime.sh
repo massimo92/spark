@@ -3,7 +3,7 @@
 cmd_run_help() {
   cat <<EOF
 
-  ${BOLD}Usage:${NC} spark run <model> [flags]
+  ${BOLD}Usage:${NC} spark run <model|alias|bundle> [flags]
 
   ${BOLD}Flags:${NC}
     --mem <float>          Force GPU memory fraction (0.0-1.0); bypasses auto-sizing.
@@ -30,6 +30,9 @@ cmd_run_help() {
   Aliases keep model settings frozen and accept operational overrides only:
   --dry-run, --explain, --force, --port, --tail, --no-wait.
 
+  Bundles declare their target, drafter, Docker build, defaults, and extra
+  flags. Example: spark run qwen38-dflash2-lookup --lookup false
+
 EOF
 }
 
@@ -38,24 +41,35 @@ cmd_run() {
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" alias_frozen_flags=0
   local ALIAS_VLLM_ARGS_JSON="" ALIAS_VLLM_IMAGE="" ALIAS_VLLM_IMAGE_ID="" ALIAS_VLLM_ENTRYPOINT="" ALIAS_VLLM_ENV_JSON=""
+  local bundle_candidate="" bundle_name="" bundle_path="" bundle_hash="" bundle_manifest=""
+  local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_HASH="" BUNDLE_ACTIVE_OPTIONS_JSON='{}' BUNDLE_ACTIVE_RUN_ARGS_JSON='[]'
+  local BUNDLE_OPTION_VALUES_JSON='{}'
   local -a alias_override_args=()
+  local -a bundle_explicit_run_args=()
+
+  bundle_candidate=$(bundle_detect_run_ref "$@" 2>/dev/null || true)
+  if [[ -n "$bundle_candidate" ]] && bundle_resolve "$bundle_candidate" "${SPARK_BUNDLE_PIN_HASH:-}"; then
+    bundle_name="$bundle_candidate" bundle_path="$BUNDLE_PATH" bundle_hash="$BUNDLE_HASH"
+    bundle_manifest="${bundle_path}/bundle.json"
+    BUNDLE_OPTION_VALUES_JSON=$(bundle_option_defaults_json "$bundle_manifest")
+  fi
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; alias_frozen_flags=1; shift 2 ;;
-      --no-mem-limit) no_mem_limit=1; alias_frozen_flags=1; shift ;;
-      --enforce-eager)    enforce_eager_flag=1; alias_frozen_flags=1; shift ;;
-      --no-enforce-eager) enforce_eager_flag=0; alias_frozen_flags=1; shift ;;
+      --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; alias_frozen_flags=1; bundle_explicit_run_args+=(--mem "$2"); shift 2 ;;
+      --no-mem-limit) no_mem_limit=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-mem-limit); shift ;;
+      --enforce-eager)    enforce_eager_flag=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--enforce-eager); shift ;;
+      --no-enforce-eager) enforce_eager_flag=0; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-enforce-eager); shift ;;
       --no-wait)   no_wait=1; alias_override_args+=(--no-wait); shift ;;
-      --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; alias_frozen_flags=1; shift 2 ;;
-      --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; alias_frozen_flags=1; shift 2 ;;
-      --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; alias_override_args+=(--port "$2"); shift 2 ;;
-      --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; alias_frozen_flags=1; shift 2 ;;
-      --mtp)       mtp_flag=1; alias_frozen_flags=1; shift ;;
-      --no-mtp)    mtp_flag=0; alias_frozen_flags=1; shift ;;
-      --tools)     tools=1; alias_frozen_flags=1; shift ;;
-      --text-only) text_only=1; alias_frozen_flags=1; shift ;;
-      --no-reasoning) no_reasoning=1; alias_frozen_flags=1; shift ;;
+      --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; alias_frozen_flags=1; bundle_explicit_run_args+=(--max-num-seqs "$2"); shift 2 ;;
+      --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; alias_frozen_flags=1; bundle_explicit_run_args+=(--max-len "$2"); shift 2 ;;
+      --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; alias_override_args+=(--port "$2"); bundle_explicit_run_args+=(--port "$2"); shift 2 ;;
+      --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; alias_frozen_flags=1; bundle_explicit_run_args+=(--kv-cache-dtype "$2"); shift 2 ;;
+      --mtp)       mtp_flag=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--mtp); shift ;;
+      --no-mtp)    mtp_flag=0; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-mtp); shift ;;
+      --tools)     tools=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--tools); shift ;;
+      --text-only) text_only=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--text-only); shift ;;
+      --no-reasoning) no_reasoning=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-reasoning); shift ;;
       --no-pull)   no_pull=1; alias_frozen_flags=1; shift ;;
       --dry-run)   dry_run=1; alias_override_args+=(--dry-run); shift ;;
       --explain)   explain=1; dry_run=1; alias_override_args+=(--explain); shift ;;
@@ -63,7 +77,15 @@ cmd_run() {
       --force)     force=1; alias_override_args+=(--force); shift ;;
       --regen-profile) regen=1; alias_frozen_flags=1; shift ;;
       -h|--help)   cmd_run_help; return 0 ;;
-      -*)          die "Unknown flag: $1" "Run 'spark run --help' for usage" ;;
+      -*)
+        if [[ -n "$bundle_name" ]] && bundle_option_exists_in "$bundle_manifest" "${1#--}"; then
+          [[ $# -ge 2 ]] || die "Missing value for $1"
+          bundle_set_option_value "$bundle_manifest" "${1#--}" "$2"
+          bundle_explicit_run_args+=("$1" "$2")
+          shift 2
+        else
+          die "Unknown flag: $1" "Run 'spark run --help' for usage"
+        fi ;;
       *)           [[ -z "$model" ]] || die "Only one model can be specified"; model="$1"; shift ;;
     esac
   done
@@ -74,6 +96,13 @@ cmd_run() {
       "Allowed overrides: --dry-run, --explain, --force, --port, --tail, --no-wait"
     cmd_alias_run "$model" "${alias_override_args[@]}"
     return 0
+  fi
+  if [[ -n "$bundle_name" ]]; then
+    [[ "$model" == "$bundle_name" ]] || die "Only one launch target can be specified"
+    [[ "$BACKEND" == "vllm" ]] || die "Bundle '${bundle_name}' requires the vLLM backend"
+    [[ "$mtp_flag" == "auto" ]] || die "Bundles with a drafter do not accept --mtp or --no-mtp"
+    bundle_prepare_run "$bundle_name" "$bundle_path" "$bundle_hash"
+    BUNDLE_ACTIVE_RUN_ARGS_JSON=$(jq -nc --args '$ARGS.positional' -- "${bundle_explicit_run_args[@]}")
   fi
   validate_model_ref_for_backend "$model"
 
@@ -125,6 +154,7 @@ alias_definition() {
 alias_save_definition() {
   local name="$1" definition="$2" force="${3:-0}" current updated backup
   is_safe_alias_name "$name" || die "Invalid alias: ${name}" "Use 1-64 letters, numbers, dots, underscores, or hyphens."
+  bundle_exists "$name" && die "Alias '${name}' conflicts with a bundle" "Choose a different alias name."
   alias_validate_definition "$definition" || die "Invalid or unsafe alias definition"
   alias_init_store
   current=$(jq -ce --arg name "$name" '.[$name] // empty' "$ALIASES_FILE" 2>/dev/null || true)
@@ -238,6 +268,17 @@ alias_validate_definition() {
         esac
       done < <(jq -r '.vllm_args[]' <<<"$definition")
       ;;
+    bundle)
+      jq -e '
+        .backend == "vllm"
+        and (.bundle | type == "string" and test("^[a-z0-9][a-z0-9._-]{0,63}$"))
+        and (.bundle_hash | type == "string" and test("^[a-f0-9]{64}$"))
+        and (.run_args | type == "array" and all(.[]; type == "string"))
+        and (.run_args | all(.[]; ([explode[] | select(. < 32 or . == 127)] | length) == 0))
+        and ((.options // {}) | type == "object")
+      ' >/dev/null <<<"$definition" || return 1
+      is_safe_model_ref "$model" || return 1
+      ;;
     *) return 1 ;;
   esac
 }
@@ -257,6 +298,13 @@ alias_prompt_yes() {
 
 alias_choose_model() {
   local choice="" i
+  bundle_collect
+  if [[ ${#BUNDLE_LIST_NAMES[@]} -gt 0 ]]; then
+    printf '  Bundles:\n' >&2
+    for i in "${!BUNDLE_LIST_NAMES[@]}"; do
+      printf '    b%d) %s\n' "$((i + 1))" "${BUNDLE_LIST_NAMES[$i]}" >&2
+    done
+  fi
   if [[ "$BACKEND" == "vllm" ]]; then
     collect_downloaded_models
     if [[ ${#MODEL_LIST_MODELS[@]} -gt 0 ]]; then
@@ -267,13 +315,55 @@ alias_choose_model() {
     printf '  Local models:\n' >&2
     ollama list 2>/dev/null | awk 'NR>1 {printf "    %s\n", $1}' >&2 || true
   fi
-  choice=$(alias_prompt_value "Model (number or reference)")
-  if [[ "$choice" =~ ^[0-9]+$ && "$BACKEND" == "vllm" ]] \
+  choice=$(alias_prompt_value "Bundle (b<number>) or model (number/reference)")
+  if [[ "$choice" =~ ^b([0-9]+)$ ]] && [[ "${BASH_REMATCH[1]}" -ge 1 && "${BASH_REMATCH[1]}" -le ${#BUNDLE_LIST_NAMES[@]} ]]; then
+    printf '%s\n' "${BUNDLE_LIST_NAMES[$((BASH_REMATCH[1] - 1))]}"
+  elif [[ "$choice" =~ ^[0-9]+$ && "$BACKEND" == "vllm" ]] \
       && [[ "$choice" -ge 1 && "$choice" -le ${#MODEL_LIST_MODELS[@]} ]]; then
     printf '%s\n' "${MODEL_LIST_MODELS[$((choice - 1))]}"
   else
     printf '%s\n' "$choice"
   fi
+}
+
+alias_bundle_guided_definition() {
+  local bundle="$1" manifest model mem max_len kv seqs eager port key type default value args_json options_json definition
+  local -a args=()
+  bundle_resolve "$bundle" || die "Bundle '${bundle}' does not exist"
+  manifest="${BUNDLE_PATH}/bundle.json"
+  model=$(jq -r '.defaults.target_model.id' "$manifest")
+  BUNDLE_OPTION_VALUES_JSON=$(bundle_option_defaults_json "$manifest")
+
+  mem=$(alias_prompt_value "GPU memory fraction (blank = bundle default)")
+  [[ -z "$mem" ]] || args+=(--mem "$mem")
+  alias_prompt_yes "Disable cgroup memory limit" && args+=(--no-mem-limit)
+  max_len=$(alias_prompt_value "Max context length (blank = bundle default)")
+  [[ -z "$max_len" ]] || args+=(--max-len "$max_len")
+  kv=$(alias_prompt_value "KV cache dtype: auto/fp8 (blank = bundle default)")
+  [[ -z "$kv" ]] || args+=(--kv-cache-dtype "$kv")
+  seqs=$(alias_prompt_value "Max concurrent sequences (blank = bundle default)")
+  [[ -z "$seqs" ]] || args+=(--max-num-seqs "$seqs")
+  eager=$(alias_prompt_value "CUDA graphs: default/on/off")
+  [[ "$eager" != "off" ]] || args+=(--enforce-eager)
+  [[ "$eager" != "on" ]] || args+=(--no-enforce-eager)
+  port=$(alias_prompt_value "Model API port (blank = bundle default)")
+  [[ -z "$port" ]] || args+=(--port "$port")
+  alias_prompt_yes "Disable reasoning parser" && args+=(--no-reasoning)
+
+  while IFS=$'\t' read -r -u 3 key type default; do
+    value=$(alias_prompt_value "--${key} ${type} (blank = ${default})")
+    if [[ -n "$value" ]]; then
+      bundle_set_option_value "$manifest" "$key" "$value"
+      args+=("--${key}" "$value")
+    fi
+  done 3< <(jq -r '(.options // {}) | to_entries[] | [.key, .value.type, (.value.default|tostring)] | @tsv' "$manifest")
+
+  args_json=$(jq -nc --args '$ARGS.positional' -- "${args[@]}")
+  options_json="$BUNDLE_OPTION_VALUES_JSON"
+  definition=$(jq -nc --arg model "$model" --arg bundle "$bundle" --arg hash "$BUNDLE_HASH" \
+    --argjson args "$args_json" --argjson options "$options_json" \
+    '{kind:"bundle",backend:"vllm",model:$model,bundle:$bundle,bundle_hash:$hash,run_args:$args,options:$options}')
+  printf '%s\n' "$definition"
 }
 
 alias_guided_definition() {
@@ -282,6 +372,10 @@ alias_guided_definition() {
   is_interactive || die "Alias creation is interactive" "Run it in a terminal."
   model=$(alias_choose_model)
   [[ -n "$model" ]] || die "A model is required"
+  if bundle_exists "$model"; then
+    alias_bundle_guided_definition "$model"
+    return 0
+  fi
   validate_model_ref_for_backend "$model"
 
   mem=$(alias_prompt_value "GPU memory fraction (blank = auto)")
@@ -319,6 +413,7 @@ alias_guided_definition() {
 
 alias_capture_definition() {
   local cname="$1" expected_model="${2:-}" inspect args model image image_id vllm_entrypoint env definition
+  local bundle_name bundle_hash bundle_options bundle_run_args
   inspect=$(docker inspect "$cname" 2>/dev/null) || die "Cannot inspect container ${cname}"
   jq -e 'type == "array" and length == 1 and .[0].State.Running == true' >/dev/null <<<"$inspect" \
     || die "Container '${cname}' is not running"
@@ -339,6 +434,26 @@ alias_capture_definition() {
   is_safe_model_ref "$model" || die "Unsafe model reference in ${cname}: ${model}"
   [[ -z "$expected_model" || "$model" == "$expected_model" ]] \
     || die "Container model mismatch" "Label says '${expected_model}', command serves '${model}'."
+
+  bundle_name=$(jq -r '.[0].Config.Labels["spark.bundle.name"] // empty' <<<"$inspect")
+  if [[ -n "$bundle_name" ]]; then
+    bundle_hash=$(jq -r '.[0].Config.Labels["spark.bundle.hash"] // empty' <<<"$inspect")
+    bundle_options=$(jq -r '.[0].Config.Labels["spark.bundle.options"] // "{}"' <<<"$inspect")
+    bundle_run_args=$(jq -r '.[0].Config.Labels["spark.bundle.run_args"] // "[]"' <<<"$inspect")
+    is_safe_bundle_name "$bundle_name" || die "Container has an invalid Spark bundle label"
+    [[ "$bundle_hash" =~ ^[a-f0-9]{64}$ ]] || die "Container has an invalid Spark bundle hash"
+    jq -e 'type == "object"' >/dev/null 2>&1 <<<"$bundle_options" || die "Container has invalid bundle options"
+    jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 <<<"$bundle_run_args" || die "Container has invalid bundle run arguments"
+    bundle_resolve "$bundle_name" "$bundle_hash" || die "Bundle revision for ${cname} is not installed"
+    [[ "$(jq -r '.defaults.target_model.id' "${BUNDLE_PATH}/bundle.json")" == "$model" ]] \
+      || die "Container bundle target does not match its served model"
+    definition=$(jq -nc --arg model "$model" --arg bundle "$bundle_name" --arg hash "$bundle_hash" \
+      --argjson args "$bundle_run_args" --argjson options "$bundle_options" \
+      '{kind:"bundle",backend:"vllm",model:$model,bundle:$bundle,bundle_hash:$hash,run_args:$args,options:$options}')
+    alias_validate_definition "$definition" || die "Invalid bundle alias captured from ${cname}"
+    printf '%s\n' "$definition"
+    return 0
+  fi
 
   image=$(jq -er '.[0].Config.Image | select(type == "string" and length > 0)' <<<"$inspect" 2>/dev/null) \
     || die "Cannot identify the container image for ${cname}"
@@ -453,6 +568,19 @@ cmd_alias_run() {
       validate_model_ref_for_backend "$model"
       run_backend_vllm
       ;;
+    bundle)
+      [[ "$BACKEND" == "vllm" ]] || die "Alias '${name}' captures a vLLM bundle; this machine uses ${BACKEND}"
+      local bundle hash model SPARK_ALIAS_BYPASS=1 SPARK_BUNDLE_PIN_HASH
+      local -a run_args=()
+      bundle=$(jq -r '.bundle' <<<"$definition")
+      hash=$(jq -r '.bundle_hash' <<<"$definition")
+      SPARK_BUNDLE_PIN_HASH="$hash"
+      bundle_resolve "$bundle" "$hash" || die "Bundle revision for alias '${name}' is not installed" \
+        "Re-import or restore ${bundle} at ${hash}."
+      while IFS= read -r arg; do run_args+=("$arg"); done < <(jq -r '.run_args[]' <<<"$definition")
+      run_args+=("${overrides[@]}")
+      cmd_run "$bundle" "${run_args[@]}"
+      ;;
     *) die "Alias '${name}' has an unsupported kind: ${kind}" ;;
   esac
 }
@@ -511,7 +639,7 @@ cmd_alias() {
 
   ${BOLD}Usage:${NC} spark alias <command>
 
-    create <alias>            Guided alias creation
+    create <alias>            Guided alias creation from a model or bundle
     capture <alias> [--force] Capture a live vLLM run exactly
     edit <alias>              Recreate an alias with the guide
     list                      List local aliases
@@ -910,6 +1038,13 @@ build_launch() {
     local env_pair
     while IFS= read -r env_pair; do docker_cmd+=(-e "$env_pair"); done \
       < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$ALIAS_VLLM_ENV_JSON")
+  fi
+  if [[ "${BUNDLE_ACTIVE:-0}" == "1" ]]; then
+    docker_cmd+=(
+      --label "spark.bundle.name=${BUNDLE_ACTIVE_NAME}"
+      --label "spark.bundle.hash=${BUNDLE_ACTIVE_HASH}"
+      --label "spark.bundle.options=${BUNDLE_ACTIVE_OPTIONS_JSON}"
+      --label "spark.bundle.run_args=${BUNDLE_ACTIVE_RUN_ARGS_JSON}")
   fi
   [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_swap_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
   docker_cmd+=("${ALIAS_VLLM_IMAGE_ID:-$ngc_image}")

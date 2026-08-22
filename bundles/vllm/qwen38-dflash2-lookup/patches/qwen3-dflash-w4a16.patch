@@ -1,0 +1,43 @@
+--- a/model_executor/models/qwen3_dflash.py
++++ b/model_executor/models/qwen3_dflash.py
+@@ -106,6 +106,31 @@
+     return target_hidden_size * num_features_to_use
+ 
+ 
++def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
++    """Return dense BF16 K/V rows from dense or packed W4A16 QKV weights."""
++    qkv = attn.qkv_proj
++    weight = getattr(qkv, "weight", None)
++    if weight is not None and weight.dim() == 2:
++        return weight[attn.q_size :]
++
++    packed, scale = qkv.weight_packed, qkv.weight_scale
++    out_features, input_features = int(packed.shape[0]), int(qkv.input_size)
++    bits = 32 * packed.shape[1] // input_features
++    from compressed_tensors.compressors.pack_quantized.base import (
++        unpack_from_int32,
++    )
++
++    quantized = unpack_from_int32(
++        packed.data, bits, torch.Size([out_features, input_features]), packed_dim=1
++    )
++    group_size = input_features // scale.shape[1]
++    dense = (
++        quantized.to(torch.float32).reshape(out_features, -1, group_size)
++        * scale.to(torch.float32)[..., None]
++    ).reshape(out_features, input_features)
++    return dense.to(torch.bfloat16)[attn.q_size :]
++
++
+ def _resolve_layer_attention(
+     config: Qwen3Config, layer_idx: int
+ ) -> tuple[int | None, bool]:
+@@ -487,7 +512,7 @@
+         self._hidden_norm_weight = self.hidden_norm.weight.data
+ 
+         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
+-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
++        kv_weights = [_dense_kv_rows(a) for a in layers_attn]
+         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+         if has_bias:
+             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]

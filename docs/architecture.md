@@ -15,6 +15,7 @@ Project: spark by Massimo Angelini - https://github.com/massimo92/spark
 
 ```text
 src/00_bootstrap.sh              constants, platform detection, shared helpers
+src/commands/05_bundle.sh        bundle catalog/import/build/TUI integration
 src/commands/10_runtime.sh       run/stop/pull/list/rm/status helpers
 src/commands/20_dashboard.sh     Web and terminal dashboard
 src/commands/30_status_doctor.sh status, logs, doctor
@@ -24,6 +25,7 @@ src/commands/60_product.sh       recommendations, update, uninstall, architectur
 src/lib/70_gateway_update.sh     update check, gateway config/runtime
 src/90_main.sh                   command dispatch and BASH_SOURCE guard
 scripts/build-single-file.sh     builds/checks root spark artifact
+bundles/vllm/                    Git-versioned vLLM bundle definitions/assets
 ```
 
 After editing `src/`, run:

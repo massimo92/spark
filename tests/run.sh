@@ -125,8 +125,21 @@ ${stdin_payload}"
     esac
     ;;
   image)
-    if [[ "${2:-}" == "inspect" && -n "${FAKE_DOCKER_LOCAL_DIGEST:-}" ]]; then
-      printf '%s@%s\n' "${*: -1}" "$FAKE_DOCKER_LOCAL_DIGEST"
+    if [[ "${2:-}" == "inspect" ]]; then
+      if [[ "${FAKE_DOCKER_IMAGE_EXISTS:-1}" == "0" && \
+            ( -z "${FAKE_DOCKER_BUILD_FILE:-}" || ! -s "${FAKE_DOCKER_BUILD_FILE}" ) ]]; then
+        exit 1
+      fi
+      case "$args" in
+        *"{{.Id}}"*) printf '%s\n' "${FAKE_DOCKER_IMAGE_ID:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
+        *"Config.Entrypoint"*) printf '%s\n' "${FAKE_DOCKER_ENTRYPOINT_JSON:-[\"vllm\",\"serve\"]}" ;;
+        *)
+          if [[ -n "${FAKE_DOCKER_LOCAL_DIGEST:-}" ]]; then
+            printf '%s@%s\n' "${*: -1}" "$FAKE_DOCKER_LOCAL_DIGEST"
+          fi ;;
+      esac
+    elif [[ "${2:-}" == "rm" ]]; then
+      exit 0
     else
       exit 0
     fi
@@ -134,6 +147,10 @@ ${stdin_payload}"
   buildx)
     [[ -n "${FAKE_DOCKER_REMOTE_OUTPUT:-${FAKE_DOCKER_REMOTE_DIGEST:-}}" ]] || exit 1
     printf '%b\n' "${FAKE_DOCKER_REMOTE_OUTPUT:-$FAKE_DOCKER_REMOTE_DIGEST}"
+    ;;
+  build)
+    [[ -n "${FAKE_DOCKER_BUILD_FILE:-}" ]] && printf '%s\n' "$args" >> "$FAKE_DOCKER_BUILD_FILE"
+    exit "${FAKE_DOCKER_BUILD_EXIT:-0}"
     ;;
   images)
     [[ -n "${FAKE_DOCKER_IMAGE:-}" ]] && printf '%b\n' "${FAKE_DOCKER_IMAGE}"
@@ -885,6 +902,10 @@ test_suite_includes() {
     test_alias_capture_replays_image_env_and_operational_overrides|\
     test_alias_capture_rejects_secret_flags|\
     test_alias_backend_mismatch_fails_closed|\
+    test_bundle_catalog_embeds_and_validates_builtin|\
+    test_bundle_imports_external_folder_and_builds_by_hash|\
+    test_bundle_run_resolves_defaults_and_dynamic_options|\
+    test_alias_create_from_bundle_stores_bundle_and_adjustments|\
     test_total_mem_detection_positive|\
     test_port_auto_skips_busy|\
     test_config_set_and_show|\
@@ -2190,6 +2211,89 @@ test_alias_backend_mismatch_fails_closed() {
     "$SPARK" run cross --dry-run </dev/null 2>&1) || status=$?
   rm -rf "$tmp"
   [[ "$status" -ne 0 && "$out" == *"targets vllm; this machine uses ollama"* ]]
+}
+
+test_bundle_catalog_embeds_and_validates_builtin() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin list show
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  list=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle list --json 2>&1)
+  show=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle show qwen38-dflash2-lookup 2>&1)
+  local ok=0
+  jq -e '.[] | select(.name == "qwen38-dflash2-lookup" and .source == "built-in")' <<<"$list" >/dev/null || ok=1
+  [[ "$show" == *"DFlash2 W4A16"* && "$show" == *"--lookup"* ]] || ok=1
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate \
+    "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" >/dev/null 2>&1 || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_imports_external_folder_and_builds_by_hash() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin source manifest_tmp build_file list out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  source="${tmp}/external-bundle"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$source"
+  manifest_tmp="${tmp}/bundle.json"
+  jq '.name="external-bundle"' "${source}/bundle.json" > "$manifest_tmp"
+  mv "$manifest_tmp" "${source}/bundle.json"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle import "$source" >/dev/null 2>&1
+  list=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle list --json 2>&1)
+  build_file="${tmp}/docker-build"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_IMAGE_EXISTS=0 \
+    FAKE_DOCKER_BUILD_FILE="$build_file" "$SPARK" bundle build external-bundle 2>&1)
+  local ok=0
+  jq -e '.[] | select(.name == "external-bundle" and .source == "imported")' <<<"$list" >/dev/null || ok=1
+  [[ -s "$build_file" && "$(cat "$build_file")" == *"spark/vllm-external-bundle:"* ]] || ok=1
+  [[ "$out" == *"Built spark/vllm-external-bundle:"* ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_run_resolves_defaults_and_dynamic_options() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run qwen38-dflash2-lookup --dry-run --max-len 32768 --lookup false 2>&1)
+  local ok=0
+  [[ "$output" == *"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"* ]] || ok=1
+  [[ "$output" == *"--max-model-len 32768"* ]] || ok=1
+  [[ "$output" == *"--speculative-config"* && "$output" == *"num_speculative_tokens"* ]] || ok=1
+  [[ "$output" == *"VLLM_DFLASH2_LOOKUP=0"* ]] || ok=1
+  [[ "$output" == *"spark.bundle.name=qwen38-dflash2-lookup"* ]] || ok=1
+  [[ "$output" != *"VLLM_SPEC_DECODE_ATTN"* ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_alias_create_from_bundle_stores_bundle_and_adjustments() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin aliases output create_output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
+  if ! create_output=$(printf 'b1\n\nn\n\n\n\n\n\nn\nfalse\n\n\n\n' | \
+    HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+    "$SPARK" alias create qwen-bundle-alias 2>&1); then
+    printf '%s\n' "$create_output" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  aliases="${tmp}/home/.config/spark/aliases.json"
+  local ok=0
+  jq -e '
+    .["qwen-bundle-alias"].kind == "bundle"
+    and .["qwen-bundle-alias"].bundle == "qwen38-dflash2-lookup"
+    and (.["qwen-bundle-alias"].bundle_hash | test("^[a-f0-9]{64}$"))
+    and .["qwen-bundle-alias"].run_args == ["--lookup","false"]
+    and .["qwen-bundle-alias"].options.lookup == false
+  ' "$aliases" >/dev/null || ok=1
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run qwen-bundle-alias --dry-run 2>&1) || ok=1
+  [[ "$output" == *"VLLM_DFLASH2_LOOKUP=0"* ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
 }
 
 test_total_mem_detection_positive() {
@@ -8221,6 +8325,10 @@ run_test "alias create preserves dash-prefixed arguments" test_alias_create_pres
 run_test "captured alias pins image/env and accepts safe overrides" test_alias_capture_replays_image_env_and_operational_overrides
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
+run_test "built-in bundle catalog is embedded and valid" test_bundle_catalog_embeds_and_validates_builtin
+run_test "external bundle imports and builds by content hash" test_bundle_imports_external_folder_and_builds_by_hash
+run_test "bundle run resolves defaults and dynamic options" test_bundle_run_resolves_defaults_and_dynamic_options
+run_test "alias create stores bundle plus adjustments" test_alias_create_from_bundle_stores_bundle_and_adjustments
 run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "setup --check reports Tailscale Funnel" test_setup_check_reports_tailscale_funnel

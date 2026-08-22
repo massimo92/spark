@@ -704,6 +704,7 @@ cmd_help() {
     doctor           Check all prerequisites (read-only)
     models           Recommend models for this hardware
     run <model>      Start serving a model (can run several at once)
+    bundle            Manage reproducible vLLM bundles (TUI with no arguments)
     down             Stop all Spark-managed model and gateway services
     alias            Save, inspect, and restore launch aliases
     calibrate <model> Measure launch configs and save the fastest one

@@ -10,6 +10,19 @@ Se gestiona con `spark alias`; al ejecutarlo, se usa `spark run <alias>`.
 Se guarda localmente bajo `~/.config/spark/`; no es configuración del proyecto
 ni se sube al repositorio.
 
+Cuando nace de un bundle, guarda su nombre, hash exacto y todos los ajustes
+pasados. Se crea con el flujo normal: `spark alias create <alias>` o
+`spark alias capture <alias>`.
+
+## Bundle
+
+Definición versionada en Git que une un target, un drafter, un Dockerfile,
+parches, valores vLLM y opciones configurables. Se ejecuta directamente con
+`spark run <bundle>`; Spark construye o reutiliza su imagen Docker.
+
+Un bundle no es un alias. El bundle es portable y compartido; el alias es una
+configuración de lanzamiento local basada en él.
+
 ## Rollback de alias
 
 Restauración de la configuración previa de un alias concreto mediante
