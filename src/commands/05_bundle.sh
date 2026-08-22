@@ -1,17 +1,7 @@
-# --- Reproducible vLLM bundles ---
+# --- vLLM bundles ---
 
 is_safe_bundle_name() {
   [[ "${1:-}" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]
-}
-
-bundle_sha256_file() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print $1}'
-  else
-    die "Cannot hash bundle files" "Install sha256sum or shasum."
-  fi
 }
 
 bundle_decode_base64() {
@@ -22,59 +12,24 @@ bundle_decode_base64() {
   fi
 }
 
-bundle_dir_hash() {
-  local dir="$1" file rel hash index
-  index=$(mktemp) || die "Cannot create bundle hash input"
-  while IFS= read -r file; do
-    rel="${file#"${dir}"/}"
-    hash=$(bundle_sha256_file "$file")
-    printf '%s  %s\n' "$hash" "$rel" >> "$index"
-  done < <(find "$dir" -type f | LC_ALL=C sort)
-  bundle_sha256_file "$index"
-  rm -f "$index"
-}
-
+# Built-ins live inside the single-file Spark release. Refresh the stable
+# directory once per process so an updated release immediately replaces them.
 bundle_materialize_builtins() {
-  local root="${BUNDLES_DIR}/builtin/${SPARK_BUILTIN_BUNDLES_HASH}" tmp rel encoded target
-  if [[ -f "${root}/.complete" ]]; then
-    printf '%s\n' "$root"
-    return 0
-  fi
-  mkdir -p "${BUNDLES_DIR}/builtin" || die "Cannot create bundle store"
-  tmp=$(mktemp -d "${BUNDLES_DIR}/builtin/.extract.XXXXXX") || die "Cannot create bundle extraction directory"
+  [[ "${BUNDLE_BUILTINS_READY:-0}" == "1" ]] && return 0
+  local root="${BUNDLES_DIR}/builtin" rel encoded target tmp
+  mkdir -p "$root" || die "Cannot create bundle store"
   while IFS=$'\t' read -r rel encoded; do
     [[ -n "$rel" ]] || continue
     [[ "$rel" =~ ^[A-Za-z0-9._/-]+$ && "$rel" != /* && "$rel" != *..* ]] \
-      || { rm -rf "$tmp"; die "Unsafe built-in bundle path: ${rel}"; }
-    target="${tmp}/${rel}"
-    mkdir -p "$(dirname "$target")" || { rm -rf "$tmp"; die "Cannot extract bundle asset"; }
-    printf '%s' "$encoded" | bundle_decode_base64 > "$target" \
-      || { rm -rf "$tmp"; die "Cannot decode bundle asset: ${rel}"; }
+      || die "Unsafe built-in bundle path: ${rel}"
+    target="${root}/${rel}"
+    mkdir -p "$(dirname "$target")" || die "Cannot extract bundle asset"
+    tmp=$(mktemp "${target}.tmp.XXXXXX") || die "Cannot create bundle asset"
+    printf '%s' "$encoded" | bundle_decode_base64 > "$tmp" \
+      || { rm -f "$tmp"; die "Cannot decode bundle asset: ${rel}"; }
+    mv "$tmp" "$target" || { rm -f "$tmp"; die "Cannot install bundle asset: ${rel}"; }
   done < <(spark_builtin_bundle_assets)
-  : > "${tmp}/.complete"
-  if ! mv "$tmp" "$root" 2>/dev/null; then
-    [[ -f "${root}/.complete" ]] || { rm -rf "$tmp"; die "Cannot install built-in bundles"; }
-    rm -rf "$tmp"
-  fi
-  printf '%s\n' "$root"
-}
-
-bundle_index_init() {
-  mkdir -p "$SPARK_CONFIG_DIR" "${BUNDLES_DIR}/imported" || die "Cannot create bundle directories"
-  if [[ ! -f "$BUNDLES_INDEX_FILE" ]]; then
-    printf '{}\n' > "$BUNDLES_INDEX_FILE" || die "Cannot create ${BUNDLES_INDEX_FILE}"
-  fi
-  chmod 600 "$BUNDLES_INDEX_FILE" 2>/dev/null || true
-  jq -e 'type == "object"' "$BUNDLES_INDEX_FILE" >/dev/null 2>&1 \
-    || die "Invalid bundle index: ${BUNDLES_INDEX_FILE}"
-}
-
-bundle_write_index() {
-  local contents="$1" tmp
-  tmp=$(mktemp "${BUNDLES_INDEX_FILE}.tmp.XXXXXX") || die "Cannot create bundle index temporary file"
-  printf '%s\n' "$contents" > "$tmp" || { rm -f "$tmp"; die "Cannot write bundle index"; }
-  chmod 600 "$tmp" 2>/dev/null || true
-  mv "$tmp" "$BUNDLES_INDEX_FILE" || { rm -f "$tmp"; die "Cannot replace bundle index"; }
+  BUNDLE_BUILTINS_READY=1
 }
 
 bundle_vllm_value() {
@@ -102,7 +57,6 @@ bundle_detect_run_ref() {
       --no-mem-limit|--mtp|--no-mtp|--enforce-eager|--no-enforce-eager|--tools|--text-only|--no-reasoning|--no-pull|--dry-run|--explain|--no-wait|--tail|--force|--regen-profile|-h|--help)
         shift ;;
       --*)
-        # Bundle-defined options always take an explicit value.
         [[ $# -ge 2 ]] || return 1
         shift 2 ;;
       *)
@@ -139,8 +93,7 @@ bundle_set_option_value() {
       BUNDLE_OPTION_VALUES_JSON=$(jq -c --arg key "$key" --argjson value "$raw" '.[$key] = $value' <<<"$BUNDLE_OPTION_VALUES_JSON")
       ;;
     string)
-      [[ ${#raw} -le 1024 && "$raw" != *$'\n'* && "$raw" != *$'\r'* ]] \
-        || die "Invalid --${key} value"
+      [[ ${#raw} -le 1024 && "$raw" != *$'\n'* && "$raw" != *$'\r'* ]] || die "Invalid --${key} value"
       BUNDLE_OPTION_VALUES_JSON=$(jq -c --arg key "$key" --arg value "$raw" '.[$key] = $value' <<<"$BUNDLE_OPTION_VALUES_JSON")
       ;;
     *) die "Bundle option --${key} has an unsupported type" ;;
@@ -181,55 +134,8 @@ bundle_vllm_add_switch_json() {
   jq -ce --arg flag "$flag" 'if index($flag) == null then . + [$flag] else . end' <<<"$vllm_json"
 }
 
-bundle_prepare_run() {
-  local name="$1" path="$2" hash="$3" manifest vllm_json image id
-  local requested_mem="$mem" requested_len="$max_len" requested_seqs="$max_num_seqs" requested_port="$port" requested_kv="$kv_dtype"
-  manifest="${path}/bundle.json"
-  bundle_validate_dir "$path" || die "Bundle '${name}' is invalid"
-  model=$(jq -r '.defaults.target_model.id' "$manifest")
-  vllm_json=$(jq -c '.defaults.vllm_args' "$manifest")
-
-  mem="${requested_mem:-$(bundle_vllm_value "$vllm_json" --gpu-memory-utilization)}"
-  max_len="${requested_len:-$(bundle_vllm_value "$vllm_json" --max-model-len)}"
-  max_num_seqs="${requested_seqs:-$(bundle_vllm_value "$vllm_json" --max-num-seqs)}"
-  port="${requested_port:-$(bundle_vllm_value "$vllm_json" --port)}"
-  kv_dtype="${requested_kv:-$(bundle_vllm_value "$vllm_json" --kv-cache-dtype)}"
-  kv_dtype="${kv_dtype:-auto}"
-
-  [[ -z "$requested_mem" ]] || vllm_json=$(alias_vllm_set_value_json "$vllm_json" --gpu-memory-utilization "$mem")
-  [[ -z "$requested_len" ]] || vllm_json=$(alias_vllm_set_value_json "$vllm_json" --max-model-len "$max_len")
-  [[ -z "$requested_seqs" ]] || vllm_json=$(alias_vllm_set_value_json "$vllm_json" --max-num-seqs "$max_num_seqs")
-  [[ -z "$requested_port" ]] || vllm_json=$(alias_vllm_set_value_json "$vllm_json" --port "$port")
-  if [[ -n "$requested_kv" ]]; then
-    vllm_json=$(bundle_vllm_remove_flag_json "$vllm_json" --kv-cache-dtype)
-    [[ "$requested_kv" == "auto" ]] || vllm_json=$(jq -ce --arg value "$requested_kv" '. + ["--kv-cache-dtype", $value]' <<<"$vllm_json")
-  fi
-  case "$enforce_eager_flag" in
-    1) vllm_json=$(bundle_vllm_add_switch_json "$vllm_json" --enforce-eager) ;;
-    0) vllm_json=$(bundle_vllm_remove_switch_json "$vllm_json" --enforce-eager) ;;
-  esac
-  [[ "$no_reasoning" != "1" ]] || vllm_json=$(bundle_vllm_remove_flag_json "$vllm_json" --reasoning-parser)
-
-  BUNDLE_PATH="$path" BUNDLE_HASH="$hash"
-  bundle_ensure_image "$name" "$dry_run"
-  image="$BUNDLE_BUILT_IMAGE"
-  id=$(bundle_image_id "$image" || true)
-  [[ -n "$id" ]] || id="$image"
-  ALIAS_VLLM_ARGS_JSON="$vllm_json"
-  ALIAS_VLLM_IMAGE="$image"
-  ALIAS_VLLM_IMAGE_ID="$id"
-  if bundle_image_entrypoint "$image"; then ALIAS_VLLM_ENTRYPOINT=true; else ALIAS_VLLM_ENTRYPOINT=false; fi
-  ALIAS_VLLM_ENV_JSON=$(bundle_options_env_json "$manifest" "$BUNDLE_OPTION_VALUES_JSON")
-  BUNDLE_ACTIVE=1
-  BUNDLE_ACTIVE_NAME="$name"
-  BUNDLE_ACTIVE_HASH="$hash"
-  BUNDLE_ACTIVE_OPTIONS_JSON="$BUNDLE_OPTION_VALUES_JSON"
-  MTP_ENABLED=0
-  mtp_flag=0
-}
-
 bundle_validate_dir() {
-  local dir="$1" manifest name vllm_json target target_rev drafter drafter_rev tokens spec revision file key type default
+  local dir="$1" manifest name vllm_json target target_rev drafter drafter_rev tokens spec revision file key type default from
   [[ -d "$dir" ]] || { err "Bundle directory not found: ${dir}"; return 1; }
   manifest="${dir}/bundle.json"
   [[ -f "$manifest" ]] || { err "Missing bundle.json in ${dir}"; return 1; }
@@ -244,8 +150,7 @@ bundle_validate_dir() {
     return 1
   fi
   jq -e '
-    . as $b
-    | type == "object"
+    type == "object"
     and .schema_version == 1
     and (.name | type == "string" and test("^[a-z0-9][a-z0-9._-]{0,63}$"))
     and (.description | type == "string" and length > 0)
@@ -276,8 +181,9 @@ bundle_validate_dir() {
   ' "$manifest" >/dev/null 2>&1 || { err "Invalid bundle.json: ${manifest}"; return 1; }
 
   name=$(jq -r '.name' "$manifest")
-  grep -Eq '^FROM[[:space:]]+[^[:space:]]+@sha256:[a-fA-F0-9]{64}([[:space:]]|$)' "${dir}/Dockerfile" \
-    || { err "Dockerfile FROM must pin its image by sha256 digest"; return 1; }
+  from=$(awk 'toupper($1) == "FROM" {print $2; exit}' "${dir}/Dockerfile")
+  [[ "$from" == *@sha256:* || ( "$from" == *:* && "$from" != *:latest ) ]] \
+    || { err "Dockerfile FROM must use a versioned base image"; return 1; }
 
   while IFS= read -r file; do
     [[ -f "${dir}/${file}" ]] || { err "Missing declared patch: ${file}"; return 1; }
@@ -301,54 +207,23 @@ bundle_validate_dir() {
   jq -e --arg model "$drafter" --arg revision "$drafter_rev" --argjson tokens "$tokens" '
     .model == $model and .revision == $revision and .num_speculative_tokens == $tokens
   ' <<<"$spec" >/dev/null 2>&1 || { err "Speculative config does not match bundle drafter/defaults"; return 1; }
-  return 0
-}
-
-bundle_current_builtin_root() {
-  local catalog
-  catalog=$(bundle_materialize_builtins)
-  printf '%s/vllm\n' "$catalog"
+  is_safe_bundle_name "$name"
 }
 
 bundle_resolve() {
-  local name="$1" wanted_hash="${2:-}" root path hash source entry
-  BUNDLE_PATH="" BUNDLE_HASH="" BUNDLE_SOURCE=""
+  local name="$1" imported builtin
+  BUNDLE_PATH="" BUNDLE_SOURCE=""
   is_safe_bundle_name "$name" || return 1
-  bundle_index_init
-  if [[ -n "$wanted_hash" && -d "${BUNDLES_DIR}/imported/${name}/${wanted_hash}" ]]; then
-    path="${BUNDLES_DIR}/imported/${name}/${wanted_hash}"
-    BUNDLE_PATH="$path" BUNDLE_HASH="$wanted_hash" BUNDLE_SOURCE="imported"
+  bundle_materialize_builtins
+  imported="${BUNDLES_DIR}/imported/${name}"
+  builtin="${BUNDLES_DIR}/builtin/vllm/${name}"
+  if [[ -d "$imported" ]]; then
+    BUNDLE_PATH="$imported" BUNDLE_SOURCE="imported"
     return 0
   fi
-  if [[ -z "$wanted_hash" ]]; then
-    entry=$(jq -cer --arg name "$name" '.[$name] // empty' "$BUNDLES_INDEX_FILE" 2>/dev/null || true)
-    if [[ -n "$entry" ]]; then
-      path=$(jq -r '.path' <<<"$entry")
-      hash=$(jq -r '.hash' <<<"$entry")
-      if [[ -d "$path" ]]; then
-        BUNDLE_PATH="$path" BUNDLE_HASH="$hash" BUNDLE_SOURCE="imported"
-        return 0
-      fi
-    fi
-  fi
-  root=$(bundle_current_builtin_root)
-  path="${root}/${name}"
-  if [[ -d "$path" ]]; then
-    hash=$(bundle_dir_hash "$path")
-    if [[ -z "$wanted_hash" || "$wanted_hash" == "$hash" ]]; then
-      BUNDLE_PATH="$path" BUNDLE_HASH="$hash" BUNDLE_SOURCE="built-in"
-      return 0
-    fi
-  fi
-  if [[ -n "$wanted_hash" ]]; then
-    while IFS= read -r path; do
-      [[ -d "$path" ]] || continue
-      hash=$(bundle_dir_hash "$path")
-      if [[ "$hash" == "$wanted_hash" ]]; then
-        BUNDLE_PATH="$path" BUNDLE_HASH="$hash" BUNDLE_SOURCE="built-in"
-        return 0
-      fi
-    done < <(find "${BUNDLES_DIR}/builtin" -path "*/vllm/${name}" -type d 2>/dev/null | LC_ALL=C sort -r)
+  if [[ -d "$builtin" ]]; then
+    BUNDLE_PATH="$builtin" BUNDLE_SOURCE="built-in"
+    return 0
   fi
   return 1
 }
@@ -358,7 +233,7 @@ bundle_exists() {
 }
 
 bundle_image_tag() {
-  printf 'spark/vllm-%s:%s\n' "$1" "${2:0:12}"
+  printf 'spark/bundle-%s:latest\n' "$1"
 }
 
 bundle_image_id() {
@@ -372,102 +247,124 @@ bundle_image_entrypoint() {
     >/dev/null 2>&1 <<<"$entry"
 }
 
-bundle_build_resolved() {
-  local name="$1" no_cache="${2:-0}" tag id
-  tag=$(bundle_image_tag "$name" "$BUNDLE_HASH")
+# Always invoke Docker's build. Docker checks the context and reuses cached
+# layers when the Dockerfile and every copied patch are unchanged.
+bundle_build_for_run() {
+  local name="$1" dry="${2:-0}" tag id
+  tag=$(bundle_image_tag "$name")
   BUNDLE_BUILT_IMAGE="$tag"
-  if [[ "$no_cache" != "1" ]] && docker image inspect "$tag" >/dev/null 2>&1; then
-    info "Bundle '${name}' already built: ${tag}"
+  if [[ "$dry" == "1" ]]; then
+    docker image inspect "$tag" >/dev/null 2>&1 \
+      || warn "Bundle image is not built; a real run will build ${tag}."
     return 0
   fi
-  info "Building bundle '${name}' as ${tag}"
-  local -a build_cmd=(docker build --pull=false
-    --label "spark.bundle.name=${name}"
-    --label "spark.bundle.hash=${BUNDLE_HASH}"
-    -t "$tag")
-  [[ "$no_cache" == "1" ]] && build_cmd+=(--no-cache)
-  build_cmd+=("$BUNDLE_PATH")
-  "${build_cmd[@]}" || die "Could not build bundle '${name}'"
+  info "Preparing bundle '${name}'"
+  docker build --pull=false \
+    --label "spark.bundle.name=${name}" \
+    -t "$tag" "$BUNDLE_PATH" || die "Could not build bundle '${name}'"
   id=$(bundle_image_id "$tag")
-  [[ "$id" =~ ^sha256:[a-fA-F0-9]{64}$ ]] || die "Built bundle image has no immutable Docker ID"
-  info "Built ${tag} (${id})"
+  [[ "$id" =~ ^sha256:[a-fA-F0-9]{64}$ ]] || die "Built bundle image has no Docker ID"
 }
 
-bundle_ensure_image() {
-  local name="$1" dry="${2:-0}" tag
-  tag=$(bundle_image_tag "$name" "$BUNDLE_HASH")
-  BUNDLE_BUILT_IMAGE="$tag"
-  if docker image inspect "$tag" >/dev/null 2>&1; then
-    return 0
+bundle_prepare_run() {
+  local name="$1" path="$2" manifest vllm_json image id
+  local requested_mem="$mem" requested_len="$max_len" requested_seqs="$max_num_seqs" requested_port="$port" requested_kv="$kv_dtype"
+  manifest="${path}/bundle.json"
+  bundle_validate_dir "$path" || die "Bundle '${name}' is invalid"
+  model=$(jq -r '.defaults.target_model.id' "$manifest")
+  vllm_json=$(jq -c '.defaults.vllm_args' "$manifest")
+
+  mem="${requested_mem:-$(bundle_vllm_value "$vllm_json" --gpu-memory-utilization)}"
+  max_len="${requested_len:-$(bundle_vllm_value "$vllm_json" --max-model-len)}"
+  max_num_seqs="${requested_seqs:-$(bundle_vllm_value "$vllm_json" --max-num-seqs)}"
+  port="${requested_port:-$(bundle_vllm_value "$vllm_json" --port)}"
+  kv_dtype="${requested_kv:-$(bundle_vllm_value "$vllm_json" --kv-cache-dtype)}"
+  kv_dtype="${kv_dtype:-auto}"
+
+  [[ -z "$requested_mem" ]] || vllm_json=$(alias_vllm_set_value_json "$vllm_json" --gpu-memory-utilization "$mem")
+  [[ -z "$requested_len" ]] || vllm_json=$(alias_vllm_set_value_json "$vllm_json" --max-model-len "$max_len")
+  [[ -z "$requested_seqs" ]] || vllm_json=$(alias_vllm_set_value_json "$vllm_json" --max-num-seqs "$max_num_seqs")
+  [[ -z "$requested_port" ]] || vllm_json=$(alias_vllm_set_value_json "$vllm_json" --port "$port")
+  if [[ -n "$requested_kv" ]]; then
+    vllm_json=$(bundle_vllm_remove_flag_json "$vllm_json" --kv-cache-dtype)
+    [[ "$requested_kv" == "auto" ]] || vllm_json=$(jq -ce --arg value "$requested_kv" '. + ["--kv-cache-dtype", $value]' <<<"$vllm_json")
   fi
-  if [[ "$dry" == "1" ]]; then
-    warn "Bundle image is not built; a real run will build ${tag}."
-    return 0
-  fi
-  bundle_build_resolved "$name"
+  case "$enforce_eager_flag" in
+    1) vllm_json=$(bundle_vllm_add_switch_json "$vllm_json" --enforce-eager) ;;
+    0) vllm_json=$(bundle_vllm_remove_switch_json "$vllm_json" --enforce-eager) ;;
+  esac
+  [[ "$no_reasoning" != "1" ]] || vllm_json=$(bundle_vllm_remove_flag_json "$vllm_json" --reasoning-parser)
+
+  BUNDLE_PATH="$path"
+  bundle_build_for_run "$name" "$dry_run"
+  image="$BUNDLE_BUILT_IMAGE"
+  id=$(bundle_image_id "$image" || true)
+  [[ -n "$id" ]] || id="$image"
+  ALIAS_VLLM_ARGS_JSON="$vllm_json"
+  ALIAS_VLLM_IMAGE="$image"
+  ALIAS_VLLM_IMAGE_ID="$id"
+  if bundle_image_entrypoint "$image"; then ALIAS_VLLM_ENTRYPOINT=true; else ALIAS_VLLM_ENTRYPOINT=false; fi
+  ALIAS_VLLM_ENV_JSON=$(bundle_options_env_json "$manifest" "$BUNDLE_OPTION_VALUES_JSON")
+  BUNDLE_ACTIVE=1
+  BUNDLE_ACTIVE_NAME="$name"
+  BUNDLE_ACTIVE_OPTIONS_JSON="$BUNDLE_OPTION_VALUES_JSON"
+  MTP_ENABLED=0
+  mtp_flag=0
 }
 
 bundle_collect() {
-  local root dir name hash entry path
-  BUNDLE_LIST_NAMES=() BUNDLE_LIST_PATHS=() BUNDLE_LIST_HASHES=() BUNDLE_LIST_SOURCES=()
-  root=$(bundle_current_builtin_root)
-  if [[ -d "$root" ]]; then
+  local dir name
+  BUNDLE_LIST_NAMES=() BUNDLE_LIST_PATHS=() BUNDLE_LIST_SOURCES=()
+  bundle_materialize_builtins
+  if [[ -d "${BUNDLES_DIR}/builtin/vllm" ]]; then
     while IFS= read -r dir; do
       [[ -d "$dir" ]] || continue
       name=$(basename "$dir")
-      hash=$(bundle_dir_hash "$dir")
-      BUNDLE_LIST_NAMES+=("$name"); BUNDLE_LIST_PATHS+=("$dir"); BUNDLE_LIST_HASHES+=("$hash"); BUNDLE_LIST_SOURCES+=("built-in")
-    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+      BUNDLE_LIST_NAMES+=("$name"); BUNDLE_LIST_PATHS+=("$dir"); BUNDLE_LIST_SOURCES+=("built-in")
+    done < <(find "${BUNDLES_DIR}/builtin/vllm" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
   fi
-  bundle_index_init
-  while IFS=$'\t' read -r name path hash; do
-    [[ -n "$name" && -d "$path" ]] || continue
-    BUNDLE_LIST_NAMES+=("$name"); BUNDLE_LIST_PATHS+=("$path"); BUNDLE_LIST_HASHES+=("$hash"); BUNDLE_LIST_SOURCES+=("imported")
-  done < <(jq -r 'to_entries[] | [.key, .value.path, .value.hash] | @tsv' "$BUNDLES_INDEX_FILE")
+  if [[ -d "${BUNDLES_DIR}/imported" ]]; then
+    while IFS= read -r dir; do
+      [[ -d "$dir" ]] || continue
+      name=$(basename "$dir")
+      BUNDLE_LIST_NAMES+=("$name"); BUNDLE_LIST_PATHS+=("$dir"); BUNDLE_LIST_SOURCES+=("imported")
+    done < <(find "${BUNDLES_DIR}/imported" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+  fi
 }
 
 cmd_bundle_list() {
-  local json="${1:-0}" i name path hash source target tag state rows='[]'
+  local json="${1:-0}" i name path source target rows='[]'
   bundle_collect
   if [[ "$json" == "1" ]]; then
     for i in "${!BUNDLE_LIST_NAMES[@]}"; do
-      name="${BUNDLE_LIST_NAMES[$i]}"; path="${BUNDLE_LIST_PATHS[$i]}"; hash="${BUNDLE_LIST_HASHES[$i]}"; source="${BUNDLE_LIST_SOURCES[$i]}"
+      name="${BUNDLE_LIST_NAMES[$i]}"; path="${BUNDLE_LIST_PATHS[$i]}"; source="${BUNDLE_LIST_SOURCES[$i]}"
       target=$(jq -r '.defaults.target_model.id' "${path}/bundle.json")
-      tag=$(bundle_image_tag "$name" "$hash")
-      state=not-built; docker image inspect "$tag" >/dev/null 2>&1 && state=built
-      rows=$(jq -c --arg name "$name" --arg target "$target" --arg state "$state" --arg source "$source" --arg hash "$hash" '. + [{name:$name,target:$target,state:$state,source:$source,hash:$hash}]' <<<"$rows")
+      rows=$(jq -c --arg name "$name" --arg target "$target" --arg source "$source" '. + [{name:$name,target:$target,source:$source}]' <<<"$rows")
     done
     printf '%s\n' "$rows" | jq .
     return 0
   fi
-  printf '\n  NAME\tSTATE\tSOURCE\tTARGET\n'
+  printf '\n  NAME\tSOURCE\tTARGET\n'
   for i in "${!BUNDLE_LIST_NAMES[@]}"; do
-    name="${BUNDLE_LIST_NAMES[$i]}"; path="${BUNDLE_LIST_PATHS[$i]}"; hash="${BUNDLE_LIST_HASHES[$i]}"; source="${BUNDLE_LIST_SOURCES[$i]}"
+    name="${BUNDLE_LIST_NAMES[$i]}"; path="${BUNDLE_LIST_PATHS[$i]}"; source="${BUNDLE_LIST_SOURCES[$i]}"
     target=$(jq -r '.defaults.target_model.id' "${path}/bundle.json")
-    tag=$(bundle_image_tag "$name" "$hash")
-    state=not-built; docker image inspect "$tag" >/dev/null 2>&1 && state=built
-    printf '  %s\t%s\t%s\t%s\n' "$name" "$state" "$source" "$target"
+    printf '  %s\t%s\t%s\n' "$name" "$source" "$target"
   done
   [[ ${#BUNDLE_LIST_NAMES[@]} -gt 0 ]] || printf '  No bundles available.\n'
   printf '\n'
 }
 
 cmd_bundle_show() {
-  local name="$1" json="${2:-0}" manifest tag state
+  local name="$1" json="${2:-0}" manifest
   bundle_resolve "$name" || die "Bundle '${name}' does not exist"
   manifest="${BUNDLE_PATH}/bundle.json"
   if [[ "$json" == "1" ]]; then jq . "$manifest"; return 0; fi
-  tag=$(bundle_image_tag "$name" "$BUNDLE_HASH")
-  state=not-built; docker image inspect "$tag" >/dev/null 2>&1 && state=built
   printf '\n  %s%s%s\n\n' "$BOLD" "$name" "$NC"
   printf '  %s\n\n' "$(jq -r '.description' "$manifest")"
   printf '  Target:   %s\n' "$(jq -r '.defaults.target_model.id' "$manifest")"
   printf '  Drafter:  %s\n' "$(jq -r '.defaults.draft_model.id' "$manifest")"
   printf '  Tokens:   %s\n' "$(jq -r '.defaults.speculative_tokens' "$manifest")"
-  printf '  State:    %s\n' "$state"
   printf '  Source:   %s\n' "$BUNDLE_SOURCE"
-  printf '  Hash:     %s\n' "$BUNDLE_HASH"
-  printf '  Image:    %s\n' "$tag"
   printf '\n  Options:\n'
   jq -r '(.options // {}) | to_entries[] | "    --\(.key) <\(.value.type)>  default=\(.value.default)\n      \(.value.description)"' "$manifest"
   printf '\n  Patches:\n'
@@ -493,53 +390,36 @@ cmd_bundle_init() {
     '  "options": {},' \
     '  "patches": []' \
     '}' > "${dir}/bundle.json"
-  printf '%s\n' 'FROM vllm/vllm-openai@sha256:REPLACE_WITH_IMMUTABLE_DIGEST' > "${dir}/Dockerfile"
+  printf '%s\n' 'FROM vllm/vllm-openai:v0.0.0' > "${dir}/Dockerfile"
   printf '# %s\n\nDescribe the tested configuration and results.\n' "$name" > "${dir}/README.md"
   info "Created bundle template: ${dir}"
 }
 
 cmd_bundle_import() {
-  local source="$1" force="${2:-0}" name hash dest current updated origin commit=""
+  local source="$1" force="${2:-0}" name dest tmp
   source="$(cd "$source" 2>/dev/null && pwd)" || die "Bundle directory not found: ${source}"
   bundle_validate_dir "$source" || die "Bundle validation failed"
   name=$(jq -r '.name' "${source}/bundle.json")
-  hash=$(bundle_dir_hash "$source")
-  bundle_resolve "$name" >/dev/null 2>&1 && [[ "$BUNDLE_SOURCE" == "built-in" ]] \
-    && die "Cannot import over built-in bundle '${name}'"
-  bundle_index_init
-  current=$(jq -r --arg name "$name" '.[$name].hash // empty' "$BUNDLES_INDEX_FILE")
-  [[ -z "$current" || "$current" == "$hash" || "$force" == "1" ]] \
-    || die "Bundle '${name}' is already imported with different content" "Use --force to select the new revision."
-  dest="${BUNDLES_DIR}/imported/${name}/${hash}"
-  if [[ ! -d "$dest" ]]; then
-    mkdir -p "$(dirname "$dest")" || die "Cannot create imported bundle store"
-    local tmp
-    tmp=$(mktemp -d "$(dirname "$dest")/.import.XXXXXX") || die "Cannot create import directory"
-    cp -R "${source}/." "$tmp/" || { rm -rf "$tmp"; die "Cannot copy bundle"; }
-    mv "$tmp" "$dest" || { rm -rf "$tmp"; die "Cannot install bundle"; }
-  fi
-  origin=$(git -C "$source" config --get remote.origin.url 2>/dev/null || printf '%s' "$source")
-  commit=$(git -C "$source" rev-parse HEAD 2>/dev/null || true)
-  updated=$(jq -c --arg name "$name" --arg hash "$hash" --arg path "$dest" --arg origin "$origin" --arg commit "$commit" \
-    '.[$name] = {hash:$hash,path:$path,origin:$origin,commit:$commit}' "$BUNDLES_INDEX_FILE") || die "Cannot update bundle index"
-  bundle_write_index "$updated"
-  info "Imported '${name}' (${hash:0:12})"
+  bundle_materialize_builtins
+  [[ ! -d "${BUNDLES_DIR}/builtin/vllm/${name}" ]] || die "Cannot import over built-in bundle '${name}'"
+  dest="${BUNDLES_DIR}/imported/${name}"
+  [[ "$source" != "$dest" ]] || die "Bundle is already imported: ${name}"
+  [[ ! -e "$dest" || "$force" == "1" ]] || die "Bundle '${name}' is already imported" "Use --force to replace it."
+  mkdir -p "${BUNDLES_DIR}/imported" || die "Cannot create imported bundle store"
+  tmp=$(mktemp -d "${BUNDLES_DIR}/imported/.import.XXXXXX") || die "Cannot create import directory"
+  cp -R "${source}/." "$tmp/" || { rm -rf "$tmp"; die "Cannot copy bundle"; }
+  rm -rf "$dest"
+  mv "$tmp" "$dest" || { rm -rf "$tmp"; die "Cannot install bundle"; }
+  info "Imported '${name}'"
 }
 
 cmd_bundle_remove() {
-  local name="$1" purge="${2:-0}" entry path hash tag updated
-  bundle_index_init
-  entry=$(jq -cer --arg name "$name" '.[$name] // empty' "$BUNDLES_INDEX_FILE" 2>/dev/null || true)
-  [[ -n "$entry" ]] || die "Imported bundle '${name}' does not exist" "Built-in bundles cannot be removed."
-  path=$(jq -r '.path' <<<"$entry"); hash=$(jq -r '.hash' <<<"$entry")
+  local name="$1" path
+  path="${BUNDLES_DIR}/imported/${name}"
+  is_safe_bundle_name "$name" || die "Invalid bundle name: ${name}"
+  [[ -d "$path" ]] || die "Imported bundle '${name}' does not exist" "Built-in bundles cannot be removed."
   confirm "Remove imported bundle '${name}'?" || { warn "Cancelled"; return 0; }
-  updated=$(jq -c --arg name "$name" 'del(.[$name])' "$BUNDLES_INDEX_FILE") || die "Cannot update bundle index"
-  bundle_write_index "$updated"
-  [[ "$path" == "${BUNDLES_DIR}/imported/${name}/${hash}" && -d "$path" ]] && rm -rf "$path"
-  if [[ "$purge" == "1" ]]; then
-    tag=$(bundle_image_tag "$name" "$hash")
-    docker image rm "$tag" >/dev/null 2>&1 || true
-  fi
+  rm -rf "$path"
   info "Removed bundle '${name}'"
 }
 
@@ -548,7 +428,6 @@ bundle_tui_run_configured() {
   local -a bundle_tui_flags=()
   bundle_resolve "$name" || die "Bundle '${name}' does not exist"
   manifest="${BUNDLE_PATH}/bundle.json"
-
   printf '  Max context length (blank = default): '; read -r value
   [[ -z "$value" ]] || bundle_tui_flags+=(--max-len "$value")
   printf '  Concurrent sequences (blank = default): '; read -r value
@@ -566,15 +445,13 @@ bundle_tui_run_configured() {
 }
 
 cmd_bundle_tui() {
-  local choice action name path hash tag state i
+  local choice action name path i
   is_interactive || die "Bundle TUI requires a terminal" "Use spark bundle --help for commands."
   bundle_collect
   printf '\n  %sSpark bundles%s\n\n' "$BOLD" "$NC"
   for i in "${!BUNDLE_LIST_NAMES[@]}"; do
-    name="${BUNDLE_LIST_NAMES[$i]}"; hash="${BUNDLE_LIST_HASHES[$i]}"; path="${BUNDLE_LIST_PATHS[$i]}"
-    tag=$(bundle_image_tag "$name" "$hash"); state=not-built
-    docker image inspect "$tag" >/dev/null 2>&1 && state=built
-    printf '    [%d] %-34s %-10s %s\n' "$((i + 1))" "$name" "$state" "$(jq -r '.description' "${path}/bundle.json")"
+    name="${BUNDLE_LIST_NAMES[$i]}"; path="${BUNDLE_LIST_PATHS[$i]}"
+    printf '    [%d] %-34s %s\n' "$((i + 1))" "$name" "$(jq -r '.description' "${path}/bundle.json")"
   done
   printf '\n    [n] Create     [i] Import     [q] Exit\n\n  Select: '
   read -r choice || choice=q
@@ -591,14 +468,13 @@ cmd_bundle_tui() {
         || die "Choose a listed bundle, n, i, or q"
       name="${BUNDLE_LIST_NAMES[$((choice - 1))]}"
       cmd_bundle_show "$name"
-      printf '    [1] Run   [2] Configure and run   [3] Build   [4] Back\n\n  Select: '
-      read -r action || action=4
+      printf '    [1] Run   [2] Configure and run   [3] Back\n\n  Select: '
+      read -r action || action=3
       case "$action" in
         1) cmd_run "$name" ;;
         2) bundle_tui_run_configured "$name" ;;
-        3) bundle_resolve "$name" || die "Bundle disappeared"; bundle_build_resolved "$name" ;;
-        4) return 0 ;;
-        *) die "Choose 1, 2, 3, or 4" ;;
+        3) return 0 ;;
+        *) die "Choose 1, 2, or 3" ;;
       esac ;;
   esac
 }
@@ -612,18 +488,18 @@ cmd_bundle_help() {
     show <name> [--json]           Describe a bundle
     init <name> [--directory DIR]  Create an external bundle template
     validate <directory>           Validate without importing
-    import <directory> [--force]   Import an immutable bundle revision
-    build <name> [--no-cache]      Build its Docker image
-    remove <name> [--purge-image]  Remove an imported bundle
+    import <directory> [--force]   Import or replace a bundle folder
+    remove <name>                  Remove an imported bundle
 
   With no command, opens the interactive bundle browser.
   Run one with: spark run <bundle> [normal flags] [bundle flags]
+  Run automatically builds its Dockerfile and reuses Docker's layer cache.
 
 EOF
 }
 
 cmd_bundle() {
-  local action="${1:-}" name="" dir="" flag=""
+  local action="${1:-}" name="" dir=""
   [[ -n "$action" ]] || { cmd_bundle_tui; return; }
   shift || true
   case "$action" in
@@ -647,16 +523,9 @@ cmd_bundle() {
       dir="${1:-}"; [[ -n "$dir" ]] || die "Usage: spark bundle import <directory> [--force]"
       [[ "${2:-}" == "--force" || -z "${2:-}" ]] || die "Usage: spark bundle import <directory> [--force]"
       cmd_bundle_import "$dir" "$([[ "${2:-}" == "--force" ]] && printf 1 || printf 0)" ;;
-    build)
-      name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark bundle build <name> [--no-cache]"
-      [[ "${2:-}" == "--no-cache" || -z "${2:-}" ]] || die "Usage: spark bundle build <name> [--no-cache]"
-      bundle_resolve "$name" || die "Bundle '${name}' does not exist"
-      bundle_validate_dir "$BUNDLE_PATH" || die "Bundle validation failed"
-      bundle_build_resolved "$name" "$([[ "${2:-}" == "--no-cache" ]] && printf 1 || printf 0)" ;;
     remove)
-      name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark bundle remove <name> [--purge-image]"
-      [[ "${2:-}" == "--purge-image" || -z "${2:-}" ]] || die "Usage: spark bundle remove <name> [--purge-image]"
-      cmd_bundle_remove "$name" "$([[ "${2:-}" == "--purge-image" ]] && printf 1 || printf 0)" ;;
+      name="${1:-}"; [[ -n "$name" && -z "${2:-}" ]] || die "Usage: spark bundle remove <name>"
+      cmd_bundle_remove "$name" ;;
     help|-h|--help) cmd_bundle_help ;;
     *) die "Unknown bundle command: ${action}" "Run 'spark bundle --help' for usage" ;;
   esac

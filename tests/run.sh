@@ -903,7 +903,7 @@ test_suite_includes() {
     test_alias_capture_rejects_secret_flags|\
     test_alias_backend_mismatch_fails_closed|\
     test_bundle_catalog_embeds_and_validates_builtin|\
-    test_bundle_imports_external_folder_and_builds_by_hash|\
+    test_bundle_imports_external_folder_and_run_builds_with_docker_cache|\
     test_bundle_run_resolves_defaults_and_dynamic_options|\
     test_alias_create_from_bundle_stores_bundle_and_adjustments|\
     test_total_mem_detection_positive|\
@@ -2228,9 +2228,9 @@ test_bundle_catalog_embeds_and_validates_builtin() {
   [[ "$ok" == "0" ]]
 }
 
-test_bundle_imports_external_folder_and_builds_by_hash() {
+test_bundle_imports_external_folder_and_run_builds_with_docker_cache() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin source manifest_tmp build_file list out
+  local tmp fake_bin source manifest_tmp build_file list
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   source="${tmp}/external-bundle"
   cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$source"
@@ -2240,12 +2240,15 @@ test_bundle_imports_external_folder_and_builds_by_hash() {
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle import "$source" >/dev/null 2>&1
   list=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle list --json 2>&1)
   build_file="${tmp}/docker-build"
-  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_IMAGE_EXISTS=0 \
-    FAKE_DOCKER_BUILD_FILE="$build_file" "$SPARK" bundle build external-bundle 2>&1)
+  make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_BUILD_FILE="$build_file" "$SPARK" run external-bundle --no-wait >/dev/null 2>&1
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_BUILD_FILE="$build_file" "$SPARK" run external-bundle --no-wait >/dev/null 2>&1
   local ok=0
   jq -e '.[] | select(.name == "external-bundle" and .source == "imported")' <<<"$list" >/dev/null || ok=1
-  [[ -s "$build_file" && "$(cat "$build_file")" == *"spark/vllm-external-bundle:"* ]] || ok=1
-  [[ "$out" == *"Built spark/vllm-external-bundle:"* ]] || ok=1
+  [[ "$(grep -c '^build ' "$build_file")" -eq 2 ]] || ok=1
+  [[ "$(cat "$build_file")" == *"-t spark/bundle-external-bundle:latest"* ]] || ok=1
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
 }
@@ -2266,7 +2269,7 @@ test_bundle_run_resolves_defaults_and_dynamic_options() {
   [[ "$output" != *"VLLM_SPEC_DECODE_ATTN"* ]] || ok=1
   unbuilt_output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     FAKE_DOCKER_IMAGE_EXISTS=0 "$SPARK" run qwen38-dflash2-lookup --dry-run 2>&1) || ok=1
-  [[ "$unbuilt_output" == *"spark/vllm-qwen38-dflash2-lookup:"* ]] || ok=1
+  [[ "$unbuilt_output" == *"spark/bundle-qwen38-dflash2-lookup:latest"* ]] || ok=1
   [[ "$unbuilt_output" == *"Docker command that would be executed"* ]] || ok=1
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
@@ -2289,8 +2292,8 @@ test_alias_create_from_bundle_stores_bundle_and_adjustments() {
   jq -e '
     .["qwen-bundle-alias"].kind == "bundle"
     and .["qwen-bundle-alias"].bundle == "qwen38-dflash2-lookup"
-    and (.["qwen-bundle-alias"].bundle_hash | test("^[a-f0-9]{64}$"))
-    and .["qwen-bundle-alias"].run_args == ["--lookup","false"]
+    and (.["qwen-bundle-alias"] | has("bundle_hash") | not)
+    and .["qwen-bundle-alias"].run_args == []
     and .["qwen-bundle-alias"].options.lookup == false
   ' "$aliases" >/dev/null || ok=1
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
@@ -8330,7 +8333,7 @@ run_test "captured alias pins image/env and accepts safe overrides" test_alias_c
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
 run_test "built-in bundle catalog is embedded and valid" test_bundle_catalog_embeds_and_validates_builtin
-run_test "external bundle imports and builds by content hash" test_bundle_imports_external_folder_and_builds_by_hash
+run_test "external bundle imports and every run checks Docker build cache" test_bundle_imports_external_folder_and_run_builds_with_docker_cache
 run_test "bundle run resolves defaults and dynamic options" test_bundle_run_resolves_defaults_and_dynamic_options
 run_test "alias create stores bundle plus adjustments" test_alias_create_from_bundle_stores_bundle_and_adjustments
 run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions

@@ -41,15 +41,15 @@ cmd_run() {
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" alias_frozen_flags=0
   local ALIAS_VLLM_ARGS_JSON="" ALIAS_VLLM_IMAGE="" ALIAS_VLLM_IMAGE_ID="" ALIAS_VLLM_ENTRYPOINT="" ALIAS_VLLM_ENV_JSON=""
-  local bundle_candidate="" bundle_name="" bundle_path="" bundle_hash="" bundle_manifest=""
-  local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_HASH="" BUNDLE_ACTIVE_OPTIONS_JSON='{}' BUNDLE_ACTIVE_RUN_ARGS_JSON='[]'
+  local bundle_candidate="" bundle_name="" bundle_path="" bundle_manifest=""
+  local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_OPTIONS_JSON='{}' BUNDLE_ACTIVE_RUN_ARGS_JSON='[]'
   local BUNDLE_OPTION_VALUES_JSON='{}'
   local -a alias_override_args=()
   local -a bundle_explicit_run_args=()
 
   bundle_candidate=$(bundle_detect_run_ref "$@" 2>/dev/null || true)
-  if [[ -n "$bundle_candidate" ]] && bundle_resolve "$bundle_candidate" "${SPARK_BUNDLE_PIN_HASH:-}"; then
-    bundle_name="$bundle_candidate" bundle_path="$BUNDLE_PATH" bundle_hash="$BUNDLE_HASH"
+  if [[ -n "$bundle_candidate" ]] && bundle_resolve "$bundle_candidate"; then
+    bundle_name="$bundle_candidate" bundle_path="$BUNDLE_PATH"
     bundle_manifest="${bundle_path}/bundle.json"
     BUNDLE_OPTION_VALUES_JSON=$(bundle_option_defaults_json "$bundle_manifest")
   fi
@@ -81,7 +81,6 @@ cmd_run() {
         if [[ -n "$bundle_name" ]] && bundle_option_exists_in "$bundle_manifest" "${1#--}"; then
           [[ $# -ge 2 ]] || die "Missing value for $1"
           bundle_set_option_value "$bundle_manifest" "${1#--}" "$2"
-          bundle_explicit_run_args+=("$1" "$2")
           shift 2
         else
           die "Unknown flag: $1" "Run 'spark run --help' for usage"
@@ -101,7 +100,7 @@ cmd_run() {
     [[ "$model" == "$bundle_name" ]] || die "Only one launch target can be specified"
     [[ "$BACKEND" == "vllm" ]] || die "Bundle '${bundle_name}' requires the vLLM backend"
     [[ "$mtp_flag" == "auto" ]] || die "Bundles with a drafter do not accept --mtp or --no-mtp"
-    bundle_prepare_run "$bundle_name" "$bundle_path" "$bundle_hash"
+    bundle_prepare_run "$bundle_name" "$bundle_path"
     BUNDLE_ACTIVE_RUN_ARGS_JSON=$(jq -nc --args '$ARGS.positional' -- "${bundle_explicit_run_args[@]}")
   fi
   validate_model_ref_for_backend "$model"
@@ -272,7 +271,6 @@ alias_validate_definition() {
       jq -e '
         .backend == "vllm"
         and (.bundle | type == "string" and test("^[a-z0-9][a-z0-9._-]{0,63}$"))
-        and (.bundle_hash | type == "string" and test("^[a-f0-9]{64}$"))
         and (.run_args | type == "array" and all(.[]; type == "string"))
         and (.run_args | all(.[]; ([explode[] | select(. < 32 or . == 127)] | length) == 0))
         and ((.options // {}) | type == "object")
@@ -354,15 +352,14 @@ alias_bundle_guided_definition() {
     value=$(alias_prompt_value "--${key} ${type} (blank = ${default})")
     if [[ -n "$value" ]]; then
       bundle_set_option_value "$manifest" "$key" "$value"
-      args+=("--${key}" "$value")
     fi
   done 3< <(jq -r '(.options // {}) | to_entries[] | [.key, .value.type, (.value.default|tostring)] | @tsv' "$manifest")
 
   args_json=$(jq -nc --args '$ARGS.positional' -- "${args[@]}")
   options_json="$BUNDLE_OPTION_VALUES_JSON"
-  definition=$(jq -nc --arg model "$model" --arg bundle "$bundle" --arg hash "$BUNDLE_HASH" \
+  definition=$(jq -nc --arg model "$model" --arg bundle "$bundle" \
     --argjson args "$args_json" --argjson options "$options_json" \
-    '{kind:"bundle",backend:"vllm",model:$model,bundle:$bundle,bundle_hash:$hash,run_args:$args,options:$options}')
+    '{kind:"bundle",backend:"vllm",model:$model,bundle:$bundle,run_args:$args,options:$options}')
   printf '%s\n' "$definition"
 }
 
@@ -413,7 +410,7 @@ alias_guided_definition() {
 
 alias_capture_definition() {
   local cname="$1" expected_model="${2:-}" inspect args model image image_id vllm_entrypoint env definition
-  local bundle_name bundle_hash bundle_options bundle_run_args
+  local bundle_name bundle_options bundle_run_args
   inspect=$(docker inspect "$cname" 2>/dev/null) || die "Cannot inspect container ${cname}"
   jq -e 'type == "array" and length == 1 and .[0].State.Running == true' >/dev/null <<<"$inspect" \
     || die "Container '${cname}' is not running"
@@ -437,19 +434,17 @@ alias_capture_definition() {
 
   bundle_name=$(jq -r '.[0].Config.Labels["spark.bundle.name"] // empty' <<<"$inspect")
   if [[ -n "$bundle_name" ]]; then
-    bundle_hash=$(jq -r '.[0].Config.Labels["spark.bundle.hash"] // empty' <<<"$inspect")
     bundle_options=$(jq -r '.[0].Config.Labels["spark.bundle.options"] // "{}"' <<<"$inspect")
     bundle_run_args=$(jq -r '.[0].Config.Labels["spark.bundle.run_args"] // "[]"' <<<"$inspect")
     is_safe_bundle_name "$bundle_name" || die "Container has an invalid Spark bundle label"
-    [[ "$bundle_hash" =~ ^[a-f0-9]{64}$ ]] || die "Container has an invalid Spark bundle hash"
     jq -e 'type == "object"' >/dev/null 2>&1 <<<"$bundle_options" || die "Container has invalid bundle options"
     jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 <<<"$bundle_run_args" || die "Container has invalid bundle run arguments"
-    bundle_resolve "$bundle_name" "$bundle_hash" || die "Bundle revision for ${cname} is not installed"
+    bundle_resolve "$bundle_name" || die "Bundle '${bundle_name}' for ${cname} is not installed"
     [[ "$(jq -r '.defaults.target_model.id' "${BUNDLE_PATH}/bundle.json")" == "$model" ]] \
       || die "Container bundle target does not match its served model"
-    definition=$(jq -nc --arg model "$model" --arg bundle "$bundle_name" --arg hash "$bundle_hash" \
+    definition=$(jq -nc --arg model "$model" --arg bundle "$bundle_name" \
       --argjson args "$bundle_run_args" --argjson options "$bundle_options" \
-      '{kind:"bundle",backend:"vllm",model:$model,bundle:$bundle,bundle_hash:$hash,run_args:$args,options:$options}')
+      '{kind:"bundle",backend:"vllm",model:$model,bundle:$bundle,run_args:$args,options:$options}')
     alias_validate_definition "$definition" || die "Invalid bundle alias captured from ${cname}"
     printf '%s\n' "$definition"
     return 0
@@ -570,14 +565,14 @@ cmd_alias_run() {
       ;;
     bundle)
       [[ "$BACKEND" == "vllm" ]] || die "Alias '${name}' captures a vLLM bundle; this machine uses ${BACKEND}"
-      local bundle hash model SPARK_ALIAS_BYPASS=1 SPARK_BUNDLE_PIN_HASH
+      local bundle option_key option_value SPARK_ALIAS_BYPASS=1
       local -a run_args=()
       bundle=$(jq -r '.bundle' <<<"$definition")
-      hash=$(jq -r '.bundle_hash' <<<"$definition")
-      SPARK_BUNDLE_PIN_HASH="$hash"
-      bundle_resolve "$bundle" "$hash" || die "Bundle revision for alias '${name}' is not installed" \
-        "Re-import or restore ${bundle} at ${hash}."
+      bundle_resolve "$bundle" || die "Bundle '${bundle}' for alias '${name}' is not installed"
       while IFS= read -r arg; do run_args+=("$arg"); done < <(jq -r '.run_args[]' <<<"$definition")
+      while IFS=$'\t' read -r option_key option_value; do
+        run_args+=("--${option_key}" "$option_value")
+      done < <(jq -r '(.options // {}) | to_entries[] | [.key, (.value|tostring)] | @tsv' <<<"$definition")
       run_args+=("${overrides[@]}")
       cmd_run "$bundle" "${run_args[@]}"
       ;;
@@ -985,8 +980,6 @@ build_launch() {
       add_vllm_flag_once --stream-interval "$stream_interval"
     fi
   fi
-  [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] && vllm_args+=(--limit-mm-per-prompt '{"image":0}')
-
   # Captured aliases preserve the effective vLLM command, including flags that
   # Spark normally derives from the hardware/model profile. Docker safety and
   # capacity checks are still rebuilt for the current host below.
@@ -995,6 +988,10 @@ build_launch() {
     while IFS= read -r arg; do vllm_args+=("$arg"); done < <(jq -r '.[]' <<<"$ALIAS_VLLM_ARGS_JSON")
     use_marlin_atomic=0
   fi
+  [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] \
+    && add_vllm_flag_once --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER"
+  [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] \
+    && add_vllm_flag_once --limit-mm-per-prompt '{"image":0}'
 
   # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
   # set higher (by the provisioned swap) so the LOAD-time peak — the loader transiently needs ~2x the
@@ -1042,7 +1039,6 @@ build_launch() {
   if [[ "${BUNDLE_ACTIVE:-0}" == "1" ]]; then
     docker_cmd+=(
       --label "spark.bundle.name=${BUNDLE_ACTIVE_NAME}"
-      --label "spark.bundle.hash=${BUNDLE_ACTIVE_HASH}"
       --label "spark.bundle.options=${BUNDLE_ACTIVE_OPTIONS_JSON}"
       --label "spark.bundle.run_args=${BUNDLE_ACTIVE_RUN_ARGS_JSON}")
   fi

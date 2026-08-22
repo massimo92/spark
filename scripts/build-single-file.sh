@@ -28,16 +28,8 @@ tmp="$(mktemp)"
 cleanup() { rm -f "$tmp"; }
 trap cleanup EXIT
 
-sha256_file() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  else
-    shasum -a 256 "$1" | awk '{print $1}'
-  fi
-}
-
 emit_builtin_bundle_assets() {
-  local root="${ROOT_DIR}/bundles" asset rel encoded index hash
+  local root="${ROOT_DIR}/bundles" asset rel encoded index
   index="$(mktemp)"
   if [[ -d "$root" ]]; then
     while IFS= read -r asset; do
@@ -46,11 +38,11 @@ emit_builtin_bundle_assets() {
       printf '%s\t%s\n' "$rel" "$encoded" >> "$index"
     done < <(find "$root" -type f | LC_ALL=C sort)
   fi
-  hash=$(sha256_file "$index")
-  printf "SPARK_BUILTIN_BUNDLES_HASH='%s'\n" "$hash" >> "$tmp"
-  printf "spark_builtin_bundle_assets() { cat <<'__SPARK_BUNDLE_ASSETS__'\n" >> "$tmp"
-  cat "$index" >> "$tmp"
-  printf '__SPARK_BUNDLE_ASSETS__\n}\n' >> "$tmp"
+  {
+    printf "spark_builtin_bundle_assets() { cat <<'__SPARK_BUNDLE_ASSETS__'\n"
+    cat "$index"
+    printf '__SPARK_BUNDLE_ASSETS__\n}\n'
+  } >> "$tmp"
   rm -f "$index"
 }
 
