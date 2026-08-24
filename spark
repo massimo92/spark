@@ -15740,8 +15740,6 @@ cmd_architecture() {
     src/lib/*.sh               lower-level shared subsystems
     src/90_main.sh             CLI dispatch and source guard
     scripts/build-single-file.sh builds/checks the generated spark artifact
-    docs/architecture.md        audit, module map, maintenance plan
-    docs/flow.md                execution flows
     tests/run.sh                fake-bin integration tests
     .github/workflows/ci.yml    syntax, shellcheck, full test suite
 

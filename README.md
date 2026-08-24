@@ -219,12 +219,6 @@ shellcheck --exclude=SC2059,SC2015,SC2016 spark install.sh tests/run.sh scripts/
 bash tests/run.sh
 ```
 
-Architecture docs:
-
-- `docs/architecture.md`
-- `docs/flow.md`
-- `docs/workspace-setup-research.md`
-
 Edit `src/` modules, then run `scripts/build-single-file.sh` to regenerate the root `spark` artifact.
 
 ## License
