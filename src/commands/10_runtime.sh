@@ -13,6 +13,7 @@ cmd_run_help() {
     --max-num-seqs <int>   Max concurrent requests; higher uses more memory.
     --mtp                  Enable MTP speculative decoding when supported.
     --no-mtp               Disable MTP speculative decoding.
+    --main                 Replace LiteLLM main after readiness; rollback if startup fails.
     --enforce-eager        Disable CUDA graphs; lower startup peak, slower inference.
     --no-enforce-eager     Force CUDA graphs on.
     --port <int>           Direct model API port; default auto-selects from 8000.
@@ -28,7 +29,7 @@ cmd_run_help() {
     --regen-profile        Recompute cached model memory profile.
 
   Aliases keep model settings frozen and accept operational overrides only:
-  --dry-run, --explain, --force, --port, --tail, --no-wait.
+  --dry-run, --explain, --force, --port, --tail, --no-wait, --main.
 
   Bundles declare their target, drafter, Docker build, defaults, and extra
   flags. Example: spark run qwen38-dflash2-lookup --lookup false
@@ -40,6 +41,7 @@ cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" alias_frozen_flags=0
+  local publish_main=0
   local ALIAS_VLLM_ARGS_JSON="" ALIAS_VLLM_IMAGE="" ALIAS_VLLM_IMAGE_ID="" ALIAS_VLLM_ENTRYPOINT="" ALIAS_VLLM_ENV_JSON=""
   local bundle_candidate="" bundle_name="" bundle_path="" bundle_manifest=""
   local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_OPTIONS_JSON='{}' BUNDLE_ACTIVE_RUN_ARGS_JSON='[]'
@@ -71,6 +73,7 @@ cmd_run() {
       --text-only) text_only=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--text-only); shift ;;
       --no-reasoning) no_reasoning=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-reasoning); shift ;;
       --no-pull)   no_pull=1; alias_frozen_flags=1; shift ;;
+      --main)      publish_main=1; alias_override_args+=(--main); shift ;;
       --dry-run)   dry_run=1; alias_override_args+=(--dry-run); shift ;;
       --explain)   explain=1; dry_run=1; alias_override_args+=(--explain); shift ;;
       --tail)      tail_logs=1; alias_override_args+=(--tail); shift ;;
@@ -90,9 +93,18 @@ cmd_run() {
   done
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
+  if [[ "$publish_main" == "1" ]]; then
+    [[ "$dry_run" == "0" ]] || die "Cannot combine --main with --dry-run/--explain"
+    [[ "$no_wait" == "0" ]] || die "Cannot combine --main with --no-wait"
+    [[ "$tail_logs" == "0" ]] || die "Cannot combine --main with --tail"
+    local gateway_config
+    gateway_config=$(gateway_load_config)
+    [[ "$gateway_config" != "{}" && "$(printf '%s\n' "$gateway_config" | jq -r '.enabled // false')" == "true" ]] || \
+      die "Cannot use --main: LiteLLM gateway is not configured" "Run 'spark setup' first"
+  fi
   if [[ "${SPARK_ALIAS_BYPASS:-0}" != "1" ]] && alias_exists "$model"; then
     [[ "$alias_frozen_flags" == "0" ]] || die "Alias model settings are frozen" \
-      "Allowed overrides: --dry-run, --explain, --force, --port, --tail, --no-wait"
+      "Allowed overrides: --dry-run, --explain, --force, --port, --tail, --no-wait, --main"
     cmd_alias_run "$model" "${alias_override_args[@]}"
     return 0
   fi
@@ -108,10 +120,141 @@ cmd_run() {
   # Pick the engine from the detected hardware (vLLM on NVIDIA, Ollama elsewhere).
   # cmd_run's flag locals are visible to the backend functions via dynamic scoping.
   case "$BACKEND" in
-    vllm)   run_backend_vllm ;;
-    ollama) run_backend_ollama ;;
+    vllm)
+      if [[ "$publish_main" == "1" ]]; then
+        run_main_replacement_vllm "$model"
+      else
+        run_backend_vllm
+      fi
+      ;;
+    ollama)
+      if [[ "$publish_main" == "1" ]]; then
+        SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_ollama
+        run_publish_main "$model"
+      else
+        run_backend_ollama
+      fi
+      ;;
     *)      die "Unknown backend: $BACKEND" "Set SPARK_BACKEND to 'vllm' or 'ollama'" ;;
   esac
+}
+
+confirm_rollback_main() {
+  local answer=""
+  printf "  Rollback previous main model? [Y/n] "
+  read -r answer || true
+  [[ -z "$answer" || "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+rollback_main_vllm() {
+  local definition="$1" model="$2" old_config="$3" gateway_was_running="$4"
+
+  if is_interactive; then
+    confirm_rollback_main || {
+      warn "Rollback declined; previous main model '${model}' remains stopped"
+      return 1
+    }
+  else
+    warn "Non-interactive run: rolling back the previous main model automatically"
+  fi
+
+  if ! (SPARK_SKIP_GATEWAY_REFRESH=1 run_captured_vllm_definition "$definition" "main rollback" --force); then
+    err "Rollback failed: could not restart previous main model '${model}'"
+    return 1
+  fi
+
+  gateway_save_config "$old_config"
+  if [[ "$gateway_was_running" == "1" ]] && ! gateway_restart; then
+    err "Rollback incomplete: previous model restarted but LiteLLM could not be restarted"
+    return 1
+  fi
+  info "Rolled back LiteLLM main to vllm/${model}"
+  return 0
+}
+
+run_main_replacement_vllm() {
+  local target_model="$1" config old_config old_provider old_model
+  local old_name="" old_definition="" gateway_was_running=0
+  local name scan_model port rest
+
+  config=$(gateway_load_config)
+  old_config="$config"
+  old_provider=$(jq -r '.main.provider // empty' <<<"$config" 2>/dev/null || true)
+  old_model=$(jq -r '.main.model // empty' <<<"$config" 2>/dev/null || true)
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    gateway_was_running=1
+  fi
+
+  # A vLLM main target is replaceable only when it maps to a live, managed
+  # container. Refuse to stop anything when the route is stale or unmanaged.
+  if [[ "$old_provider" == "vllm" && -n "$old_model" ]]; then
+    while IFS=$'\t' read -r name scan_model port rest; do
+      if [[ "$scan_model" == "$old_model" ]]; then
+        old_name="$name"
+        break
+      fi
+    done < <(list_managed_containers)
+    [[ -n "$old_name" ]] || die "Cannot replace LiteLLM main safely" \
+      "Current main vllm/${old_model} has no live managed container"
+
+    if [[ "$old_model" == "$target_model" && "${force:-0}" != "1" ]]; then
+      run_publish_main "$target_model"
+      return 0
+    fi
+
+    old_definition=$(alias_capture_definition "$old_name" "$old_model") || \
+      die "Cannot capture the current main model before stopping it"
+    info "Stopping current LiteLLM main '${old_model}' before checking capacity for '${target_model}'"
+    SPARK_SKIP_GATEWAY_REFRESH=1 stop_one_container "$old_name" || \
+      die "Could not stop current main model '${old_model}'"
+  fi
+
+  if [[ -z "$old_definition" ]]; then
+    SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm
+    run_publish_main "$target_model"
+    return 0
+  fi
+
+  # Run in a subshell because backend failures call die/exit. This lets the
+  # parent restore the captured launch without losing the original shell.
+  if (SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm && run_publish_main "$target_model"); then
+    return 0
+  fi
+
+  if rollback_main_vllm "$old_definition" "$old_model" "$old_config" "$gateway_was_running"; then
+    die "Could not replace LiteLLM main with ${target_model}" \
+      "The previous main model was restored."
+  fi
+  die "Could not replace LiteLLM main with ${target_model}" \
+    "The previous main model is unavailable; start it with: spark run ${old_model} --main"
+}
+
+run_publish_main() {
+  local model="$1" config old_config port name running rest
+  config=$(gateway_load_config)
+  old_config="$config"
+
+  if [[ "$BACKEND" == "vllm" ]]; then
+    port=""
+    while IFS=$'\t' read -r name running port rest; do
+      [[ "$running" == "$model" ]] && break
+      port=""
+    done < <(list_managed_containers)
+    [[ "$port" =~ ^[0-9]+$ ]] && model_api_ready "$port" || \
+      die "Cannot publish ${model} as main: model API is not ready"
+  fi
+
+  gateway_set_main_model "$BACKEND" "$model" || \
+    die "Could not update LiteLLM main to ${model}"
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    if ! (gateway_restart); then
+      gateway_save_config "$old_config"
+      (gateway_restart) >/dev/null 2>&1 || true
+      die "Could not restart LiteLLM after publishing ${model} as main"
+    fi
+  fi
+  info "LiteLLM main now targets ${BACKEND}/${model}"
 }
 
 # --- Launch aliases ---
@@ -501,6 +644,66 @@ cmd_alias_capture() {
   info "Captured '${name}' from ${cname}"
 }
 
+run_captured_vllm_definition() {
+  local definition="$1" label="${2:-captured launch}"
+  shift 2 || true
+  local -a overrides=("$@")
+  local model port mem max_len kv_dtype tools=0 text_only=0 no_reasoning=0 dry_run=0 explain=0 tail_logs=0
+  local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" publish_main=0
+  local ALIAS_VLLM_ARGS_JSON ALIAS_VLLM_IMAGE ALIAS_VLLM_IMAGE_ID ALIAS_VLLM_ENTRYPOINT ALIAS_VLLM_ENV_JSON override_port=""
+
+  alias_validate_definition "$definition" || die "${label} has an invalid or unsafe vLLM definition"
+  [[ "$(jq -r '.kind' <<<"$definition")" == "captured-vllm" ]] \
+    || die "${label} is not a captured vLLM definition"
+  [[ "$(jq -r '.backend' <<<"$definition")" == "vllm" ]] \
+    || die "${label} does not target vLLM"
+
+  ALIAS_VLLM_ARGS_JSON=$(jq -c '.vllm_args' <<<"$definition")
+  ALIAS_VLLM_IMAGE=$(jq -r '.image // empty' <<<"$definition")
+  ALIAS_VLLM_IMAGE_ID=$(jq -r '.image_id // empty' <<<"$definition")
+  ALIAS_VLLM_ENTRYPOINT=$(jq -r 'if has("vllm_entrypoint") then .vllm_entrypoint else empty end' <<<"$definition")
+  ALIAS_VLLM_ENV_JSON=$(jq -c '.env // {}' <<<"$definition")
+  [[ -n "$ALIAS_VLLM_IMAGE" ]] || warn "${label} has no captured image; resolving the current vLLM image."
+  model=$(jq -r '.model' <<<"$definition")
+  mem=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --gpu-memory-utilization)
+  max_len=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-model-len)
+  max_num_seqs=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-num-seqs)
+  port=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --port)
+  kv_dtype=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --kv-cache-dtype)
+  # An omitted KV flag means vLLM's auto mode. Treat it as explicit here so a
+  # restart never asks an interactive question about a launch we are replaying.
+  [[ -n "$kv_dtype" ]] || kv_dtype="auto"
+  alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enforce-eager && enforce_eager_flag=1
+  alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --speculative-config && mtp_flag=1
+  alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enable-auto-tool-choice && tools=1
+  alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --limit-mm-per-prompt && text_only=1
+
+  set -- "${overrides[@]}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --explain) explain=1; dry_run=1; shift ;;
+      --force) force=1; shift ;;
+      --port) [[ $# -ge 2 ]] || die "Missing value for --port"; override_port="$2"; shift 2 ;;
+      --tail) tail_logs=1; shift ;;
+      --no-wait) no_wait=1; shift ;;
+      --main) publish_main=1; shift ;;
+      *) die "Unsupported captured-launch override: $1" ;;
+    esac
+  done
+  if [[ -n "$override_port" ]]; then
+    port="$override_port"
+    ALIAS_VLLM_ARGS_JSON=$(alias_vllm_set_value_json "$ALIAS_VLLM_ARGS_JSON" --port "$port") \
+      || die "Captured launch has an invalid --port argument"
+  fi
+  validate_model_ref_for_backend "$model"
+  if [[ "$publish_main" == "1" ]]; then
+    run_main_replacement_vllm "$model"
+  else
+    run_backend_vllm
+  fi
+}
+
 cmd_alias_run() {
   local name="$1" definition backend kind
   shift
@@ -524,44 +727,8 @@ cmd_alias_run() {
     captured-vllm)
       [[ "$BACKEND" == "vllm" ]] || die "Alias '${name}' captures a vLLM launch; this machine uses ${BACKEND}" \
         "Create or edit an alias for this backend: spark alias edit ${name}"
-      local model port mem max_len kv_dtype tools=0 text_only=0 no_reasoning=0 dry_run=0 explain=0 tail_logs=0
-      local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto"
-      local ALIAS_VLLM_ARGS_JSON ALIAS_VLLM_IMAGE ALIAS_VLLM_IMAGE_ID ALIAS_VLLM_ENTRYPOINT ALIAS_VLLM_ENV_JSON override_port=""
-      ALIAS_VLLM_ARGS_JSON=$(jq -c '.vllm_args' <<<"$definition")
-      ALIAS_VLLM_IMAGE=$(jq -r '.image // empty' <<<"$definition")
-      ALIAS_VLLM_IMAGE_ID=$(jq -r '.image_id // empty' <<<"$definition")
-      ALIAS_VLLM_ENTRYPOINT=$(jq -r 'if has("vllm_entrypoint") then .vllm_entrypoint else empty end' <<<"$definition")
-      ALIAS_VLLM_ENV_JSON=$(jq -c '.env // {}' <<<"$definition")
-      [[ -n "$ALIAS_VLLM_IMAGE" ]] || warn "Alias '${name}' predates image capture; resolving the current vLLM image."
-      model=$(jq -r '.model' <<<"$definition")
-      mem=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --gpu-memory-utilization)
-      max_len=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-model-len)
-      max_num_seqs=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --max-num-seqs)
-      port=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --port)
-      kv_dtype=$(alias_vllm_value "$ALIAS_VLLM_ARGS_JSON" --kv-cache-dtype)
-      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enforce-eager && enforce_eager_flag=1
-      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --speculative-config && mtp_flag=1
-      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --enable-auto-tool-choice && tools=1
-      alias_vllm_has "$ALIAS_VLLM_ARGS_JSON" --limit-mm-per-prompt && text_only=1
-      set -- "${overrides[@]}"
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --dry-run) dry_run=1; shift ;;
-          --explain) explain=1; dry_run=1; shift ;;
-          --force) force=1; shift ;;
-          --port) [[ $# -ge 2 ]] || die "Missing value for --port"; override_port="$2"; shift 2 ;;
-          --tail) tail_logs=1; shift ;;
-          --no-wait) no_wait=1; shift ;;
-          *) die "Unsupported alias override: $1" ;;
-        esac
-      done
-      if [[ -n "$override_port" ]]; then
-        port="$override_port"
-        ALIAS_VLLM_ARGS_JSON=$(alias_vllm_set_value_json "$ALIAS_VLLM_ARGS_JSON" --port "$port") \
-          || die "Captured alias has an invalid --port argument"
-      fi
-      validate_model_ref_for_backend "$model"
-      run_backend_vllm
+      # The captured path shares the same centralized run_backend_vllm launcher.
+      run_captured_vllm_definition "$definition" "Alias '${name}'" "${overrides[@]}"
       ;;
     bundle)
       [[ "$BACKEND" == "vllm" ]] || die "Alias '${name}' captures a vLLM bundle; this machine uses ${BACKEND}"
@@ -1064,8 +1231,11 @@ await_startup() {
       oom=$(docker inspect -f '{{.State.OOMKilled}}' "$cname" 2>/dev/null || echo "false")
       logs=$(docker logs --tail 80 "$cname" 2>&1 || true)
       [[ "$oom" == "true" ]] && { printf 'exit:oom\n'; return 0; }
-      n=$(printf '%s' "$logs" | grep -oiE 'max_num_seqs to at most [0-9]+' | grep -oE '[0-9]+' | head -1)
-      if [[ -z "$n" ]] && printf '%s' "$logs" | grep -qiE 'mamba cache blocks|exceeds available .*cache blocks'; then
+      if grep -qiE 'No available memory for (the )?cache blocks|Available KV cache memory:[[:space:]]*-' <<< "$logs"; then
+        printf 'exit:kv-memory\n'; return 0
+      fi
+      n=$(grep -oiE 'max_num_seqs to at most [0-9]+' <<< "$logs" | grep -oE '[0-9]+' | head -1)
+      if [[ -z "$n" ]] && grep -qiE 'mamba cache blocks|exceeds available .*cache blocks' <<< "$logs"; then
         n=64   # pattern matched but no number parsed — conservative fallback
       fi
       [[ -n "$n" ]] && { printf 'exit:mamba:%s\n' "$n"; return 0; }
@@ -1307,7 +1477,8 @@ run_backend_vllm() {
 
   # Supervised adaptive launch: start the container, wait until it serves, and auto-retry
   # recoverable startup failures. Levers: lower $seqs (concurrency) for cache-block errors;
-  # flip $enforce_eager (removes the torch.compile/CUDA-graph startup peak) on a warmup OOM.
+  # raise the vLLM memory fraction when multimodal profiling leaves no KV reservation; flip
+  # $enforce_eager (removes the torch.compile/CUDA-graph startup peak) on a warmup OOM.
   local attempt=0 serve_state="nowait"
   while : ; do
     docker rm -f "$cname" >/dev/null 2>&1 || true
@@ -1353,6 +1524,28 @@ run_backend_vllm() {
         err "vLLM couldn't start within the concurrency this size allows."
         docker logs --tail 15 "$cname" 2>&1 | sed 's/^/    /'
         exit 1 ;;
+      exit:kv-memory)
+        local next_util next_need retry_reserved retry_free
+        next_util=$(awk -v u="$GPU_MEM_UTIL" 'BEGIN { n=u+0.15; if(n>0.95)n=0.95; printf "%.2f", n }')
+        next_need=$(awk -v u="$next_util" -v t="$TOTAL_MEM_GB" 'BEGIN { printf "%.1f", u*t }')
+        retry_reserved=$(reserved_budget_gb "$cname")
+        retry_free=$(effective_free_gb "$retry_reserved")
+        if [[ "$attempt" -lt "$STARTUP_MAX_RETRIES" && -z "$mem" && "$next_util" != "$GPU_MEM_UTIL" ]] &&
+            awk -v n="$next_need" -v f="$retry_free" 'BEGIN { exit !(n <= f) }'; then
+          attempt=$((attempt + 1))
+          GPU_MEM_UTIL="$next_util"
+          NEED_GB="$next_need"
+          info "KV cache reservation too small — retrying with --gpu-memory-utilization ${next_util}."
+          build_launch
+          continue
+        fi
+        err "vLLM could not reserve KV cache memory for ${model}."
+        if [[ -n "$mem" ]]; then
+          printf "    Raise --mem above %s, reduce --max-len, or use --text-only.\n" "$GPU_MEM_UTIL"
+        else
+          printf "    Free memory, reduce --max-len, or use --text-only for a multimodal model.\n"
+        fi
+        exit 1 ;;
       exit:oom)
         # The startup peak (torch.compile + CUDA-graph capture) overflowed the container cap. The
         # principled fix is --enforce-eager: it removes that peak entirely (no graph capture).
@@ -1391,7 +1584,8 @@ run_backend_vllm() {
   esac
 
   # Auto-restart gateway if running so it picks up the new model
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != "1" ]] && \
+      docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     gateway_restart
   fi
 
@@ -1634,7 +1828,8 @@ gateway_enable_ollama() {
   config=$(gateway_load_config)
   config=$(printf '%s' "$config" | jq '.providers.ollama.enabled = true' 2>/dev/null) || return 0
   gateway_save_config "$config"
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != "1" ]] && \
+      docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     gateway_restart
   fi
 }
@@ -2297,7 +2492,7 @@ print_workspace_overview() {
   n8n_url=$(workspace_read_env N8N_URL 2>/dev/null || true)
   hermes_url=$(workspace_read_env HERMES_URL 2>/dev/null || true)
   mode=$(workspace_read_env WORKSPACE_TAILSCALE_MODE 2>/dev/null || true)
-  model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
+  model=$(workspace_main_model 2>/dev/null || true)
   dashboard_row ok "workspace" "configured (${mode:-unknown} mode)"
   dashboard_row ok "Hermes model" "${model:-unset}"
   dashboard_row ok "$(workspace_task_manager_label "$task_manager")" "${task_url:-unset}"

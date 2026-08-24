@@ -4,17 +4,26 @@
 # remote one over SSH); every step below runs against the chosen target via ctx_*, so a
 # server receives the exact same software whether it is configured locally or remotely.
 
-# Write controller stdin to a root-owned file on the target.
+# Write controller stdin to a root-owned file on the target. Stage the content first so sudo
+# authentication and file content never share stdin: a cached sudo ticket may not consume the
+# password line, which would otherwise make tee write that password into the destination.
 ctx_sudo_write() {  # $1 = path; reads file content from stdin
-  ensure_sudo_pw
-  if [[ -z "$SUDO_PW" ]]; then
-    if [[ "$SETUP_TARGET" == "remote" ]]; then remote_in "sudo -n tee $1 >/dev/null"; else sudo -n tee "$1" >/dev/null; fi
-  elif [[ "$SETUP_TARGET" == "remote" ]]; then
-    # sudo -S eats the first stdin line (the password); tee gets the rest (the content).
-    { printf '%s\n' "$SUDO_PW"; cat; } | remote_in "sudo -S -p '' tee $1 >/dev/null"
+  local path="$1" tmp q_tmp q_path rc=0
+  tmp=$(ctx_run 'umask 077; mktemp /tmp/spark-sudo-write.XXXXXX') || return 1
+  [[ "$tmp" == /tmp/spark-sudo-write.* && "$tmp" != *$'\n'* ]] || return 1
+  printf -v q_tmp '%q' "$tmp"
+  printf -v q_path '%q' "$path"
+
+  if [[ "$SETUP_TARGET" == "remote" ]]; then
+    remote_in "umask 077; cat > $q_tmp" || rc=1
   else
-    { printf '%s\n' "$SUDO_PW"; cat; } | sudo -S -p '' tee "$1" >/dev/null
+    cat > "$tmp" || rc=1
   fi
+  if [[ "$rc" -eq 0 ]]; then
+    ctx_sudo "install -o root -g root -m 0644 -- $q_tmp $q_path" || rc=1
+  fi
+  ctx_run "rm -f -- $q_tmp" >/dev/null 2>&1 || true
+  return "$rc"
 }
 
 # --- Install steps (shared across local/remote) ---
@@ -269,7 +278,7 @@ step_tailscale() {
 tailscale_funnel_status_active() {
   command -v tailscale >/dev/null 2>&1 || return 1
   tailscale status >/dev/null 2>&1 || return 1
-  tailscale funnel status 2>/dev/null | grep -qE 'https?://'
+  tailscale funnel status 2>/dev/null | grep -qE '\(Funnel on\)|(^|[[:space:]#])Funnel on:|Available on the internet:'
 }
 
 tailscale_funnel_show_status() {
@@ -338,13 +347,13 @@ step_tailscale_funnel() {
   local auto_yes="$1" check_only="$2" action="${3:-}" choice
   tailscale_funnel_action_valid "$action" || die "--funnel-action must be reset or abort"
   ctx_run 'command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1' >/dev/null 2>&1 || return 0
-  ctx_run "tailscale funnel status 2>/dev/null | grep -qE 'https?://'" >/dev/null 2>&1 || return 0
+  ctx_run "tailscale funnel status 2>/dev/null | grep -qE '\\(Funnel on\\)|(^|[[:space:]#])Funnel on:|Available on the internet:'" >/dev/null 2>&1 || return 0
   if [[ "$check_only" == "1" ]]; then
     setup_fail "Tailscale Funnel is active; public internet exposure must be removed"
     return 1
   fi
   if [[ "$action" == "reset" ]]; then
-    if ctx_run 'tailscale funnel reset' && ! ctx_run "tailscale funnel status 2>/dev/null | grep -qE 'https?://'" >/dev/null 2>&1; then
+    if ctx_run 'tailscale funnel reset' && ! ctx_run "tailscale funnel status 2>/dev/null | grep -qE '\\(Funnel on\\)|(^|[[:space:]#])Funnel on:|Available on the internet:'" >/dev/null 2>&1; then
       info "Tailscale Funnel reset"
       return 0
     fi
@@ -368,7 +377,7 @@ step_tailscale_funnel() {
     read -r choice || true
     case "$choice" in
       1)
-        if ctx_run 'tailscale funnel reset' && ! ctx_run "tailscale funnel status 2>/dev/null | grep -qE 'https?://'" >/dev/null 2>&1; then
+        if ctx_run 'tailscale funnel reset' && ! ctx_run "tailscale funnel status 2>/dev/null | grep -qE '\\(Funnel on\\)|(^|[[:space:]#])Funnel on:|Available on the internet:'" >/dev/null 2>&1; then
           info "Tailscale Funnel reset"
           return 0
         fi
@@ -476,19 +485,18 @@ step_gateway() {
 #   2) early-OOM (earlyoom) kills the offending model early, before the kernel OOM-cascade.
 #   3) control-plane protection: MemoryMin + OOMScoreAdjust=-1000 on sshd/dbus/tailscaled/logind/
 #      resolved so the OOM killer can only hit the model, never the services you need to recover.
-# earlyoom is the emergency backstop. Declarative: reconciles to '-m $EARLYOOM_MIN_FREE_PCT
-# -s $EARLYOOM_MIN_SWAP_PCT' regardless of any old/divergent config (e.g. a -m 8 / -s 100 left from
-# experiments). The -s threshold is LOW on purpose: earlyoom kills only when free RAM AND free swap
-# are both nearly gone — so a legitimate load can borrow swap for its peak without being killed,
-# while a true runaway (RAM + swap exhausted) still gets killed early.
+# earlyoom is the emergency backstop. It requires BOTH the RAM and swap thresholds. Setting -s 100
+# makes the swap condition always eligible, so -m is an effective RAM-pressure trigger even when
+# unified-memory GPU allocations cannot be reclaimed into otherwise-empty swap.
 step_earlyoom() {
-  local auto_yes="$1" check_only="$2" want="$EARLYOOM_MIN_FREE_PCT" wsw="$EARLYOOM_MIN_SWAP_PCT" installed=0 active=0 cur_m cur_s
+  local auto_yes="$1" check_only="$2" want="$EARLYOOM_MIN_FREE_PCT" wsw="$EARLYOOM_MIN_SWAP_PCT" installed=0 active=0 cur_m cur_s config_lines
   local ef="${EARLYOOM_DEFAULT_FILE:-/etc/default/earlyoom}"
   ctx_run 'command -v earlyoom >/dev/null 2>&1' && installed=1
   ctx_run 'systemctl is-active --quiet earlyoom' && active=1
   cur_m="$(ctx_run "grep -oE -- '-m[ =][0-9]+' '$ef' 2>/dev/null | grep -oE '[0-9]+' | head -1")"
   cur_s="$(ctx_run "grep -oE -- '-s[ =][0-9]+' '$ef' 2>/dev/null | grep -oE '[0-9]+' | head -1")"
-  if [[ "$installed" == "1" && "$active" == "1" && "$cur_m" == "$want" && "$cur_s" == "$wsw" ]]; then
+  config_lines="$(ctx_run "awk 'END {print NR}' '$ef' 2>/dev/null" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "$installed" == "1" && "$active" == "1" && "$cur_m" == "$want" && "$cur_s" == "$wsw" && "$config_lines" == "1" ]]; then
     info "early-OOM: earlyoom active (-m ${want}% -s ${wsw}%, reclaim-protected backstop)"
     return 0
   fi
@@ -499,8 +507,8 @@ step_earlyoom() {
   fi
   printf "    ${DIM}What: install/configure 'earlyoom' (-m ${want}%% -s ${wsw}%%): kill the memory hog when RAM is low.\n"
   printf "    Why: it kills the offending model EARLY, before the machine bogs down and locks you out.\n"
-  printf "    The low -s lets a legitimate model LOAD borrow swap for its peak without being killed; it\n"
-  printf "    only fires when RAM and swap are both nearly gone (a real runaway).${NC}\n"
+  printf "    Swap does not gate this backstop: unified-memory GPU allocations may not be reclaimable\n"
+  printf "    even while most swap is free.${NC}\n"
   if [[ "$auto_yes" == "1" ]] || confirm "Install/repair earlyoom at -m ${want}% -s ${wsw}%?"; then
     if [[ "$installed" != "1" ]] && ! ctx_sudo 'apt-get update >/dev/null 2>&1 && apt-get install -y earlyoom >/dev/null 2>&1'; then
       setup_fail "Could not install earlyoom (apt)"; return 0
@@ -710,11 +718,12 @@ swap_activate_existing_file() {
 
 step_swap_ensure() {
   local auto_yes="$1" check_only="$2" sf="/swapfile.spark"
-  local cur_sw total_mib total_source total_diag target_mib size_mib used_mib active gap_mib desired_mib next_action
+  local cur_sw total_mib total_source total_diag target_mib size_mib used_mib active gap_mib desired_mib next_action sysctl_failed=0
   cur_sw="$(swap_cur_swappiness)"
+  ctx_run 'systemctl is-failed --quiet systemd-sysctl.service 2>/dev/null' && sysctl_failed=1
   swap_read_total total_mib total_source total_diag
   target_mib="$(swap_target_mib)"
-  if swap_total_satisfies_target "$total_mib" "$target_mib" && [[ "$cur_sw" == "$SWAPPINESS" ]]; then
+  if swap_total_satisfies_target "$total_mib" "$target_mib" && [[ "$cur_sw" == "$SWAPPINESS" && "$sysctl_failed" == "0" ]]; then
     info "Swap: on (${total_mib}MiB total) $(swap_total_context "$total_source" "$total_diag") + swappiness=${SWAPPINESS} (absorbs load peaks; runtime stays in RAM)"
     return 0
   fi
@@ -722,7 +731,12 @@ step_swap_ensure() {
     if ! swap_total_satisfies_target "$total_mib" "$target_mib"; then
       setup_fail "Swap too small (${total_mib}MiB $(swap_total_context "$total_source" "$total_diag"), want ≥${target_mib}MiB) — large-model loads need it for their transient peak"
     fi
-    [[ "$cur_sw" != "$SWAPPINESS" ]] && setup_fail "vm.swappiness=${cur_sw:-?} (want ${SWAPPINESS}) — runtime may swap the working set"
+    if [[ "$cur_sw" != "$SWAPPINESS" ]]; then
+      setup_fail "vm.swappiness=${cur_sw:-?} (want ${SWAPPINESS}) — runtime may swap the working set"
+    fi
+    if [[ "$sysctl_failed" == "1" ]]; then
+      setup_fail "systemd-sysctl failed — rewrite /etc/sysctl.d/99-spark.conf and reload kernel settings"
+    fi
     return 0
   fi
   printf "    ${DIM}What: ensure ≥${SWAP_PROVISION_GB}G of swap (top up with ${sf} if needed) + vm.swappiness=${SWAPPINESS}.\n"
@@ -761,9 +775,9 @@ step_swap_ensure() {
         return 0
       fi
     fi
-    if [[ "$cur_sw" != "$SWAPPINESS" ]]; then
+    if [[ "$cur_sw" != "$SWAPPINESS" || "$sysctl_failed" == "1" ]]; then
       printf 'vm.swappiness=%s\n' "$SWAPPINESS" | ctx_sudo_write /etc/sysctl.d/99-spark.conf
-      if ! ctx_sudo "sysctl --system >/dev/null 2>&1 || sysctl -w vm.swappiness=${SWAPPINESS} >/dev/null"; then
+      if ! ctx_sudo "systemctl restart systemd-sysctl.service >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || sysctl -w vm.swappiness=${SWAPPINESS} >/dev/null"; then
         swap_fail_reconcile "$total_mib" "$target_mib" "$cur_sw" "$sf" "apply vm.swappiness=${SWAPPINESS}" "$total_source" "$total_diag"
         return 0
       fi
@@ -1091,6 +1105,194 @@ setup_summary() {
     printf "  Start one:  ${BOLD}spark run <model>${NC}\n"
     printf "  Gateway:    ${BOLD}http://localhost:%s/v1${NC}\n\n" "$GATEWAY_PORT"
   fi
+}
+
+model_server_state() {
+  local model="$1" name m rest running=0 route_ok=0
+  while IFS=$'\t' read -r name m rest; do
+    [[ "$m" == "$model" ]] && running=1
+  done < <(list_managed_containers)
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    route_ok=1
+  fi
+  if [[ "$running" == "1" && "$route_ok" == "1" ]]; then printf 'running+routed'
+  elif [[ "$running" == "1" ]]; then printf 'running'
+  else printf 'stopped'; fi
+}
+
+model_server_tool_calling_ready() {
+  local model="$1" container args parser profile_file expected=""
+  [[ "$BACKEND" == "vllm" ]] || return 0
+  [[ -n "$model" ]] || return 1
+  container=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  args=$(docker inspect -f '{{json .Config.Cmd}}' "$container" 2>/dev/null || true)
+  parser=$(printf '%s\n' "$args" | jq -er '
+    if type == "array" and index("--enable-auto-tool-choice") != null then
+      index("--tool-call-parser") as $i |
+      if $i != null and ($i + 1) < length then .[$i + 1] else empty end
+    else empty end
+  ' 2>/dev/null) || return 1
+  [[ -n "$parser" ]] || return 1
+  profile_file="${PROFILES_DIR}/$(printf '%s' "$model" | sed 's/\//--/g').json"
+  if [[ -f "$profile_file" ]]; then
+    expected=$(jq -r '
+      if .hf.raw.model_type == "qwen3_5" then "qwen3_coder"
+      else (.tool_call_parser // "") end
+    ' "$profile_file" 2>/dev/null || true)
+  fi
+  [[ -z "$expected" || "$parser" == "$expected" ]]
+}
+
+model_server_context_ready() {
+  local model="$1" minimum="$2" container max_len
+  [[ "$BACKEND" == "vllm" ]] || return 0
+  container=$(container_for_ref "$model" 2>/dev/null || true)
+  [[ -n "$container" ]] || return 1
+  max_len=$(docker inspect -f '{{index .Config.Labels "spark.max_model_len"}}' "$container" 2>/dev/null || true)
+  [[ "$max_len" =~ ^[0-9]+$ && "$max_len" -ge "$minimum" ]]
+}
+
+model_server_ensure_gateway_config() {
+  local check_only="$1" provider="$2" gw_json
+  [[ -f "$GATEWAY_CONFIG" ]] && return 0
+  if [[ "$check_only" == "1" ]]; then
+    err "LiteLLM gateway is not configured"
+    printf "    Run: spark setup\n"
+    return 1
+  fi
+  gw_json=$(jq -n --argjson port "$GATEWAY_PORT" \
+    --argjson vllm_en "$( [[ "$provider" == "vllm" ]] && echo true || echo false )" \
+    --argjson ollama_en "$( [[ "$provider" == "ollama" ]] && echo true || echo false )" \
+    '{enabled:true, port:$port, providers:{
+      vllm:{enabled:$vllm_en, port:8000},
+      ollama:{enabled:$ollama_en},
+      openrouter:{enabled:false, api_key:""},
+      zen:{enabled:false, api_key:""},
+      together:{enabled:false, api_key:""}
+    }}') || return 1
+  gateway_save_config "$gw_json"
+  info "Configured LiteLLM gateway"
+}
+
+model_server_resolve_repair_model() {
+  local requested="${1:-}" configured="" name model port rest count=0 only=""
+  [[ -n "$requested" ]] && { printf '%s\n' "$requested"; return 0; }
+  if [[ -f "$GATEWAY_CONFIG" ]]; then
+    configured=$(jq -r '.main.model // ""' "$GATEWAY_CONFIG" 2>/dev/null || true)
+  fi
+  [[ -n "$configured" ]] && { printf '%s\n' "$configured"; return 0; }
+  while IFS=$'\t' read -r name model port rest; do
+    [[ -n "$model" ]] || continue
+    count=$((count + 1)); only="$model"
+  done < <(list_managed_containers)
+  [[ "$count" -eq 1 ]] && printf '%s\n' "$only"
+}
+
+model_server_repair() {
+  local check_only="$1" auto_yes="$2" model="$3" require_tools="$4" minimum_context="$5" disable_mtp="$6"
+  local provider="vllm" state restart=0 configured_provider configured_model args=("$model")
+  [[ "$BACKEND" == "ollama" ]] && provider="ollama"
+  model_server_ensure_gateway_config "$check_only" "$provider" || return 1
+  state=$(model_server_state "$model")
+  [[ "$disable_mtp" == "1" ]] && args+=(--no-mtp)
+  [[ "$require_tools" == "1" ]] && args+=(--tools)
+  [[ -n "$minimum_context" ]] && args+=(--max-len "$minimum_context")
+
+  if [[ "$state" == *"running"* ]]; then
+    [[ "$require_tools" == "1" ]] && ! model_server_tool_calling_ready "$model" && restart=1
+    [[ -n "$minimum_context" ]] && ! model_server_context_ready "$model" "$minimum_context" && restart=1
+    if [[ "$restart" == "1" ]]; then
+      if [[ "$check_only" == "1" ]]; then
+        err "Running model does not satisfy the requested repair policy: ${model}"
+        return 1
+      fi
+      info "Restarting ${model} with the requested model-server policy"
+      cmd_run "${args[@]}" --force
+    fi
+  else
+    if [[ "$check_only" == "1" ]]; then
+      err "Model is not running: ${model}"
+      return 1
+    fi
+    if [[ "$auto_yes" != "1" ]] && ! confirm "Start ${model} now?"; then
+      return 1
+    fi
+    if [[ "${SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL:-}" == "$model" && \
+          -n "${SPARK_WORKSPACE_RESTART_VLLM_DEFINITION:-}" ]]; then
+      run_captured_vllm_definition "$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION" \
+        "workspace restart" --force
+    else
+      cmd_run "${args[@]}"
+    fi
+  fi
+
+  if [[ "$check_only" == "1" ]]; then
+    configured_provider=$(jq -r '.main.provider // ""' "$GATEWAY_CONFIG" 2>/dev/null || true)
+    configured_model=$(jq -r '.main.model // ""' "$GATEWAY_CONFIG" 2>/dev/null || true)
+    [[ "$configured_provider" == "$provider" && "$configured_model" == "$model" ]] || {
+      err "LiteLLM main does not target ${provider}/${model}"
+      return 1
+    }
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$" || {
+      err "LiteLLM gateway is not running"
+      return 1
+    }
+    gateway_rendered_config_ready || {
+      err "LiteLLM rendered configuration is stale"
+      return 1
+    }
+    return 0
+  fi
+
+  gateway_set_main_model "$provider" "$model" || {
+    err "Could not select LiteLLM main model"
+    return 1
+  }
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
+    if ! gateway_rendered_config_ready; then
+      info "Refreshing LiteLLM main route"
+      gateway_restart || { err "Could not refresh LiteLLM gateway"; return 1; }
+    else
+      info "LiteLLM gateway: running"
+    fi
+  else
+    if [[ "$auto_yes" != "1" ]] && ! confirm "Start the LiteLLM gateway now?"; then
+      return 1
+    fi
+    gateway_start || { err "Could not start LiteLLM gateway"; return 1; }
+  fi
+}
+
+cmd_repair_help() {
+  cat <<EOF
+
+  ${BOLD}Usage:${NC} spark repair [--model MODEL] [--yes] [--check] [--tools] [--max-len TOKENS] [--no-mtp]
+
+  Repairs the model server created by spark setup: the selected model, LiteLLM,
+  and the static main route. It never repairs the agent workspace.
+
+EOF
+}
+
+cmd_repair() {
+  local auto_yes=0 check_only=0 model="" require_tools=0 minimum_context="" disable_mtp=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes) auto_yes=1; shift ;;
+      --check) check_only=1; shift ;;
+      --model) model="${2:-}"; [[ -n "$model" ]] || die "--model requires a value"; shift 2 ;;
+      --tools) require_tools=1; shift ;;
+      --max-len) minimum_context="${2:-}"; is_positive_int "$minimum_context" || die "--max-len requires a positive integer"; shift 2 ;;
+      --no-mtp) disable_mtp=1; shift ;;
+      -h|--help) cmd_repair_help; return 0 ;;
+      *) die "Unknown repair flag: $1" ;;
+    esac
+  done
+  model=$(model_server_resolve_repair_model "$model")
+  [[ -n "$model" ]] || die "No model selected for repair" "Use: spark repair --model ORG/MODEL"
+  printf "\n  ${BOLD}spark repair${NC} — model server\n\n"
+  model_server_repair "$check_only" "$auto_yes" "$model" "$require_tools" "$minimum_context" "$disable_mtp"
 }
 
 cmd_setup_help() {

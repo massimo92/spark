@@ -9,7 +9,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.1.91"
+VERSION="0.1.109"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -27,6 +27,7 @@ ALIASES_FILE="${SPARK_CONFIG_DIR}/aliases.json"
 ALIASES_BACKUP_FILE="${SPARK_CONFIG_DIR}/aliases.backup.json"
 BUNDLES_DIR="${SPARK_DATA_DIR}/bundles"
 UPDATE_FILE="${SPARK_CONFIG_DIR}/update.json"
+HERMES_SETTINGS_FILE="${SPARK_CONFIG_DIR}/hermes.json"
 GITHUB_REPO="massimo92/spark"
 DEFAULT_PORT=8000
 HF_CACHE_DIR="${HOME}/.cache/huggingface"
@@ -60,6 +61,7 @@ WORKSPACE_VIKUNJA_CONTAINER="workspace-vikunja"
 WORKSPACE_SUPERSYNC_CONTAINER="workspace-supersync"
 WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_CONTAINER="workspace-super-productivity-electron"
 WORKSPACE_N8N_CONTAINER="workspace-n8n"
+WORKSPACE_N8N_HERMES_FOLDER_NAME="Hermes"
 WORKSPACE_HERMES_CONTAINER="workspace-hermes"
 WORKSPACE_VIKUNJA_PORT=3456
 WORKSPACE_TASK_MANAGER_PORT=3456
@@ -69,7 +71,9 @@ WORKSPACE_HERMES_PORT=18789
 WORKSPACE_HERMES_LOCAL_PORT=8642
 WORKSPACE_HERMES_TAILSCALE_PROXY_PORT=18790
 WORKSPACE_HERMES_TAILSCALE_PROXY_CONTAINER="spark-hermes-dashboard-proxy"
-WORKSPACE_HERMES_MIN_CONTEXT=65536
+WORKSPACE_HERMES_CONTEXT_DEFAULT=65536
+WORKSPACE_HERMES_CONTEXT_MODE_DEFAULT="custom"
+WORKSPACE_HERMES_WEB_PROVIDER="ddgs"
 WORKSPACE_HERMES_MAX_TOKENS_DEFAULT=512
 WORKSPACE_HERMES_REASONING_EFFORT_DEFAULT="none"
 WORKSPACE_HERMES_CLI_TOOLSETS_DEFAULT="terminal file web skills memory todo cronjob delegation"
@@ -212,16 +216,17 @@ CALIBRATE_CUDAGRAPH="${SPARK_CALIBRATE_CUDAGRAPH:-1}"
 # --max-num-seqs when you need more concurrency (uses more memory).
 MAX_NUM_SEQS_DEFAULT="${SPARK_MAX_NUM_SEQS:-5}"
 # Adaptive startup supervision: wait until the model serves; auto-retry recoverable startup failures
-# (concurrency too high for the cache → lower --max-num-seqs; warmup OOM → --enforce-eager).
+# (concurrency too high for the cache → lower --max-num-seqs; insufficient KV
+# reservation → raise the memory fraction; warmup OOM → --enforce-eager).
 STARTUP_TIMEOUT="${SPARK_STARTUP_TIMEOUT:-600}"          # seconds to wait for the API to come up
 STARTUP_MAX_RETRIES="${SPARK_STARTUP_MAX_RETRIES:-2}"    # auto-retries on a recoverable failure
 # earlyoom's emergency floor: kill the hog when free RAM drops below this %. The last-resort backstop
 # (the cgroup cap + admission keep normal operation far from it). spark setup configures earlyoom here.
 EARLYOOM_MIN_FREE_PCT="${SPARK_EARLYOOM_MIN_FREE_PCT:-5}"
-# earlyoom only fires when BOTH free RAM < -m AND free swap < -s. Keeping this LOW (not 100) is what
-# lets a legitimate model LOAD borrow swap for its transient peak without being killed — earlyoom
-# only acts when swap is also nearly exhausted (a real runaway, not a load spike).
-EARLYOOM_MIN_SWAP_PCT="${SPARK_EARLYOOM_MIN_SWAP_PCT:-10}"
+# earlyoom requires BOTH free RAM < -m and free swap < -s. At 100, swap never gates the RAM-pressure
+# trigger. This matters on unified-memory GPUs: their allocations may be unreclaimable even with
+# nearly all swap free.
+EARLYOOM_MIN_SWAP_PCT="${SPARK_EARLYOOM_MIN_SWAP_PCT:-100}"
 # Swap is KEPT ON (not disabled): it absorbs the one-time load-time peak of large models (the loader
 # transiently needs ~2x the weights) and is a cushion before the OOM killer. Runtime thrash is avoided
 # by a LOW swappiness + admission (one model fits in RAM), not by removing swap. If the box has no

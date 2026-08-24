@@ -21,6 +21,7 @@ main() {
     logs)         shift; cmd_logs "$@" ;;
     doctor)       shift; cmd_doctor "$@" ;;
     setup)        shift; cmd_setup "$@" ;;
+    repair)       shift; cmd_repair "$@" ;;
     ws)           shift; cmd_workspace "$@" ;;
     update)       shift; cmd_update "$@" ;;
     gateway)      shift; cmd_gateway "$@" ;;

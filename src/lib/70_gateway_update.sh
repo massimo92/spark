@@ -17,6 +17,22 @@ save_update_config() {
   fi
 }
 
+save_hermes_context_config() {
+  local mode="$1" length="${2:-}" tmp
+  command -v jq >/dev/null 2>&1 || die "jq is required to save Hermes settings"
+  mkdir -p "$SPARK_CONFIG_DIR"
+  chmod 700 "$SPARK_CONFIG_DIR" 2>/dev/null || true
+  tmp="${HERMES_SETTINGS_FILE}.tmp"
+  if [[ -n "$length" ]]; then
+    jq -n --arg mode "$mode" --argjson length "$length" \
+      '{mode: $mode, length: $length}' > "$tmp"
+  else
+    jq -n --arg mode "$mode" '{mode: $mode}' > "$tmp"
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$HERMES_SETTINGS_FILE"
+}
+
 # --- Gateway Config ---
 gateway_load_config() {
   if [[ -f "$GATEWAY_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
@@ -37,6 +53,22 @@ gateway_save_config() {
   umask "$old_umask"
 }
 
+gateway_set_main_model() {
+  local provider="$1" model="$2" config updated
+  config=$(gateway_load_config)
+  updated=$(printf '%s\n' "$config" | jq --arg provider "$provider" --arg model "$model" \
+    '.main = {provider: $provider, model: $model}') || return 1
+  [[ "$updated" == "$config" ]] || gateway_save_config "$updated"
+}
+
+gateway_rendered_config_ready() {
+  local path="${SPARK_CONFIG_DIR}/litellm_config.yaml" expected current
+  [[ -f "$path" ]] || return 1
+  expected=$(gateway_generate_litellm_yaml) || return 1
+  current=$(cat "$path" 2>/dev/null || true)
+  [[ -n "$expected" && "$current" == "$expected" ]]
+}
+
 gateway_provider_enabled() {
   local provider="$1"
   local config
@@ -54,8 +86,10 @@ gateway_get_api_key() {
 gateway_generate_litellm_yaml() {
   local config
   config=$(gateway_load_config)
-  local vllm_port
+  local vllm_port main_provider main_model main_added=0
   vllm_port=$(echo "$config" | jq -r '.providers.vllm.port // 8000' 2>/dev/null)
+  main_provider=$(echo "$config" | jq -r '.main.provider // ""' 2>/dev/null)
+  main_model=$(echo "$config" | jq -r '.main.model // ""' 2>/dev/null)
 
   local yaml="model_list:"
   local has_models=0
@@ -63,7 +97,7 @@ gateway_generate_litellm_yaml() {
   # vLLM — one explicit entry per running model (routes to its own port),
   # plus the wildcard passthrough for backwards compatibility.
   if [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]]; then
-    local primary_port="" name model port rest
+    local primary_port="" primary_model="" main_match=0 name model port rest
     while IFS=$'\t' read -r name model port rest; do
       [[ -z "$model" ]] && continue
       yaml+="
@@ -73,10 +107,31 @@ gateway_generate_litellm_yaml() {
       api_base: \"http://localhost:${port}/v1\"
       api_key: \"dummy\""
       has_models=1
-      [[ -z "$primary_port" ]] && primary_port="$port"   # first model
-      [[ "$port" == "$vllm_port" ]] && primary_port="$port"  # prefer the default port
+      if [[ -z "$primary_port" ]]; then
+        primary_port="$port"
+        primary_model="$model"
+      fi
+      if [[ "$port" == "$vllm_port" && "$main_match" == "0" ]]; then
+        primary_port="$port"
+        primary_model="$model"
+      fi
+      if [[ "$main_provider" == "vllm" && "$model" == "$main_model" ]]; then
+        primary_port="$port"
+        primary_model="$model"
+        main_match=1
+      fi
     done < <(list_managed_containers)
     [[ -z "$primary_port" ]] && primary_port="$vllm_port"
+
+    if [[ -n "$primary_model" ]]; then
+      yaml+="
+  - model_name: \"main\"
+    litellm_params:
+      model: \"openai/${primary_model}\"
+      api_base: \"http://localhost:${primary_port}/v1\"
+      api_key: \"dummy\""
+      main_added=1
+    fi
 
     yaml+="
   - model_name: \"vllm/*\"
@@ -109,6 +164,14 @@ gateway_generate_litellm_yaml() {
       model: \"ollama_chat/*\"
       api_base: \"http://${ollama_host}:11434\""
     has_models=1
+    if [[ "$main_added" == "0" && "$main_provider" == "ollama" && -n "$main_model" ]]; then
+      yaml+="
+  - model_name: \"main\"
+    litellm_params:
+      model: \"ollama_chat/${main_model}\"
+      api_base: \"http://${ollama_host}:11434\""
+      main_added=1
+    fi
   fi
 
   # Zen (OpenCode)
@@ -227,23 +290,99 @@ check_for_updates() {
       printf "    ${YELLOW}⊘${NC} %s\n" "$u"
     done
     printf "\n  Run ${BOLD}spark update${NC} to update, or enable auto-update:\n"
-    printf "    ${DIM}spark config auto-update on${NC}\n\n"
+    printf "    ${DIM}spark config --auto-update on${NC}\n\n"
   fi
 }
 
+cmd_config_hermes_context_tui() {
+  local choice length
+  is_interactive || die "Hermes settings require a terminal" "Use: spark config --hermes-ctx max|custom|<tokens>"
+  printf "\n  Hermes context mode:\n"
+  printf "    [1] max    vLLM effective context\n"
+  printf "    [2] custom min(65536, vLLM) or an explicit value\n\n"
+  printf "  Select [1/2]: "
+  read -r choice || true
+  case "$choice" in
+    1)
+      save_hermes_context_config max
+      info "Hermes context: max (vLLM effective context)"
+      ;;
+    2)
+      printf "  Custom tokens (blank = min(65536, vLLM)): "
+      read -r length || true
+      if [[ -n "$length" ]]; then
+        [[ "$length" =~ ^[1-9][0-9]*$ ]] || die "Hermes custom context must be a positive integer"
+        save_hermes_context_config custom "$length"
+        info "Hermes context: custom (${length})"
+      else
+        save_hermes_context_config custom
+        info "Hermes context: custom (min(65536, vLLM))"
+      fi
+      ;;
+    *) die "Choose 1 or 2" ;;
+  esac
+}
+
+cmd_config_tui() {
+  local choice value
+  is_interactive || die "Spark settings require a terminal" "Use spark config --help for non-interactive options"
+  printf "\n  Spark configuration:\n"
+  printf "    [1] auto-update (%s)\n" "$(get_update_config "auto_update" "false")"
+  printf "    [2] Hermes context\n\n"
+  printf "  Select [1/2]: "
+  read -r choice || true
+  case "$choice" in
+    1)
+      printf "  Auto-update [on/off]: "
+      read -r value || true
+      case "$value" in
+        on|true) save_update_config "$(get_update_config "last_check" "")" true; info "Auto-update enabled" ;;
+        off|false) save_update_config "$(get_update_config "last_check" "")" false; info "Auto-update disabled" ;;
+        *) die "Choose on or off" ;;
+      esac
+      ;;
+    2) cmd_config_hermes_context_tui ;;
+    *) die "Choose 1 or 2" ;;
+  esac
+}
+
+cmd_config_set_hermes_context() {
+  local value="$1"
+  case "$value" in
+    max)
+      save_hermes_context_config max
+      info "Hermes context: max (vLLM effective context)"
+      ;;
+    custom)
+      save_hermes_context_config custom
+      info "Hermes context: custom (min(65536, vLLM))"
+      ;;
+    ''|*[!0-9]*) die "Usage: spark config --hermes-ctx max|custom|<tokens>" ;;
+    0) die "Hermes custom context must be a positive integer" ;;
+    *)
+      save_hermes_context_config custom "$value"
+      info "Hermes context: custom (${value})"
+      ;;
+  esac
+}
+
 cmd_config() {
-  local key="${1:-}" value="${2:-}"
+  local key="${1:-}" value="${2:-}" extra="${3:-}"
 
   case "$key" in
     help|-h|--help)
       cat <<EOF
 
-  ${BOLD}Usage:${NC} spark config [auto-update on|off]
+  ${BOLD}Usage:${NC} spark config [--show | --auto-update on|off | --hermes-ctx max|custom|<tokens>]
 
-  With no arguments, show the current Spark configuration.
+  With no arguments, open the interactive configuration menu.
 
   ${BOLD}Settings:${NC}
-    auto-update on|off   Enable or disable automatic Spark updates.
+    --show               Show the current configuration.
+    --auto-update on|off Enable or disable automatic Spark updates.
+    --hermes-ctx max     Use the context actually configured in vLLM.
+    --hermes-ctx custom  Use min(65536, vLLM context).
+    --hermes-ctx <tokens> Use an explicit Hermes context.
 
 EOF
       return 0
@@ -251,13 +390,28 @@ EOF
   esac
 
   if [[ -z "$key" ]]; then
+    cmd_config_tui
+    return
+  fi
+
+  if [[ "$key" == "--show" ]]; then
+    [[ -z "$value" ]] || die "Usage: spark config --show"
     printf "\n  ${BOLD}Configuration:${NC}\n"
     printf "    auto-update: %s\n\n" "$(get_update_config "auto_update" "false")"
+    if [[ -f "$HERMES_SETTINGS_FILE" ]] && command -v jq >/dev/null 2>&1; then
+      printf "    hermes-context: %s" "$(jq -r '.mode // "custom"' "$HERMES_SETTINGS_FILE" 2>/dev/null || echo custom)"
+      local hermes_length
+      hermes_length=$(jq -r 'if .length == null then "min(65536, vLLM)" else (.length|tostring) end' "$HERMES_SETTINGS_FILE" 2>/dev/null || echo 'min(65536, vLLM)')
+      printf " (%s)\n\n" "$hermes_length"
+    else
+      printf "    hermes-context: custom (min(65536, vLLM))\n\n"
+    fi
     return 0
   fi
 
   case "$key" in
-    auto-update)
+    --auto-update)
+      [[ -z "$extra" ]] || die "Usage: spark config --auto-update on|off"
       case "$value" in
         on|true)
           save_update_config "$(get_update_config "last_check" "")" "true"
@@ -268,12 +422,16 @@ EOF
           info "Auto-update disabled"
           ;;
         *)
-          die "Usage: spark config auto-update on|off"
+          die "Usage: spark config --auto-update on|off"
           ;;
       esac
       ;;
+    --hermes-ctx)
+      [[ -z "$extra" ]] || die "Usage: spark config --hermes-ctx max|custom|<tokens>"
+      cmd_config_set_hermes_context "$value"
+      ;;
     *)
-      die "Unknown config key: $key" "Available: auto-update"
+      die "Unknown config option: $key" "Available: --auto-update, --hermes-ctx, --show"
       ;;
   esac
 }

@@ -84,6 +84,18 @@ ${stdin_payload}"
           *"CREATE USER n8n"*|*"ALTER USER n8n"*|*"CREATE DATABASE n8n"*|*"ALTER DATABASE n8n"*) exit 0 ;;
           *"n8n user-management:reset"*) exit "${FAKE_N8N_USER_RESET_EXIT:-0}" ;;
           *"n8n --version"*) printf '%s\n' "${FAKE_N8N_VERSION:-2.30.5}" ;;
+          *"n8n license:info"*)
+            if [[ "${FAKE_N8N_FOLDERS:-1}" == "1" ]]; then
+              printf '%s\n' 'features: {"planName":"Registered Community","feat:folders":true}'
+            else
+              printf '%s\n' 'features: {"planName":"Community"}'
+            fi ;;
+          *"FROM folder f JOIN project p"*)
+            if [[ "${FAKE_N8N_FOLDER_DB_MATCH:-1}" == "1" || ( -n "${FAKE_N8N_FOLDER_MARKER:-}" && -e "${FAKE_N8N_FOLDER_MARKER}" ) ]]; then
+              printf '1|1\n'
+            else
+              printf '0|0\n'
+            fi ;;
           *"bcryptjs"*) printf '%s\n' "${FAKE_N8N_PASSWORD_HASH:-\$2b\$10\$12345678901234567890123456789012345678901234567890123}" ;;
           *"user reset-password "*) exit "${FAKE_VIKUNJA_PASSWORD_RESET_EXIT:-0}" ;;
           *"user create -u "*)
@@ -159,6 +171,8 @@ ${stdin_payload}"
     # Managed-container listing (TSV rows via FAKE_MANAGED); plain name listing otherwise.
     if [[ "$args" == *"label=spark.managed=1"* ]]; then
       [[ -n "${FAKE_MANAGED:-}" ]] && printf '%b' "${FAKE_MANAGED}"
+    elif [[ "$args" == *"-q"* ]]; then
+      [[ -n "${FAKE_DOCKER_IDS:-}" ]] && printf '%b' "${FAKE_DOCKER_IDS}"
     elif [[ "$args" == *'{{.Ports}}'* ]]; then
       [[ -n "${FAKE_DOCKER_PORTS:-}" ]] && printf '%b' "${FAKE_DOCKER_PORTS}"
     elif [[ "$args" == *'{{.Names}}'* ]]; then
@@ -183,6 +197,10 @@ ${stdin_payload}"
     exit "${FAKE_DOCKER_STOP_EXIT:-0}"
     ;;
   inspect)
+    if [[ -n "${FAKE_DOCKER_INSPECT_ALL_JSON:-}" && "$args" != *"{{"* ]]; then
+      printf '%s\n' "$FAKE_DOCKER_INSPECT_ALL_JSON"
+      exit 0
+    fi
     if [[ -n "${FAKE_CONTAINER_INSPECT_JSON:-}" && "$args" != *"{{"* ]]; then
       printf '%s\n' "$FAKE_CONTAINER_INSPECT_JSON"
       exit 0
@@ -209,6 +227,8 @@ ${stdin_payload}"
     [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run ' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
     if [[ "${FAKE_RETRY:-}" == "mamba" && "${_att}" -le 1 ]]; then
       echo "ValueError: max_num_seqs (100) exceeds available Mamba cache blocks (${FAKE_MAMBA_N:-64}). Lower max_num_seqs to at most ${FAKE_MAMBA_N:-64} or increase gpu_memory_utilization."
+    elif [[ "${FAKE_RETRY:-}" == "kv-memory" && "${_att}" -le 1 ]]; then
+      echo "ValueError: No available memory for the cache blocks. Try increasing gpu_memory_utilization."
     else
       [[ -n "${FAKE_DOCKER_LOGS:-}" ]] && echo "${FAKE_DOCKER_LOGS}"
     fi
@@ -307,6 +327,19 @@ stdin_payload=""
 [[ "$*" == *"@-"* ]] && stdin_payload=$(cat || true)
 args="$*
 ${stdin_payload}"
+output_file=""
+write_status=0
+previous=""
+for argument in "$@"; do
+  [[ "$previous" == "-o" ]] && output_file="$argument"
+  [[ "$previous" == "-w" ]] && write_status=1
+  previous="$argument"
+done
+fake_n8n_response() {
+  local body="$1" status="$2"
+  if [[ -n "$output_file" ]]; then printf '%s\n' "$body" > "$output_file"; else printf '%s\n' "$body"; fi
+  [[ "$write_status" == "1" ]] && printf '%s' "$status"
+}
 case "$args" in
   *https://tasks.test-tailnet.ts.net/api/v1/info*) exit "${FAKE_TAILSCALE_VIKUNJA_EXIT:-0}" ;;
   *https://n8n.test-tailnet.ts.net/healthz*) exit "${FAKE_TAILSCALE_N8N_EXIT:-0}" ;;
@@ -345,6 +378,31 @@ case "$args" in
   *:3456/api/v1/user*) echo "${FAKE_VIKUNJA_USER_JSON:-{\"id\":3,\"username\":\"bot-hermes\",\"email\":\"\",\"bot_owner_id\":1}}"; exit "${FAKE_VIKUNJA_USER_EXIT:-0}" ;;
   *:5678/healthz*) exit "${FAKE_N8N_HEALTH_EXIT:-0}" ;;
   *:5678/rest/owner/setup*) [[ -n "${FAKE_N8N_OWNER_MARKER:-}" ]] && : > "$FAKE_N8N_OWNER_MARKER"; echo '{"data":{"id":"owner"}}'; exit "${FAKE_N8N_OWNER_EXIT:-0}" ;;
+  *:5678/rest/projects/personal" -o "*)
+    [[ -n "${FAKE_CURL_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_CURL_FILE}"
+    if [[ -n "${FAKE_N8N_PERSONAL_PROJECT_JSON:-}" ]]; then
+      fake_n8n_response "$FAKE_N8N_PERSONAL_PROJECT_JSON" "${FAKE_N8N_PROJECTS_HTTP:-200}"
+    else
+      fake_n8n_response '{"data":{"id":"personal-project-id","name":"Personal","type":"personal"}}' "${FAKE_N8N_PROJECTS_HTTP:-200}"
+    fi
+    exit 0 ;;
+  *:5678/rest/projects/*/folders/*" -o "*)
+    [[ -n "${FAKE_CURL_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_CURL_FILE}"
+    if [[ "$args" == *"-X POST"* ]]; then
+      [[ -n "${FAKE_N8N_FOLDER_MARKER:-}" ]] && : > "$FAKE_N8N_FOLDER_MARKER"
+      if [[ -n "${FAKE_N8N_FOLDER_CREATE_JSON:-}" ]]; then
+        fake_n8n_response "$FAKE_N8N_FOLDER_CREATE_JSON" "${FAKE_N8N_FOLDER_CREATE_HTTP:-200}"
+      else
+        fake_n8n_response '{"data":{"id":"hermes-folder-id","name":"Hermes","parentFolderId":null}}' "${FAKE_N8N_FOLDER_CREATE_HTTP:-200}"
+      fi
+    elif [[ -n "${FAKE_N8N_FOLDERS_JSON:-}" ]]; then
+      fake_n8n_response "$FAKE_N8N_FOLDERS_JSON" "${FAKE_N8N_FOLDERS_HTTP:-200}"
+    elif [[ -n "${FAKE_N8N_FOLDER_MARKER:-}" && -e "${FAKE_N8N_FOLDER_MARKER}" ]]; then
+      fake_n8n_response '{"count":1,"data":[{"id":"hermes-folder-id","name":"Hermes","parentFolderId":null}]}' "${FAKE_N8N_FOLDERS_HTTP:-200}"
+    else
+      fake_n8n_response '{"count":0,"data":[]}' "${FAKE_N8N_FOLDERS_HTTP:-200}"
+    fi
+    exit 0 ;;
   *:5678/rest/login*)
     if [[ -n "${FAKE_N8N_LOGIN_COUNT_FILE:-}" ]]; then
       login_count=0
@@ -377,7 +435,7 @@ case "$args" in
       if [[ -n "${FAKE_LITELLM_MODELS:-}" ]]; then
         printf '%s\n' "$FAKE_LITELLM_MODELS"
       else
-        printf '%s\n' '{"data":[{"id":"vllm/Org/Alpha"}]}'
+        printf '%s\n' '{"data":[{"id":"main"},{"id":"vllm/Org/Alpha"}]}'
       fi
       exit 0
     fi
@@ -413,6 +471,7 @@ EOF
 args="$*"
 case "$args" in
   *is-active*earlyoom*)        exit "${FAKE_EARLYOOM_ACTIVE:-1}" ;;
+  *is-failed*systemd-sysctl*)  exit "${FAKE_SYSTEMD_SYSCTL_FAILED:-1}" ;;
   *list-unit-files*)
     for u in ssh.service dbus.service tailscaled.service systemd-logind.service systemd-resolved.service; do
       case "$args" in *"${u}"*) echo "${u} enabled enabled"; break ;; esac
@@ -444,6 +503,7 @@ write_value() {
   local file_name="$1" value="$2" file_path=""
   file_path="${!file_name:-}"
   [[ -n "$file_path" ]] && printf '%s\n' "$value" > "$file_path"
+  return 0
 }
 
 swap_total_mib() {
@@ -504,7 +564,16 @@ fi
 if [[ "${args[0]:-}" == "bash" && "${args[1]:-}" == "-c" ]]; then
   cmd="${args[2]:-}"
   record "$cmd"
-  if [[ "$cmd" == *"/swapfile.spark"* && "$cmd" == *"fallocate -l "* ]]; then
+  if [[ "$cmd" == install\ -o\ root\ -g\ root\ -m\ 0644\ --\ * ]]; then
+    read -r -a install_args <<< "$cmd"
+    source_path="${install_args[${#install_args[@]}-2]}"
+    target="${install_args[${#install_args[@]}-1]}"
+    content="$(cat "$source_path")"
+    record "install ${target}: ${content}"
+    if [[ "$target" == "/etc/sysctl.d/99-spark.conf" && "$content" =~ vm.swappiness=([0-9]+) ]]; then
+      write_value FAKE_SWAPPINESS_FILE "${BASH_REMATCH[1]}"
+    fi
+  elif [[ "$cmd" == *"/swapfile.spark"* && "$cmd" == *"fallocate -l "* ]]; then
     desired="$(sed -n 's/.*fallocate -l \([0-9][0-9]*\)M .*/\1/p' <<<"$cmd")"
     total="$(swap_total_mib)"
     size="$(swap_size_mib)"
@@ -724,13 +793,31 @@ EOF
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_HERMES_DASHBOARD_HOST=%s\n' "${NEMOCLAW_HERMES_DASHBOARD_HOST:-}" >> "${FAKE_NEMOHERMES_FILE}"
 [[ -n "${FAKE_NEMOHERMES_FILE:-}" ]] && printf 'NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE=%s\n' "${NEMOCLAW_CONFIRM_LEGACY_MANAGED_RECREATE:-}" >> "${FAKE_NEMOHERMES_FILE}"
 case "$*" in
-  *"update --check"*) echo "${FAKE_NEMOHERMES_UPDATE_CHECK:-Current NemoHermes version: 0.0.55
+  *"update --check"*)
+    if [[ -n "${FAKE_NEMOHERMES_UPDATE_MARKER:-}" && -e "$FAKE_NEMOHERMES_UPDATE_MARKER" ]]; then
+      echo "${FAKE_NEMOHERMES_UPDATE_AFTER_CHECK:-Current NemoHermes version: 0.0.78
 Latest maintained version: 0.0.78
-Update available:         no}"; exit "${FAKE_NEMOHERMES_UPDATE_CHECK_EXIT:-0}" ;;
-  *"update --yes"*) exit "${FAKE_NEMOHERMES_UPDATE_EXIT:-0}" ;;
+Update available:         no}"
+    else
+      echo "${FAKE_NEMOHERMES_UPDATE_CHECK:-Current NemoHermes version: 0.0.55
+Latest maintained version: 0.0.78
+Update available:         no}"
+    fi
+    exit "${FAKE_NEMOHERMES_UPDATE_CHECK_EXIT:-0}" ;;
+  *"update --yes"*)
+    [[ -n "${FAKE_NEMOHERMES_UPDATE_MARKER:-}" ]] && : > "$FAKE_NEMOHERMES_UPDATE_MARKER"
+    exit "${FAKE_NEMOHERMES_UPDATE_EXIT:-0}" ;;
   *dashboard-url*) echo "${FAKE_NEMOHERMES_DASHBOARD_URL:-http://127.0.0.1:18789}" ;;
-  *"inference get --json"*) echo "${FAKE_NEMOHERMES_INFERENCE_JSON:-{\"provider\":\"compatible-endpoint\",\"model\":\"vllm/Org/Alpha\"}}" ;;
-  *"inference get"*) echo "${FAKE_NEMOHERMES_INFERENCE_TEXT:-Provider: compatible-endpoint Model: vllm/Org/Alpha}" ;;
+  *"inference get --json"*) echo "${FAKE_NEMOHERMES_INFERENCE_JSON:-{\"provider\":\"compatible-endpoint\",\"model\":\"main\"}}" ;;
+  *"inference get"*) echo "${FAKE_NEMOHERMES_INFERENCE_TEXT:-Provider: compatible-endpoint Model: main}" ;;
+  *"hermes config get --key model.default --format json"*) printf '"%s"\n' "${FAKE_HERMES_CONFIG_MODEL:-main}" ;;
+  *"hermes config get --key _nemoclaw_upstream.model --format json"*) printf '"%s"\n' "${FAKE_HERMES_CONFIG_UPSTREAM_MODEL:-${FAKE_HERMES_CONFIG_MODEL:-main}}" ;;
+  *"hermes config get --format json"*)
+    if [[ -n "${FAKE_HERMES_CONFIG_JSON:-}" ]]; then
+      printf '%s\n' "$FAKE_HERMES_CONFIG_JSON"
+    else
+      printf '%s\n' '{"platform_toolsets":{"cli":["audio","browser","nemoclaw"]}}'
+    fi ;;
   *"policy-explain --json"*) echo "${FAKE_NEMOHERMES_POLICY_JSON:-{\"tier\":\"restricted\",\"appliedPresets\":[]}}" ;;
   *"policy-explain"*) echo "${FAKE_NEMOHERMES_POLICY_TEXT:-Policy tier: restricted}" ;;
   *"policy-list"*) echo "${FAKE_NEMOHERMES_POLICY_LIST:-restricted}" ;;
@@ -759,6 +846,12 @@ Update available:         no}"; exit "${FAKE_NEMOHERMES_UPDATE_CHECK_EXIT:-0}" ;
   disabled  spotify
   disabled  yuanbao
   disabled  computer_use}" ;;
+  *"hermes exec"*"sh -lc"*"command -v python3"*) echo "${FAKE_HERMES_PYTHON_BINARY:-/usr/bin/python3}" ;;
+  *"hermes exec"*"import ddgs"*) exit "${FAKE_HERMES_DDGS_IMPORT_EXIT:-0}" ;;
+  *"hermes exec"*"hermes plugins list --plain --no-bundled"*)
+    printf '%b\n' "${FAKE_HERMES_PLUGINS_LIST:-enabled user 0.1.0 web-ddgs}" ;;
+  *"hermes exec"*"hermes config get --key web.backend --format json"*) printf '"%s"\n' "${FAKE_HERMES_WEB_CONFIG_BACKEND:-ddgs}" ;;
+  *"hermes exec"*"hermes config get --key web.search_backend --format json"*) printf '"%s"\n' "${FAKE_HERMES_WEB_CONFIG_SEARCH:-ddgs}" ;;
   *"channels status --channel whatsapp --json"*) echo "${FAKE_WHATSAPP_STATUS_JSON:-{\"verdict\":\"healthy\"}}" ;;
   *"hermes exec"*"-X POST"*"/labels"*)
     [[ "${FAKE_HERMES_TODOIST_LABEL_CREATE_EXIT:-0}" == "0" ]] || exit "${FAKE_HERMES_TODOIST_LABEL_CREATE_EXIT}"
@@ -813,6 +906,12 @@ case "$args" in
     fi ;;
   sandbox\ provider\ attach*|policy\ update*)
     exit "${FAKE_OPENSHELL_POLICY_EXIT:-0}" ;;
+  "forward list")
+    if [[ "${FAKE_OPENSHELL_FORWARDS_READY:-1}" == "1" ]]; then
+      printf 'SANDBOX BIND PORT PID STATUS\n'
+      printf 'hermes 127.0.0.1 18789 100 running\n'
+      printf 'hermes 127.0.0.1 8642 101 running\n'
+    fi ;;
   *) exit 0 ;;
 esac
 EOF
@@ -1697,6 +1796,29 @@ test_workspace_task_manager_teardown_covers_services_and_data() {
 }
 
 
+test_workspace_task_manager_teardown_stops_before_data_removal() {
+  local tmp log calls status
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cpu SPARK_BACKEND=ollama SPARK_TEST_LOG="$log" bash -c '
+      source "$1"
+      workspace_cleanup_abandoned_hermes_access() { return 1; }
+      workspace_remove_task_manager_images() { printf "images\n" >> "$SPARK_TEST_LOG"; }
+      workspace_drop_task_manager_database() { printf "database:%s\n" "$1" >> "$SPARK_TEST_LOG"; }
+      workspace_remove_managed_path() { printf "remove:%s\n" "$1" >> "$SPARK_TEST_LOG"; }
+      docker() { printf "docker:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+      ! workspace_teardown_super_productivity
+      ! workspace_teardown_vikunja
+      ! workspace_teardown_todoist
+    ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  calls=$(cat "$log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ -z "$calls" ]]
+}
+
+
 test_workspace_task_manager_teardown_removes_hermes_access() {
   local tmp log calls
   tmp=$(mktemp -d)
@@ -1734,7 +1856,7 @@ test_workspace_task_manager_teardown_removes_hermes_access() {
     [[ "$calls" == *"openshell:provider delete spark-todoist"* ]] &&
     [[ "$calls" == *"nemohermes:hermes skill remove todoist"* ]] &&
     [[ "$calls" == *"remove:${tmp}/home/.config/spark/workspace/hermes-skills/todoist"* ]] &&
-    [[ "$(grep -c '^nemohermes:hermes gateway restart --quiet$' <<<"$calls")" == 3 ]]
+    [[ "$calls" != *"gateway restart"* ]]
 }
 
 
@@ -1938,6 +2060,38 @@ test_setup_check_reports_incomplete() {
     [[ "$output" != *"Setup complete"* ]]
 }
 
+test_ctx_sudo_write_separates_password_from_content() {
+  local tmp target content status=0
+  tmp=$(mktemp -d)
+  target="${tmp}/target.conf"
+  HOME="${tmp}/home" SPARK_OS_OVERRIDE=Linux SPARK_ARCH_OVERRIDE=aarch64 \
+    SPARK_ACCEL=cuda-unified SPARK_BACKEND=vllm bash -c '
+      source "$1"
+      sudo() {
+        while [[ $# -gt 0 ]]; do
+          case "$1" in -S|-n) shift ;; -p) shift 2 ;; *) break ;; esac
+        done
+        if [[ "${1:-}" == "bash" && "${2:-}" == "-c" && "${3:-}" == install\ * ]]; then
+          local -a install_args=()
+          read -r -a install_args <<< "$3"
+          command cp "${install_args[${#install_args[@]}-2]}" "${install_args[${#install_args[@]}-1]}"
+          return
+        fi
+        "$@"
+      }
+      SUDO_READY=1
+      SUDO_PW="sentinel-sudo-secret"
+      SETUP_TARGET=local
+      printf "%s\n" "EARLYOOM_ARGS=expected" | ctx_sudo_write "$2"
+    ' _ "$SPARK" "$target" || status=$?
+  content=$(cat "$target" 2>/dev/null || true)
+  rm -rf "$tmp"
+
+  [[ "$status" -eq 0 ]] &&
+    [[ "$content" == "EARLYOOM_ARGS=expected" ]] &&
+    [[ "$content" != *"sentinel-sudo-secret"* ]]
+}
+
 test_setup_check_reports_tailscale_funnel() {
   local tmp fake_bin output status tailscale_calls
   tmp=$(mktemp -d)
@@ -1948,7 +2102,7 @@ test_setup_check_reports_tailscale_funnel() {
   set +e
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com (Funnel on)\n' \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
     "$SPARK" setup --check </dev/null 2>&1)
   status=$?
@@ -1969,11 +2123,71 @@ test_doctor_reports_tailscale_funnel() {
 
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com (Funnel on)\n' \
     "$SPARK" doctor 2>&1)
   rm -rf "$tmp"
 
   [[ "$output" == *"Tailscale Funnel"* ]] && [[ "$output" == *"active public exposure"* ]]
+}
+
+test_doctor_reports_failed_systemd_sysctl() {
+  local tmp fake_bin output
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_OVERRIDE=Linux \
+    FAKE_SYSTEMD_SYSCTL_FAILED=0 "$SPARK" doctor --verbose 2>&1 || true)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"systemd-sysctl"* ]] &&
+    [[ "$output" == *"failed"* ]]
+}
+
+test_doctor_rejects_swap_gated_earlyoom() {
+  local tmp fake_bin output
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  printf 'EARLYOOM_ARGS="-m 5 -s 10"\n' > "${tmp}/earlyoom.conf"
+
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_OVERRIDE=Linux \
+    FAKE_EARLYOOM_ACTIVE=0 EARLYOOM_DEFAULT_FILE="${tmp}/earlyoom.conf" \
+    "$SPARK" doctor --verbose 2>&1 || true)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"early-OOM"* ]] &&
+    [[ "$output" == *"unsafe config (-m 5% -s 10%)"* ]]
+}
+
+test_doctor_reports_unbounded_vllm_container() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output inspect
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  inspect='[{"Name":"/unsafe-vllm","State":{"Running":true},"Config":{"Image":"nvcr.io/nvidia/vllm:26.06-py3","Labels":{}},"Path":"vllm","Args":["serve","google/gemma"],"HostConfig":{"Memory":0}}]'
+
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_OS_OVERRIDE=Linux \
+    FAKE_DOCKER_INFO_EXIT=0 FAKE_DOCKER_IDS=$'deadbeef\n' \
+    FAKE_DOCKER_INSPECT_ALL_JSON="$inspect" "$SPARK" doctor --verbose 2>&1 || true)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"vLLM cgroup limits"* ]] &&
+    [[ "$output" == *"unsafe-vllm"* ]] &&
+    [[ "$output" == *"unlimited"* ]]
+}
+
+test_tailscale_funnel_ignores_tailnet_only_services() {
+  local tmp fake_bin
+  tmp=$(mktemp -d)
+  fake_bin="${tmp}/bin"
+  make_fake_bin "$fake_bin"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://hermes.example.ts.net (tailnet only) (svc:hermes)\n' \
+    bash -c 'source "$1"; ! tailscale_funnel_status_active' _ "$SPARK"
+  rm -rf "$tmp"
 }
 
 test_doctor_json_quiet_and_exit_codes() {
@@ -2179,9 +2393,24 @@ test_alias_capture_replays_image_env_and_operational_overrides() {
   [[ "$out" != *"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa vllm serve"* ]] || ok=1
   [[ "$out" == *"VLLM_MARLIN_USE_ATOMIC_ADD=1"* ]] || ok=1
   [[ "$out" == *"--port 8001"* && "$out" != *"--port 8000"* && "$out" != *"--port=9000"* ]] || ok=1
+  [[ "$out" == *"--label spark.managed=1"* ]] || ok=1
+  [[ "$out" == *"--memory "* && "$out" == *"--memory-swap "* ]] || ok=1
+  [[ "$out" == *"--network host"* && "$out" == *"--ipc=host"* ]] || ok=1
   [[ ! -s "$stop_file" && ! -s "$run_file" ]] || ok=1
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
+}
+
+test_vllm_launch_paths_are_centralized() {
+  local runtime dashboard docker_builds
+  runtime="${ROOT_DIR}/src/commands/10_runtime.sh"
+  dashboard="${ROOT_DIR}/src/commands/20_dashboard.sh"
+  docker_builds=$(grep -c 'docker_cmd=(docker run -d' "$runtime")
+
+  [[ "$docker_builds" -eq 1 ]] &&
+    grep -A320 '^run_backend_vllm()' "$runtime" | grep -q 'build_launch' &&
+    grep -A80 '^cmd_alias_run()' "$runtime" | grep -q 'run_backend_vllm' &&
+    ! grep -q 'docker run' "$dashboard"
 }
 
 test_alias_capture_rejects_secret_flags() {
@@ -2621,12 +2850,12 @@ test_port_auto_skips_busy() {
 
 test_gateway_yaml_per_model() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin yaml
+  local tmp fake_bin yaml main_block
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"
   make_fake_bin "$fake_bin"
   mkdir -p "${tmp}/home/.config/spark"
   cat > "${tmp}/home/.config/spark/gateway.json" <<'EOF'
-{ "enabled": true, "port": 4000, "providers": {
+{ "enabled": true, "port": 4000, "main": {"provider":"vllm","model":"org/B"}, "providers": {
   "vllm": { "enabled": true, "port": 8000 }, "openrouter": { "enabled": false },
   "ollama": { "enabled": false }, "zen": { "enabled": false }, "together": { "enabled": false } } }
 EOF
@@ -2635,10 +2864,17 @@ EOF
     FAKE_MANAGED='spark-vllm-a\torg/A\t8000\t40.0\t30.0\t10.0\nspark-vllm-b\torg/B\t8001\t60.0\t55.0\t5.0\n' \
     "$SPARK" gateway start >/dev/null 2>&1 || true
   yaml=$(cat "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || echo "")
+  main_block=$(printf '%s\n' "$yaml" | awk '
+    /model_name: "main"/ { found=1; next }
+    found && /model_name:/ { exit }
+    found { print }
+  ')
   rm -rf "$tmp"
 
   [[ "$yaml" == *'model_name: "vllm/org/A"'* ]] &&
     [[ "$yaml" == *'model_name: "vllm/org/B"'* ]] &&
+    [[ "$main_block" == *'model: "openai/org/B"'* ]] &&
+    [[ "$main_block" == *'api_base: "http://localhost:8001/v1"'* ]] &&
     [[ "$yaml" == *'model_name: "vllm/*"'* ]]
 }
 
@@ -2893,6 +3129,126 @@ EOF
     [[ "$rm_out" == *"Disabled ollama"* ]] && [[ "$disabled" == "false" ]]
 }
 
+test_run_main_publishes_alias_target() {
+  local tmp fake_bin output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"fast":{"kind":"guided","backend":"ollama","model":"qwen3:30b","run_args":[]}}' \
+    > "${tmp}/home/.config/spark/aliases.json"
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_ACCEL=cpu \
+    FAKE_NAMES='spark-litellm\n' bash -c '
+      source "$1"
+      gateway_load_config() { printf "%s\n" "{\"enabled\":true}"; }
+      run_backend_ollama() { printf "run:%s\n" "$model"; }
+      gateway_set_main_model() { printf "main:%s:%s\n" "$1" "$2"; }
+      gateway_restart() { printf "restart\n"; }
+      cmd_run fast --main
+    ' _ "$SPARK" 2>&1)
+  rm -rf "$tmp"
+  [[ "$output" == *"run:qwen3:30b"* ]] &&
+    [[ "$output" == *"main:ollama:qwen3:30b"* ]] &&
+    [[ "$output" == *"restart"* ]]
+}
+
+test_run_main_replaces_current_vllm_main() {
+  local out
+  out=$(bash -c '
+    source "$1"
+    BACKEND=vllm
+    model=Org/New
+    GATEWAY_CONTAINER=spark-litellm
+    gateway_load_config() { printf "%s\n" '"'"'{"enabled":true,"main":{"provider":"vllm","model":"Org/Old"}}'"'"'; }
+    docker() { [[ "$*" == "ps --format {{.Names}}" ]] && printf "spark-litellm\n"; }
+    list_managed_containers() { printf "spark-old\tOrg/Old\t8000\t80\n"; }
+    alias_capture_definition() { printf "captured-old\n"; }
+    stop_one_container() { printf "stop:%s\n" "$1"; }
+    run_backend_vllm() { printf "launch:%s\n" "$model"; }
+    run_publish_main() { printf "publish:%s\n" "$1"; }
+    run_main_replacement_vllm Org/New
+  ' _ "$SPARK")
+  [[ "$out" == *"stop:spark-old"* ]] &&
+    [[ "$out" == *"launch:Org/New"* ]] &&
+    [[ "$out" == *"publish:Org/New"* ]] &&
+    [[ "$out" != *"Rollback"* ]]
+}
+
+test_run_main_checks_capacity_after_stopping_current_main() {
+  local out
+  out=$(bash -c '
+    source "$1"
+    BACKEND=vllm
+    GATEWAY_CONTAINER=spark-litellm
+    sequence=""
+    gateway_load_config() { printf "%s\n" '\''{"enabled":true,"main":{"provider":"vllm","model":"Org/Old"}}'\''; }
+    docker() { [[ "$*" == "ps --format {{.Names}}" ]] && printf "spark-litellm\n"; }
+    list_managed_containers() { printf "spark-old\tOrg/Old\t8000\t80\n"; }
+    alias_capture_definition() { printf "captured-old\n"; }
+    stop_one_container() { sequence="${sequence}stop "; }
+    run_backend_vllm() {
+      [[ "$sequence" == "stop " ]] || { printf "capacity-before-stop\n"; return 1; }
+      sequence="${sequence}capacity "
+      printf "capacity-after-stop\n"
+    }
+    run_publish_main() { printf "publish:%s\n" "$1"; }
+    run_main_replacement_vllm Org/New
+  ' _ "$SPARK")
+  [[ "$out" == *"capacity-after-stop"* ]] &&
+    [[ "$out" != *"capacity-before-stop"* ]]
+}
+test_run_main_failure_offers_and_accepts_rollback() {
+  local out status
+  set +e
+  out=$(bash -c '
+    source "$1"
+    BACKEND=vllm
+    GATEWAY_CONTAINER=spark-litellm
+    gateway_load_config() { printf "%s\n" '"'"'{"enabled":true,"main":{"provider":"vllm","model":"Org/Old"}}'"'"'; }
+    docker() { [[ "$*" == "ps --format {{.Names}}" ]] && printf "spark-litellm\n"; }
+    list_managed_containers() { printf "spark-old\tOrg/Old\t8000\t80\n"; }
+    alias_capture_definition() { printf "captured-old\n"; }
+    stop_one_container() { printf "stop:%s\n" "$1"; }
+    run_backend_vllm() { printf "launch-new\n"; return 1; }
+    run_captured_vllm_definition() { printf "rollback:%s\n" "$2"; }
+    gateway_save_config() { printf "restore-config\n"; }
+    gateway_restart() { printf "gateway-restart\n"; }
+    is_interactive() { return 0; }
+    confirm_rollback_main() { printf "Rollback previous main model? [Y/n]\n"; return 0; }
+    run_main_replacement_vllm Org/New
+  ' _ "$SPARK" 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Rollback previous main model? [Y/n]"* ]] &&
+    [[ "$out" == *"rollback:main rollback"* ]] &&
+    [[ "$out" == *"restore-config"* ]] &&
+    [[ "$out" == *"The previous main model was restored"* ]]
+}
+
+test_run_main_failure_can_decline_rollback() {
+  local out status
+  set +e
+  out=$(bash -c '
+    source "$1"
+    BACKEND=vllm
+    GATEWAY_CONTAINER=spark-litellm
+    gateway_load_config() { printf "%s\n" '"'"'{"enabled":true,"main":{"provider":"vllm","model":"Org/Old"}}'"'"'; }
+    docker() { [[ "$*" == "ps --format {{.Names}}" ]] && printf "spark-litellm\n"; }
+    list_managed_containers() { printf "spark-old\tOrg/Old\t8000\t80\n"; }
+    alias_capture_definition() { printf "captured-old\n"; }
+    stop_one_container() { printf "stop:%s\n" "$1"; }
+    run_backend_vllm() { return 1; }
+    run_captured_vllm_definition() { printf "unexpected-rollback\n"; }
+    is_interactive() { return 0; }
+    confirm_rollback_main() { return 1; }
+    run_main_replacement_vllm Org/New
+  ' _ "$SPARK" 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"remains stopped"* ]] &&
+    [[ "$out" != *"unexpected-rollback"* ]]
+}
+
 # --- Platform / accelerator detection ---
 test_detect_metal_on_apple_silicon() {
   local tmp fake_bin out
@@ -2997,7 +3353,7 @@ test_host_check_vllm_no_gpu() {
     [[ "$out" == *"incomplete"* ]]
 }
 
-# --- Host OS hardening (swap-off + earlyoom -m5 + sshd MemoryMin/OOMScoreAdjust) ---
+# --- Host OS hardening (swap + earlyoom RAM-pressure trigger + control-plane protection) ---
 test_host_check_hardening_missing() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -3010,7 +3366,7 @@ test_host_check_hardening_missing() {
 test_host_check_hardening_present() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  printf 'EARLYOOM_ARGS="-m 5 -s 10"\n' > "${tmp}/earlyoom.conf"
+  printf 'EARLYOOM_ARGS="-m 5 -s 100"\n' > "${tmp}/earlyoom.conf"
   printf '#!/usr/bin/env bash\nexit 0\n' > "${fake_bin}/earlyoom"; chmod +x "${fake_bin}/earlyoom"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
     SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 FAKE_SWAP_TOTAL_GB=64 FAKE_SWAPPINESS=10 \
@@ -3018,9 +3374,41 @@ test_host_check_hardening_present() {
     EARLYOOM_DEFAULT_FILE="${tmp}/earlyoom.conf" \
     "$SPARK" setup --check </dev/null 2>&1) || true
   rm -rf "$tmp"
-  [[ "$out" == *"earlyoom active (-m 5% -s 10%"* ]] && [[ "$out" == *"control-plane: OOM-protected"* ]] &&
+  [[ "$out" == *"earlyoom active (-m 5% -s 100%"* ]] && [[ "$out" == *"control-plane: OOM-protected"* ]] &&
     [[ "$out" == *"swappiness=10"* ]] && [[ "$out" != *"early-OOM not active"* ]] &&
     [[ "$out" != *"not fully protected"* ]] && [[ "$out" != *"Swap too small"* ]]
+}
+
+test_earlyoom_rejects_swap_gated_configuration() {
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  printf 'EARLYOOM_ARGS="-m 5 -s 10"\n' > "${tmp}/earlyoom.conf"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "${fake_bin}/earlyoom"; chmod +x "${fake_bin}/earlyoom"
+
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_EARLYOOM_ACTIVE=0 EARLYOOM_DEFAULT_FILE="${tmp}/earlyoom.conf" \
+    "$SPARK" setup --check </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+
+  [[ "$out" == *"earlyoom not at -m 5% -s 100%"* ]] &&
+    [[ "$out" == *"found '-m 5 -s 10'"* ]]
+}
+
+test_swap_repairs_failed_systemd_sysctl() {
+  local tmp fake_bin sudo_log output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  sudo_log="${tmp}/sudo.log"
+
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_ACCEL=cuda-unified \
+    SPARK_OS_OVERRIDE=Linux FAKE_SWAP_TOTAL_GB=64 FAKE_SWAPPINESS=10 \
+    FAKE_SYSTEMD_SYSCTL_FAILED=0 FAKE_SUDO_LOG="$sudo_log" \
+    bash -c 'source "$1"; SETUP_TARGET=local; step_swap_ensure 1 0' _ "$SPARK" 2>&1)
+  sudo_log=$(cat "$sudo_log" 2>/dev/null || true)
+  rm -rf "$tmp"
+
+  [[ "$output" == *"Swap: on"* ]] &&
+    [[ "$sudo_log" == *"install /etc/sysctl.d/99-spark.conf: vm.swappiness=10"* ]] &&
+    [[ "$sudo_log" == *"systemctl restart systemd-sysctl.service"* ]]
 }
 
 # Swap is reconciled by TOTAL active swap: ≥ target → no-op (no extra file); < target → flags it.
@@ -3262,13 +3650,14 @@ make_min_workspace_config() {
 }
 
 test_help_text_tracks_current_cli() {
-  local top bundle dashboard gateway config models reinstall uninstall ws recover setup_error status
+  local top bundle dashboard gateway config models repair reinstall uninstall ws recover setup_error status
   top=$("$SPARK" help 2>&1)
   bundle=$("$SPARK" bundle --help 2>&1)
   dashboard=$("$SPARK" dashboard --help 2>&1)
   gateway=$("$SPARK" gateway --help 2>&1)
   config=$("$SPARK" config --help 2>&1)
   models=$("$SPARK" models --help 2>&1)
+  repair=$("$SPARK" repair --help 2>&1)
   reinstall=$("$SPARK" reinstall --help 2>&1)
   uninstall=$("$SPARK" uninstall --help 2>&1)
   ws=$("$SPARK" ws --help 2>&1)
@@ -3294,6 +3683,8 @@ test_help_text_tracks_current_cli() {
     [[ "$gateway" == *"start|stop|status|logs|add|remove"* ]] &&
     [[ "$config" == *"auto-update on|off"* ]] &&
     [[ "$models" == *"recommend [--json]"* ]] &&
+    [[ "$top" == *"repair           Repair the model server"* ]] &&
+    [[ "$repair" == *"selected model, LiteLLM"* ]] &&
     [[ "$reinstall" == *"--purge-models|--keep-models"* ]] &&
     [[ "$uninstall" == *"-y|--yes"* ]] &&
     [[ "$ws" == *"Reset a Vikunja human or n8n owner password"* ]] &&
@@ -3327,7 +3718,7 @@ test_workspace_lifecycle_commands() {
     workspace_migrate_runtime_config() { printf "migrate\n" >> "$CALLS"; }
     workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Model\n"; }
     workspace_compose() { printf "compose %s\n" "$*" >> "$CALLS"; }
-    workspace_ensure_gateway() { printf "gateway %s\n" "$*" >> "$CALLS"; }
+    cmd_repair() { printf "repair %s\n" "$*" >> "$CALLS"; }
     workspace_tailscale_services_configured() { return 0; }
     workspace_start_hermes_gateway_proxy() { printf "bridge start\n" >> "$CALLS"; }
     workspace_stop_hermes_gateway_proxy() { printf "bridge stop\n" >> "$CALLS"; }
@@ -3354,11 +3745,12 @@ test_workspace_lifecycle_commands() {
   rm -rf "$tmp"
   [[ "$calls" == *"migrate"* ]] &&
     [[ "$calls" == *"compose up -d --remove-orphans"* ]] &&
-    [[ "$calls" == *"gateway 0 1 Org/Model"* ]] &&
+    [[ "$calls" == *"repair --model Org/Model --tools --no-mtp --yes"* ]] &&
     [[ "$calls" == *"bridge start"* ]] &&
     [[ "$calls" == *"tasks bridge start"* ]] &&
     [[ "$calls" == *"dashboard proxy start"* ]] &&
     [[ "$calls" == *"hermes start"* ]] &&
+    [[ "$calls" == *"docker update --stop-timeout 60 workspace-hermes"* ]] &&
     [[ "$calls" == *"nemohermes hermes stop"* ]] &&
     [[ "$calls" == *"gateway stop"* ]] &&
     [[ "$calls" == *"bridge stop"* ]] &&
@@ -3371,15 +3763,196 @@ test_workspace_lifecycle_commands() {
     [[ "$status" -ne 0 ]] && [[ "$down" == *"Unknown ws command: down"* ]]
 }
 
+test_workspace_hermes_stop_timeout_is_configurable() {
+  local tmp out
+  tmp=$(mktemp)
+  TRACE="$tmp" SPARK_WORKSPACE_HERMES_STOP_TIMEOUT=45 bash -c '
+    source "$1"
+    workspace_hermes_running_container_name() { printf "hermes-container\n"; }
+    docker() { printf "docker %s\n" "$*" >> "$TRACE"; }
+    nemohermes() { printf "nemohermes %s\n" "$*" >> "$TRACE"; }
+    workspace_pause_hermes_private_proxy
+  ' _ "$SPARK"
+  out=$(cat "$tmp")
+  rm -f "$tmp"
+  [[ "$out" == *"docker update --stop-timeout 45 hermes-container"* ]] &&
+    [[ "$out" == *"nemohermes hermes stop"* ]]
+}
+
+test_workspace_hermes_stop_timeout_failure_aborts_stop() {
+  local out status
+  set +e
+  out=$(bash -c '
+    source "$1"
+    workspace_hermes_running_container_name() { printf "hermes-container\n"; }
+    docker() { return 1; }
+    nemohermes() { printf "nemohermes %s\n" "$*"; }
+    workspace_pause_hermes_private_proxy
+  ' _ "$SPARK" 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"Could not configure Hermes stop timeout"* ]] &&
+    [[ "$out" != *"nemohermes hermes stop"* ]]
+}
+
 test_workspace_restart_orders_stop_then_start() {
   local out
   out=$(bash -c '
     source "$1"
+    workspace_capture_restart_model() { :; }
     workspace_stop() { printf "stop\n"; }
     workspace_start() { printf "start\n"; }
     workspace_restart
   ' _ "$SPARK")
   [[ "$out" == $'stop\nstart' ]]
+}
+
+test_workspace_restart_captures_launch_before_stop_and_discards_it() {
+  local out
+  out=$(bash -c '
+    source "$1"
+    BACKEND=vllm
+    workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Model\n"; }
+    container_for_ref() { printf "spark-vllm-model\n"; }
+    alias_capture_definition() { printf "captured-launch\n"; }
+    workspace_stop() { printf "stop:%s\n" "$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION"; }
+    workspace_start() { printf "start:%s\n" "$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION"; }
+    workspace_restart
+    printf "after:%s\n" "$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION"
+  ' _ "$SPARK")
+  [[ "$out" == *"stop:captured-launch"* ]] &&
+    [[ "$out" == *"start:captured-launch"* ]] &&
+    [[ "$out" == *"after:"* ]] &&
+    [[ "$out" != *"after:captured-launch"* ]]
+}
+
+test_workspace_migrates_hermes_model_env_to_main() {
+  local tmp fake_bin env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark/workspace"
+  printf '%s\n' \
+    'HERMES_MODEL=Org/Alpha' \
+    'HERMES_LITELLM_MODEL=main' \
+    > "${tmp}/home/.config/spark/workspace/secrets.env"
+  printf '%s\n' \
+    '{"enabled":true,"port":4000,"main":{"provider":"vllm","model":"Org/Alpha"}}' \
+    > "${tmp}/home/.config/spark/gateway.json"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm bash -c '
+    source "$1"
+    workspace_migrate_runtime_config
+  ' _ "$SPARK"
+  env=$(cat "${tmp}/home/.config/spark/workspace/secrets.env")
+  rm -rf "$tmp"
+  [[ "$env" == *$'HERMES_MODEL=main\n'* || "$env" == *$'HERMES_MODEL=main' ]] &&
+    [[ "$env" != *"HERMES_LITELLM_MODEL="* ]]
+}
+
+test_captured_vllm_launch_defaults_omitted_kv_to_auto() {
+  local out definition
+  definition='{"kind":"captured-vllm","backend":"vllm","model":"Org/Model","image":"eugr/spark-vllm:latest","image_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vllm_entrypoint":true,"env":{},"vllm_args":["vllm","serve","Org/Model","--port","8000"]}'
+  out=$(bash -c '
+    source "$1"
+    run_backend_vllm() { printf "kv=%s force=%s\nargs=%s\n" "$kv_dtype" "$force" "$ALIAS_VLLM_ARGS_JSON"; }
+    run_captured_vllm_definition "$2" "workspace restart" --force
+  ' _ "$SPARK" "$definition")
+  [[ "$out" == *"kv=auto force=1"* ]] && [[ "$out" == *'"--port","8000"'* ]]
+}
+
+test_repair_uses_workspace_restart_snapshot() {
+  local out definition
+  definition='captured-launch'
+  out=$(bash -c '
+    source "$1"
+    SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=Org/Model
+    SPARK_WORKSPACE_RESTART_VLLM_DEFINITION="$2"
+    model_server_state() { printf "stopped\n"; }
+    model_server_ensure_gateway_config() { :; }
+    run_captured_vllm_definition() { printf "captured:%s\n" "$*"; }
+    cmd_run() { printf "generic:%s\n" "$*"; }
+    gateway_set_main_model() { :; }
+    gateway_rendered_config_ready() { return 0; }
+    docker() { [[ "$*" == *"ps --format"* ]] && printf "%s\n" "$GATEWAY_CONTAINER"; }
+    model_server_repair 0 1 Org/Model 1 65536 1
+  ' _ "$SPARK" "$definition")
+  [[ "$out" == *"captured:captured-launch workspace restart --force"* ]] &&
+    [[ "$out" != *"generic:"* ]]
+}
+
+test_workspace_repair_is_operator_triggered_only() {
+  ! grep -Eq 'enable-linger|spark-workspace[.]service|ws repair --yes --boot' "$SPARK"
+}
+
+test_workspace_detects_hermes_mcp_config_drift() {
+  bash -c '
+    source "$1"
+    workspace_hermes_container_name() { printf "openshell-hermes-test\n"; }
+    docker() {
+      local i
+      [[ "$1" == logs ]] || return 1
+      printf "[SECURITY] HERMES_MCP_CONFIG_DRIFT: rebuild required\n"
+      for ((i = 0; i < 4000; i++)); do
+        printf "later container output that must not hide the drift marker\n"
+      done
+    }
+    workspace_hermes_mcp_config_drift_detected
+    ! workspace_hermes_mcp_config_consistent
+  ' _ "$SPARK"
+}
+
+test_workspace_repair_rebuilds_mcp_drift_and_reconciles() {
+  local tmp log calls status
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  HOME="${tmp}/home" SPARK_TEST_LOG="$log" bash -c '
+    source "$1"
+    workspace_require_config() { :; }
+    workspace_migrate_runtime_config() { printf "migrate\n" >> "$SPARK_TEST_LOG"; }
+    workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Alpha\n"; }
+    workspace_compose() { printf "compose:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+    cmd_repair() { printf "base-repair:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+    workspace_start_hermes_gateway_proxy() { printf "inference-proxy\n" >> "$SPARK_TEST_LOG"; }
+    workspace_hermes_mcp_config_drift_detected() { return 0; }
+    nemohermes_rebuild_with_workspace_env() { printf "rebuild:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+    workspace_start() { printf "start\n" >> "$SPARK_TEST_LOG"; }
+    workspace_configure_hermes_runtime() { printf "runtime\n" >> "$SPARK_TEST_LOG"; }
+    workspace_task_manager() { printf "todoist\n"; }
+    workspace_setup_hermes_todoist_access() { printf "todoist\n" >> "$SPARK_TEST_LOG"; }
+    cmd_workspace_doctor() { printf "doctor:%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+    workspace_repair --yes
+  ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  calls=$(cat "$log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$calls" == *"base-repair:--model Org/Alpha --tools --no-mtp --yes"* ]] &&
+    [[ "$calls" == *"rebuild:--yes"* ]] &&
+    [[ "$calls" == *$'rebuild:--yes\nstart\nruntime\ntodoist\ndoctor:--verbose'* ]]
+}
+
+test_workspace_repair_force_rebuild_is_explicit() {
+  local tmp log calls
+  tmp=$(mktemp -d); log="${tmp}/calls"
+  HOME="${tmp}/home" SPARK_TEST_LOG="$log" bash -c '
+    source "$1"
+    workspace_require_config() { :; }
+    workspace_migrate_runtime_config() { :; }
+    workspace_read_env() { [[ "$1" == HERMES_MODEL ]] && printf "Org/Alpha\n"; }
+    workspace_compose() { :; }
+    cmd_repair() { :; }
+    workspace_start_hermes_gateway_proxy() { :; }
+    workspace_hermes_mcp_config_drift_detected() { return 0; }
+    nemohermes_rebuild_with_workspace_env() { printf "%s\n" "$*" >> "$SPARK_TEST_LOG"; }
+    workspace_start() { :; }
+    workspace_configure_hermes_runtime() { :; }
+    workspace_task_manager() { printf "todoist\n"; }
+    workspace_setup_hermes_todoist_access() { :; }
+    cmd_workspace_doctor() { :; }
+    workspace_repair --force-hermes-rebuild
+  ' _ "$SPARK" >/dev/null 2>&1
+  calls=$(cat "$log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$calls" == "--yes --force" ]]
 }
 
 test_workspace_hermes_start_uses_official_lifecycle() {
@@ -3400,6 +3973,34 @@ test_workspace_hermes_start_uses_official_lifecycle() {
     printf "%b" "$nemo_calls"
   ' _ "$SPARK")
   [[ "$out" == *"hermes start"* ]] && [[ "$out" == *"hermes recover"* ]]
+}
+
+test_workspace_hermes_start_recovers_stopped_agent_gateway() {
+  local tmp log calls status
+  tmp=$(mktemp -d)
+  log="${tmp}/calls"
+  SPARK_TEST_LOG="$log" bash -c '
+    source "$1"
+    agent_started=0
+    nemohermes() {
+      printf "nemohermes:%s\n" "$*" >> "$SPARK_TEST_LOG"
+      case "$*" in
+        "hermes status")
+          [[ "$agent_started" == 1 ]] && printf "Hermes Agent: running\n"
+          ;;
+        "hermes connect --probe-only") return 1 ;;
+        "hermes exec -- sh -lc "*) agent_started=1 ;;
+      esac
+    }
+    sleep() { :; }
+    workspace_ensure_hermes_agent_gateway
+  ' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  calls=$(cat "$log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$calls" == *"nemohermes:hermes connect --probe-only"* ]] &&
+    [[ "$calls" == *"nemohermes:hermes exec -- sh -lc nohup hermes gateway run"* ]]
 }
 
 test_workspace_bridge_waits_for_delayed_readiness() {
@@ -3439,7 +4040,7 @@ test_workspace_dashboard_proxy_rewrites_host_on_loopback() {
     [[ "$docker_args" == *"hermes-dashboard-proxy.py 18790 18789"* ]] &&
     grep -Fq 'asyncio.start_server(handle, "127.0.0.1"' "$proxy_script" &&
     grep -Fq 'Host: 127.0.0.1:' "$proxy_script" &&
-    grep -Fq 'Origin: http://127.0.0.1:' "$proxy_script"
+    grep -Fq 'elif lower.startswith(b"origin:") and websocket:' "$proxy_script"
   local status=$?
   rm -rf "$tmp"
   return "$status"
@@ -3455,7 +4056,7 @@ test_workspace_listener_check_allows_only_openshell_gateway_bridge() {
   ' _ "$SPARK"
 }
 
-test_workspace_model_start_disables_mtp_for_reliable_recovery() {
+test_repair_starts_model_with_requested_policy() {
   local tmp out
   tmp=$(mktemp -d)
   mkdir -p "${tmp}/home/.config/spark"
@@ -3463,15 +4064,32 @@ test_workspace_model_start_disables_mtp_for_reliable_recovery() {
   out=$(HOME="${tmp}/home" bash -c '
     source "$1"
     docker() { [[ "$*" == *"ps --format"* ]] && printf "%s\n" "$GATEWAY_CONTAINER"; }
-    workspace_model_state() { printf "stopped\n"; }
+    model_server_state() { printf "stopped\n"; }
+    model_server_ensure_gateway_config() { :; }
+    gateway_set_main_model() { :; }
+    gateway_rendered_config_ready() { return 0; }
     cmd_run() { printf "%s\n" "$*"; }
-    workspace_ensure_gateway 0 1 Org/Model
+    cmd_repair --model Org/Model --yes --tools --max-len 65536 --no-mtp
   ' _ "$SPARK")
   rm -rf "$tmp"
   [[ "$out" == *"Org/Model --no-mtp --tools --max-len 65536"* ]] && [[ "$out" != *"--no-wait"* ]]
 }
 
-test_workspace_model_restarts_without_tool_calling() {
+test_repair_defaults_to_litellm_main_model() {
+  local tmp out
+  tmp=$(mktemp -d)
+  mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"main":{"provider":"vllm","model":"Org/Main"}}' > "${tmp}/home/.config/spark/gateway.json"
+  out=$(HOME="${tmp}/home" bash -c '
+    source "$1"
+    model_server_repair() { printf "%s\n" "$*"; }
+    cmd_repair --yes
+  ' _ "$SPARK")
+  rm -rf "$tmp"
+  [[ "$out" == *"0 1 Org/Main 0  0"* ]]
+}
+
+test_repair_restarts_model_without_tool_calling() {
   local tmp out
   tmp=$(mktemp -d)
   mkdir -p "${tmp}/home/.config/spark"
@@ -3479,16 +4097,20 @@ test_workspace_model_restarts_without_tool_calling() {
   out=$(HOME="${tmp}/home" bash -c '
     source "$1"
     docker() { [[ "$*" == *"ps --format"* ]] && printf "%s\n" "$GATEWAY_CONTAINER"; }
-    workspace_model_state() { printf "running+routed\n"; }
-    workspace_model_tool_calling_ready() { return 1; }
+    model_server_state() { printf "running+routed\n"; }
+    model_server_tool_calling_ready() { return 1; }
+    model_server_context_ready() { return 0; }
+    model_server_ensure_gateway_config() { :; }
+    gateway_set_main_model() { :; }
+    gateway_rendered_config_ready() { return 0; }
     cmd_run() { printf "%s\n" "$*"; }
-    workspace_ensure_gateway 0 1 Org/Model
+    cmd_repair --model Org/Model --yes --tools --max-len 65536 --no-mtp
   ' _ "$SPARK")
   rm -rf "$tmp"
   [[ "$out" == *"Org/Model --no-mtp --tools --max-len 65536 --force"* ]]
 }
 
-test_workspace_model_tool_calling_requires_expected_parser() {
+test_repair_model_tool_calling_requires_expected_parser() {
   local tmp fake_bin wrong=0 right=0 profile
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   mkdir -p "${tmp}/home/.config/spark/profiles"
@@ -3497,27 +4119,34 @@ test_workspace_model_tool_calling_requires_expected_parser() {
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
     FAKE_DOCKER_CMD_JSON='["Org/Model","--enable-auto-tool-choice","--tool-call-parser","qwen3_xml"]' \
-    bash -c 'source "$1"; workspace_model_tool_calling_ready Org/Model' _ "$SPARK" || wrong=$?
+    bash -c 'source "$1"; model_server_tool_calling_ready Org/Model' _ "$SPARK" || wrong=$?
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
     FAKE_DOCKER_CMD_JSON='["Org/Model","--enable-auto-tool-choice","--tool-call-parser","qwen3_coder"]' \
-    bash -c 'source "$1"; workspace_model_tool_calling_ready Org/Model' _ "$SPARK" || right=$?
+    bash -c 'source "$1"; model_server_tool_calling_ready Org/Model' _ "$SPARK" || right=$?
   rm -rf "$tmp"
   [[ "$wrong" -ne 0 && "$right" -eq 0 ]]
 }
 
-test_workspace_hermes_toolsets_are_balanced() {
+test_workspace_hermes_runtime_uses_supported_config_writes() {
   local tmp fake_bin calls wrong=0
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
-    bash -c 'source "$1"; workspace_configure_hermes_cli_toolsets; workspace_hermes_cli_toolsets_ready' _ "$SPARK"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_HERMES_CONFIG_JSON='{}' \
+    bash -c 'source "$1"; workspace_configure_hermes_runtime; workspace_hermes_cli_toolsets_ready' _ "$SPARK"
   calls=$(cat "${tmp}/nemohermes.log")
-  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
     FAKE_HERMES_TOOLS_LIST=$'Built-in toolsets (cli):\n  enabled  terminal\n  enabled  browser' \
     bash -c 'source "$1"; workspace_hermes_cli_toolsets_ready' _ "$SPARK" || wrong=$?
   rm -rf "$tmp"
-  [[ "$calls" == *"hermes tools enable --platform cli terminal file web skills memory todo cronjob delegation"* ]] &&
-    [[ "$calls" == *"hermes tools disable --platform cli browser code_execution vision video image_gen video_gen x_search tts context_engine session_search clarify homeassistant spotify yuanbao computer_use"* ]] &&
+  [[ "$calls" == *"hermes config set --config-accept-new-path --key model.max_tokens --value 512"* ]] &&
+    [[ "$calls" == *"hermes config set --config-accept-new-path --key model.context_length --value 65536"* ]] &&
+    [[ "$calls" == *"hermes config set --config-accept-new-path --key agent.reasoning_effort --value none"* ]] &&
+    [[ "$calls" == *"hermes config get --format json"* ]] &&
+    [[ "$calls" == *"hermes config set --config-accept-new-path --key platform_toolsets.cli --value"* ]] &&
+    [[ "$calls" != *"hermes exec --no-tty --timeout 30 -- hermes config set"* ]] &&
+    [[ "$calls" != *"hermes tools enable"* ]] &&
+    [[ "$calls" != *"hermes tools disable"* ]] &&
     [[ "$wrong" -ne 0 ]]
 }
 
@@ -3789,9 +4418,12 @@ test_workspace_setup_writes_compose_names() {
     [[ "$nemo_calls" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
     [[ "$nemo_calls" == *"CHAT_UI_URL=https://hermes.test-tailnet.ts.net"* ]] &&
     [[ "$nemo_calls" == *"hermes skill install "*"/hermes-skills/vikunja"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set model.max_tokens 512"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set model.context_length 65536"* ]] &&
-    [[ "$nemo_calls" == *"hermes config set agent.reasoning_effort none"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key model.max_tokens --value 512"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key model.context_length --value 65536"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key agent.reasoning_effort --value none"* ]] &&
+    [[ "$nemo_calls" == *"hermes config set --config-accept-new-path --key platform_toolsets.cli --value"* ]] &&
+    [[ "$nemo_calls" == *"hermes exec --no-tty --timeout 30 -- hermes config set web.backend ddgs"* ]] &&
+    [[ "$nemo_calls" == *"hermes exec --no-tty --timeout 30 -- hermes config set web.search_backend ddgs"* ]] &&
     [[ "$nemo_calls" == *"hermes gateway restart --quiet"* ]] &&
     [[ "$docker_calls" == *"--name spark-hermes-litellm-proxy"* ]] &&
     [[ "$docker_calls" == *"172.19.0.1 4000 127.0.0.1 4000"* ]] &&
@@ -3812,8 +4444,11 @@ test_workspace_setup_writes_compose_names() {
     [[ "$env" == *"WORKSPACE_TAILSCALE_MODE=services"* ]] &&
     [[ "$env" == *"VIKUNJA_URL=https://tasks.test-tailnet.ts.net"* ]] &&
     [[ "$env" == *"HERMES_DASHBOARD_PORT=18789"* ]] &&
-    [[ "$env" == *"HERMES_LITELLM_MODEL=vllm/Org/Alpha"* ]] &&
+    [[ "$env" == *"HERMES_MODEL=main"* ]] &&
+    [[ "$env" != *"HERMES_LITELLM_MODEL="* ]] &&
+    [[ "$env" == *"HERMES_CONTEXT_MODE=custom"* ]] &&
     [[ "$env" == *"HERMES_CONTEXT_LENGTH=65536"* ]] &&
+    [[ "$env" == *"HERMES_WEB_PROVIDER=ddgs"* ]] &&
     [[ "$env" == *"HERMES_MAX_TOKENS=512"* ]] &&
     [[ "$env" == *"HERMES_REASONING_EFFORT=none"* ]] &&
     [[ "$env" == *"HERMES_POLICY_TIER=restricted"* ]] &&
@@ -4063,6 +4698,30 @@ test_workspace_setup_stops_when_nemohermes_update_fails() {
     [[ "$out" == *"NemoHermes update failed"* ]] &&
     [[ "$nemo_calls" == *"update --yes"* ]] &&
     [[ "$nemo_calls" != *"onboard --non-interactive"* ]]
+}
+
+test_workspace_setup_accepts_successful_nemohermes_update_postcondition() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin nemo_calls check_count
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
+    FAKE_NEMOHERMES_UPDATE_MARKER="${tmp}/nemohermes.updated" \
+    FAKE_NEMOHERMES_UPDATE_CHECK=$'Current NemoHermes version: 0.0.55\nLatest maintained version: 0.0.78\nUpdate available:         yes' \
+    FAKE_NEMOHERMES_UPDATE_AFTER_CHECK=$'Current NemoHermes version: 0.0.78\nLatest maintained version: 0.0.78\nUpdate available:         no' \
+    FAKE_NEMOHERMES_UPDATE_EXIT=9 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  nemo_calls=$(cat "${tmp}/nemohermes.log" 2>/dev/null || echo "")
+  check_count=$(grep -c '^update --check$' <<< "$nemo_calls" || true)
+  rm -rf "$tmp"
+  [[ "$check_count" -ge 2 ]] &&
+    [[ "$nemo_calls" == *"update --yes"* ]] &&
+    [[ "$nemo_calls" == *"onboard --non-interactive"* ]]
 }
 
 test_workspace_setup_keeps_hermes_dashboard_on_loopback() {
@@ -4509,7 +5168,7 @@ test_workspace_setup_blocks_tailscale_funnel() {
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_EXIT=0 FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_EXIT=0 FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com (Funnel on)\n' \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha 2>&1)
@@ -4537,7 +5196,7 @@ test_workspace_setup_resets_tailscale_funnel_with_flag() {
     SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
     SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
     SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_EXIT=0 FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_EXIT=0 FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com (Funnel on)\n' \
     FAKE_TAILSCALE_FUNNEL_RESET_MARKER="${tmp}/funnel.reset" \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
@@ -4560,7 +5219,7 @@ test_workspace_setup_check_reports_funnel_without_reset() {
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://public.example.com (Funnel on)\n' \
     FAKE_TAILSCALE_FILE="${tmp}/tailscale.log" FAKE_NAMES='spark-litellm\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --task-manager vikunja --check --model Org/Alpha 2>&1)
@@ -4920,6 +5579,39 @@ test_workspace_setup_prompts_for_existing_vikunja_password() {
     [[ "$env" != *"CurrentPassword123"* ]]
 }
 
+test_workspace_setup_prompts_for_existing_n8n_password() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin env_file staged out env
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=InitialPassword123 \
+    SPARK_WORKSPACE_N8N_EMAIL=m@example.com SPARK_WORKSPACE_N8N_PASSWORD=secret456 \
+    FAKE_N8N_FOLDER_MARKER="${tmp}/n8n.folder" FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  env_file="${tmp}/home/.config/spark/workspace/secrets.env"
+  staged="${env_file}.staged"
+  grep -v -E '^N8N_HERMES_FOLDER_(ID|STATUS)=' "$env_file" > "$staged"
+  printf '%s\n' 'N8N_HERMES_FOLDER_ID=' 'N8N_HERMES_FOLDER_STATUS=manual' >> "$staged"
+  mv "$staged" "$env_file"
+  rm -f "${tmp}/n8n.folder"
+  out=$(printf '%s\n' 'CurrentN8nPassword123' | \
+    HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_ASSUME_INTERACTIVE=1 FAKE_DOCKER_READ_STDIN=0 \
+    FAKE_N8N_FOLDER_DB_MATCH=0 FAKE_N8N_FOLDER_MARKER="${tmp}/n8n.folder" \
+    FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha 2>&1 || true)
+  env=$(cat "$env_file")
+  rm -rf "$tmp"
+  [[ "$out" == *"Current n8n password for m@example.com"* ]] &&
+    [[ "$out" != *"CurrentN8nPassword123"* ]] &&
+    [[ "$env" == *"N8N_HERMES_FOLDER_STATUS=created"* ]] &&
+    [[ "$env" != *"CurrentN8nPassword123"* ]]
+}
+
 test_workspace_credentials_command_removed() {
   local out status
   set +e
@@ -5223,7 +5915,7 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"64/64 checks passed"* ]] &&
+    [[ "$out" == *"70/70 checks passed"* ]] &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
@@ -5247,6 +5939,7 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] Vikunja projects are shared with bot-hermes"* ]] &&
     [[ "$out" == *"[x] n8n hardened for private agent workflows"* ]] &&
     [[ "$out" == *"[x] n8n owner/admin ready"* ]] &&
+    [[ "$out" == *"[x] n8n Hermes folder ready in Personal"* ]] &&
     [[ "$out" == *"[x] Tailscale supports selected private access mode"* ]] &&
     [[ "$out" == *"[x] Tailscale Services registered/authorized"* ]] &&
     [[ "$out" == *"[x] Tailscale Serve enabled"* ]] &&
@@ -5266,7 +5959,7 @@ test_workspace_doctor_checklist_passes() {
     [[ "$out" == *"[x] NemoHermes sandbox doctor passes"* ]] &&
     [[ "$out" == *"[x] NemoHermes inference route uses selected LiteLLM model"* ]] &&
     [[ "$out" == *"[x] Hermes model supports automatic tool calling"* ]] &&
-    [[ "$out" == *"[x] Hermes model context is at least 65536 tokens"* ]] &&
+    [[ "$out" == *"[x] Hermes context fits the effective vLLM context"* ]] &&
     [[ "$out" == *"[x] Hermes output and reasoning limits are configured"* ]] &&
     [[ "$out" == *"[x] Hermes CLI uses the balanced local-model tool profile"* ]] &&
     [[ "$out" == *"[x] Hermes reaches Vikunja as bot-hermes"* ]] &&
@@ -5318,7 +6011,7 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"65/65 checks passed"* ]] &&
+  [[ "$out" == *"71/71 checks passed"* ]] &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -5369,22 +6062,24 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 64 and
+    .passed == 70 and
     .failed == 0 and
-    .total == 64 and
+    .total == 70 and
     .model == "Org/Alpha" and
     ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Identity & recovery" and .passed == 13 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Inference & agent" and .passed == 16 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Identity & recovery" and .passed == 14 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Resilience" and .passed == 2 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Inference & agent" and .passed == 19 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM Hermes route completes smoke request" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "NemoHermes inference route uses selected LiteLLM model" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes model supports automatic tool calling" and .ok == true)] | length == 1) and
-    ([.checks[] | select(.label == "Hermes model context is at least 65536 tokens" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "Hermes context fits the effective vLLM context" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes output and reasoning limits are configured" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes CLI uses the balanced local-model tool profile" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Hermes reaches Vikunja as bot-hermes" and .ok == true)] | length == 1) and
+    ([.checks[] | select(.label == "n8n Hermes folder ready in Personal" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "Tailscale workspace URLs respond" and .ok == true)] | length == 1)
   ' >/dev/null
 }
@@ -6313,6 +7008,57 @@ test_workspace_doctor_flags_wrong_nemohermes_route() {
     [[ "$out" == *"[ ] NemoHermes inference route uses selected LiteLLM model"* ]]
 }
 
+test_workspace_doctor_flags_split_hermes_model_config() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_HERMES_CONFIG_MODEL='vllm/Other' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] Hermes config model matches selected LiteLLM route"* ]]
+}
+
+test_workspace_doctor_flags_wrong_main_target() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status config
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  config="${tmp}/home/.config/spark/gateway.json"
+  jq '.main.model = "Org/Other"' "$config" > "${config}.tmp" && mv "${config}.tmp" "$config"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --model Org/Alpha 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"[ ] LiteLLM main alias targets selected physical model"* ]]
+}
+
 test_workspace_doctor_flags_nemohermes_doctor_failure() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status
@@ -6337,6 +7083,33 @@ test_workspace_doctor_flags_nemohermes_doctor_failure() {
   [[ "$status" -ne 0 ]] &&
     [[ "$out" == *"[ ] Hermes local API is reachable"* ]] &&
     [[ "$out" == *"[ ] NemoHermes sandbox doctor passes"* ]]
+}
+
+test_workspace_doctor_flags_mcp_drift_and_dead_forwards() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_cached_model "${tmp}/home" "Org/Alpha"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com \
+    SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com \
+    SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_OPENSHELL_FORWARDS_READY=0 \
+    FAKE_DOCKER_LOGS='[SECURITY] HERMES_MCP_CONFIG_DRIFT: rebuild required\n' \
+    FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\nopenshell-hermes-test\n' \
+    FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
+    "$SPARK" ws doctor --json --model Org/Alpha 2>/dev/null)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$(jq -r '.checks[] | select(.id == "hermes_mcp_configuration_matches_nemoclaw_registry") | .ok' <<< "$out")" == false ]] &&
+    [[ "$(jq -r '.checks[] | select(.id == "hermes_openshell_forwards_are_alive") | .ok' <<< "$out")" == false ]]
 }
 
 test_workspace_doctor_flags_missing_tailscale_service_registration() {
@@ -6506,7 +7279,7 @@ test_workspace_doctor_flags_tailscale_funnel_enabled() {
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_TAILSCALE_FUNNEL_EXIT=0 \
-    FAKE_TAILSCALE_FUNNEL_STATUS='https://tasks.example.com\n' \
+    FAKE_TAILSCALE_FUNNEL_STATUS='https://tasks.example.com (Funnel on)\n' \
     FAKE_NAMES='spark-litellm\n' FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n' \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --model Org/Alpha 2>&1)
@@ -6590,7 +7363,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"64/64 checks passed"* ]] &&
+  [[ "$out" == *"70/70 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -6612,7 +7385,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"64/64 checks passed"* ]] &&
+  [[ "$out" == *"70/70 checks passed"* ]] &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -7024,6 +7797,69 @@ test_workspace_setup_uses_only_n8n_2x_login_field() {
   [[ "$env" == *"N8N_OWNER_SETUP_STATUS=exists"* ]]
 }
 
+test_workspace_n8n_hermes_folder_create_and_reuse() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin config env curl_calls post_count
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  config="${tmp}/home/.config/spark/workspace"
+  mkdir -p "$config"
+  printf '%s\n' 'WORKSPACE_TAILSCALE_MODE=services' > "${config}/secrets.env"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_N8N_FOLDERS=1 FAKE_N8N_FOLDER_MARKER="${tmp}/hermes.folder" \
+    FAKE_CURL_FILE="${tmp}/curl.calls" \
+    bash -c 'source "$1"; workspace_ensure_n8n_hermes_folder owner@example.com correct-password; workspace_ensure_n8n_hermes_folder owner@example.com ""' _ "$SPARK"
+  env=$(cat "${config}/secrets.env")
+  curl_calls=$(cat "${tmp}/curl.calls" 2>/dev/null || true)
+  post_count=$(grep -c -- '-X POST.*:5678/rest/projects/personal-project-id/folders/' <<< "$curl_calls" || true)
+  rm -rf "$tmp"
+  [[ "$env" == *"N8N_HERMES_FOLDER_ID=hermes-folder-id"* ]] &&
+    [[ "$env" == *"N8N_HERMES_FOLDER_STATUS=created"* ]] &&
+    [[ "$post_count" -eq 1 ]]
+}
+
+test_workspace_n8n_hermes_folder_rejects_unsupported_license() {
+  local tmp fake_bin config env curl_calls status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  config="${tmp}/home/.config/spark/workspace"
+  mkdir -p "$config"
+  printf '%s\n' 'WORKSPACE_TAILSCALE_MODE=services' > "${config}/secrets.env"
+  set +e
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_N8N_FOLDERS=0 \
+    FAKE_CURL_FILE="${tmp}/curl.calls" \
+    bash -c 'source "$1"; workspace_ensure_n8n_hermes_folder owner@example.com ""' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  set -e
+  env=$(cat "${config}/secrets.env")
+  curl_calls=$(cat "${tmp}/curl.calls" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$env" == *$'N8N_HERMES_FOLDER_ID=\n'* ]] &&
+    [[ "$env" == *"N8N_HERMES_FOLDER_STATUS=unsupported"* ]] &&
+    [[ "$curl_calls" != *":5678/rest/projects/"* ]]
+}
+
+test_workspace_n8n_hermes_folder_refuses_duplicates() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin config env curl_calls status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  config="${tmp}/home/.config/spark/workspace"
+  mkdir -p "$config"
+  printf '%s\n' 'WORKSPACE_TAILSCALE_MODE=services' > "${config}/secrets.env"
+  set +e
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_N8N_FOLDERS=1 \
+    FAKE_N8N_FOLDERS_JSON='{"count":2,"data":[{"id":"one","name":"Hermes","parentFolderId":null},{"id":"two","name":"Hermes","parentFolderId":null}]}' \
+    FAKE_CURL_FILE="${tmp}/curl.calls" \
+    bash -c 'source "$1"; workspace_ensure_n8n_hermes_folder owner@example.com correct-password' _ "$SPARK" >/dev/null 2>&1
+  status=$?
+  set -e
+  env=$(cat "${config}/secrets.env")
+  curl_calls=$(cat "${tmp}/curl.calls" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$env" == *"N8N_HERMES_FOLDER_STATUS=duplicate"* ]] &&
+    [[ "$curl_calls" != *"-X POST"* ]]
+}
+
 # --- Doctor per backend ---
 test_doctor_ollama_backend() {
   local tmp fake_bin out
@@ -7358,6 +8194,26 @@ test_startup_retry_mamba() {
   rm -rf "$tmp"
   [[ "$nruns" -eq 2 ]] && [[ "$last" == *"--max-num-seqs 2"* ]] &&
     [[ "$out" == *"retrying with --max-num-seqs 2"* ]] && [[ "$out" == *"serving"* ]]
+}
+
+test_startup_retry_kv_memory() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out first last first_util last_util nruns
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    FAKE_RETRY=kv-memory \
+    "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1 || true)
+  first=$(grep '^run ' "${tmp}/d.txt" 2>/dev/null | head -1 || true)
+  last=$(grep '^run ' "${tmp}/d.txt" 2>/dev/null | tail -1 || true)
+  first_util=$(sed -n 's/.*--gpu-memory-utilization \([^ ]*\).*/\1/p' <<< "$first")
+  last_util=$(sed -n 's/.*--gpu-memory-utilization \([^ ]*\).*/\1/p' <<< "$last")
+  nruns=$(grep -c '^run ' "${tmp}/d.txt" 2>/dev/null || echo 0)
+  rm -rf "$tmp"
+  [[ "$nruns" -eq 2 ]] &&
+    awk -v a="$first_util" -v b="$last_util" 'BEGIN { exit !(b > a) }' &&
+    [[ "$out" == *"KV cache reservation too small"* ]] && [[ "$out" == *"serving"* ]]
 }
 
 # Warmup OOM → raise the cgroup margin (25%→50%) within the cap and retry.
@@ -8118,31 +8974,114 @@ test_config_set_and_show() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin set_out show_out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  set_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config auto-update on 2>&1)
-  show_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config 2>&1)
+  set_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config --auto-update on 2>&1)
+  show_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config --show 2>&1)
   rm -rf "$tmp"
   [[ "$set_out" == *"Auto-update enabled"* ]] && [[ "$show_out" == *"auto-update: true"* ]]
 }
 
-test_update_check_accepts_zero_padded_month() {
+test_config_sets_hermes_context() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out settings
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" config --hermes-ctx 131072 2>&1)
+  settings=$(cat "${tmp}/home/.config/spark/hermes.json" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"Hermes context: custom (131072)"* ]] &&
+    [[ "$settings" == *'"mode": "custom"'* ]] &&
+    [[ "$settings" == *'"length": 131072'* ]]
+}
+
+test_hermes_context_modes_follow_vllm_limit() {
+  local tmp fake_bin max_ctx custom_ctx status=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  max_ctx=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
+    FAKE_DOCKER_MAX_MODEL_LEN=262144 \
+    bash -c 'source "$1"; workspace_set_env_key HERMES_CONTEXT_MODE max; workspace_hermes_context_for_model Org/Model' _ "$SPARK")
+  custom_ctx=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
+    FAKE_DOCKER_MAX_MODEL_LEN=32768 \
+    bash -c 'source "$1"; workspace_hermes_context_for_model Org/Model' _ "$SPARK")
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_MANAGED=$'spark-vllm-model\tOrg/Model\t8000\t1\t1\t0\n' \
+    FAKE_DOCKER_MAX_MODEL_LEN=65536 \
+    bash -c 'source "$1"; workspace_set_env_key HERMES_CONTEXT_MODE custom; workspace_set_env_key HERMES_CONTEXT_LENGTH 131072; workspace_hermes_context_for_model Org/Model' _ "$SPARK" >/dev/null 2>&1 || status=$?
+  rm -rf "$tmp"
+  [[ "$max_ctx" == "262144" ]] && [[ "$custom_ctx" == "32768" ]] && [[ "$status" -ne 0 ]]
+}
+
+test_hermes_web_provider_is_ddgs() {
+  local tmp fake_bin calls wrong=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NEMOHERMES_FILE="${tmp}/nemo.log" FAKE_HERMES_DDGS_IMPORT_EXIT=1 \
+    bash -c 'source "$1"; workspace_configure_hermes_web' _ "$SPARK"
+  calls=$(cat "${tmp}/nemo.log" 2>/dev/null || true)
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    FAKE_HERMES_PLUGINS_LIST='enabled user 0.1.0 web-ddgs' \
+    FAKE_HERMES_WEB_CONFIG_BACKEND=ddgs FAKE_HERMES_WEB_CONFIG_SEARCH=ddgs \
+    bash -c 'source "$1"; workspace_hermes_web_ready' _ "$SPARK" || wrong=$?
+  rm -rf "$tmp"
+  [[ "$calls" == *"/usr/bin/python3 -m pip install --user ddgs"* ]] &&
+    [[ "$calls" == *"hermes plugins enable web-ddgs"* ]] &&
+    [[ "$calls" == *"hermes config set web.backend ddgs"* ]] &&
+  [[ "$calls" == *"hermes config set web.search_backend ddgs"* ]] &&
+    [[ "$wrong" -eq 0 ]]
+}
+
+test_update_accepts_zero_padded_august_month() {
+  command -v python3 >/dev/null 2>&1 || { printf "skip - python3 not installed\n"; return 0; }
   local tmp fake_bin out status
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   cat > "${fake_bin}/date" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-  +%F) printf '2026-08-24\n' ;;
+  +%Y-%m-%d) printf '2026-08-05\n' ;;
   +%y) printf '26\n' ;;
   +%m) printf '08\n' ;;
-  *) /bin/date "$@" ;;
+  *) command /bin/date "$@" ;;
 esac
 EOF
   chmod +x "${fake_bin}/date"
+  set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
-    SPARK_VLLM_IMAGE="nvcr.io/nvidia/vllm:26.07-py3" \
-    "$SPARK" config 2>&1) && status=0 || status=$?
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.07-py3" \
+    python3 - "$SPARK" <<'PY'
+import errno
+import os
+import pty
+import subprocess
+import sys
+
+master, slave = pty.openpty()
+process = subprocess.Popen(
+    [sys.argv[1], "help"],
+    stdin=subprocess.DEVNULL,
+    stdout=slave,
+    stderr=slave,
+    env=os.environ,
+)
+os.close(slave)
+chunks = []
+while True:
+    try:
+        data = os.read(master, 4096)
+        if not data:
+            break
+        chunks.append(data)
+    except OSError as exc:
+        if exc.errno == errno.EIO:
+            break
+        raise
+os.close(master)
+sys.stdout.buffer.write(b"".join(chunks))
+raise SystemExit(process.wait())
+PY
+  )
+  status=$?
+  set -e
   rm -rf "$tmp"
-  [[ "$status" -eq 0 ]] && [[ "$out" == *"Configuration:"* ]] &&
-    [[ "$out" != *"invalid octal number"* ]]
+  [[ "$status" -eq 0 ]] && [[ "$out" != *"octal"* ]] && [[ "$out" != *"número octal"* ]]
 }
 
 test_update_prompts_workspace_tool_updates_one_by_one() {
@@ -8154,8 +9093,7 @@ test_update_prompts_workspace_tool_updates_one_by_one() {
 WORKSPACE_POSTGRES_IMAGE=postgres:17
 WORKSPACE_VIKUNJA_IMAGE=vikunja/vikunja:latest
 WORKSPACE_N8N_IMAGE=docker.n8n.io/n8nio/n8n:latest
-HERMES_MODEL=Org/Alpha
-HERMES_LITELLM_MODEL=vllm/Org/Alpha
+HERMES_MODEL=main
 HERMES_CONTEXT_LENGTH=65536
 HERMES_MAX_TOKENS=512
 HERMES_REASONING_EFFORT=none
@@ -8164,13 +9102,14 @@ HERMES_DASHBOARD_PORT=18789
 HERMES_POLICY_TIER=restricted
 HERMES_URL=https://hermes.test-tailnet.ts.net
 ENV
+  printf '%s\n' '{"enabled":true,"port":4000,"main":{"provider":"vllm","model":"Org/Alpha"},"providers":{"vllm":{"enabled":true,"port":8000}}}' > "${tmp}/home/.config/spark/gateway.json"
   : > "${tmp}/home/.config/spark/workspace/docker-compose.yml"
   cat > "${fake_bin}/curl" <<EOF
 #!/usr/bin/env bash
 printf 'VERSION="%s"\\n' "$SPARK_VERSION"
 EOF
   chmod +x "${fake_bin}/curl"
-  out=$(printf 'y\ny\ny\ny\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+  out=$(printf 'y\ny\ny\ny\ny\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:${current_tag}" \
     FAKE_COMPOSE_FILE="${tmp}/compose.log" \
     FAKE_NEMOHERMES_FILE="${tmp}/nemohermes.log" \
@@ -8191,7 +9130,7 @@ EOF
     [[ "$compose_log" == *"up -d --remove-orphans"* ]] &&
     [[ "$nemo_log" == *"hermes rebuild"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_ENDPOINT_URL=http://host.openshell.internal:4000/v1"* ]] &&
-    [[ "$nemo_log" == *"NEMOCLAW_MODEL=vllm/Org/Alpha"* ]] &&
+    [[ "$nemo_log" == *"NEMOCLAW_MODEL=main"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_NO_GPU=1"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_SANDBOX_GPU=0"* ]] &&
     [[ "$nemo_log" == *"COMPATIBLE_API_KEY=dummy"* ]]
@@ -8385,7 +9324,7 @@ test_update_nemohermes_rebuild_uses_stored_compatible_key() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   mkdir -p "${tmp}/home/.config/spark/workspace"
   cat > "${tmp}/home/.config/spark/workspace/secrets.env" <<ENV
-HERMES_LITELLM_MODEL=vllm/Org/Alpha
+HERMES_MODEL=main
 HERMES_CONTEXT_LENGTH=65536
 HERMES_MAX_TOKENS=512
 HERMES_REASONING_EFFORT=none
@@ -8530,6 +9469,7 @@ run_test "workspace scopes Vikunja secret guard to Vikunja data" test_workspace_
 run_test "workspace selects abandoned task manager for teardown" test_workspace_selects_abandoned_task_manager_for_teardown
 run_test "workspace task manager teardown removes images" test_workspace_task_manager_teardown_removes_images
 run_test "workspace task manager teardown covers services and data" test_workspace_task_manager_teardown_covers_services_and_data
+run_test "workspace task manager teardown stops before data removal" test_workspace_task_manager_teardown_stops_before_data_removal
 run_test "workspace task manager teardown removes Hermes access" test_workspace_task_manager_teardown_removes_hermes_access
 run_test "workspace task manager teardown drops database and role" test_workspace_task_manager_teardown_drops_database_and_role
 run_test "workspace task manager teardown waits and retries" test_workspace_task_manager_teardown_waits_and_retries
@@ -8540,6 +9480,7 @@ run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vll
 run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wins
 run_test "alias create preserves dash-prefixed arguments" test_alias_create_preserves_dash_prefixed_args
 run_test "captured alias pins image/env and accepts safe overrides" test_alias_capture_replays_image_env_and_operational_overrides
+run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_centralized
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
 run_test "built-in bundle catalog is embedded and valid" test_bundle_catalog_embeds_and_validates_builtin
@@ -8553,8 +9494,13 @@ run_test "bundle run resolves defaults and dynamic options" test_bundle_run_reso
 run_test "alias create stores bundle plus adjustments" test_alias_create_from_bundle_stores_bundle_and_adjustments
 run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
+run_test "sudo file writes separate authentication from content" test_ctx_sudo_write_separates_password_from_content
 run_test "setup --check reports Tailscale Funnel" test_setup_check_reports_tailscale_funnel
 run_test "doctor reports Tailscale Funnel risk" test_doctor_reports_tailscale_funnel
+run_test "doctor reports failed systemd-sysctl" test_doctor_reports_failed_systemd_sysctl
+run_test "doctor rejects swap-gated earlyoom" test_doctor_rejects_swap_gated_earlyoom
+run_test "doctor reports unbounded vLLM containers" test_doctor_reports_unbounded_vllm_container
+run_test "Funnel detection ignores tailnet-only services" test_tailscale_funnel_ignores_tailnet_only_services
 run_test "doctor supports JSON, quiet, and failure exit codes" test_doctor_json_quiet_and_exit_codes
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
 run_test "dry-run uses JSON profiles without executing model data" test_dry_run_uses_json_profile_safely
@@ -8581,6 +9527,11 @@ run_test "status supports JSON, quiet, and operational exit codes" test_status_j
 run_test "dashboard web writes product UI" test_dashboard_web_once_writes_product_ui
 run_test "dashboard terminal renders product snapshot" test_dashboard_terminal_still_renders_snapshot
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
+run_test "spark run --main publishes an alias target" test_run_main_publishes_alias_target
+run_test "spark run --main replaces the current vLLM main" test_run_main_replaces_current_vllm_main
+run_test "spark run --main checks capacity after stopping current main" test_run_main_checks_capacity_after_stopping_current_main
+run_test "spark run --main offers rollback after failure" test_run_main_failure_offers_and_accepts_rollback
+run_test "spark run --main can decline rollback" test_run_main_failure_can_decline_rollback
 run_test "pull (vllm) reports ready" test_pull_vllm_ready
 run_test "pull routes to Ollama on the ollama backend" test_pull_ollama_routes
 run_test "list shows downloaded models" test_list_shows_models
@@ -8595,7 +9546,8 @@ run_test "rm errors on a model not in cache" test_rm_not_found
 run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
-run_test "update check accepts zero-padded month" test_update_check_accepts_zero_padded_month
+run_test "config sets Hermes context" test_config_sets_hermes_context
+run_test "update accepts zero-padded August month" test_update_accepts_zero_padded_august_month
 run_test "update prompts workspace tool updates one by one" test_update_prompts_workspace_tool_updates_one_by_one
 run_test "update skips images already at remote digest" test_update_skips_images_already_at_remote_digest
 run_test "update parses human Buildx digest output" test_update_parses_human_buildx_digest_output
@@ -8641,6 +9593,7 @@ run_test "per-container --memory limit honors warmup headroom env" test_mem_limi
 run_test "default max-num-seqs cap is 100 (announced)" test_max_num_seqs_default
 run_test "--max-num-seqs overrides the default" test_max_num_seqs_override
 run_test "startup retries Mamba failure with lower --max-num-seqs" test_startup_retry_mamba
+run_test "startup retries insufficient KV cache reservation" test_startup_retry_kv_memory
 run_test "startup retries warmup OOM with more headroom" test_startup_retry_oom
 run_test "unrecoverable startup aborts without retry" test_startup_unrecoverable_aborts
 run_test "--no-wait launches without supervising" test_startup_no_wait
@@ -8682,6 +9635,8 @@ run_test "setup --host (ollama) reports ready" test_host_check_ollama_ready
 run_test "setup --host (vllm) flags a missing GPU" test_host_check_vllm_no_gpu
 run_test "setup --host flags missing OS hardening" test_host_check_hardening_missing
 run_test "setup --host passes with hardening present" test_host_check_hardening_present
+run_test "setup rejects swap-gated earlyoom configuration" test_earlyoom_rejects_swap_gated_configuration
+run_test "setup repairs failed systemd-sysctl" test_swap_repairs_failed_systemd_sysctl
 run_test "swap reconciled by total active swap" test_swap_reconcile_by_total
 run_test "swap ready state is a no-op" test_swap_ready_no_mutation
 run_test "swap trusts swapon when free reports zero" test_swap_swapon_wins_when_free_reports_zero
@@ -8701,14 +9656,28 @@ run_test "help text tracks current CLI" test_help_text_tracks_current_cli
 run_test "workspace help renders only as ws" test_workspace_help_and_command
 run_test "workspace lifecycle start/stop replaces down" test_workspace_lifecycle_commands
 run_test "workspace restart orders stop then start" test_workspace_restart_orders_stop_then_start
+run_test "Hermes stop timeout is configurable" test_workspace_hermes_stop_timeout_is_configurable
+run_test "Hermes stop timeout failure aborts stop" test_workspace_hermes_stop_timeout_failure_aborts_stop
+run_test "workspace restart captures and discards the vLLM launch" test_workspace_restart_captures_launch_before_stop_and_discards_it
+run_test "workspace migrates the Hermes model env to main" test_workspace_migrates_hermes_model_env_to_main
+run_test "captured vLLM launch treats omitted KV mode as auto" test_captured_vllm_launch_defaults_omitted_kv_to_auto
+run_test "model repair reuses the workspace restart snapshot" test_repair_uses_workspace_restart_snapshot
+run_test "workspace repair is operator-triggered only" test_workspace_repair_is_operator_triggered_only
+run_test "workspace detects Hermes MCP config drift" test_workspace_detects_hermes_mcp_config_drift
+run_test "workspace repair rebuilds MCP drift and reconciles" test_workspace_repair_rebuilds_mcp_drift_and_reconciles
+run_test "workspace repair force rebuild is explicit" test_workspace_repair_force_rebuild_is_explicit
 run_test "workspace Hermes start uses official lifecycle" test_workspace_hermes_start_uses_official_lifecycle
+run_test "workspace Hermes start recovers stopped agent gateway" test_workspace_hermes_start_recovers_stopped_agent_gateway
 run_test "workspace bridge waits for delayed readiness" test_workspace_bridge_waits_for_delayed_readiness
 run_test "workspace dashboard proxy rewrites Host on loopback" test_workspace_dashboard_proxy_rewrites_host_on_loopback
+run_test "Hermes context modes follow vLLM limit" test_hermes_context_modes_follow_vllm_limit
+run_test "Hermes web provider is DDG" test_hermes_web_provider_is_ddgs
 run_test "workspace listener check allows OpenShell gateway bridge" test_workspace_listener_check_allows_only_openshell_gateway_bridge
-run_test "workspace model recovery disables MTP" test_workspace_model_start_disables_mtp_for_reliable_recovery
-run_test "workspace model recovery enables tool calling" test_workspace_model_restarts_without_tool_calling
-run_test "workspace model requires expected tool parser" test_workspace_model_tool_calling_requires_expected_parser
-run_test "workspace Hermes uses balanced CLI toolsets" test_workspace_hermes_toolsets_are_balanced
+run_test "repair starts model with requested policy" test_repair_starts_model_with_requested_policy
+run_test "repair defaults to LiteLLM main model" test_repair_defaults_to_litellm_main_model
+run_test "repair restarts model without tool calling" test_repair_restarts_model_without_tool_calling
+run_test "repair model requires expected tool parser" test_repair_model_tool_calling_requires_expected_parser
+run_test "workspace Hermes runtime uses supported config writes" test_workspace_hermes_runtime_uses_supported_config_writes
 run_test "workspace status uses Tailscale Services config" test_workspace_status_uses_tailscale_services_config
 run_test "workspace restores OpenShell Hermes container name" test_workspace_restores_openshell_hermes_name
 run_test "workspace setup --check does not write files" test_workspace_check_no_mutation
@@ -8728,6 +9697,7 @@ run_test "workspace setup refuses missing secret with data" test_workspace_setup
 run_test "workspace setup fails when Hermes onboard fails" test_workspace_setup_fails_when_hermes_onboard_fails
 run_test "workspace setup updates stale NemoHermes" test_workspace_setup_updates_stale_nemohermes
 run_test "workspace setup stops when NemoHermes update fails" test_workspace_setup_stops_when_nemohermes_update_fails
+run_test "workspace setup verifies NemoHermes update postcondition" test_workspace_setup_accepts_successful_nemohermes_update_postcondition
 run_test "workspace derives tailnet from Tailscale self DNSName" test_workspace_tailnet_from_self_dnsname
 run_test "workspace setup requires tailnet URLs" test_workspace_setup_requires_tailnet_urls
 run_test "workspace ports mode requires MagicDNS URLs" test_workspace_ports_requires_magicdns_urls
@@ -8760,6 +9730,7 @@ run_test "workspace setup missing required values does not pollute env" test_wor
 run_test "workspace setup generates, prints, and forgets human passwords" test_workspace_setup_generates_prints_and_forgets_passwords
 run_test "workspace setup accepts password flags and files" test_workspace_setup_accepts_password_flags_and_files
 run_test "workspace setup prompts for existing Vikunja password" test_workspace_setup_prompts_for_existing_vikunja_password
+run_test "workspace setup prompts for existing n8n password" test_workspace_setup_prompts_for_existing_n8n_password
 run_test "workspace credentials command is removed" test_workspace_credentials_command_removed
 run_test "workspace setup rejects removed SMTP" test_workspace_setup_rejects_removed_smtp
 run_test "workspace setup removes legacy SMTP" test_workspace_setup_removes_legacy_smtp
@@ -8811,7 +9782,10 @@ run_test "workspace doctor flags missing Postgres runtime DB" test_workspace_doc
 run_test "workspace doctor flags missing LiteLLM route" test_workspace_doctor_flags_missing_litellm_route
 run_test "workspace doctor flags LiteLLM smoke failure" test_workspace_doctor_flags_litellm_smoke_failure
 run_test "workspace doctor flags wrong NemoHermes route" test_workspace_doctor_flags_wrong_nemohermes_route
+run_test "workspace doctor flags split Hermes model config" test_workspace_doctor_flags_split_hermes_model_config
+run_test "workspace doctor flags wrong LiteLLM main target" test_workspace_doctor_flags_wrong_main_target
 run_test "workspace doctor flags NemoHermes doctor failure" test_workspace_doctor_flags_nemohermes_doctor_failure
+run_test "workspace doctor flags MCP drift and dead forwards" test_workspace_doctor_flags_mcp_drift_and_dead_forwards
 run_test "workspace doctor flags missing Tailscale Service registration" test_workspace_doctor_flags_missing_tailscale_service_registration
 run_test "workspace doctor flags Tailscale Serve disabled" test_workspace_doctor_flags_tailscale_serve_disabled
 run_test "workspace doctor flags Tailscale Service host not advertised" test_workspace_doctor_flags_tailscale_service_host_not_advertised
@@ -8841,6 +9815,9 @@ run_test "workspace setup rejects multiline Todoist token" test_workspace_setup_
 run_test "workspace setup rejects removed Vikunja token flag" test_workspace_setup_rejects_removed_vikunja_token_flag
 run_test "workspace setup rerun bootstraps n8n owner" test_workspace_setup_rerun_bootstraps_n8n_owner
 run_test "workspace setup uses only n8n 2.x login field" test_workspace_setup_uses_only_n8n_2x_login_field
+run_test "workspace n8n creates and reuses Hermes folder" test_workspace_n8n_hermes_folder_create_and_reuse
+run_test "workspace n8n rejects unsupported folder license" test_workspace_n8n_hermes_folder_rejects_unsupported_license
+run_test "workspace n8n refuses duplicate Hermes folders" test_workspace_n8n_hermes_folder_refuses_duplicates
 
 if [[ "$test_list_only" == "1" ]]; then
   (( selected > 0 ))
