@@ -1070,7 +1070,7 @@ test_architecture_command_maps_core_boundaries() {
     [[ "$output" == *"src/commands/*.sh"* ]] &&
     [[ "$output" == *"workspace"* ]] &&
     [[ "$output" == *"gateway"* ]] &&
-    [[ "$output" == *"docs/architecture.md"* ]]
+    [[ "$output" == *".github/workflows/ci.yml"* ]]
 }
 
 test_single_file_build_matches_modules() {
