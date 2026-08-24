@@ -113,7 +113,11 @@ cmd_run() {
     [[ "$BACKEND" == "vllm" ]] || die "Bundle '${bundle_name}' requires the vLLM backend"
     [[ "$mtp_flag" == "auto" ]] || die "Bundles with a drafter do not accept --mtp or --no-mtp"
     bundle_prepare_run "$bundle_name" "$bundle_path"
-    BUNDLE_ACTIVE_RUN_ARGS_JSON=$(jq -nc --args '$ARGS.positional' -- "${bundle_explicit_run_args[@]}")
+    if [[ ${#bundle_explicit_run_args[@]} -gt 0 ]]; then
+      BUNDLE_ACTIVE_RUN_ARGS_JSON=$(jq -nc --args '$ARGS.positional' -- "${bundle_explicit_run_args[@]}")
+    else
+      BUNDLE_ACTIVE_RUN_ARGS_JSON='[]'
+    fi
   fi
   validate_model_ref_for_backend "$model"
 
@@ -498,7 +502,11 @@ alias_bundle_guided_definition() {
     fi
   done 3< <(jq -r '(.options // {}) | to_entries[] | [.key, .value.type, (.value.default|tostring)] | @tsv' "$manifest")
 
-  args_json=$(jq -nc --args '$ARGS.positional' -- "${args[@]}")
+  if [[ ${#args[@]} -gt 0 ]]; then
+    args_json=$(jq -nc --args '$ARGS.positional' -- "${args[@]}")
+  else
+    args_json='[]'
+  fi
   options_json="$BUNDLE_OPTION_VALUES_JSON"
   definition=$(jq -nc --arg model "$model" --arg bundle "$bundle" \
     --argjson args "$args_json" --argjson options "$options_json" \
@@ -544,7 +552,11 @@ alias_guided_definition() {
   alias_prompt_yes "Recompute model profile before launch" && args+=(--regen-profile)
   :
 
-  args_json=$(jq -nc --args '$ARGS.positional' -- "${args[@]}")
+  if [[ ${#args[@]} -gt 0 ]]; then
+    args_json=$(jq -nc --args '$ARGS.positional' -- "${args[@]}")
+  else
+    args_json='[]'
+  fi
   definition=$(jq -nc --arg backend "$BACKEND" --arg model "$model" --argjson args "$args_json" \
     '{kind:"guided", backend:$backend, model:$model, run_args:$args}')
   printf '%s\n' "$definition"
