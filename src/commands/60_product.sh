@@ -704,7 +704,7 @@ cmd_help() {
     doctor           Check all prerequisites (read-only)
     models           Recommend models for this hardware
     run <model>      Start serving a model (can run several at once)
-    bundle            Browse, import, validate, synchronize, and run vLLM bundles
+    bundle            Browse, import, submit, synchronize, and run vLLM bundles
     down             Stop all Spark-managed model and gateway services
     alias            Save, inspect, and restore launch aliases
     calibrate <model> Measure launch configs and save the fastest one
@@ -731,6 +731,8 @@ cmd_help() {
                                    Import it; --force replaces the installed copy
     bundle remove <name>           Remove an imported bundle
     bundle sync [--check]          Embed Git-tracked built-ins into the spark executable
+    bundle submit <name|directory> [--dry-run] [--draft]
+                                   Validate and open a bundle pull request
 
   ${BOLD}Run flags:${NC}
     --mem <float>          Force GPU memory fraction (0.0-1.0); bypasses auto-sizing

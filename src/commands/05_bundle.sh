@@ -504,6 +504,168 @@ cmd_bundle_sync() {
   fi
 }
 
+BUNDLE_SUBMIT_TMP_DIR=""
+
+bundle_submit_cleanup() {
+  local path="${BUNDLE_SUBMIT_TMP_DIR:-}"
+  [[ -n "$path" && -d "$path" && "$(basename "$path")" == spark-bundle-submit.* ]] || return 0
+  rm -rf -- "$path"
+  BUNDLE_SUBMIT_TMP_DIR=""
+}
+
+bundle_submit_source() {
+  local ref="$1"
+  BUNDLE_SUBMIT_SOURCE=""
+  if [[ -d "$ref" ]]; then
+    BUNDLE_SUBMIT_SOURCE=$(cd "$ref" 2>/dev/null && pwd) \
+      || die "Bundle directory not found: ${ref}"
+    return 0
+  fi
+  bundle_resolve "$ref" || die "Bundle '${ref}' does not exist" \
+    "Pass an installed bundle name or a bundle directory."
+  BUNDLE_SUBMIT_SOURCE="$BUNDLE_PATH"
+}
+
+cmd_bundle_submit() {
+  local ref="$1" dry="${2:-0}" draft="${3:-0}"
+  local source manifest name target drafter tokens target_repo repo_url base cache_root checkout dest
+  local change verb title branch login permission repo_name push_remote head_ref fork_parent body pr_url
+  local -a pr_args=()
+
+  command -v git >/dev/null 2>&1 || die "git is required to submit a bundle"
+  bundle_submit_source "$ref"
+  source="$BUNDLE_SUBMIT_SOURCE"
+  bundle_validate_dir "$source" || die "Bundle validation failed"
+  manifest="${source}/bundle.json"
+  name=$(jq -r '.name' "$manifest")
+  target=$(jq -r '.defaults.target_model.id' "$manifest")
+  drafter=$(jq -r '.defaults.draft_model.id' "$manifest")
+  tokens=$(jq -r '.defaults.speculative_tokens' "$manifest")
+
+  target_repo="${SPARK_BUNDLE_SUBMIT_GITHUB_REPO:-$GITHUB_REPO}"
+  base="${SPARK_BUNDLE_SUBMIT_BASE:-main}"
+  repo_url="${SPARK_BUNDLE_SUBMIT_REPO_URL:-https://github.com/${target_repo}.git}"
+  cache_root="${SPARK_BUNDLE_SUBMIT_TMP_ROOT:-${TMPDIR:-/tmp}}"
+  mkdir -p "$cache_root" || die "Cannot create bundle submission workspace"
+  BUNDLE_SUBMIT_TMP_DIR=$(mktemp -d "${cache_root%/}/spark-bundle-submit.XXXXXX") \
+    || die "Cannot create bundle submission workspace"
+  trap bundle_submit_cleanup EXIT
+  checkout="${BUNDLE_SUBMIT_TMP_DIR}/spark"
+
+  info "Valid bundle '${name}'"
+  info "Preparing an isolated Spark checkout"
+  git clone --quiet --depth 1 --branch "$base" "$repo_url" "$checkout" \
+    || die "Could not clone ${target_repo}" "Check network access and the target repository."
+  [[ -x "${checkout}/scripts/build-single-file.sh" && -d "${checkout}/bundles/vllm" ]] \
+    || die "Submission repository does not have the expected Spark layout"
+
+  dest="${checkout}/bundles/vllm/${name}"
+  change="new"
+  if [[ -d "$dest" ]]; then
+    change="update"
+    rm -rf -- "$dest"
+  fi
+  mkdir -p "$(dirname "$dest")" || die "Cannot prepare bundle destination"
+  cp -R "${source}/." "$dest/" || die "Cannot copy bundle into submission checkout"
+  bundle_validate_dir "$dest" || die "Copied bundle failed validation"
+
+  while IFS= read -r dest; do
+    [[ -d "$dest" ]] || continue
+    bundle_validate_dir "$dest" || die "Repository bundle validation failed: $(basename "$dest")"
+  done < <(find "${checkout}/bundles/vllm" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+
+  "${checkout}/scripts/build-single-file.sh" >/dev/null \
+    || die "Could not synchronize the bundle catalog"
+  git -C "$checkout" add -- "bundles/vllm/${name}" spark \
+    || die "Could not stage the bundle submission"
+  git -C "$checkout" diff --cached --quiet \
+    && die "Bundle '${name}' matches ${target_repo}:${base}" "There is nothing to submit."
+
+  printf '\n  %sBundle submission%s\n\n' "$BOLD" "$NC"
+  printf '  Name:     %s\n' "$name"
+  printf '  Change:   %s\n' "$change"
+  printf '  Target:   %s\n' "$target"
+  printf '  Drafter:  %s\n' "$drafter"
+  printf '  Tokens:   %s\n\n' "$tokens"
+  git -C "$checkout" diff --cached --stat
+  printf '\n  Bundle diff:\n\n'
+  git -C "$checkout" diff --cached -- "bundles/vllm/${name}"
+  printf '\n'
+
+  if [[ "$dry" == "1" ]]; then
+    info "Dry run complete; no branch, push, or PR was created"
+    bundle_submit_cleanup
+    trap - EXIT
+    return 0
+  fi
+
+  command -v gh >/dev/null 2>&1 || die "GitHub CLI is required to open the PR" \
+    "Install gh, then run: gh auth login"
+  is_interactive || die "Publishing a bundle requires confirmation" \
+    "Review first with: spark bundle submit ${ref} --dry-run"
+  confirm "Open a ${change} bundle PR for '${name}'?" || {
+    warn "Cancelled"
+    bundle_submit_cleanup
+    trap - EXIT
+    return 0
+  }
+  GH_PROMPT_DISABLED=1 gh auth status --hostname github.com >/dev/null 2>&1 \
+    || die "GitHub CLI is not authenticated" "Run: gh auth login"
+  login=$(GH_PROMPT_DISABLED=1 gh api user --jq .login 2>/dev/null) \
+    || die "Could not determine the authenticated GitHub user"
+  [[ "$login" =~ ^[A-Za-z0-9-]+$ ]] || die "GitHub returned an invalid login"
+  permission=$(GH_PROMPT_DISABLED=1 gh repo view "$target_repo" \
+    --json viewerPermission --jq .viewerPermission 2>/dev/null) \
+    || die "Could not inspect GitHub permissions for ${target_repo}"
+
+  [[ "$change" == "new" ]] && verb="add" || verb="update"
+  title="bundle: ${verb} ${name}"
+  branch="spark-bundle/${name}-$(date -u +%Y%m%d%H%M%S)"
+  git -C "$checkout" switch --quiet -c "$branch" \
+    || die "Could not create submission branch"
+  git -C "$checkout" config user.name "$login"
+  git -C "$checkout" config user.email "${login}@users.noreply.github.com"
+  git -C "$checkout" commit --quiet -m "$title" \
+    || die "Could not commit the bundle submission"
+
+  push_remote="origin"
+  head_ref="$branch"
+  case "$permission" in
+    ADMIN|MAINTAIN|WRITE) ;;
+    *)
+      repo_name="${target_repo##*/}"
+      fork_parent=$(GH_PROMPT_DISABLED=1 gh repo view "${login}/${repo_name}" \
+        --json parent --jq '.parent.nameWithOwner // ""' 2>/dev/null || true)
+      if [[ -z "$fork_parent" ]]; then
+        GH_PROMPT_DISABLED=1 gh repo fork "$target_repo" --clone=false >/dev/null \
+          || die "Could not create a fork of ${target_repo}"
+        fork_parent=$(GH_PROMPT_DISABLED=1 gh repo view "${login}/${repo_name}" \
+          --json parent --jq '.parent.nameWithOwner // ""' 2>/dev/null || true)
+      fi
+      [[ "$fork_parent" == "$target_repo" ]] \
+        || die "${login}/${repo_name} is not a fork of ${target_repo}"
+      git -C "$checkout" remote add submit \
+        "${SPARK_BUNDLE_SUBMIT_FORK_URL:-https://github.com/${login}/${repo_name}.git}"
+      push_remote="submit"
+      head_ref="${login}:${branch}"
+      ;;
+  esac
+  git -C "$checkout" push --quiet -u "$push_remote" "$branch" \
+    || die "Could not push the submission branch"
+
+  body=$(printf '## Bundle\n\n- Name: `%s`\n- Change: `%s`\n- Target: `%s`\n- Drafter: `%s`\n- Speculative tokens: `%s`\n\nPrepared with `spark bundle submit`.\n' \
+    "$name" "$change" "$target" "$drafter" "$tokens")
+  pr_args=(pr create --repo "$target_repo" --base "$base" --head "$head_ref" \
+    --title "$title" --body "$body")
+  [[ "$draft" == "1" ]] && pr_args+=(--draft)
+  pr_url=$(GH_PROMPT_DISABLED=1 gh "${pr_args[@]}" 2>/dev/null) \
+    || die "The branch was pushed, but GitHub could not create the PR" \
+      "Open it manually from branch: ${head_ref}"
+  info "Pull request opened: ${pr_url}"
+  bundle_submit_cleanup
+  trap - EXIT
+}
+
 bundle_tui_run_configured() {
   local name="$1" manifest value key type default
   local -a bundle_tui_flags=()
@@ -572,6 +734,8 @@ cmd_bundle_help() {
     import <directory> [--force]   Import or replace a bundle folder
     remove <name>                  Remove an imported bundle
     sync [--check]                 Embed Git-tracked bundles into spark
+    submit <name|directory>        Validate and open a GitHub pull request
+      [--dry-run] [--draft]        Preview only, or open it as a draft
 
   With no command, opens the interactive bundle browser.
   Run one with: spark run <bundle> [normal flags] [bundle flags]
@@ -581,7 +745,7 @@ EOF
 }
 
 cmd_bundle() {
-  local action="${1:-}" name="" dir=""
+  local action="${1:-}" name="" dir="" dry=0 draft=0 ref=""
   [[ -n "$action" ]] || { cmd_bundle_tui; return; }
   shift || true
   case "$action" in
@@ -611,6 +775,18 @@ cmd_bundle() {
     sync)
       [[ "${1:-}" == "--check" || -z "${1:-}" ]] || die "Usage: spark bundle sync [--check]"
       cmd_bundle_sync "$([[ "${1:-}" == "--check" ]] && printf 1 || printf 0)" ;;
+    submit)
+      ref="${1:-}"; [[ -n "$ref" ]] || die "Usage: spark bundle submit <name|directory> [--dry-run] [--draft]"
+      shift || true
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --dry-run) dry=1 ;;
+          --draft) draft=1 ;;
+          *) die "Usage: spark bundle submit <name|directory> [--dry-run] [--draft]" ;;
+        esac
+        shift
+      done
+      cmd_bundle_submit "$ref" "$dry" "$draft" ;;
     help|-h|--help) cmd_bundle_help ;;
     *) die "Unknown bundle command: ${action}" "Run 'spark bundle --help' for usage" ;;
   esac

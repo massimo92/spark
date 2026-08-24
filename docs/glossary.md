@@ -10,8 +10,8 @@ Se gestiona con `spark alias`; al ejecutarlo, se usa `spark run <alias>`.
 Se guarda localmente bajo `~/.config/spark/`; no es configuración del proyecto
 ni se sube al repositorio.
 
-Cuando nace de un bundle, guarda su nombre, hash exacto y todos los ajustes
-pasados. Se crea con el flujo normal: `spark alias create <alias>` o
+Cuando nace de un bundle, guarda su nombre y todos los ajustes pasados. Se crea
+con el flujo normal: `spark alias create <alias>` o
 `spark alias capture <alias>`.
 
 ## Bundle
@@ -22,6 +22,10 @@ parches, valores vLLM y opciones configurables. Se ejecuta directamente con
 
 Un bundle no es un alias. El bundle es portable y compartido; el alias es una
 configuración de lanzamiento local basada en él.
+
+Se comparte con `spark bundle submit <nombre|directorio>`, que valida el
+contenido, muestra los cambios y abre una pull request. `--dry-run` no publica
+nada.
 
 ## Rollback de alias
 

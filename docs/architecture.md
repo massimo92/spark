@@ -15,7 +15,7 @@ Project: spark by Massimo Angelini - https://github.com/massimo92/spark
 
 ```text
 src/00_bootstrap.sh              constants, platform detection, shared helpers
-src/commands/05_bundle.sh        bundle catalog/import/build/TUI integration
+src/commands/05_bundle.sh        bundle catalog/import/build/submit/TUI integration
 src/commands/10_runtime.sh       run/stop/pull/list/rm/status helpers
 src/commands/20_dashboard.sh     Web and terminal dashboard
 src/commands/30_status_doctor.sh status, logs, doctor

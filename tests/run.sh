@@ -905,6 +905,9 @@ test_suite_includes() {
     test_bundle_catalog_embeds_and_validates_builtin|\
     test_bundle_validation_requires_declared_applied_patches|\
     test_bundle_sync_checks_git_catalog|\
+    test_bundle_submit_dry_run_prepares_new_and_updated_changes|\
+    test_bundle_submit_opens_confirmed_draft_pr|\
+    test_bundle_submit_uses_fork_without_write_permission|\
     test_bundle_imports_external_folder_and_run_builds_with_docker_cache|\
     test_bundle_run_resolves_defaults_and_dynamic_options|\
     test_alias_create_from_bundle_stores_bundle_and_adjustments|\
@@ -2278,6 +2281,133 @@ test_bundle_sync_checks_git_catalog() {
     "$standalone" bundle sync --check 2>&1) && status=0 || status=$?
   [[ "$status" -ne 0 && "$output" == *"Cannot find the Spark source repository"* ]] || ok=1
 
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+make_bundle_submit_origin() {
+  local origin="$1" head
+  head=$(git -C "$ROOT_DIR" rev-parse HEAD)
+  git clone --quiet --bare "$ROOT_DIR" "$origin"
+  git --git-dir="$origin" branch -f main "$head"
+  git --git-dir="$origin" symbolic-ref HEAD refs/heads/main
+}
+
+test_bundle_submit_dry_run_prepares_new_and_updated_changes() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin origin new_source update_source manifest_tmp new_out update_out status=0 no_change_out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  origin="${tmp}/origin.git"
+  make_bundle_submit_origin "$origin"
+
+  new_source="${tmp}/new-bundle"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$new_source"
+  manifest_tmp="${tmp}/bundle.json"
+  jq '.name="submit-new-bundle"' "${new_source}/bundle.json" > "$manifest_tmp"
+  mv "$manifest_tmp" "${new_source}/bundle.json"
+  new_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_BUNDLE_SUBMIT_REPO_URL="$origin" SPARK_BUNDLE_SUBMIT_TMP_ROOT="$tmp" \
+    "$SPARK" bundle submit "$new_source" --dry-run 2>&1)
+
+  update_source="${tmp}/update-bundle"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$update_source"
+  printf '\nSubmission update test.\n' >> "${update_source}/README.md"
+  update_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_BUNDLE_SUBMIT_REPO_URL="$origin" SPARK_BUNDLE_SUBMIT_TMP_ROOT="$tmp" \
+    "$SPARK" bundle submit "$update_source" --draft --dry-run 2>&1)
+
+  no_change_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_BUNDLE_SUBMIT_REPO_URL="$origin" SPARK_BUNDLE_SUBMIT_TMP_ROOT="$tmp" \
+    "$SPARK" bundle submit qwen38-dflash2-lookup --dry-run 2>&1) && status=0 || status=$?
+  local ok=0
+  [[ "$new_out" == *"Change:   new"* && "$new_out" == *"Dry run complete"* ]] || ok=1
+  [[ "$update_out" == *"Change:   update"* && "$update_out" == *"Dry run complete"* ]] || ok=1
+  [[ "$status" -ne 0 && "$no_change_out" == *"There is nothing to submit"* ]] || ok=1
+  git --git-dir="$origin" for-each-ref --format='%(refname)' refs/heads/spark-bundle/ | grep -q . && ok=1
+  find "$tmp" -maxdepth 1 -type d -name 'spark-bundle-submit.*' | grep -q . && ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_submit_opens_confirmed_draft_pr() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin origin source manifest_tmp gh_log out refs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  origin="${tmp}/origin.git"
+  make_bundle_submit_origin "$origin"
+  source="${tmp}/published-bundle"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$source"
+  manifest_tmp="${tmp}/bundle.json"
+  jq '.name="submit-published-bundle"' "${source}/bundle.json" > "$manifest_tmp"
+  mv "$manifest_tmp" "${source}/bundle.json"
+  gh_log="${tmp}/gh.log"
+  cat > "${fake_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${FAKE_GH_LOG}"
+case "$*" in
+  "auth status --hostname github.com") exit 0 ;;
+  "api user --jq .login") printf 'spark-tester\n' ;;
+  *"--json viewerPermission --jq .viewerPermission") printf 'WRITE\n' ;;
+  pr\ create\ *) printf 'https://github.com/massimo92/spark/pull/123\n' ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "${fake_bin}/gh"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+    FAKE_GH_LOG="$gh_log" SPARK_BUNDLE_SUBMIT_REPO_URL="$origin" \
+    SPARK_BUNDLE_SUBMIT_TMP_ROOT="$tmp" \
+    "$SPARK" bundle submit "$source" --draft 2>&1)
+  refs=$(git --git-dir="$origin" for-each-ref --format='%(refname)' \
+    'refs/heads/spark-bundle/submit-published-bundle-*')
+  local ok=0
+  [[ "$out" == *"Pull request opened: https://github.com/massimo92/spark/pull/123"* ]] || ok=1
+  [[ -n "$refs" ]] || ok=1
+  grep -q -- '--draft' "$gh_log" || ok=1
+  find "$tmp" -maxdepth 1 -type d -name 'spark-bundle-submit.*' | grep -q . && ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_submit_uses_fork_without_write_permission() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin origin fork source manifest_tmp gh_log out fork_refs origin_refs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  origin="${tmp}/origin.git"; fork="${tmp}/fork.git"
+  make_bundle_submit_origin "$origin"
+  git clone --quiet --bare "$origin" "$fork"
+  source="${tmp}/fork-bundle"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$source"
+  manifest_tmp="${tmp}/bundle.json"
+  jq '.name="submit-fork-bundle"' "${source}/bundle.json" > "$manifest_tmp"
+  mv "$manifest_tmp" "${source}/bundle.json"
+  gh_log="${tmp}/gh.log"
+  cat > "${fake_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${FAKE_GH_LOG}"
+case "$*" in
+  "auth status --hostname github.com") exit 0 ;;
+  "api user --jq .login") printf 'spark-tester\n' ;;
+  *"--json viewerPermission --jq .viewerPermission") printf 'READ\n' ;;
+  "repo view spark-tester/spark --json parent --jq "*) printf 'massimo92/spark\n' ;;
+  pr\ create\ *) printf 'https://github.com/massimo92/spark/pull/124\n' ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "${fake_bin}/gh"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+    FAKE_GH_LOG="$gh_log" SPARK_BUNDLE_SUBMIT_REPO_URL="$origin" \
+    SPARK_BUNDLE_SUBMIT_FORK_URL="$fork" SPARK_BUNDLE_SUBMIT_TMP_ROOT="$tmp" \
+    "$SPARK" bundle submit "$source" 2>&1)
+  fork_refs=$(git --git-dir="$fork" for-each-ref --format='%(refname)' \
+    'refs/heads/spark-bundle/submit-fork-bundle-*')
+  origin_refs=$(git --git-dir="$origin" for-each-ref --format='%(refname)' \
+    'refs/heads/spark-bundle/submit-fork-bundle-*')
+  local ok=0
+  [[ "$out" == *"Pull request opened: https://github.com/massimo92/spark/pull/124"* ]] || ok=1
+  [[ -n "$fork_refs" && -z "$origin_refs" ]] || ok=1
+  grep -q -- '--head spark-tester:spark-bundle/submit-fork-bundle-' "$gh_log" || ok=1
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
 }
@@ -8415,6 +8545,9 @@ run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatc
 run_test "built-in bundle catalog is embedded and valid" test_bundle_catalog_embeds_and_validates_builtin
 run_test "bundle validation requires every patch to be declared and applied" test_bundle_validation_requires_declared_applied_patches
 run_test "bundle sync validates the Git catalog and generated executable" test_bundle_sync_checks_git_catalog
+run_test "bundle submit previews new and updated changes" test_bundle_submit_dry_run_prepares_new_and_updated_changes
+run_test "bundle submit opens a confirmed draft PR" test_bundle_submit_opens_confirmed_draft_pr
+run_test "bundle submit uses a fork without write permission" test_bundle_submit_uses_fork_without_write_permission
 run_test "external bundle imports and every run checks Docker build cache" test_bundle_imports_external_folder_and_run_builds_with_docker_cache
 run_test "bundle run resolves defaults and dynamic options" test_bundle_run_resolves_defaults_and_dynamic_options
 run_test "alias create stores bundle plus adjustments" test_alias_create_from_bundle_stores_bundle_and_adjustments
