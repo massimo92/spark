@@ -7994,6 +7994,27 @@ test_config_set_and_show() {
   [[ "$set_out" == *"Auto-update enabled"* ]] && [[ "$show_out" == *"auto-update: true"* ]]
 }
 
+test_update_check_accepts_zero_padded_month() {
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  cat > "${fake_bin}/date" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  +%F) printf '2026-08-24\n' ;;
+  +%y) printf '26\n' ;;
+  +%m) printf '08\n' ;;
+  *) /bin/date "$@" ;;
+esac
+EOF
+  chmod +x "${fake_bin}/date"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_VLLM_IMAGE="nvcr.io/nvidia/vllm:26.07-py3" \
+    "$SPARK" config 2>&1) && status=0 || status=$?
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] && [[ "$out" == *"Configuration:"* ]] &&
+    [[ "$out" != *"invalid octal number"* ]]
+}
+
 test_update_prompts_workspace_tool_updates_one_by_one() {
   local tmp fake_bin out current_tag compose_log nemo_log
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -8441,6 +8462,7 @@ run_test "rm errors on a model not in cache" test_rm_not_found
 run_test "logs on ollama points to the service logs" test_logs_ollama_message
 run_test "logs errors when no container exists" test_logs_vllm_no_container
 run_test "config sets and shows auto-update" test_config_set_and_show
+run_test "update check accepts zero-padded month" test_update_check_accepts_zero_padded_month
 run_test "update prompts workspace tool updates one by one" test_update_prompts_workspace_tool_updates_one_by_one
 run_test "update skips images already at remote digest" test_update_skips_images_already_at_remote_digest
 run_test "update parses human Buildx digest output" test_update_parses_human_buildx_digest_output
