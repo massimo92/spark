@@ -904,6 +904,7 @@ test_suite_includes() {
     test_alias_backend_mismatch_fails_closed|\
     test_bundle_catalog_embeds_and_validates_builtin|\
     test_bundle_validation_requires_declared_applied_patches|\
+    test_bundle_sync_checks_git_catalog|\
     test_bundle_imports_external_folder_and_run_builds_with_docker_cache|\
     test_bundle_run_resolves_defaults_and_dynamic_options|\
     test_alias_create_from_bundle_stores_bundle_and_adjustments|\
@@ -2257,6 +2258,30 @@ test_bundle_validation_requires_declared_applied_patches() {
   [[ "$ok" == "0" ]]
 }
 
+test_bundle_sync_checks_git_catalog() {
+  local tmp fake_bin output check_output standalone outside status=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  output=$(cd "$ROOT_DIR" && HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    "$SPARK" bundle sync 2>&1)
+  check_output=$(cd "$ROOT_DIR" && HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    "$SPARK" bundle sync --check 2>&1)
+  local ok=0
+  [[ "$output" == *"Synchronized 1 built-in bundle(s) into spark"* ]] || ok=1
+  [[ "$check_output" == *"Built-in bundles are synchronized (1)"* ]] || ok=1
+
+  standalone="${tmp}/standalone-spark"
+  outside="${tmp}/outside"
+  cp "$SPARK" "$standalone"
+  chmod +x "$standalone"
+  mkdir -p "$outside"
+  output=$(cd "$outside" && HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    "$standalone" bundle sync --check 2>&1) && status=0 || status=$?
+  [[ "$status" -ne 0 && "$output" == *"Cannot find the Spark source repository"* ]] || ok=1
+
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
 test_bundle_imports_external_folder_and_run_builds_with_docker_cache() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin source manifest_tmp build_file list
@@ -3107,8 +3132,9 @@ make_min_workspace_config() {
 }
 
 test_help_text_tracks_current_cli() {
-  local top dashboard gateway config models reinstall uninstall ws recover setup_error status
+  local top bundle dashboard gateway config models reinstall uninstall ws recover setup_error status
   top=$("$SPARK" help 2>&1)
+  bundle=$("$SPARK" bundle --help 2>&1)
   dashboard=$("$SPARK" dashboard --help 2>&1)
   gateway=$("$SPARK" gateway --help 2>&1)
   config=$("$SPARK" config --help 2>&1)
@@ -3127,9 +3153,13 @@ test_help_text_tracks_current_cli() {
     [[ "$top" == *"--no-mem-limit"* ]] &&
     [[ "$top" == *"--mtp / --no-mtp"* ]] &&
     [[ "$top" == *"--explain"* ]] &&
+    [[ "$top" == *"bundle sync [--check]"* ]] &&
+    [[ "$top" == *"spark bundle --help"* ]] &&
     [[ "$top" != *"default: 128K"* ]] &&
     [[ "$top" != *"default: 5"* ]] &&
     [[ "$dashboard" == *"--terminal"* ]] &&
+    [[ "$bundle" == *"sync [--check]"* ]] &&
+    [[ "$bundle" == *"Run automatically builds its Dockerfile"* ]] &&
     [[ "$dashboard" == *"--watch [seconds]"* ]] &&
     [[ "$gateway" == *"start|stop|status|logs|add|remove"* ]] &&
     [[ "$config" == *"auto-update on|off"* ]] &&
@@ -8363,6 +8393,7 @@ run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_re
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
 run_test "built-in bundle catalog is embedded and valid" test_bundle_catalog_embeds_and_validates_builtin
 run_test "bundle validation requires every patch to be declared and applied" test_bundle_validation_requires_declared_applied_patches
+run_test "bundle sync validates the Git catalog and generated executable" test_bundle_sync_checks_git_catalog
 run_test "external bundle imports and every run checks Docker build cache" test_bundle_imports_external_folder_and_run_builds_with_docker_cache
 run_test "bundle run resolves defaults and dynamic options" test_bundle_run_resolves_defaults_and_dynamic_options
 run_test "alias create stores bundle plus adjustments" test_alias_create_from_bundle_stores_bundle_and_adjustments

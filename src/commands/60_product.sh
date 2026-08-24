@@ -704,7 +704,7 @@ cmd_help() {
     doctor           Check all prerequisites (read-only)
     models           Recommend models for this hardware
     run <model>      Start serving a model (can run several at once)
-    bundle            Manage reproducible vLLM bundles (TUI with no arguments)
+    bundle            Browse, import, validate, synchronize, and run vLLM bundles
     down             Stop all Spark-managed model and gateway services
     alias            Save, inspect, and restore launch aliases
     calibrate <model> Measure launch configs and save the fastest one
@@ -720,6 +720,17 @@ cmd_help() {
     config           Configure Spark settings (e.g. auto-update)
     architecture     Show developer architecture map and invariants
     version          Show the installed Spark version
+
+  ${BOLD}Bundle commands:${NC}
+    bundle                         Open the interactive bundle browser
+    bundle list                    List available bundles
+    bundle show <name>             Show models, defaults, options, and patches
+    bundle init <name>             Create an external bundle folder
+    bundle validate <directory>    Validate a bundle without importing it
+    bundle import <directory> [--force]
+                                   Import it; --force replaces the installed copy
+    bundle remove <name>           Remove an imported bundle
+    bundle sync [--check]          Embed Git-tracked built-ins into the spark executable
 
   ${BOLD}Run flags:${NC}
     --mem <float>          Force GPU memory fraction (0.0-1.0); bypasses auto-sizing
@@ -753,6 +764,7 @@ cmd_help() {
 
   ${BOLD}Help:${NC}
     spark run --help
+    spark bundle --help
     spark setup --help
     spark dashboard --help
     spark doctor --help

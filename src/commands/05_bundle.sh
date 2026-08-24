@@ -462,6 +462,48 @@ cmd_bundle_remove() {
   info "Removed bundle '${name}'"
 }
 
+bundle_repo_root() {
+  local candidate root
+  for candidate in "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" "$PWD"; do
+    root=$(git -C "$candidate" rev-parse --show-toplevel 2>/dev/null || true)
+    [[ -n "$root" ]] || continue
+    if [[ -f "${root}/scripts/build-single-file.sh" && -d "${root}/bundles/vllm" && -d "${root}/src" ]]; then
+      printf '%s\n' "$root"
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd_bundle_sync() {
+  local check="${1:-0}" root dir file rel name count=0
+  root=$(bundle_repo_root) || die "Cannot find the Spark source repository" \
+    "Run this command from the Spark repository."
+  while IFS= read -r dir; do
+    [[ -d "$dir" ]] || continue
+    bundle_validate_dir "$dir" || die "Built-in bundle validation failed: $(basename "$dir")"
+    name=$(jq -r '.name' "${dir}/bundle.json")
+    [[ "$(basename "$dir")" == "$name" ]] \
+      || die "Built-in bundle folder must match its name: ${name}"
+    while IFS= read -r file; do
+      rel="${file#"${root}/"}"
+      git -C "$root" ls-files --error-unmatch "$rel" >/dev/null 2>&1 \
+        || die "Bundle asset is not tracked by Git: ${rel}" "Run: git add ${rel}"
+    done < <(find "$dir" -type f | LC_ALL=C sort)
+    count=$((count + 1))
+  done < <(find "${root}/bundles/vllm" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+  [[ "$count" -gt 0 ]] || die "No built-in bundles found"
+
+  if [[ "$check" == "1" ]]; then
+    "${root}/scripts/build-single-file.sh" --check \
+      || die "Built-in bundles are not synchronized" "Run: spark bundle sync"
+    info "Built-in bundles are synchronized (${count})"
+  else
+    "${root}/scripts/build-single-file.sh" || die "Could not synchronize built-in bundles"
+    info "Synchronized ${count} built-in bundle(s) into spark"
+  fi
+}
+
 bundle_tui_run_configured() {
   local name="$1" manifest value key type default
   local -a bundle_tui_flags=()
@@ -529,6 +571,7 @@ cmd_bundle_help() {
     validate <directory>           Validate without importing
     import <directory> [--force]   Import or replace a bundle folder
     remove <name>                  Remove an imported bundle
+    sync [--check]                 Embed Git-tracked bundles into spark
 
   With no command, opens the interactive bundle browser.
   Run one with: spark run <bundle> [normal flags] [bundle flags]
@@ -565,6 +608,9 @@ cmd_bundle() {
     remove)
       name="${1:-}"; [[ -n "$name" && -z "${2:-}" ]] || die "Usage: spark bundle remove <name>"
       cmd_bundle_remove "$name" ;;
+    sync)
+      [[ "${1:-}" == "--check" || -z "${1:-}" ]] || die "Usage: spark bundle sync [--check]"
+      cmd_bundle_sync "$([[ "${1:-}" == "--check" ]] && printf 1 || printf 0)" ;;
     help|-h|--help) cmd_bundle_help ;;
     *) die "Unknown bundle command: ${action}" "Run 'spark bundle --help' for usage" ;;
   esac

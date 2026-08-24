@@ -24,8 +24,8 @@ MODULES=(
   "src/90_main.sh"
 )
 
-tmp="$(mktemp)"
-cleanup() { rm -f "$tmp"; }
+tmp="$(mktemp "${OUT}.tmp.XXXXXX")"
+cleanup() { [[ -z "${tmp:-}" ]] || rm -f "$tmp"; }
 trap cleanup EXIT
 
 emit_builtin_bundle_assets() {
@@ -61,6 +61,7 @@ if [[ "$CHECK" == "1" ]]; then
   exit 0
 fi
 
-cp "$tmp" "$OUT"
-chmod +x "$OUT"
+chmod +x "$tmp"
+mv "$tmp" "$OUT"
+tmp=""
 printf 'Built %s from %d modules\n' "$OUT" "${#MODULES[@]}"
