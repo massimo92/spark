@@ -21,9 +21,11 @@ fi
 
 # --- Constants ---
 SPARK_CONFIG_DIR="${HOME}/.config/spark"
+SPARK_DATA_DIR="${HOME}/.local/share/spark"
 PROFILES_DIR="${SPARK_CONFIG_DIR}/profiles"
 ALIASES_FILE="${SPARK_CONFIG_DIR}/aliases.json"
 ALIASES_BACKUP_FILE="${SPARK_CONFIG_DIR}/aliases.backup.json"
+BUNDLES_DIR="${SPARK_DATA_DIR}/bundles"
 UPDATE_FILE="${SPARK_CONFIG_DIR}/update.json"
 HERMES_SETTINGS_FILE="${SPARK_CONFIG_DIR}/hermes.json"
 GITHUB_REPO="massimo92/spark"
@@ -82,6 +84,11 @@ WORKSPACE_SUPERSYNC_IMAGE_DEFAULT="spark/supersync:18.15.1"
 WORKSPACE_SUPER_PRODUCTIVITY_VERSION_DEFAULT="v18.15.1"
 WORKSPACE_SUPER_PRODUCTIVITY_COMMIT_DEFAULT="014b789c22c9bf75fd7202845639569b61e7cd8e"
 WORKSPACE_N8N_IMAGE_DEFAULT="docker.n8n.io/n8nio/n8n:latest"
+
+# The release builder replaces this with the Git-tracked built-in catalog.
+# The empty default keeps source modules usable without the release build.
+# shellcheck disable=SC2317,SC2329
+spark_builtin_bundle_assets() { :; }
 
 # Detect total system memory in GiB. On the GB10 (unified memory) nvidia-smi reports
 # N/A, so read the system memory instead: /proc/meminfo (Linux), sysctl (macOS).

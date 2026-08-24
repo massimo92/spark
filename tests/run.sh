@@ -137,8 +137,21 @@ ${stdin_payload}"
     esac
     ;;
   image)
-    if [[ "${2:-}" == "inspect" && -n "${FAKE_DOCKER_LOCAL_DIGEST:-}" ]]; then
-      printf '%s@%s\n' "${*: -1}" "$FAKE_DOCKER_LOCAL_DIGEST"
+    if [[ "${2:-}" == "inspect" ]]; then
+      if [[ "${FAKE_DOCKER_IMAGE_EXISTS:-1}" == "0" && \
+            ( -z "${FAKE_DOCKER_BUILD_FILE:-}" || ! -s "${FAKE_DOCKER_BUILD_FILE}" ) ]]; then
+        exit 1
+      fi
+      case "$args" in
+        *"{{.Id}}"*) printf '%s\n' "${FAKE_DOCKER_IMAGE_ID:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
+        *"Config.Entrypoint"*) printf '%s\n' "${FAKE_DOCKER_ENTRYPOINT_JSON:-[\"vllm\",\"serve\"]}" ;;
+        *)
+          if [[ -n "${FAKE_DOCKER_LOCAL_DIGEST:-}" ]]; then
+            printf '%s@%s\n' "${*: -1}" "$FAKE_DOCKER_LOCAL_DIGEST"
+          fi ;;
+      esac
+    elif [[ "${2:-}" == "rm" ]]; then
+      exit 0
     else
       exit 0
     fi
@@ -146,6 +159,10 @@ ${stdin_payload}"
   buildx)
     [[ -n "${FAKE_DOCKER_REMOTE_OUTPUT:-${FAKE_DOCKER_REMOTE_DIGEST:-}}" ]] || exit 1
     printf '%b\n' "${FAKE_DOCKER_REMOTE_OUTPUT:-$FAKE_DOCKER_REMOTE_DIGEST}"
+    ;;
+  build)
+    [[ -n "${FAKE_DOCKER_BUILD_FILE:-}" ]] && printf '%s\n' "$args" >> "$FAKE_DOCKER_BUILD_FILE"
+    exit "${FAKE_DOCKER_BUILD_EXIT:-0}"
     ;;
   images)
     [[ -n "${FAKE_DOCKER_IMAGE:-}" ]] && printf '%b\n' "${FAKE_DOCKER_IMAGE}"
@@ -984,6 +1001,15 @@ test_suite_includes() {
     test_alias_capture_replays_image_env_and_operational_overrides|\
     test_alias_capture_rejects_secret_flags|\
     test_alias_backend_mismatch_fails_closed|\
+    test_bundle_catalog_embeds_and_validates_builtin|\
+    test_bundle_validation_requires_declared_applied_patches|\
+    test_bundle_sync_checks_git_catalog|\
+    test_bundle_submit_dry_run_prepares_new_and_updated_changes|\
+    test_bundle_submit_opens_confirmed_draft_pr|\
+    test_bundle_submit_uses_fork_without_write_permission|\
+    test_bundle_imports_external_folder_and_run_builds_with_docker_cache|\
+    test_bundle_run_resolves_defaults_and_dynamic_options|\
+    test_alias_create_from_bundle_stores_bundle_and_adjustments|\
     test_total_mem_detection_positive|\
     test_port_auto_skips_busy|\
     test_config_set_and_show|\
@@ -2421,6 +2447,275 @@ test_alias_backend_mismatch_fails_closed() {
   [[ "$status" -ne 0 && "$out" == *"targets vllm; this machine uses ollama"* ]]
 }
 
+test_bundle_catalog_embeds_and_validates_builtin() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin list show
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  list=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle list --json 2>&1)
+  show=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle show qwen38-dflash2-lookup 2>&1)
+  local ok=0
+  jq -e '.[] | select(.name == "qwen38-dflash2-lookup" and .source == "built-in")' <<<"$list" >/dev/null || ok=1
+  [[ "$show" == *"DFlash2 W4A16"* && "$show" == *"--lookup"* ]] || ok=1
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate \
+    "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" >/dev/null 2>&1 || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_validation_requires_declared_applied_patches() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin undeclared unapplied docker_tmp out status=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  undeclared="${tmp}/undeclared"
+  unapplied="${tmp}/unapplied"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$undeclared"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$unapplied"
+
+  printf '%s\n' 'unused' > "${undeclared}/patches/unused.patch"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate "$undeclared" 2>&1) \
+    && status=0 || status=$?
+  local ok=0
+  [[ "$status" -ne 0 && "$out" == *"Patch file is not declared in bundle.json: patches/unused.patch"* ]] || ok=1
+
+  docker_tmp="${tmp}/Dockerfile"
+  sed '/^[[:space:]]*< \/tmp\/qwen38-patches\/qwen3-dflash-w4a16.patch;/d' \
+    "${unapplied}/Dockerfile" > "$docker_tmp"
+  mv "$docker_tmp" "${unapplied}/Dockerfile"
+  status=0
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate "$unapplied" 2>&1) \
+    && status=0 || status=$?
+  [[ "$status" -ne 0 && "$out" == *"Declared patch is not applied by Dockerfile: patches/qwen3-dflash-w4a16.patch"* ]] || ok=1
+
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_sync_checks_git_catalog() {
+  local tmp fake_bin output check_output standalone outside status=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  output=$(cd "$ROOT_DIR" && HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    "$SPARK" bundle sync 2>&1)
+  check_output=$(cd "$ROOT_DIR" && HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    "$SPARK" bundle sync --check 2>&1)
+  local ok=0
+  [[ "$output" == *"Synchronized 1 built-in bundle(s) into spark"* ]] || ok=1
+  [[ "$check_output" == *"Built-in bundles are synchronized (1)"* ]] || ok=1
+
+  standalone="${tmp}/standalone-spark"
+  outside="${tmp}/outside"
+  cp "$SPARK" "$standalone"
+  chmod +x "$standalone"
+  mkdir -p "$outside"
+  output=$(cd "$outside" && HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    "$standalone" bundle sync --check 2>&1) && status=0 || status=$?
+  [[ "$status" -ne 0 && "$output" == *"Cannot find the Spark source repository"* ]] || ok=1
+
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+make_bundle_submit_origin() {
+  local origin="$1" head
+  head=$(git -C "$ROOT_DIR" rev-parse HEAD)
+  git clone --quiet --bare "$ROOT_DIR" "$origin"
+  git --git-dir="$origin" branch -f main "$head"
+  git --git-dir="$origin" symbolic-ref HEAD refs/heads/main
+}
+
+test_bundle_submit_dry_run_prepares_new_and_updated_changes() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin origin new_source update_source manifest_tmp new_out update_out status=0 no_change_out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  origin="${tmp}/origin.git"
+  make_bundle_submit_origin "$origin"
+
+  new_source="${tmp}/new-bundle"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$new_source"
+  manifest_tmp="${tmp}/bundle.json"
+  jq '.name="submit-new-bundle"' "${new_source}/bundle.json" > "$manifest_tmp"
+  mv "$manifest_tmp" "${new_source}/bundle.json"
+  new_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_BUNDLE_SUBMIT_REPO_URL="$origin" SPARK_BUNDLE_SUBMIT_TMP_ROOT="$tmp" \
+    "$SPARK" bundle submit "$new_source" --dry-run 2>&1)
+
+  update_source="${tmp}/update-bundle"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$update_source"
+  printf '\nSubmission update test.\n' >> "${update_source}/README.md"
+  update_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_BUNDLE_SUBMIT_REPO_URL="$origin" SPARK_BUNDLE_SUBMIT_TMP_ROOT="$tmp" \
+    "$SPARK" bundle submit "$update_source" --draft --dry-run 2>&1)
+
+  no_change_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_BUNDLE_SUBMIT_REPO_URL="$origin" SPARK_BUNDLE_SUBMIT_TMP_ROOT="$tmp" \
+    "$SPARK" bundle submit qwen38-dflash2-lookup --dry-run 2>&1) && status=0 || status=$?
+  local ok=0
+  [[ "$new_out" == *"Change:   new"* && "$new_out" == *"Dry run complete"* ]] || ok=1
+  [[ "$update_out" == *"Change:   update"* && "$update_out" == *"Dry run complete"* ]] || ok=1
+  [[ "$status" -ne 0 && "$no_change_out" == *"There is nothing to submit"* ]] || ok=1
+  git --git-dir="$origin" for-each-ref --format='%(refname)' refs/heads/spark-bundle/ | grep -q . && ok=1
+  find "$tmp" -maxdepth 1 -type d -name 'spark-bundle-submit.*' | grep -q . && ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_submit_opens_confirmed_draft_pr() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin origin source manifest_tmp gh_log out refs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  origin="${tmp}/origin.git"
+  make_bundle_submit_origin "$origin"
+  source="${tmp}/published-bundle"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$source"
+  manifest_tmp="${tmp}/bundle.json"
+  jq '.name="submit-published-bundle"' "${source}/bundle.json" > "$manifest_tmp"
+  mv "$manifest_tmp" "${source}/bundle.json"
+  gh_log="${tmp}/gh.log"
+  cat > "${fake_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${FAKE_GH_LOG}"
+case "$*" in
+  "auth status --hostname github.com") exit 0 ;;
+  "api user --jq .login") printf 'spark-tester\n' ;;
+  *"--json viewerPermission --jq .viewerPermission") printf 'WRITE\n' ;;
+  pr\ create\ *) printf 'https://github.com/massimo92/spark/pull/123\n' ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "${fake_bin}/gh"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+    FAKE_GH_LOG="$gh_log" SPARK_BUNDLE_SUBMIT_REPO_URL="$origin" \
+    SPARK_BUNDLE_SUBMIT_TMP_ROOT="$tmp" \
+    "$SPARK" bundle submit "$source" --draft 2>&1)
+  refs=$(git --git-dir="$origin" for-each-ref --format='%(refname)' \
+    'refs/heads/spark-bundle/submit-published-bundle-*')
+  local ok=0
+  [[ "$out" == *"Pull request opened: https://github.com/massimo92/spark/pull/123"* ]] || ok=1
+  [[ -n "$refs" ]] || ok=1
+  grep -q -- '--draft' "$gh_log" || ok=1
+  find "$tmp" -maxdepth 1 -type d -name 'spark-bundle-submit.*' | grep -q . && ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_submit_uses_fork_without_write_permission() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin origin fork source manifest_tmp gh_log out fork_refs origin_refs
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  origin="${tmp}/origin.git"; fork="${tmp}/fork.git"
+  make_bundle_submit_origin "$origin"
+  git clone --quiet --bare "$origin" "$fork"
+  source="${tmp}/fork-bundle"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$source"
+  manifest_tmp="${tmp}/bundle.json"
+  jq '.name="submit-fork-bundle"' "${source}/bundle.json" > "$manifest_tmp"
+  mv "$manifest_tmp" "${source}/bundle.json"
+  gh_log="${tmp}/gh.log"
+  cat > "${fake_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${FAKE_GH_LOG}"
+case "$*" in
+  "auth status --hostname github.com") exit 0 ;;
+  "api user --jq .login") printf 'spark-tester\n' ;;
+  *"--json viewerPermission --jq .viewerPermission") printf 'READ\n' ;;
+  "repo view spark-tester/spark --json parent --jq "*) printf 'massimo92/spark\n' ;;
+  pr\ create\ *) printf 'https://github.com/massimo92/spark/pull/124\n' ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "${fake_bin}/gh"
+  out=$(printf 'y\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+    FAKE_GH_LOG="$gh_log" SPARK_BUNDLE_SUBMIT_REPO_URL="$origin" \
+    SPARK_BUNDLE_SUBMIT_FORK_URL="$fork" SPARK_BUNDLE_SUBMIT_TMP_ROOT="$tmp" \
+    "$SPARK" bundle submit "$source" 2>&1)
+  fork_refs=$(git --git-dir="$fork" for-each-ref --format='%(refname)' \
+    'refs/heads/spark-bundle/submit-fork-bundle-*')
+  origin_refs=$(git --git-dir="$origin" for-each-ref --format='%(refname)' \
+    'refs/heads/spark-bundle/submit-fork-bundle-*')
+  local ok=0
+  [[ "$out" == *"Pull request opened: https://github.com/massimo92/spark/pull/124"* ]] || ok=1
+  [[ -n "$fork_refs" && -z "$origin_refs" ]] || ok=1
+  grep -q -- '--head spark-tester:spark-bundle/submit-fork-bundle-' "$gh_log" || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_imports_external_folder_and_run_builds_with_docker_cache() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin source manifest_tmp build_file list
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  source="${tmp}/external-bundle"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$source"
+  manifest_tmp="${tmp}/bundle.json"
+  jq '.name="external-bundle"' "${source}/bundle.json" > "$manifest_tmp"
+  mv "$manifest_tmp" "${source}/bundle.json"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle import "$source" >/dev/null 2>&1
+  list=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle list --json 2>&1)
+  build_file="${tmp}/docker-build"
+  make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_BUILD_FILE="$build_file" "$SPARK" run external-bundle --no-wait >/dev/null 2>&1
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_BUILD_FILE="$build_file" "$SPARK" run external-bundle --no-wait >/dev/null 2>&1
+  local ok=0
+  jq -e '.[] | select(.name == "external-bundle" and .source == "imported")' <<<"$list" >/dev/null || ok=1
+  [[ "$(grep -c '^build ' "$build_file")" -eq 2 ]] || ok=1
+  [[ "$(cat "$build_file")" == *"-t spark/bundle-external-bundle:latest"* ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_run_resolves_defaults_and_dynamic_options() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output unbuilt_output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run qwen38-dflash2-lookup --dry-run --max-len 32768 --lookup false 2>&1)
+  local ok=0
+  [[ "$output" == *"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"* ]] || ok=1
+  [[ "$output" == *"--max-model-len 32768"* ]] || ok=1
+  [[ "$output" == *"--speculative-config"* && "$output" == *"num_speculative_tokens"* ]] || ok=1
+  [[ "$output" == *"VLLM_DFLASH2_LOOKUP=0"* ]] || ok=1
+  [[ "$output" == *"spark.bundle.name=qwen38-dflash2-lookup"* ]] || ok=1
+  [[ "$output" != *"VLLM_SPEC_DECODE_ATTN"* ]] || ok=1
+  unbuilt_output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_IMAGE_EXISTS=0 "$SPARK" run qwen38-dflash2-lookup --dry-run 2>&1) || ok=1
+  [[ "$unbuilt_output" == *"spark/bundle-qwen38-dflash2-lookup:latest"* ]] || ok=1
+  [[ "$unbuilt_output" == *"Docker command that would be executed"* ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_alias_create_from_bundle_stores_bundle_and_adjustments() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin aliases output create_output
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
+  if ! create_output=$(printf 'b1\n\nn\n\n\n\n\n\nn\nfalse\n\n\n\n' | \
+    HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+    "$SPARK" alias create qwen-bundle-alias 2>&1); then
+    printf '%s\n' "$create_output" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  aliases="${tmp}/home/.config/spark/aliases.json"
+  local ok=0
+  jq -e '
+    .["qwen-bundle-alias"].kind == "bundle"
+    and .["qwen-bundle-alias"].bundle == "qwen38-dflash2-lookup"
+    and (.["qwen-bundle-alias"] | has("bundle_hash") | not)
+    and .["qwen-bundle-alias"].run_args == []
+    and .["qwen-bundle-alias"].options.lookup == false
+  ' "$aliases" >/dev/null || ok=1
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run qwen-bundle-alias --dry-run 2>&1) || ok=1
+  [[ "$output" == *"VLLM_DFLASH2_LOOKUP=0"* ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
 test_total_mem_detection_positive() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin output mem
@@ -3355,8 +3650,9 @@ make_min_workspace_config() {
 }
 
 test_help_text_tracks_current_cli() {
-  local top dashboard gateway config models repair reinstall uninstall ws recover setup_error status
+  local top bundle dashboard gateway config models repair reinstall uninstall ws recover setup_error status
   top=$("$SPARK" help 2>&1)
+  bundle=$("$SPARK" bundle --help 2>&1)
   dashboard=$("$SPARK" dashboard --help 2>&1)
   gateway=$("$SPARK" gateway --help 2>&1)
   config=$("$SPARK" config --help 2>&1)
@@ -3376,9 +3672,13 @@ test_help_text_tracks_current_cli() {
     [[ "$top" == *"--no-mem-limit"* ]] &&
     [[ "$top" == *"--mtp / --no-mtp"* ]] &&
     [[ "$top" == *"--explain"* ]] &&
+    [[ "$top" == *"bundle sync [--check]"* ]] &&
+    [[ "$top" == *"spark bundle --help"* ]] &&
     [[ "$top" != *"default: 128K"* ]] &&
     [[ "$top" != *"default: 5"* ]] &&
     [[ "$dashboard" == *"--terminal"* ]] &&
+    [[ "$bundle" == *"sync [--check]"* ]] &&
+    [[ "$bundle" == *"Run automatically builds its Dockerfile"* ]] &&
     [[ "$dashboard" == *"--watch [seconds]"* ]] &&
     [[ "$gateway" == *"start|stop|status|logs|add|remove"* ]] &&
     [[ "$config" == *"auto-update on|off"* ]] &&
@@ -9183,6 +9483,15 @@ run_test "captured alias pins image/env and accepts safe overrides" test_alias_c
 run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_centralized
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
+run_test "built-in bundle catalog is embedded and valid" test_bundle_catalog_embeds_and_validates_builtin
+run_test "bundle validation requires every patch to be declared and applied" test_bundle_validation_requires_declared_applied_patches
+run_test "bundle sync validates the Git catalog and generated executable" test_bundle_sync_checks_git_catalog
+run_test "bundle submit previews new and updated changes" test_bundle_submit_dry_run_prepares_new_and_updated_changes
+run_test "bundle submit opens a confirmed draft PR" test_bundle_submit_opens_confirmed_draft_pr
+run_test "bundle submit uses a fork without write permission" test_bundle_submit_uses_fork_without_write_permission
+run_test "external bundle imports and every run checks Docker build cache" test_bundle_imports_external_folder_and_run_builds_with_docker_cache
+run_test "bundle run resolves defaults and dynamic options" test_bundle_run_resolves_defaults_and_dynamic_options
+run_test "alias create stores bundle plus adjustments" test_alias_create_from_bundle_stores_bundle_and_adjustments
 run_test "doctor reports bad HF cache permissions" test_doctor_reports_bad_hf_cache_permissions
 run_test "setup --check reports incomplete setup" test_setup_check_reports_incomplete
 run_test "sudo file writes separate authentication from content" test_ctx_sudo_write_separates_password_from_content

@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "name": "qwen38-dflash2-lookup",
+  "description": "Qwen3.8-27B NVFP4 with a DFlash2 W4A16 drafter and lookup-augmented k15 verification on NVIDIA GB10.",
+  "defaults": {
+    "target_model": {
+      "id": "sakamakismile/Qwen3.8-27B-MTP-NVFP4",
+      "revision": "6d98dc1f1d5259c9582794014b73852baf20f805"
+    },
+    "draft_model": {
+      "id": "syvai/Qwen3.8-27B-DFlash2-W4A16",
+      "revision": "4d30ec736ffc6b8688dc2ae2b502d9b48bdec279"
+    },
+    "speculative_tokens": 15,
+    "vllm_args": [
+      "vllm",
+      "serve",
+      "sakamakismile/Qwen3.8-27B-MTP-NVFP4",
+      "--revision",
+      "6d98dc1f1d5259c9582794014b73852baf20f805",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "8000",
+      "--gpu-memory-utilization",
+      "0.70",
+      "--max-model-len",
+      "57344",
+      "--max-num-seqs",
+      "4",
+      "--max-num-batched-tokens",
+      "8192",
+      "--enable-chunked-prefill",
+      "--enable-prefix-caching",
+      "--mamba-cache-mode",
+      "align",
+      "--mamba-cache-dtype",
+      "bfloat16",
+      "--mamba-ssm-cache-dtype",
+      "bfloat16",
+      "--attention-backend",
+      "flash_attn",
+      "--no-async-scheduling",
+      "--speculative-config",
+      "{\"method\":\"dflash\",\"num_speculative_tokens\":15,\"model\":\"syvai/Qwen3.8-27B-DFlash2-W4A16\",\"revision\":\"4d30ec736ffc6b8688dc2ae2b502d9b48bdec279\"}",
+      "--reasoning-parser",
+      "qwen3",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser",
+      "qwen3_coder",
+      "--served-model-name",
+      "sakamakismile/Qwen3.8-27B-MTP-NVFP4"
+    ]
+  },
+  "options": {
+    "lookup": {
+      "description": "Fill DFlash2's extra verification positions from matching request context.",
+      "type": "boolean",
+      "default": true,
+      "env": "VLLM_DFLASH2_LOOKUP"
+    },
+    "adaptive-lookup": {
+      "description": "Use lookup candidates only when recent request state predicts a benefit.",
+      "type": "boolean",
+      "default": true,
+      "env": "VLLM_DFLASH2_LOOKUP_ADAPTIVE"
+    },
+    "graph-both": {
+      "description": "Capture CUDA graphs for both lookup and non-lookup verification paths.",
+      "type": "boolean",
+      "default": true,
+      "env": "VLLM_DFLASH2_GRAPH_BOTH"
+    },
+    "flashinfer-sampler": {
+      "description": "Use vLLM's normal FlashInfer sampler instead of the experimental sampler patch.",
+      "type": "boolean",
+      "default": true,
+      "env": "VLLM_USE_FLASHINFER_SAMPLER"
+    }
+  },
+  "patches": [
+    {
+      "file": "patches/qwen3-dflash-w4a16.patch",
+      "description": "Loads packed W4A16 QKV weights when DFlash builds its fused KV projection."
+    },
+    {
+      "file": "patches/lookup-vllm-dev.patch",
+      "description": "Separates DFlash2's trained draft block of 7 from k15 verification and fills the remainder with lookup."
+    }
+  ]
+}

@@ -7,6 +7,7 @@ main() {
 
   case "${1:-}" in
     run)          shift; cmd_run "$@" ;;
+    bundle)       shift; cmd_bundle "$@" ;;
     alias)        shift; cmd_alias "$@" ;;
     calibrate)    shift; cmd_calibrate "$@" ;;
     dashboard)    shift; cmd_dashboard "$@" ;;
