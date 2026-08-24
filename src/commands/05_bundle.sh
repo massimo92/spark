@@ -134,8 +134,27 @@ bundle_vllm_add_switch_json() {
   jq -ce --arg flag "$flag" 'if index($flag) == null then . + [$flag] else . end' <<<"$vllm_json"
 }
 
+bundle_dockerfile_instructions() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (instruction == "") instruction = line
+      else instruction = instruction " " line
+      if (line ~ /\\[[:space:]]*$/) {
+        sub(/\\[[:space:]]*$/, "", instruction)
+        next
+      }
+      print instruction
+      instruction = ""
+    }
+    END { if (instruction != "") print instruction }
+  ' "$1"
+}
+
 bundle_validate_dir() {
-  local dir="$1" manifest name vllm_json target target_rev drafter drafter_rev tokens spec revision file key type default from
+  local dir="$1" manifest dockerfile docker_instructions name vllm_json target target_rev drafter drafter_rev tokens spec revision file patch_name actual key type default from
   [[ -d "$dir" ]] || { err "Bundle directory not found: ${dir}"; return 1; }
   manifest="${dir}/bundle.json"
   [[ -f "$manifest" ]] || { err "Missing bundle.json in ${dir}"; return 1; }
@@ -174,20 +193,40 @@ bundle_validate_dir() {
       and (if .value.type == "boolean" then (.value.default | type == "boolean")
            elif .value.type == "integer" then (.value.default | type == "number" and floor == .)
            else (.value.default | type == "string") end))
-    and (.patches | type == "array")
+    and (.patches | type == "array" and (map(.file) | unique | length) == length)
     and all(.patches[];
-      (.file | type == "string" and test("^patches/[A-Za-z0-9._/-]+$") and (contains("..") | not))
+      (.file | type == "string" and test("^patches/[A-Za-z0-9._/-]+[.]patch$") and (contains("..") | not))
       and (.description | type == "string" and length > 0))
   ' "$manifest" >/dev/null 2>&1 || { err "Invalid bundle.json: ${manifest}"; return 1; }
 
   name=$(jq -r '.name' "$manifest")
-  from=$(awk 'toupper($1) == "FROM" {print $2; exit}' "${dir}/Dockerfile")
+  dockerfile="${dir}/Dockerfile"
+  docker_instructions=$(bundle_dockerfile_instructions "$dockerfile")
+  from=$(awk 'toupper($1) == "FROM" {print $2; exit}' <<<"$docker_instructions")
   [[ "$from" == *@sha256:* || ( "$from" == *:* && "$from" != *:latest ) ]] \
     || { err "Dockerfile FROM must use a versioned base image"; return 1; }
 
   while IFS= read -r file; do
     [[ -f "${dir}/${file}" ]] || { err "Missing declared patch: ${file}"; return 1; }
+    awk -v file="$file" '
+      (toupper($1) == "COPY" || toupper($1) == "ADD") && index($0, file) { found=1 }
+      END { exit !found }
+    ' <<<"$docker_instructions" \
+      || { err "Declared patch is not copied explicitly by Dockerfile: ${file}"; return 1; }
+    patch_name="${file##*/}"
+    awk -v file="$patch_name" '
+      toupper($1) == "RUN" && index($0, file) &&
+        $0 ~ /(^|[[:space:];])(patch|git[[:space:]]+apply)([[:space:];]|$)/ { found=1 }
+      END { exit !found }
+    ' <<<"$docker_instructions" \
+      || { err "Declared patch is not applied by Dockerfile: ${file}"; return 1; }
   done < <(jq -r '.patches[].file' "$manifest")
+
+  while IFS= read -r actual; do
+    actual="${actual#"${dir}/"}"
+    jq -e --arg file "$actual" 'any(.patches[]; .file == $file)' "$manifest" >/dev/null 2>&1 \
+      || { err "Patch file is not declared in bundle.json: ${actual}"; return 1; }
+  done < <(find "${dir}/patches" -type f -name '*.patch' | LC_ALL=C sort)
 
   while IFS=$'\t' read -r key type default; do
     bundle_core_flag_reserved "$key" && { err "Bundle option conflicts with spark run: --${key}"; return 1; }

@@ -903,6 +903,7 @@ test_suite_includes() {
     test_alias_capture_rejects_secret_flags|\
     test_alias_backend_mismatch_fails_closed|\
     test_bundle_catalog_embeds_and_validates_builtin|\
+    test_bundle_validation_requires_declared_applied_patches|\
     test_bundle_imports_external_folder_and_run_builds_with_docker_cache|\
     test_bundle_run_resolves_defaults_and_dynamic_options|\
     test_alias_create_from_bundle_stores_bundle_and_adjustments|\
@@ -2224,6 +2225,34 @@ test_bundle_catalog_embeds_and_validates_builtin() {
   [[ "$show" == *"DFlash2 W4A16"* && "$show" == *"--lookup"* ]] || ok=1
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate \
     "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" >/dev/null 2>&1 || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_validation_requires_declared_applied_patches() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin undeclared unapplied docker_tmp out status=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  undeclared="${tmp}/undeclared"
+  unapplied="${tmp}/unapplied"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$undeclared"
+  cp -R "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" "$unapplied"
+
+  printf '%s\n' 'unused' > "${undeclared}/patches/unused.patch"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate "$undeclared" 2>&1) \
+    && status=0 || status=$?
+  local ok=0
+  [[ "$status" -ne 0 && "$out" == *"Patch file is not declared in bundle.json: patches/unused.patch"* ]] || ok=1
+
+  docker_tmp="${tmp}/Dockerfile"
+  sed '/^[[:space:]]*< \/tmp\/qwen38-patches\/qwen3-dflash-w4a16.patch;/d' \
+    "${unapplied}/Dockerfile" > "$docker_tmp"
+  mv "$docker_tmp" "${unapplied}/Dockerfile"
+  status=0
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate "$unapplied" 2>&1) \
+    && status=0 || status=$?
+  [[ "$status" -ne 0 && "$out" == *"Declared patch is not applied by Dockerfile: patches/qwen3-dflash-w4a16.patch"* ]] || ok=1
+
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
 }
@@ -8333,6 +8362,7 @@ run_test "captured alias pins image/env and accepts safe overrides" test_alias_c
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
 run_test "built-in bundle catalog is embedded and valid" test_bundle_catalog_embeds_and_validates_builtin
+run_test "bundle validation requires every patch to be declared and applied" test_bundle_validation_requires_declared_applied_patches
 run_test "external bundle imports and every run checks Docker build cache" test_bundle_imports_external_folder_and_run_builds_with_docker_cache
 run_test "bundle run resolves defaults and dynamic options" test_bundle_run_resolves_defaults_and_dynamic_options
 run_test "alias create stores bundle plus adjustments" test_alias_create_from_bundle_stores_bundle_and_adjustments
