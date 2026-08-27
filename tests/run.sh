@@ -1035,6 +1035,7 @@ test_suite_includes() {
     test_source_guard_loads_without_dispatch|\
     test_alias_create_preserves_dash_prefixed_args|\
     test_alias_list_renders_aligned_sorted_table|\
+    test_alias_remove_accepts_multiple_names|\
     test_alias_capture_replays_image_env_and_operational_overrides|\
     test_alias_capture_rejects_secret_flags|\
     test_alias_backend_mismatch_fails_closed|\
@@ -2482,6 +2483,40 @@ test_alias_list_renders_aligned_sorted_table() {
   rm -rf "$tmp"
 
   [[ "$out" == "$expected" && "$out" != *$'\t'* && "$empty" == "  No aliases saved." ]]
+}
+
+test_alias_remove_accepts_multiple_names() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp aliases backup out missing_out duplicate_out status=0 ok=0
+  tmp=$(mktemp -d)
+  aliases="${tmp}/home/.config/spark/aliases.json"
+  backup="${tmp}/home/.config/spark/aliases.backup.json"
+  mkdir -p "$(dirname "$aliases")"
+  printf '%s\n' '{
+    "alpha":{"kind":"guided","backend":"vllm","model":"Org/Alpha","run_args":[]},
+    "beta":{"kind":"guided","backend":"vllm","model":"Org/Beta","run_args":[]},
+    "keep":{"kind":"guided","backend":"vllm","model":"Org/Keep","run_args":[]}
+  }' > "$aliases"
+
+  out=$(printf 'y\n' | HOME="${tmp}/home" "$SPARK" alias remove alpha beta)
+  [[ "$out" == *"Remove 2 aliases (alpha, beta)?"* ]] || ok=1
+  [[ "$out" == *"Removed 2 aliases: alpha, beta"* ]] || ok=1
+  jq -e 'keys == ["keep"]' "$aliases" >/dev/null || ok=1
+  jq -e '(.alpha.model == "Org/Alpha") and (.beta.model == "Org/Beta")' "$backup" >/dev/null || ok=1
+
+  set +e
+  missing_out=$(printf 'y\n' | HOME="${tmp}/home" "$SPARK" alias remove keep missing 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 && "$missing_out" == *"Alias 'missing' does not exist"* ]] || ok=1
+  jq -e 'keys == ["keep"]' "$aliases" >/dev/null || ok=1
+
+  duplicate_out=$(printf 'y\n' | HOME="${tmp}/home" "$SPARK" alias remove keep keep)
+  [[ "$duplicate_out" == *"Remove alias 'keep'?"* && "$duplicate_out" == *"Removed alias 'keep'"* ]] || ok=1
+  jq -e 'keys == []' "$aliases" >/dev/null || ok=1
+
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
 }
 
 test_alias_capture_replays_image_env_and_operational_overrides() {
@@ -9740,6 +9775,7 @@ run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vll
 run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wins
 run_test "alias create preserves dash-prefixed arguments" test_alias_create_preserves_dash_prefixed_args
 run_test "alias list renders a sorted aligned table" test_alias_list_renders_aligned_sorted_table
+run_test "alias remove accepts multiple names atomically" test_alias_remove_accepts_multiple_names
 run_test "captured alias pins image/env and accepts safe overrides" test_alias_capture_replays_image_env_and_operational_overrides
 run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_centralized
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
