@@ -99,14 +99,16 @@ cmd_run() {
   done
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
-  for arg in "${vllm_passthrough_args[@]}"; do
-    case "${arg%%=*}" in
-      --speculative-config|-sc|--spec-method|--spec-model|--spec-tokens)
-        vllm_speculation_passthrough=1
-        [[ -n "$bundle_name" ]] || mtp_flag=1
-        ;;
-    esac
-  done
+  if [[ ${#vllm_passthrough_args[@]} -gt 0 ]]; then
+    for arg in "${vllm_passthrough_args[@]}"; do
+      case "${arg%%=*}" in
+        --speculative-config|-sc|--spec-method|--spec-model|--spec-tokens)
+          vllm_speculation_passthrough=1
+          [[ -n "$bundle_name" ]] || mtp_flag=1
+          ;;
+      esac
+    done
+  fi
   if [[ "$publish_main" == "1" ]]; then
     [[ "$dry_run" == "0" ]] || die "Cannot combine --main with --dry-run/--explain"
     [[ "$no_wait" == "0" ]] || die "Cannot combine --main with --no-wait"
