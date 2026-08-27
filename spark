@@ -1911,13 +1911,42 @@ cmd_bundle_import() {
 }
 
 cmd_bundle_remove() {
-  local name="$1" path
-  path="${BUNDLES_DIR}/imported/${name}"
-  is_safe_bundle_name "$name" || die "Invalid bundle name: ${name}"
-  [[ -d "$path" ]] || die "Imported bundle '${name}' does not exist" "Built-in bundles cannot be removed."
-  confirm "Remove imported bundle '${name}'?" || { warn "Cancelled"; return 0; }
-  rm -rf "$path"
-  info "Removed bundle '${name}'"
+  [[ $# -gt 0 ]] || die "Usage: spark bundle remove <name> [<name>...]"
+  local candidate existing duplicate=0 name path label="" i
+  local -a names=() paths=()
+
+  for candidate in "$@"; do
+    is_safe_bundle_name "$candidate" || die "Invalid bundle name: ${candidate}"
+    duplicate=0
+    if (( ${#names[@]} > 0 )); then
+      for existing in "${names[@]}"; do
+        [[ "$candidate" == "$existing" ]] && { duplicate=1; break; }
+      done
+    fi
+    [[ "$duplicate" == "1" ]] && continue
+    path="${BUNDLES_DIR}/imported/${candidate}"
+    [[ -d "$path" ]] || die "Imported bundle '${candidate}' does not exist" "Built-in bundles cannot be removed."
+    names+=("$candidate")
+    paths+=("$path")
+  done
+
+  label="${names[0]}"
+  for ((i = 1; i < ${#names[@]}; i++)); do label+=", ${names[$i]}"; done
+  if (( ${#names[@]} == 1 )); then
+    confirm "Remove imported bundle '${names[0]}'?" || { warn "Cancelled"; return 0; }
+  else
+    confirm "Remove ${#names[@]} imported bundles (${label})?" || { warn "Cancelled"; return 0; }
+  fi
+
+  for i in "${!paths[@]}"; do
+    name="${names[$i]}"
+    rm -rf -- "${paths[$i]}" || die "Cannot remove imported bundle '${name}'"
+  done
+  if (( ${#names[@]} == 1 )); then
+    info "Removed bundle '${names[0]}'"
+  else
+    info "Removed ${#names[@]} bundles: ${label}"
+  fi
 }
 
 bundle_repo_root() {
@@ -2190,7 +2219,7 @@ cmd_bundle_help() {
     init <name> [--directory DIR]  Create an external bundle template
     validate <directory>           Validate without importing
     import <directory> [--force]   Import or replace a bundle folder
-    remove <name>                  Remove an imported bundle
+    remove <name>...               Remove one or more imported bundles
     sync [--check]                 Embed Git-tracked bundles into spark
     submit <name|directory>        Validate and open a GitHub pull request
       [--dry-run] [--draft]        Preview only, or open it as a draft
@@ -2228,8 +2257,8 @@ cmd_bundle() {
       [[ "${2:-}" == "--force" || -z "${2:-}" ]] || die "Usage: spark bundle import <directory> [--force]"
       cmd_bundle_import "$dir" "$([[ "${2:-}" == "--force" ]] && printf 1 || printf 0)" ;;
     remove)
-      name="${1:-}"; [[ -n "$name" && -z "${2:-}" ]] || die "Usage: spark bundle remove <name>"
-      cmd_bundle_remove "$name" ;;
+      [[ $# -gt 0 ]] || die "Usage: spark bundle remove <name> [<name>...]"
+      cmd_bundle_remove "$@" ;;
     sync)
       [[ "${1:-}" == "--check" || -z "${1:-}" ]] || die "Usage: spark bundle sync [--check]"
       cmd_bundle_sync "$([[ "${1:-}" == "--check" ]] && printf 1 || printf 0)" ;;
