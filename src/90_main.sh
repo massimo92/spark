@@ -10,6 +10,7 @@ main() {
     bundle)       shift; cmd_bundle "$@" ;;
     alias)        shift; cmd_alias "$@" ;;
     calibrate)    shift; cmd_calibrate "$@" ;;
+    benchmark)    shift; cmd_benchmark "$@" ;;
     dashboard)    shift; cmd_dashboard "$@" ;;
     stop)         shift; cmd_stop "$@" ;;
     down)         shift; cmd_down "$@" ;;

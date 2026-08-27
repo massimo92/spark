@@ -1073,6 +1073,67 @@ test_architecture_command_maps_core_boundaries() {
     [[ "$output" == *".github/workflows/ci.yml"* ]]
 }
 
+test_benchmark_auto_selects_single_model() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_OS_OVERRIDE=Linux \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8007\t1.0\t1.0\t0.0\n' \
+    "$SPARK" benchmark --dry-run 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Benchmark target: Org/Alpha (spark-vllm-alpha, port 8007)"* ]] &&
+    [[ "$out" == *"kind=huggingface,source=garage-bAInd/Open-Platypus"* ]] &&
+    [[ "$out" == *"kind=sweep,sweep_size=5"* ]] &&
+    [[ "$out" == *"ghcr.io/vllm-project/guidellm:v0.7.2"* ]] &&
+    [[ "$out" == *"--network host"* ]]
+}
+
+test_benchmark_requires_model_when_noninteractive() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  set +e
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1\t1\t0\nspark-vllm-beta\tOrg/Beta\t8001\t1\t1\t0\n' \
+    "$SPARK" benchmark --dry-run 2>&1)
+  status=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] && [[ "$out" == *"Several models are running; choose one with --model"* ]]
+}
+
+test_benchmark_interactively_selects_model() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  out=$(printf '2\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
+    SPARK_ASSUME_INTERACTIVE=1 \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1\t1\t0\nspark-vllm-beta\tOrg/Beta\t8001\t1\t1\t0\n' \
+    "$SPARK" benchmark --dry-run 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"1) Org/Alpha"* ]] && [[ "$out" == *"2) Org/Beta"* ]] &&
+    [[ "$out" == *"Benchmark target: Org/Beta (spark-vllm-beta, port 8001)"* ]]
+}
+
+test_benchmark_runs_guidellm_and_writes_manifest() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out calls manifest
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm SPARK_OS_OVERRIDE=Linux \
+    FAKE_DOCKER_ARGS_FILE="${tmp}/docker.log" \
+    FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1\t1\t0\n' \
+    "$SPARK" benchmark --model Org/Alpha --profile synchronous --duration 12 \
+      --thinking on --output-dir "${tmp}/results" -- --disable-console-interactive >/dev/null 2>&1
+  calls=$(cat "${tmp}/docker.log" 2>/dev/null || true)
+  manifest="${tmp}/results/spark.json"
+  out=$(jq -r '[.model,.profile,.constraint,.thinking,(.seed|tostring)] | join("|")' "$manifest" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$calls" == *"ghcr.io/vllm-project/guidellm:v0.7.2 run"* ]] &&
+    [[ "$calls" == *"--disable-console-interactive"* ]] &&
+    [[ "$calls" == *"chat_template_kwargs"* ]] &&
+    [[ "$out" == "Org/Alpha|kind=synchronous|kind=max_duration,seconds=12|on|42" ]]
+}
+
 test_single_file_build_matches_modules() {
   "${ROOT_DIR}/scripts/build-single-file.sh" --check
 }
@@ -9512,6 +9573,10 @@ test_stop_ollama_unloads() {
 }
 
 run_test "architecture command maps core boundaries" test_architecture_command_maps_core_boundaries
+run_test "benchmark auto-selects one running model" test_benchmark_auto_selects_single_model
+run_test "benchmark requires --model without a TTY" test_benchmark_requires_model_when_noninteractive
+run_test "benchmark interactively selects a running model" test_benchmark_interactively_selects_model
+run_test "benchmark runs GuideLLM and writes metadata" test_benchmark_runs_guidellm_and_writes_manifest
 run_test "single-file build matches modules" test_single_file_build_matches_modules
 run_test "source guard loads functions without dispatch" test_source_guard_loads_without_dispatch
 run_test "workspace generates Super Productivity alternative" test_super_productivity_workspace_files
