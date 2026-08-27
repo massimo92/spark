@@ -778,6 +778,54 @@ cmd_alias_run() {
   esac
 }
 
+alias_print_table() {
+  local rows
+  rows=$(jq -r '
+    to_entries
+    | sort_by(.key)[]
+    | [.key, .value.backend, .value.model, .value.kind]
+    | @tsv
+  ' "$ALIASES_FILE") || die "Cannot read aliases"
+
+  if [[ -z "$rows" ]]; then
+    printf '  No aliases saved.\n'
+    return 0
+  fi
+
+  awk -F '\t' '
+    function rule(width, value, i) {
+      value = ""
+      for (i = 0; i < width; i++) value = value "-"
+      return value
+    }
+    BEGIN {
+      header[1] = "NAME"
+      header[2] = "BACKEND"
+      header[3] = "MODEL"
+      header[4] = "SOURCE"
+      for (column = 1; column <= 4; column++) width[column] = length(header[column])
+    }
+    {
+      count++
+      name[count] = $1
+      backend[count] = $2
+      model[count] = $3
+      source[count] = $4
+      if (length($1) > width[1]) width[1] = length($1)
+      if (length($2) > width[2]) width[2] = length($2)
+      if (length($3) > width[3]) width[3] = length($3)
+      if (length($4) > width[4]) width[4] = length($4)
+    }
+    END {
+      format = "  %-" width[1] "s  %-" width[2] "s  %-" width[3] "s  %s\n"
+      printf format, header[1], header[2], header[3], header[4]
+      printf format, rule(width[1]), rule(width[2]), rule(width[3]), rule(width[4])
+      for (row = 1; row <= count; row++)
+        printf format, name[row], backend[row], model[row], source[row]
+    }
+  ' <<<"$rows"
+}
+
 cmd_alias() {
   local action="${1:-help}" name="" force=0 definition
   shift || true
@@ -803,8 +851,7 @@ cmd_alias() {
       ;;
     list)
       alias_init_store
-      jq -r 'to_entries[] | "  \(.key)\t\(.value.backend)\t\(.value.model)\t\(.value.kind)"' "$ALIASES_FILE" \
-        | { read -r first || true; [[ -n "${first:-}" ]] || { printf '  No aliases saved.\n'; return 0; }; printf '  NAME\tBACKEND\tMODEL\tSOURCE\n%s\n' "$first"; cat; }
+      alias_print_table
       ;;
     show)
       name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark alias show <alias>"

@@ -1034,6 +1034,7 @@ test_suite_includes() {
     test_single_file_build_matches_modules|\
     test_source_guard_loads_without_dispatch|\
     test_alias_create_preserves_dash_prefixed_args|\
+    test_alias_list_renders_aligned_sorted_table|\
     test_alias_capture_replays_image_env_and_operational_overrides|\
     test_alias_capture_rejects_secret_flags|\
     test_alias_backend_mismatch_fails_closed|\
@@ -2461,6 +2462,26 @@ test_alias_create_preserves_dash_prefixed_args() {
   local ok=$?
   rm -rf "$tmp"
   [[ "$ok" == "0" && "$out" == *"Saved alias 'demo'"* ]]
+}
+
+test_alias_list_renders_aligned_sorted_table() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp aliases out empty expected
+  tmp=$(mktemp -d)
+  aliases="${tmp}/home/.config/spark/aliases.json"
+  mkdir -p "$(dirname "$aliases")"
+  printf '%s\n' '{
+    "zeta":{"kind":"captured-vllm","backend":"vllm","model":"Org/LongerModel"},
+    "alpha":{"kind":"guided","backend":"ollama","model":"qwen3:8b"}
+  }' > "$aliases"
+
+  out=$(HOME="${tmp}/home" "$SPARK" alias list)
+  expected=$'  NAME   BACKEND  MODEL            SOURCE\n  -----  -------  ---------------  -------------\n  alpha  ollama   qwen3:8b         guided\n  zeta   vllm     Org/LongerModel  captured-vllm'
+  printf '{}\n' > "$aliases"
+  empty=$(HOME="${tmp}/home" "$SPARK" alias list)
+  rm -rf "$tmp"
+
+  [[ "$out" == "$expected" && "$out" != *$'\t'* && "$empty" == "  No aliases saved." ]]
 }
 
 test_alias_capture_replays_image_env_and_operational_overrides() {
@@ -9718,6 +9739,7 @@ run_test "doctor reports missing NGC image without aborting" test_doctor_reports
 run_test "doctor skips blocked NGC vLLM image" test_doctor_skips_blocked_ngc_vllm_image
 run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wins
 run_test "alias create preserves dash-prefixed arguments" test_alias_create_preserves_dash_prefixed_args
+run_test "alias list renders a sorted aligned table" test_alias_list_renders_aligned_sorted_table
 run_test "captured alias pins image/env and accepts safe overrides" test_alias_capture_replays_image_env_and_operational_overrides
 run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_centralized
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
