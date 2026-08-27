@@ -638,7 +638,7 @@ validate_profile_values() {
   [[ "$WEIGHTS_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: weights_gb"
   [[ "$KV_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: kv_gb"
   [[ "$NEED_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: need_gb"
-  [[ -z "$KV_CACHE_DTYPE" || "$KV_CACHE_DTYPE" =~ ^(auto|fp8)$ ]] || die "Invalid profile value: kv_cache_dtype"
+  [[ -z "$KV_CACHE_DTYPE" || "$KV_CACHE_DTYPE" =~ ^(auto|bfloat16|fp8)$ ]] || die "Invalid profile value: kv_cache_dtype"
 }
 
 load_profile() {
@@ -1009,7 +1009,7 @@ load_launch_calibration() {
   [[ "$CALIBRATED_MTP_ENABLED" =~ ^(0|1)$ ]] || CALIBRATED_MTP_ENABLED=""
   [[ "$CALIBRATED_STREAM_INTERVAL" =~ ^[0-9]+$ ]] || CALIBRATED_STREAM_INTERVAL=""
   [[ "$CALIBRATED_MAX_NUM_BATCHED_TOKENS" =~ ^[0-9]+$ ]] || CALIBRATED_MAX_NUM_BATCHED_TOKENS=""
-  [[ "$CALIBRATED_KV_CACHE_DTYPE" =~ ^(auto|fp8)$ ]] || CALIBRATED_KV_CACHE_DTYPE=""
+  [[ "$CALIBRATED_KV_CACHE_DTYPE" =~ ^(auto|bfloat16|fp8)$ ]] || CALIBRATED_KV_CACHE_DTYPE=""
   [[ "$CALIBRATED_TOKENS_PER_SECOND" =~ ^[0-9]+([.][0-9]+)?$ ]] || CALIBRATED_TOKENS_PER_SECOND=""
 }
 
@@ -1442,6 +1442,12 @@ download_model_full() {
   printf "\n"
 }
 spark_builtin_bundle_assets() { cat <<'__SPARK_BUNDLE_ASSETS__'
+vllm/gemma4-dspark6-lookup/Dockerfile	RlJPTSB2bGxtL3ZsbG0tb3BlbmFpOm5pZ2h0bHlAc2hhMjU2OjJjNzQ1N2ExZTI2ODgyODMxOGZmMGEzYjYwYTFjZmQ5MTE5Yjk5M2E2MDEzNTk5NjM1ZGQ5NDZkNGUyMzM3ODQKCkNPUFkgcGF0Y2hlcy9kc3BhcmtfbG9va3VwLnB5IC91c3IvbG9jYWwvbGliL3B5dGhvbjMuMTIvZGlzdC1wYWNrYWdlcy92bGxtL3YxL3dvcmtlci9ncHUvc3BlY19kZWNvZGUvZHNwYXJrL2xvb2t1cC5weQoKQ09QWSBwYXRjaGVzL21vZGVsLXJ1bm5lci1yZXEtc3RhdGVzLnBhdGNoIC90bXAvbW9kZWwtcnVubmVyLXJlcS1zdGF0ZXMucGF0Y2gKUlVOIHBhdGNoIC1kIC91c3IvbG9jYWwvbGliL3B5dGhvbjMuMTIvZGlzdC1wYWNrYWdlcyAtcDEgPCAvdG1wL21vZGVsLXJ1bm5lci1yZXEtc3RhdGVzLnBhdGNoCgpDT1BZIHBhdGNoZXMvZHNwYXJrLWxvb2t1cC5wYXRjaCAvdG1wL2RzcGFyay1sb29rdXAucGF0Y2gKUlVOIHBhdGNoIC1kIC91c3IvbG9jYWwvbGliL3B5dGhvbjMuMTIvZGlzdC1wYWNrYWdlcyAtcDEgPCAvdG1wL2RzcGFyay1sb29rdXAucGF0Y2gKCkVOViBWTExNX01BUkxJTl9VU0VfQVRPTUlDX0FERD0xIFwKICAgIFZMTE1fVVNFX0ZMQVNISU5GRVJfU0FNUExFUj0wCg==
+vllm/gemma4-dspark6-lookup/README.md	IyBHZW1tYSA0IERTcGFyayArIGxvb2t1cAoKRXhwZXJpbWVudGFsIE5WSURJQSBHQjEwIGJ1bmRsZS4gSXQga2VlcHMgdGhlIG1lYXN1cmVkIEdlbW1hIDQgRFNwYXJrIGs9NiwKMTI4SyBjb250ZXh0LCBhbmQgQkYxNiBLViBjb25maWd1cmF0aW9uLCB0aGVuIGNvbXBsZW1lbnRzIGl0cyBwcm9wb3NhbCB3aXRoIGEKc2FtZS1yZXF1ZXN0IHN1ZmZpeCBsb29rdXAuCgpMb29rdXAgaXMgZGVsaWJlcmF0ZWx5IGFjdGl2ZSBvbmx5IGZvciBncmVlZHkgZGVjb2RpbmcuIFNhbXBsZWQgZGVjb2Rpbmcga2VlcHMKdGhlIG9yaWdpbmFsIERTcGFyayBwcm9wb3NhbCBzbyByZWplY3Rpb24gc2FtcGxpbmcgcmVtYWlucyBkaXN0cmlidXRpb24tY29ycmVjdC4KClRoZSBjb250cm9sIHJ1biB1c2VzIHRoZSBzYW1lIGltYWdlIGFuZCBwYXRjaGVzIHdpdGggbG9va3VwIGRpc2FibGVkOgoKYGBgYmFzaApzcGFyayBydW4gZ2VtbWE0LWRzcGFyazYtbG9va3VwIC0tbG9va3VwIGZhbHNlCmBgYAo=
+vllm/gemma4-dspark6-lookup/bundle.json	ewogICJzY2hlbWFfdmVyc2lvbiI6IDEsCiAgIm5hbWUiOiAiZ2VtbWE0LWRzcGFyazYtbG9va3VwIiwKICAiZGVzY3JpcHRpb24iOiAiR2VtbWEgNCAyNkIgTlZGUDQgd2l0aCBEU3BhcmsgazYgYW5kIGNvbXBsZW1lbnRhcnkgZ3JlZWR5IHN1ZmZpeCBsb29rdXAgb24gTlZJRElBIEdCMTAuIiwKICAiZGVmYXVsdHMiOiB7CiAgICAidGFyZ2V0X21vZGVsIjogewogICAgICAiaWQiOiAibnZpZGlhL0dlbW1hLTQtMjZCLUE0Qi1OVkZQNCIsCiAgICAgICJyZXZpc2lvbiI6ICJhMTljZmUwMGJlODQ1NjhhNjg2NzExMWM5YTY4YzljNDRmZGNmZmU2IgogICAgfSwKICAgICJkcmFmdF9tb2RlbCI6IHsKICAgICAgImlkIjogIm1ha29yYS1haS9nZW1tYTQtMjZiLWE0Yi1kc3BhcmsiLAogICAgICAicmV2aXNpb24iOiAiZTZmNzM5MjMxZTg5MmZlNDUxMmM0NzAxMzY0OTBkNTQ0MWZmZTYyZiIKICAgIH0sCiAgICAic3BlY3VsYXRpdmVfdG9rZW5zIjogNiwKICAgICJ2bGxtX2FyZ3MiOiBbCiAgICAgICJ2bGxtIiwKICAgICAgInNlcnZlIiwKICAgICAgIm52aWRpYS9HZW1tYS00LTI2Qi1BNEItTlZGUDQiLAogICAgICAiLS1yZXZpc2lvbiIsCiAgICAgICJhMTljZmUwMGJlODQ1NjhhNjg2NzExMWM5YTY4YzljNDRmZGNmZmU2IiwKICAgICAgIi0tdHJ1c3QtcmVtb3RlLWNvZGUiLAogICAgICAiLS1ncHUtbWVtb3J5LXV0aWxpemF0aW9uIiwKICAgICAgIjAuNzgiLAogICAgICAiLS1rdi1jYWNoZS1kdHlwZSIsCiAgICAgICJiZmxvYXQxNiIsCiAgICAgICItLW1heC1tb2RlbC1sZW4iLAogICAgICAiMTMxMDcyIiwKICAgICAgIi0tbWF4LW51bS1zZXFzIiwKICAgICAgIjQiLAogICAgICAiLS1wb3J0IiwKICAgICAgIjgwMDAiLAogICAgICAiLS1lbmFibGUtY2h1bmtlZC1wcmVmaWxsIiwKICAgICAgIi0tZW5hYmxlLXByZWZpeC1jYWNoaW5nIiwKICAgICAgIi0tbW9lLWJhY2tlbmQiLAogICAgICAibWFybGluIiwKICAgICAgIi0tcmVhc29uaW5nLXBhcnNlciIsCiAgICAgICJnZW1tYTQiLAogICAgICAiLS1lbmFibGUtYXV0by10b29sLWNob2ljZSIsCiAgICAgICItLXRvb2wtY2FsbC1wYXJzZXIiLAogICAgICAiZ2VtbWE0IiwKICAgICAgIi0tbWF4LW51bS1iYXRjaGVkLXRva2VucyIsCiAgICAgICIzMjc2OCIsCiAgICAgICItLXNwZWN1bGF0aXZlLWNvbmZpZyIsCiAgICAgICJ7XCJtZXRob2RcIjpcImRzcGFya1wiLFwibW9kZWxcIjpcIm1ha29yYS1haS9nZW1tYTQtMjZiLWE0Yi1kc3BhcmtcIixcInJldmlzaW9uXCI6XCJlNmY3MzkyMzFlODkyZmU0NTEyYzQ3MDEzNjQ5MGQ1NDQxZmZlNjJmXCIsXCJudW1fc3BlY3VsYXRpdmVfdG9rZW5zXCI6Nn0iCiAgICBdCiAgfSwKICAib3B0aW9ucyI6IHsKICAgICJsb29rdXAiOiB7CiAgICAgICJkZXNjcmlwdGlvbiI6ICJGdXNlIHN0cm9uZyBzYW1lLXJlcXVlc3Qgc3VmZml4IG1hdGNoZXMgaW50byB0aGUgZ3JlZWR5IERTcGFyayBwcm9wb3NhbC4iLAogICAgICAidHlwZSI6ICJib29sZWFuIiwKICAgICAgImRlZmF1bHQiOiB0cnVlLAogICAgICAiZW52IjogIlZMTE1fRFNQQVJLX0xPT0tVUCIKICAgIH0sCiAgICAibG9va3VwLW5taW4iOiB7CiAgICAgICJkZXNjcmlwdGlvbiI6ICJNaW5pbXVtIHN1ZmZpeCBtYXRjaCBsZW5ndGggY29uc2lkZXJlZCBieSBsb29rdXAuIiwKICAgICAgInR5cGUiOiAiaW50ZWdlciIsCiAgICAgICJkZWZhdWx0IjogNiwKICAgICAgImVudiI6ICJWTExNX0RTUEFSS19MT09LVVBfTk1JTiIKICAgIH0sCiAgICAibG9va3VwLW5zdHJvbmciOiB7CiAgICAgICJkZXNjcmlwdGlvbiI6ICJTdWZmaXggbGVuZ3RoIHRoYXQgY2FuIG92ZXJyaWRlIERTcGFyayB3aXRob3V0IGFncmVlbWVudC4iLAogICAgICAidHlwZSI6ICJpbnRlZ2VyIiwKICAgICAgImRlZmF1bHQiOiA4LAogICAgICAiZW52IjogIlZMTE1fRFNQQVJLX0xPT0tVUF9OU1RST05HIgogICAgfSwKICAgICJsb29rdXAtYWdyZWUiOiB7CiAgICAgICJkZXNjcmlwdGlvbiI6ICJMZWFkaW5nIERTcGFyayB0b2tlbnMgdGhhdCBtdXN0IGFncmVlIGZvciBhIHNob3J0ZXIgbWF0Y2guIiwKICAgICAgInR5cGUiOiAiaW50ZWdlciIsCiAgICAgICJkZWZhdWx0IjogMiwKICAgICAgImVudiI6ICJWTExNX0RTUEFSS19MT09LVVBfQUdSRUUiCiAgICB9CiAgfSwKICAicGF0Y2hlcyI6IFsKICAgIHsKICAgICAgImZpbGUiOiAicGF0Y2hlcy9tb2RlbC1ydW5uZXItcmVxLXN0YXRlcy5wYXRjaCIsCiAgICAgICJkZXNjcmlwdGlvbiI6ICJFeHBvc2VzIGxpdmUgcmVxdWVzdCB0b2tlbiBoaXN0b3J5IHRvIHNwZWN1bGF0b3JzIHRoYXQgb3B0IGludG8gbG9va3VwLiIKICAgIH0sCiAgICB7CiAgICAgICJmaWxlIjogInBhdGNoZXMvZHNwYXJrLWxvb2t1cC5wYXRjaCIsCiAgICAgICJkZXNjcmlwdGlvbiI6ICJGdXNlcyBzYWZlIGdyZWVkeSBsb29rdXAgcHJvcG9zYWxzIGludG8gRFNwYXJrIGFmdGVyIHNlcXVlbnRpYWwgTWFya292IHNhbXBsaW5nLiIKICAgIH0KICBdCn0K
+vllm/gemma4-dspark6-lookup/patches/dspark-lookup.patch	ZGlmZiAtcnVOIC14ICoub3JpZyAteCAqLnJlaiAteCBfX3B5Y2FjaGVfXyBhL3ZsbG0vdjEvd29ya2VyL2dwdS9zcGVjX2RlY29kZS9kc3Bhcmsvc3BlY3VsYXRvci5weSBiL3ZsbG0vdjEvd29ya2VyL2dwdS9zcGVjX2RlY29kZS9kc3Bhcmsvc3BlY3VsYXRvci5weQotLS0gYS92bGxtL3YxL3dvcmtlci9ncHUvc3BlY19kZWNvZGUvZHNwYXJrL3NwZWN1bGF0b3IucHkJMjAyNi0wOC0yNiAwMDowMDowMAorKysgYi92bGxtL3YxL3dvcmtlci9ncHUvc3BlY19kZWNvZGUvZHNwYXJrL3NwZWN1bGF0b3IucHkJMjAyNi0wOC0yNiAwMDowMDowMApAQCAtMjAsNiArMjAsNyBAQAogQ1VEQSBncmFwaHMgKEZVTEwsIG1pcnJvcmluZyBERmxhc2gpIGNvdmVyIHRoZSB3aG9sZSBkcmFmdCBzdGVwOiB0aGUgcGFyYWxsZWwKIGJhY2tib25lIGZvcndhcmQgQU5EIHRoZSBzZXF1ZW50aWFsIE1hcmtvdiBzYW1wbGluZy4KICIiIgoraW1wb3J0IG9zCiAKIGZyb20gdHlwaW5nIGltcG9ydCBBbnkKIApAQCAtMzEsNSArMzIsOSBAQAogZnJvbSB2bGxtLnYxLndvcmtlci5ncHUuc2FtcGxlLmd1bWJlbCBpbXBvcnQgZ3VtYmVsX3NhbXBsZQogZnJvbSB2bGxtLnYxLndvcmtlci5ncHUuc3BlY19kZWNvZGUuZGZsYXNoLnNwZWN1bGF0b3IgaW1wb3J0IERGbGFzaFNwZWN1bGF0b3IKK2Zyb20gdmxsbS52MS53b3JrZXIuZ3B1LnNwZWNfZGVjb2RlLmRzcGFyay5sb29rdXAgaW1wb3J0ICgKKyAgICBmdXNlX2xvb2t1cCwKKyAgICBzdWZmaXhfbG9va3VwLAorKQogZnJvbSB2bGxtLnYxLndvcmtlci5ncHUuc3BlY19kZWNvZGUuZHNwYXJrLnV0aWxzIGltcG9ydCBsb2FkX2RzcGFya19tb2RlbAogCiAKQEAgLTc4LDYgKzgzLDM3IEBACiAgICAgICAgICAgICBzZWxmLmRyYWZ0X21vZGVsX2NvbmZpZy5oZl9jb25maWcsICJkc3BhcmtfZHJhZnRfdG9wayIsIE5vbmUKICAgICAgICAgKQogCisgICAgICAgICMgTG9va3VwIGlzIGdyZWVkeS1vbmx5LiBTYW1wbGVkIGRlY29kaW5nIGtlZXBzIERTcGFyaydzIG9yaWdpbmFsCisgICAgICAgICMgcHJvcG9zYWwgc28gaXRzIHJlamVjdGlvbiBkaXN0cmlidXRpb24gcmVtYWlucyBleGFjdC4KKyAgICAgICAgc2VsZi5fbG9va3VwID0gb3MuZW52aXJvbi5nZXQoIlZMTE1fRFNQQVJLX0xPT0tVUCIsICIwIikgPT0gIjEiCisgICAgICAgIHNlbGYuX2xvb2t1cF9ubWluID0gaW50KG9zLmVudmlyb24uZ2V0KCJWTExNX0RTUEFSS19MT09LVVBfTk1JTiIsICI2IikpCisgICAgICAgIHNlbGYuX2xvb2t1cF9ubWF4ID0gaW50KG9zLmVudmlyb24uZ2V0KCJWTExNX0RTUEFSS19MT09LVVBfTk1BWCIsICIxMiIpKQorICAgICAgICBzZWxmLl9sb29rdXBfbnN0cm9uZyA9IGludCgKKyAgICAgICAgICAgIG9zLmVudmlyb24uZ2V0KCJWTExNX0RTUEFSS19MT09LVVBfTlNUUk9ORyIsICI4IikKKyAgICAgICAgKQorICAgICAgICBzZWxmLl9sb29rdXBfYWdyZWUgPSBpbnQoCisgICAgICAgICAgICBvcy5lbnZpcm9uLmdldCgiVkxMTV9EU1BBUktfTE9PS1VQX0FHUkVFIiwgIjIiKQorICAgICAgICApCisgICAgICAgIHNlbGYuX2xvb2t1cF9zZWFyY2ggPSBpbnQoCisgICAgICAgICAgICBvcy5lbnZpcm9uLmdldCgiVkxMTV9EU1BBUktfTE9PS1VQX1NFQVJDSCIsIHN0cigxIDw8IDMwKSkKKyAgICAgICAgKQorICAgICAgICBzZWxmLl9yZXFfc3RhdGVzID0gTm9uZQorICAgICAgICBzZWxmLl9sb29rdXBfdG9rZW5zID0gdG9yY2guemVyb3MoCisgICAgICAgICAgICAoc2VsZi5tYXhfbnVtX3JlcXMsIHNlbGYubnVtX3NwZWN1bGF0aXZlX3N0ZXBzKSwKKyAgICAgICAgICAgIGR0eXBlPXRvcmNoLmludDMyLAorICAgICAgICAgICAgZGV2aWNlPWRldmljZSwKKyAgICAgICAgKQorICAgICAgICBzZWxmLl9sb29rdXBfbGVuID0gdG9yY2guemVyb3MoCisgICAgICAgICAgICBzZWxmLm1heF9udW1fcmVxcywgZHR5cGU9dG9yY2guaW50MzIsIGRldmljZT1kZXZpY2UKKyAgICAgICAgKQorICAgICAgICBzZWxmLl9sb29rdXBfdmFsaWQgPSB0b3JjaC56ZXJvcygKKyAgICAgICAgICAgIHNlbGYubWF4X251bV9yZXFzLCBkdHlwZT10b3JjaC5pbnQzMiwgZGV2aWNlPWRldmljZQorICAgICAgICApCisgICAgICAgIHNlbGYuX2xvb2t1cF9oaXRzID0gdG9yY2guemVyb3MoKCksIGR0eXBlPXRvcmNoLmludDY0LCBkZXZpY2U9ZGV2aWNlKQorCisgICAgZGVmIHNldF9yZXFfc3RhdGVzKHNlbGYsIHJlcV9zdGF0ZXMpIC0+IE5vbmU6CisgICAgICAgIHNlbGYuX3JlcV9zdGF0ZXMgPSByZXFfc3RhdGVzCisKICAgICBkZWYgbG9hZF9kcmFmdF9tb2RlbCgKICAgICAgICAgc2VsZiwKICAgICAgICAgdGFyZ2V0X21vZGVsOiB0b3JjaC5ubi5Nb2R1bGUsCkBAIC0yMjAsMyArMjU2LDM2IEBACiAgICAgICAgICAgICBjdWRhZ3JhcGhfcnVudGltZV9tb2RlLAogICAgICAgICApCiAgICAgICAgIHNlbGYuX3NhbXBsZV9zZXF1ZW50aWFsKG51bV9yZXFzLCBoZWFkX2hpZGRlbikKKyAgICAgICAgc2VsZi5fYXBwbHlfbG9va3VwKG51bV9yZXFzKQorCisgICAgZGVmIF9hcHBseV9sb29rdXAoc2VsZiwgbnVtX3JlcXM6IGludCkgLT4gTm9uZToKKyAgICAgICAgaWYgbm90IHNlbGYuX2xvb2t1cCBvciBzZWxmLl9yZXFfc3RhdGVzIGlzIE5vbmUgb3Igc2VsZi5kcmFmdF9sb2dpdHMgaXMgbm90IE5vbmU6CisgICAgICAgICAgICByZXR1cm4KKyAgICAgICAgdG9rZW5zLCBtYXRjaF9sZW4sIHZhbGlkID0gc3VmZml4X2xvb2t1cCgKKyAgICAgICAgICAgIHNlbGYuX3JlcV9zdGF0ZXMuYWxsX3Rva2VuX2lkcy5ncHUsCisgICAgICAgICAgICBzZWxmLl9yZXFfc3RhdGVzLnRvdGFsX2xlbi5ncHUsCisgICAgICAgICAgICBzZWxmLnNhbXBsZV9pZHhfbWFwcGluZywKKyAgICAgICAgICAgIG51bV9yZXFzLAorICAgICAgICAgICAgc2VsZi5udW1fc3BlY3VsYXRpdmVfc3RlcHMsCisgICAgICAgICAgICBpZHhfbWFwcGluZ19zdHJpZGU9c2VsZi5udW1fc3BlY3VsYXRpdmVfc3RlcHMsCisgICAgICAgICAgICBubWF4PXNlbGYuX2xvb2t1cF9ubWF4LAorICAgICAgICAgICAgbm1pbj1zZWxmLl9sb29rdXBfbm1pbiwKKyAgICAgICAgICAgIHNlYXJjaF9tYXg9c2VsZi5fbG9va3VwX3NlYXJjaCwKKyAgICAgICAgICAgIG91dF90b2tlbnM9c2VsZi5fbG9va3VwX3Rva2Vuc1s6bnVtX3JlcXNdLAorICAgICAgICAgICAgb3V0X2xlbj1zZWxmLl9sb29rdXBfbGVuWzpudW1fcmVxc10sCisgICAgICAgICAgICBvdXRfdmFsaWQ9c2VsZi5fbG9va3VwX3ZhbGlkWzpudW1fcmVxc10sCisgICAgICAgICkKKyAgICAgICAgZnVzZV9sb29rdXAoCisgICAgICAgICAgICBzZWxmLmRyYWZ0X3Rva2Vuc1s6bnVtX3JlcXNdLAorICAgICAgICAgICAgdG9rZW5zLAorICAgICAgICAgICAgbWF0Y2hfbGVuLAorICAgICAgICAgICAgdmFsaWQsCisgICAgICAgICAgICBzZWxmLnNhbXBsZV9pZHhfbWFwcGluZywKKyAgICAgICAgICAgIHNlbGYuX2xvb2t1cF9oaXRzLAorICAgICAgICAgICAgbnVtX3JlcXMsCisgICAgICAgICAgICBzZWxmLm51bV9zcGVjdWxhdGl2ZV9zdGVwcywKKyAgICAgICAgICAgIGlkeF9tYXBwaW5nX3N0cmlkZT1zZWxmLm51bV9zcGVjdWxhdGl2ZV9zdGVwcywKKyAgICAgICAgICAgIG5taW49c2VsZi5fbG9va3VwX25taW4sCisgICAgICAgICAgICBuc3Ryb25nPXNlbGYuX2xvb2t1cF9uc3Ryb25nLAorICAgICAgICAgICAgYWdyZWVfbWluPXNlbGYuX2xvb2t1cF9hZ3JlZSwKKyAgICAgICAgKQo=
+vllm/gemma4-dspark6-lookup/patches/dspark_lookup.py	IiIiR3JlZWR5IHNhbWUtcmVxdWVzdCBzdWZmaXggbG9va3VwIGZvciBEU3BhcmsgcHJvcG9zYWxzLiIiIgoKaW1wb3J0IHRvcmNoCgpmcm9tIHZsbG0udHJpdG9uX3V0aWxzIGltcG9ydCB0bCwgdHJpdG9uCgpTQ09SRV9TVFJJREUgPSB0bC5jb25zdGV4cHIoMSA8PCAzMikKCgpAdHJpdG9uLmppdApkZWYgX3N1ZmZpeF9sb29rdXBfa2VybmVsKAogICAgYWxsX3Rva2VuX2lkc19wdHIsCiAgICBhbGxfdG9rZW5faWRzX3N0cmlkZSwKICAgIHRvdGFsX2xlbl9wdHIsCiAgICBpZHhfbWFwcGluZ19wdHIsCiAgICBpZHhfbWFwcGluZ19zdHJpZGUsCiAgICBvdXRfdG9rZW5zX3B0ciwKICAgIG91dF90b2tlbnNfc3RyaWRlLAogICAgb3V0X2xlbl9wdHIsCiAgICBvdXRfdmFsaWRfcHRyLAogICAgc2VhcmNoX21heCwKICAgIGs6IHRsLmNvbnN0ZXhwciwKICAgIE5NQVg6IHRsLmNvbnN0ZXhwciwKICAgIE5NSU46IHRsLmNvbnN0ZXhwciwKICAgIEJMT0NLOiB0bC5jb25zdGV4cHIsCiAgICBCTE9DS19LVDogdGwuY29uc3RleHByLAopOgogICAgcmVxID0gdGwucHJvZ3JhbV9pZCgwKQogICAgcmVxX3N0YXRlID0gdGwubG9hZChpZHhfbWFwcGluZ19wdHIgKyByZXEgKiBpZHhfbWFwcGluZ19zdHJpZGUpCiAgICBpZiByZXFfc3RhdGUgPCAwOgogICAgICAgIHJldHVybgogICAgdGwuc3RvcmUob3V0X2xlbl9wdHIgKyByZXEsIDApCiAgICB0bC5zdG9yZShvdXRfdmFsaWRfcHRyICsgcmVxLCAwKQogICAgdG90YWxfbGVuID0gdGwubG9hZCh0b3RhbF9sZW5fcHRyICsgcmVxX3N0YXRlKQogICAgaWYgdG90YWxfbGVuIDwgTk1JTiArIDI6CiAgICAgICAgcmV0dXJuCiAgICBiYXNlID0gYWxsX3Rva2VuX2lkc19wdHIgKyByZXFfc3RhdGUudG8odGwuaW50NjQpICogYWxsX3Rva2VuX2lkc19zdHJpZGUKICAgIGVuZF9vZl9zdWZmaXggPSB0b3RhbF9sZW4gLSAxCiAgICBoaSA9IGVuZF9vZl9zdWZmaXgKICAgIGxvID0gdGwubWF4aW11bShOTUlOIC0gMSwgdG90YWxfbGVuIC0gc2VhcmNoX21heCkKICAgIGJlc3QgPSB0bC5mdWxsKFtdLCAtMSwgdGwuaW50NjQpCiAgICBmb3Igc3RhcnQgaW4gcmFuZ2UobG8sIGhpLCBCTE9DSyk6CiAgICAgICAgZW5kID0gc3RhcnQgKyB0bC5hcmFuZ2UoMCwgQkxPQ0spCiAgICAgICAgYWxpdmUgPSAoZW5kIDwgaGkpICYgKGVuZCA+PSBsbykKICAgICAgICBmb3IgaiBpbiByYW5nZShOTUlOKToKICAgICAgICAgICAgc291cmNlID0gdGwubG9hZChiYXNlICsgZW5kX29mX3N1ZmZpeCAtIGopCiAgICAgICAgICAgIGNhbmRpZGF0ZSA9IHRsLmxvYWQoCiAgICAgICAgICAgICAgICBiYXNlICsgZW5kIC0gaiwgbWFzaz1hbGl2ZSAmICgoZW5kIC0gaikgPj0gMCksIG90aGVyPS0xCiAgICAgICAgICAgICkKICAgICAgICAgICAgYWxpdmUgPSBhbGl2ZSAmIChjYW5kaWRhdGUgPT0gc291cmNlKQogICAgICAgIGlmIHRsLm1heChhbGl2ZS50byh0bC5pbnQzMikpID4gMDoKICAgICAgICAgICAgbWF0Y2ggPSB0bC53aGVyZShhbGl2ZSwgTk1JTiwgMCkKICAgICAgICAgICAgbG9uZ2VyID0gYWxpdmUKICAgICAgICAgICAgZm9yIGogaW4gcmFuZ2UoTk1JTiwgTk1BWCk6CiAgICAgICAgICAgICAgICBzb3VyY2UgPSB0bC5sb2FkKAogICAgICAgICAgICAgICAgICAgIGJhc2UgKyBlbmRfb2Zfc3VmZml4IC0gaiwKICAgICAgICAgICAgICAgICAgICBtYXNrPShlbmRfb2Zfc3VmZml4IC0gaikgPj0gMCwKICAgICAgICAgICAgICAgICAgICBvdGhlcj0tMiwKICAgICAgICAgICAgICAgICkKICAgICAgICAgICAgICAgIGNhbmRpZGF0ZSA9IHRsLmxvYWQoCiAgICAgICAgICAgICAgICAgICAgYmFzZSArIGVuZCAtIGosCiAgICAgICAgICAgICAgICAgICAgbWFzaz1sb25nZXIgJiAoKGVuZCAtIGopID49IDApLAogICAgICAgICAgICAgICAgICAgIG90aGVyPS0xLAogICAgICAgICAgICAgICAgKQogICAgICAgICAgICAgICAgbG9uZ2VyID0gbG9uZ2VyICYgKGNhbmRpZGF0ZSA9PSBzb3VyY2UpCiAgICAgICAgICAgICAgICBtYXRjaCA9IHRsLndoZXJlKGxvbmdlciwgbWF0Y2ggKyAxLCBtYXRjaCkKICAgICAgICAgICAgc2NvcmUgPSB0bC53aGVyZSgKICAgICAgICAgICAgICAgIGFsaXZlLAogICAgICAgICAgICAgICAgbWF0Y2gudG8odGwuaW50NjQpICogU0NPUkVfU1RSSURFICsgZW5kLnRvKHRsLmludDY0KSwKICAgICAgICAgICAgICAgIC0xLAogICAgICAgICAgICApCiAgICAgICAgICAgIGJlc3QgPSB0bC5tYXhpbXVtKGJlc3QsIHRsLm1heChzY29yZSwgYXhpcz0wKSkKICAgIGlmIGJlc3QgPCAwOgogICAgICAgIHJldHVybgogICAgbWF0Y2hfbGVuID0gKGJlc3QgLy8gU0NPUkVfU1RSSURFKS50byh0bC5pbnQzMikKICAgIGVuZCA9IChiZXN0ICUgU0NPUkVfU1RSSURFKS50byh0bC5pbnQzMikKICAgIHZhbGlkID0gdGwubWluaW11bShrLCBlbmRfb2Zfc3VmZml4IC0gZW5kKQogICAgaWR4ID0gdGwuYXJhbmdlKDAsIEJMT0NLX0tUKQogICAgdG9rZW5zID0gdGwubG9hZChiYXNlICsgZW5kICsgMSArIGlkeCwgbWFzaz1pZHggPCB2YWxpZCwgb3RoZXI9MCkKICAgIHRsLnN0b3JlKG91dF90b2tlbnNfcHRyICsgcmVxICogb3V0X3Rva2Vuc19zdHJpZGUgKyBpZHgsIHRva2VucywgbWFzaz1pZHggPCBrKQogICAgdGwuc3RvcmUob3V0X2xlbl9wdHIgKyByZXEsIG1hdGNoX2xlbikKICAgIHRsLnN0b3JlKG91dF92YWxpZF9wdHIgKyByZXEsIHZhbGlkKQoKCkB0cml0b24uaml0CmRlZiBfZnVzZV9sb29rdXBfa2VybmVsKAogICAgZHJhZnRfdG9rZW5zX3B0ciwKICAgIGRyYWZ0X3N0cmlkZSwKICAgIGxvb2t1cF90b2tlbnNfcHRyLAogICAgbG9va3VwX3N0cmlkZSwKICAgIG1hdGNoX2xlbl9wdHIsCiAgICB2YWxpZF9wdHIsCiAgICBpZHhfbWFwcGluZ19wdHIsCiAgICBpZHhfbWFwcGluZ19zdHJpZGUsCiAgICBoaXRzX3B0ciwKICAgIG5taW4sCiAgICBuc3Ryb25nLAogICAgYWdyZWVfbWluLAogICAgazogdGwuY29uc3RleHByLAogICAgQkxPQ0tfS1Q6IHRsLmNvbnN0ZXhwciwKKToKICAgIHJlcSA9IHRsLnByb2dyYW1faWQoMCkKICAgIGlmIHRsLmxvYWQoaWR4X21hcHBpbmdfcHRyICsgcmVxICogaWR4X21hcHBpbmdfc3RyaWRlKSA8IDA6CiAgICAgICAgcmV0dXJuCiAgICBpZHggPSB0bC5hcmFuZ2UoMCwgQkxPQ0tfS1QpCiAgICBrbWFzayA9IGlkeCA8IGsKICAgIG1hdGNoX2xlbiA9IHRsLmxvYWQobWF0Y2hfbGVuX3B0ciArIHJlcSkKICAgIHZhbGlkID0gdGwubG9hZCh2YWxpZF9wdHIgKyByZXEpCiAgICBkcmFmdGVkID0gdGwubG9hZCgKICAgICAgICBkcmFmdF90b2tlbnNfcHRyICsgcmVxICogZHJhZnRfc3RyaWRlICsgaWR4LCBtYXNrPWttYXNrLCBvdGhlcj0wCiAgICApCiAgICBsb29rZWQgPSB0bC5sb2FkKAogICAgICAgIGxvb2t1cF90b2tlbnNfcHRyICsgcmVxICogbG9va3VwX3N0cmlkZSArIGlkeCwgbWFzaz1rbWFzaywgb3RoZXI9MAogICAgKS50byh0bC5pbnQ2NCkKICAgIGRpc2FncmVlID0gKGRyYWZ0ZWQgIT0gbG9va2VkKSAmIChpZHggPCB2YWxpZCkgJiBrbWFzawogICAgYWdyZWVtZW50ID0gdGwubWluaW11bSh0bC5taW4odGwud2hlcmUoZGlzYWdyZWUsIGlkeCwgaykpLCB2YWxpZCkKICAgIHRha2UgPSAobWF0Y2hfbGVuID49IG5zdHJvbmcpIHwgKAogICAgICAgIChtYXRjaF9sZW4gPj0gbm1pbikgJiAoYWdyZWVtZW50ID49IGFncmVlX21pbikKICAgICkKICAgIHVzZSA9IHRha2UgJiAoaWR4IDwgdmFsaWQpICYga21hc2sKICAgIHRsLnN0b3JlKGRyYWZ0X3Rva2Vuc19wdHIgKyByZXEgKiBkcmFmdF9zdHJpZGUgKyBpZHgsIGxvb2tlZCwgbWFzaz11c2UpCiAgICB0bC5hdG9taWNfYWRkKGhpdHNfcHRyLCB0YWtlLnRvKHRsLmludDY0KSkKCgpkZWYgc3VmZml4X2xvb2t1cCgKICAgIGFsbF90b2tlbl9pZHM6IHRvcmNoLlRlbnNvciwKICAgIHRvdGFsX2xlbjogdG9yY2guVGVuc29yLAogICAgaWR4X21hcHBpbmc6IHRvcmNoLlRlbnNvciwKICAgIG51bV9yZXFzOiBpbnQsCiAgICBrOiBpbnQsCiAgICBpZHhfbWFwcGluZ19zdHJpZGU6IGludCwKICAgIG5tYXg6IGludCwKICAgIG5taW46IGludCwKICAgIHNlYXJjaF9tYXg6IGludCwKICAgIG91dF90b2tlbnM6IHRvcmNoLlRlbnNvciwKICAgIG91dF9sZW46IHRvcmNoLlRlbnNvciwKICAgIG91dF92YWxpZDogdG9yY2guVGVuc29yLAopIC0+IHR1cGxlW3RvcmNoLlRlbnNvciwgdG9yY2guVGVuc29yLCB0b3JjaC5UZW5zb3JdOgogICAgX3N1ZmZpeF9sb29rdXBfa2VybmVsWyhudW1fcmVxcywpXSgKICAgICAgICBhbGxfdG9rZW5faWRzLAogICAgICAgIGFsbF90b2tlbl9pZHMuc3RyaWRlKDApLAogICAgICAgIHRvdGFsX2xlbiwKICAgICAgICBpZHhfbWFwcGluZywKICAgICAgICBpZHhfbWFwcGluZ19zdHJpZGUsCiAgICAgICAgb3V0X3Rva2VucywKICAgICAgICBvdXRfdG9rZW5zLnN0cmlkZSgwKSwKICAgICAgICBvdXRfbGVuLAogICAgICAgIG91dF92YWxpZCwKICAgICAgICBzZWFyY2hfbWF4LAogICAgICAgIGs9aywKICAgICAgICBOTUFYPW5tYXgsCiAgICAgICAgTk1JTj1ubWluLAogICAgICAgIEJMT0NLPTEwMjQsCiAgICAgICAgQkxPQ0tfS1Q9dHJpdG9uLm5leHRfcG93ZXJfb2ZfMihrKSwKICAgICAgICBudW1fd2FycHM9NCwKICAgICkKICAgIHJldHVybiBvdXRfdG9rZW5zLCBvdXRfbGVuLCBvdXRfdmFsaWQKCgpkZWYgZnVzZV9sb29rdXAoCiAgICBkcmFmdF90b2tlbnM6IHRvcmNoLlRlbnNvciwKICAgIGxvb2t1cF90b2tlbnM6IHRvcmNoLlRlbnNvciwKICAgIG1hdGNoX2xlbjogdG9yY2guVGVuc29yLAogICAgdmFsaWQ6IHRvcmNoLlRlbnNvciwKICAgIGlkeF9tYXBwaW5nOiB0b3JjaC5UZW5zb3IsCiAgICBoaXRzOiB0b3JjaC5UZW5zb3IsCiAgICBudW1fcmVxczogaW50LAogICAgazogaW50LAogICAgaWR4X21hcHBpbmdfc3RyaWRlOiBpbnQsCiAgICBubWluOiBpbnQsCiAgICBuc3Ryb25nOiBpbnQsCiAgICBhZ3JlZV9taW46IGludCwKKSAtPiBOb25lOgogICAgX2Z1c2VfbG9va3VwX2tlcm5lbFsobnVtX3JlcXMsKV0oCiAgICAgICAgZHJhZnRfdG9rZW5zLAogICAgICAgIGRyYWZ0X3Rva2Vucy5zdHJpZGUoMCksCiAgICAgICAgbG9va3VwX3Rva2VucywKICAgICAgICBsb29rdXBfdG9rZW5zLnN0cmlkZSgwKSwKICAgICAgICBtYXRjaF9sZW4sCiAgICAgICAgdmFsaWQsCiAgICAgICAgaWR4X21hcHBpbmcsCiAgICAgICAgaWR4X21hcHBpbmdfc3RyaWRlLAogICAgICAgIGhpdHMsCiAgICAgICAgbm1pbiwKICAgICAgICBuc3Ryb25nLAogICAgICAgIGFncmVlX21pbiwKICAgICAgICBrPWssCiAgICAgICAgQkxPQ0tfS1Q9dHJpdG9uLm5leHRfcG93ZXJfb2ZfMihrKSwKICAgICAgICBudW1fd2FycHM9MSwKICAgICkK
+vllm/gemma4-dspark6-lookup/patches/model-runner-req-states.patch	ZGlmZiAtcnVOIC14ICoub3JpZyAteCAqLnJlaiAteCBfX3B5Y2FjaGVfXyBhL3ZsbG0vdjEvd29ya2VyL2dwdS9tb2RlbF9ydW5uZXIucHkgYi92bGxtL3YxL3dvcmtlci9ncHUvbW9kZWxfcnVubmVyLnB5Ci0tLSBhL3ZsbG0vdjEvd29ya2VyL2dwdS9tb2RlbF9ydW5uZXIucHkJMjAyNi0wOC0yNiAwMDowMDowMAorKysgYi92bGxtL3YxL3dvcmtlci9ncHUvbW9kZWxfcnVubmVyLnB5CTIwMjYtMDgtMjYgMDA6MDA6MDAKQEAgLTI2Myw2ICsyNjMsOCBAQAogICAgICAgICAgICAgZGV2aWNlPXNlbGYuZGV2aWNlLAogICAgICAgICAgICAgbnVtX3ByZWZpbGxfbG9va2FoZWFkPW51bV9wcmVmaWxsX2xvb2thaGVhZCwKICAgICAgICAgKQorICAgICAgICBpZiBzZWxmLnNwZWN1bGF0b3IgaXMgbm90IE5vbmUgYW5kIGhhc2F0dHIoc2VsZi5zcGVjdWxhdG9yLCAic2V0X3JlcV9zdGF0ZXMiKToKKyAgICAgICAgICAgIHNlbGYuc3BlY3VsYXRvci5zZXRfcmVxX3N0YXRlcyhzZWxmLnJlcV9zdGF0ZXMpCiAgICAgICAgIHNlbGYuaW5wdXRfYnVmZmVycyA9IElucHV0QnVmZmVycygKICAgICAgICAgICAgIG1heF9udW1fcmVxcz1zZWxmLm1heF9udW1fcmVxcywKICAgICAgICAgICAgIG1heF9udW1fdG9rZW5zPXNlbGYubWF4X251bV90b2tlbnMsCg==
 vllm/qwen38-dflash2-lookup/Dockerfile	RlJPTSBnaGNyLmlvL2tyaXNpdG93bi92bGxtLWdiMTAtZGZsYXNoQHNoYTI1Njo3YTk2NjEyNDU3YmI4Y2NmYjUyNmYyMjAzZjJkOTgyYzFjZjY2NGIyNjEzYzY3Mjc0NjMwZWMwYzk2ZDA1NmRlCgpDT1BZIHBhdGNoZXMvcXdlbjMtZGZsYXNoLXc0YTE2LnBhdGNoIHBhdGNoZXMvbG9va3VwLXZsbG0tZGV2LnBhdGNoIC90bXAvcXdlbjM4LXBhdGNoZXMvCgpSVU4gc2V0IC1ldXg7IFwKICAgIFZMTE09L3Vzci9sb2NhbC9saWIvcHl0aG9uMy4xMi9kaXN0LXBhY2thZ2VzL3ZsbG07IFwKICAgIHBhdGNoIC0tYmF0Y2ggLS1mb3J3YXJkIC1wMSAtZCAiJFZMTE0iIFwKICAgICAgPCAvdG1wL3F3ZW4zOC1wYXRjaGVzL3F3ZW4zLWRmbGFzaC13NGExNi5wYXRjaDsgXAogICAgcGF0Y2ggLS1iYXRjaCAtLWZvcndhcmQgLXAyIC1kICIkVkxMTSIgXAogICAgICA8IC90bXAvcXdlbjM4LXBhdGNoZXMvbG9va3VwLXZsbG0tZGV2LnBhdGNoOyBcCiAgICAvdXNyL2Jpbi9weXRob24zIC1tIHB5X2NvbXBpbGUgXAogICAgICAiJFZMTE0vbW9kZWxfZXhlY3V0b3IvbW9kZWxzL3F3ZW4zX2RmbGFzaC5weSIgXAogICAgICAiJFZMTE0vbW9kZWxfZXhlY3V0b3IvbW9kZWxzL3F3ZW4zX2RmbGFzaDIucHkiIFwKICAgICAgIiRWTExNL3YxL3dvcmtlci9ncHUvY3VkYWdyYXBoX3V0aWxzLnB5IiBcCiAgICAgICIkVkxMTS92MS93b3JrZXIvZ3B1L21vZGVsX3J1bm5lci5weSIgXAogICAgICAiJFZMTE0vdjEvd29ya2VyL2dwdS9zcGVjX2RlY29kZS9kZmxhc2gvc3BlY3VsYXRvci5weSIgXAogICAgICAiJFZMTE0vdjEvd29ya2VyL2dwdS9zcGVjX2RlY29kZS9kZmxhc2gyL2xvb2t1cC5weSIgXAogICAgICAiJFZMTE0vdjEvd29ya2VyL2dwdS9zcGVjX2RlY29kZS9kZmxhc2gyL3NwZWN1bGF0b3IucHkiIFwKICAgICAgIiRWTExNL3YxL3dvcmtlci9ncHUvc3BlY19kZWNvZGUvdXRpbHMucHkiOyBcCiAgICBybSAtcmYgL3RtcC9xd2VuMzgtcGF0Y2hlcwoKRU5WIFZMTE1fREZMQVNIMl9MT09LVVA9MSBcCiAgICBWTExNX0RGTEFTSDJfTE9PS1VQX0FEQVBUSVZFPTEgXAogICAgVkxMTV9ERkxBU0gyX0dSQVBIX0JPVEg9MSBcCiAgICBWTExNX1VTRV9GTEFTSElORkVSX1NBTVBMRVI9MQo=
 vllm/qwen38-dflash2-lookup/README.md	IyBRd2VuMy44IERGbGFzaDIgbG9va3VwCgpNaW5pbWFsIHVuaWZpZWQgYnVuZGxlIHRlc3RlZCBvbiBOVklESUEgR0IxMC4gSXQgc2VydmVzIHRoZSBwaW5uZWQgUXdlbjMuOC0yN0IKTlZGUDQgdGFyZ2V0IHdpdGggdGhlIHBpbm5lZCBERmxhc2gyIFc0QTE2IGRyYWZ0ZXIsIHZlcmlmaWVzIGsxNSwgYW5kIGVuYWJsZXMKbG9va3VwLiBJdCBkZWxpYmVyYXRlbHkgZXhjbHVkZXMgc3BsaXQtS1YsIHRoZSBjdXN0b20gc2FtcGxlciwgc3BlY3VsYXRpdmUgS1YKSU5UOCwgaHlicmlkIEtWIGdyb3VwaW5nLCBhbmQgcmVjdXJyZW50LXN0YXRlIGJvdW5kcyBwYXRjaGVzLgoKVGhlIHJ1bnRpbWUgZGVmYXVsdHMgdXNlIDQsMDk2LXRva2VuIHByZWZpbGwgY2h1bmtzLCBvcHRpbWl6YXRpb24gbGV2ZWwgMiwKdGhlIGBpbnRlcmFjdGl2aXR5YCBwZXJmb3JtYW5jZSBwcm9maWxlLCBhbmQgc3luY2hyb25vdXMgc2NoZWR1bGluZy4gQWdhaW5zdAp0aGUgcHJldmlvdXMgOCwxOTItdG9rZW4gYGJhbGFuY2VkYCBkZWZhdWx0cywgdGhpcyBrZXB0IHNob3J0LXByb21wdCBkZWNvZGUgYXQKYWJvdXQgMzguMSB0b2svcyB3aGlsZSByZWR1Y2luZyBjb2xkIFRURlQgYXQgNTBrIHRva2VucyBmcm9tIDI5Ljk0IHRvIDIzLjQ2CnNlY29uZHMuIEZvdXIgc2ltdWx0YW5lb3VzIGNvbGQgNDlrLXRva2VuIHJlcXVlc3RzIGNvbXBsZXRlZCA5LjQlIHNvb25lci4KCk1lYXN1cmVkIG9uIHRoZSBER1ggU3BhcmsgdXNlZCBmb3IgZGV2ZWxvcG1lbnQ6CgotIENoYXQgQzE6IDM4Ljk5OCB0b2svcyBtZWFuIG92ZXIgdGhyZWUgcnVucy4KLSBOYXR1cmFsIHJlcGxheTogYXBwcm94aW1hdGVseSAxMDYgdG9rL3MuCi0gQzQgd2l0aCBhcHByb3hpbWF0ZWx5IDQ5ay10b2tlbiBwcm9tcHRzOiBjb21wbGV0ZWQgd2l0aG91dCBPT007IGNhY2hlZCByb3VuZHMKICByZWFjaGVkIDM1Ljc3NiBhbmQgMzYuMjkzIGFnZ3JlZ2F0ZSB0b2svcy4KClJ1biB3aXRoIGRlZmF1bHRzOgoKYGBgYmFzaApzcGFyayBydW4gcXdlbjM4LWRmbGFzaDItbG9va3VwCmBgYAoKQ3JlYXRlIGFuIGFsaWFzIGZyb20gdGhpcyBidW5kbGUgYW5kIGNob29zZSBpdHMgYWRqdXN0bWVudHMgaW4gdGhlIGV4aXN0aW5nCmFsaWFzIGd1aWRlOgoKYGBgYmFzaApzcGFyayBhbGlhcyBjcmVhdGUgcXdlbjM4LXVuaWZpZWQKYGBgCg==
 vllm/qwen38-dflash2-lookup/bundle.json	ewogICJzY2hlbWFfdmVyc2lvbiI6IDEsCiAgIm5hbWUiOiAicXdlbjM4LWRmbGFzaDItbG9va3VwIiwKICAiZGVzY3JpcHRpb24iOiAiUXdlbjMuOC0yN0IgTlZGUDQgd2l0aCBhIERGbGFzaDIgVzRBMTYgZHJhZnRlciBhbmQgbG9va3VwLWF1Z21lbnRlZCBrMTUgdmVyaWZpY2F0aW9uIG9uIE5WSURJQSBHQjEwLiIsCiAgImRlZmF1bHRzIjogewogICAgInRhcmdldF9tb2RlbCI6IHsKICAgICAgImlkIjogInNha2FtYWtpc21pbGUvUXdlbjMuOC0yN0ItTVRQLU5WRlA0IiwKICAgICAgInJldmlzaW9uIjogIjZkOThkYzFmMWQ1MjU5Yzk1ODI3OTQwMTRiNzM4NTJiYWYyMGY4MDUiCiAgICB9LAogICAgImRyYWZ0X21vZGVsIjogewogICAgICAiaWQiOiAic3l2YWkvUXdlbjMuOC0yN0ItREZsYXNoMi1XNEExNiIsCiAgICAgICJyZXZpc2lvbiI6ICI0ZDMwZWM3MzZmZmM2Yjg2ODhkYzJhZTJiNTAyZDliNDhiZGVjMjc5IgogICAgfSwKICAgICJzcGVjdWxhdGl2ZV90b2tlbnMiOiAxNSwKICAgICJ2bGxtX2FyZ3MiOiBbCiAgICAgICJ2bGxtIiwKICAgICAgInNlcnZlIiwKICAgICAgInNha2FtYWtpc21pbGUvUXdlbjMuOC0yN0ItTVRQLU5WRlA0IiwKICAgICAgIi0tcmV2aXNpb24iLAogICAgICAiNmQ5OGRjMWYxZDUyNTljOTU4Mjc5NDAxNGI3Mzg1MmJhZjIwZjgwNSIsCiAgICAgICItLWhvc3QiLAogICAgICAiMC4wLjAuMCIsCiAgICAgICItLXBvcnQiLAogICAgICAiODAwMCIsCiAgICAgICItLWdwdS1tZW1vcnktdXRpbGl6YXRpb24iLAogICAgICAiMC43MCIsCiAgICAgICItLW1heC1tb2RlbC1sZW4iLAogICAgICAiNTczNDQiLAogICAgICAiLS1tYXgtbnVtLXNlcXMiLAogICAgICAiNCIsCiAgICAgICItLW1heC1udW0tYmF0Y2hlZC10b2tlbnMiLAogICAgICAiNDA5NiIsCiAgICAgICItLWVuYWJsZS1jaHVua2VkLXByZWZpbGwiLAogICAgICAiLS1lbmFibGUtcHJlZml4LWNhY2hpbmciLAogICAgICAiLS1tYW1iYS1jYWNoZS1tb2RlIiwKICAgICAgImFsaWduIiwKICAgICAgIi0tbWFtYmEtY2FjaGUtZHR5cGUiLAogICAgICAiYmZsb2F0MTYiLAogICAgICAiLS1tYW1iYS1zc20tY2FjaGUtZHR5cGUiLAogICAgICAiYmZsb2F0MTYiLAogICAgICAiLS1hdHRlbnRpb24tYmFja2VuZCIsCiAgICAgICJmbGFzaF9hdHRuIiwKICAgICAgIi0tb3B0aW1pemF0aW9uLWxldmVsIiwKICAgICAgIjIiLAogICAgICAiLS1wZXJmb3JtYW5jZS1tb2RlIiwKICAgICAgImludGVyYWN0aXZpdHkiLAogICAgICAiLS1uby1hc3luYy1zY2hlZHVsaW5nIiwKICAgICAgIi0tc3BlY3VsYXRpdmUtY29uZmlnIiwKICAgICAgIntcIm1ldGhvZFwiOlwiZGZsYXNoXCIsXCJudW1fc3BlY3VsYXRpdmVfdG9rZW5zXCI6MTUsXCJtb2RlbFwiOlwic3l2YWkvUXdlbjMuOC0yN0ItREZsYXNoMi1XNEExNlwiLFwicmV2aXNpb25cIjpcIjRkMzBlYzczNmZmYzZiODY4OGRjMmFlMmI1MDJkOWI0OGJkZWMyNzlcIn0iLAogICAgICAiLS1yZWFzb25pbmctcGFyc2VyIiwKICAgICAgInF3ZW4zIiwKICAgICAgIi0tZW5hYmxlLWF1dG8tdG9vbC1jaG9pY2UiLAogICAgICAiLS10b29sLWNhbGwtcGFyc2VyIiwKICAgICAgInF3ZW4zX2NvZGVyIiwKICAgICAgIi0tc2VydmVkLW1vZGVsLW5hbWUiLAogICAgICAic2FrYW1ha2lzbWlsZS9Rd2VuMy44LTI3Qi1NVFAtTlZGUDQiCiAgICBdCiAgfSwKICAib3B0aW9ucyI6IHsKICAgICJsb29rdXAiOiB7CiAgICAgICJkZXNjcmlwdGlvbiI6ICJGaWxsIERGbGFzaDIncyBleHRyYSB2ZXJpZmljYXRpb24gcG9zaXRpb25zIGZyb20gbWF0Y2hpbmcgcmVxdWVzdCBjb250ZXh0LiIsCiAgICAgICJ0eXBlIjogImJvb2xlYW4iLAogICAgICAiZGVmYXVsdCI6IHRydWUsCiAgICAgICJlbnYiOiAiVkxMTV9ERkxBU0gyX0xPT0tVUCIKICAgIH0sCiAgICAiYWRhcHRpdmUtbG9va3VwIjogewogICAgICAiZGVzY3JpcHRpb24iOiAiVXNlIGxvb2t1cCBjYW5kaWRhdGVzIG9ubHkgd2hlbiByZWNlbnQgcmVxdWVzdCBzdGF0ZSBwcmVkaWN0cyBhIGJlbmVmaXQuIiwKICAgICAgInR5cGUiOiAiYm9vbGVhbiIsCiAgICAgICJkZWZhdWx0IjogdHJ1ZSwKICAgICAgImVudiI6ICJWTExNX0RGTEFTSDJfTE9PS1VQX0FEQVBUSVZFIgogICAgfSwKICAgICJncmFwaC1ib3RoIjogewogICAgICAiZGVzY3JpcHRpb24iOiAiQ2FwdHVyZSBDVURBIGdyYXBocyBmb3IgYm90aCBsb29rdXAgYW5kIG5vbi1sb29rdXAgdmVyaWZpY2F0aW9uIHBhdGhzLiIsCiAgICAgICJ0eXBlIjogImJvb2xlYW4iLAogICAgICAiZGVmYXVsdCI6IHRydWUsCiAgICAgICJlbnYiOiAiVkxMTV9ERkxBU0gyX0dSQVBIX0JPVEgiCiAgICB9LAogICAgImZsYXNoaW5mZXItc2FtcGxlciI6IHsKICAgICAgImRlc2NyaXB0aW9uIjogIlVzZSB2TExNJ3Mgbm9ybWFsIEZsYXNoSW5mZXIgc2FtcGxlciBpbnN0ZWFkIG9mIHRoZSBleHBlcmltZW50YWwgc2FtcGxlciBwYXRjaC4iLAogICAgICAidHlwZSI6ICJib29sZWFuIiwKICAgICAgImRlZmF1bHQiOiB0cnVlLAogICAgICAiZW52IjogIlZMTE1fVVNFX0ZMQVNISU5GRVJfU0FNUExFUiIKICAgIH0KICB9LAogICJwYXRjaGVzIjogWwogICAgewogICAgICAiZmlsZSI6ICJwYXRjaGVzL3F3ZW4zLWRmbGFzaC13NGExNi5wYXRjaCIsCiAgICAgICJkZXNjcmlwdGlvbiI6ICJMb2FkcyBwYWNrZWQgVzRBMTYgUUtWIHdlaWdodHMgd2hlbiBERmxhc2ggYnVpbGRzIGl0cyBmdXNlZCBLViBwcm9qZWN0aW9uLiIKICAgIH0sCiAgICB7CiAgICAgICJmaWxlIjogInBhdGNoZXMvbG9va3VwLXZsbG0tZGV2LnBhdGNoIiwKICAgICAgImRlc2NyaXB0aW9uIjogIlNlcGFyYXRlcyBERmxhc2gyJ3MgdHJhaW5lZCBkcmFmdCBibG9jayBvZiA3IGZyb20gazE1IHZlcmlmaWNhdGlvbiBhbmQgZmlsbHMgdGhlIHJlbWFpbmRlciB3aXRoIGxvb2t1cC4iCiAgICB9CiAgXQp9Cg==
@@ -2253,7 +2259,7 @@ cmd_run_help() {
     --mem <float>          Force GPU memory fraction (0.0-1.0); bypasses auto-sizing.
     --no-mem-limit         Do not set a cgroup memory cap for unified-memory backends.
     --max-len <int>        Force context length; affects KV cache memory.
-    --kv-cache-dtype fp8   Use fp8 KV cache to reduce memory.
+    --kv-cache-dtype <dt>  KV cache dtype: auto, bfloat16, or fp8.
     --max-num-seqs <int>   Max concurrent requests; higher uses more memory.
     --mtp                  Enable MTP speculative decoding when supported.
     --no-mtp               Disable MTP speculative decoding.
@@ -2271,6 +2277,11 @@ cmd_run_help() {
     --tail                 Follow logs after launch.
     --force                Replace an already running instance of the model.
     --regen-profile        Recompute cached model memory profile.
+    -- <vLLM args...>      Forward all remaining arguments to vLLM unchanged.
+
+  Unknown flags after the model are also forwarded to vLLM unchanged. Spark
+  applies its defaults first, then forwarded arguments, so vLLM owns validation
+  and newly added vLLM flags work without a Spark release.
 
   Aliases keep model settings frozen and accept operational overrides only:
   --dry-run, --explain, --force, --port, --tail, --no-wait, --main.
@@ -2285,12 +2296,12 @@ cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" alias_frozen_flags=0
-  local publish_main=0
+  local publish_main=0 vllm_speculation_passthrough=0 arg
   local ALIAS_VLLM_ARGS_JSON="" ALIAS_VLLM_IMAGE="" ALIAS_VLLM_IMAGE_ID="" ALIAS_VLLM_ENTRYPOINT="" ALIAS_VLLM_ENV_JSON=""
   local bundle_candidate="" bundle_name="" bundle_path="" bundle_manifest=""
   local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_OPTIONS_JSON='{}' BUNDLE_ACTIVE_RUN_ARGS_JSON='[]'
   local BUNDLE_OPTION_VALUES_JSON='{}'
-  local -a alias_override_args=()
+  local -a alias_override_args=() vllm_passthrough_args=()
   local -a bundle_explicit_run_args=()
 
   bundle_candidate=$(bundle_detect_run_ref "$@" 2>/dev/null || true)
@@ -2323,6 +2334,7 @@ cmd_run() {
       --tail)      tail_logs=1; alias_override_args+=(--tail); shift ;;
       --force)     force=1; alias_override_args+=(--force); shift ;;
       --regen-profile) regen=1; alias_frozen_flags=1; shift ;;
+      --)          shift; vllm_passthrough_args+=("$@"); [[ $# -eq 0 ]] || alias_frozen_flags=1; break ;;
       -h|--help)   cmd_run_help; return 0 ;;
       -*)
         if [[ -n "$bundle_name" ]] && bundle_option_exists_in "$bundle_manifest" "${1#--}"; then
@@ -2330,13 +2342,23 @@ cmd_run() {
           bundle_set_option_value "$bundle_manifest" "${1#--}" "$2"
           shift 2
         else
-          die "Unknown flag: $1" "Run 'spark run --help' for usage"
+          vllm_passthrough_args+=("$1"); alias_frozen_flags=1; shift
         fi ;;
-      *)           [[ -z "$model" ]] || die "Only one model can be specified"; model="$1"; shift ;;
+      *)           if [[ -z "$model" ]]; then model="$1"; else vllm_passthrough_args+=("$1"); alias_frozen_flags=1; fi; shift ;;
     esac
   done
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
+  if [[ ${#vllm_passthrough_args[@]} -gt 0 ]]; then
+    for arg in "${vllm_passthrough_args[@]}"; do
+      case "${arg%%=*}" in
+        --speculative-config|-sc|--spec-method|--spec-model|--spec-tokens)
+          vllm_speculation_passthrough=1
+          [[ -n "$bundle_name" ]] || mtp_flag=1
+          ;;
+      esac
+    done
+  fi
   if [[ "$publish_main" == "1" ]]; then
     [[ "$dry_run" == "0" ]] || die "Cannot combine --main with --dry-run/--explain"
     [[ "$no_wait" == "0" ]] || die "Cannot combine --main with --no-wait"
@@ -2357,6 +2379,7 @@ cmd_run() {
     [[ "$BACKEND" == "vllm" ]] || die "Bundle '${bundle_name}' requires the vLLM backend"
     [[ "$mtp_flag" == "auto" ]] || die "Bundles with a drafter do not accept --mtp or --no-mtp"
     bundle_prepare_run "$bundle_name" "$bundle_path"
+    [[ ${#vllm_passthrough_args[@]} -eq 0 ]] || bundle_explicit_run_args+=("${vllm_passthrough_args[@]}")
     if [[ ${#bundle_explicit_run_args[@]} -gt 0 ]]; then
       BUNDLE_ACTIVE_RUN_ARGS_JSON=$(jq -nc --args '$ARGS.positional' -- "${bundle_explicit_run_args[@]}")
     else
@@ -2376,6 +2399,8 @@ cmd_run() {
       fi
       ;;
     ollama)
+      [[ ${#vllm_passthrough_args[@]} -eq 0 ]] \
+        || die "vLLM arguments cannot be used with the Ollama backend"
       if [[ "$publish_main" == "1" ]]; then
         SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_ollama
         run_publish_main "$model"
@@ -2728,7 +2753,7 @@ alias_bundle_guided_definition() {
   alias_prompt_yes "Disable cgroup memory limit" && args+=(--no-mem-limit)
   max_len=$(alias_prompt_value "Max context length (blank = bundle default)")
   [[ -z "$max_len" ]] || args+=(--max-len "$max_len")
-  kv=$(alias_prompt_value "KV cache dtype: auto/fp8 (blank = bundle default)")
+  kv=$(alias_prompt_value "KV cache dtype: auto/bfloat16/fp8 (blank = bundle default)")
   [[ -z "$kv" ]] || args+=(--kv-cache-dtype "$kv")
   seqs=$(alias_prompt_value "Max concurrent sequences (blank = bundle default)")
   [[ -z "$seqs" ]] || args+=(--max-num-seqs "$seqs")
@@ -2775,7 +2800,7 @@ alias_guided_definition() {
   alias_prompt_yes "Disable cgroup memory limit" && args+=(--no-mem-limit)
   max_len=$(alias_prompt_value "Max context length (blank = auto)")
   [[ -z "$max_len" ]] || args+=(--max-len "$max_len")
-  kv=$(alias_prompt_value "KV cache dtype: auto/fp8 (blank = auto)")
+  kv=$(alias_prompt_value "KV cache dtype: auto/bfloat16/fp8 (blank = auto)")
   [[ -z "$kv" || "$kv" == "auto" ]] || args+=(--kv-cache-dtype "$kv")
   seqs=$(alias_prompt_value "Max concurrent sequences (blank = auto)")
   [[ -z "$seqs" ]] || args+=(--max-num-seqs "$seqs")
@@ -3391,13 +3416,15 @@ build_launch() {
     use_marlin_atomic=1
   fi
   add_recommended_command_flags
-  [[ "$KV_CACHE_DTYPE" == "fp8" ]] && vllm_args+=(--kv-cache-dtype fp8)
+  [[ "$KV_CACHE_DTYPE" == "auto" ]] || vllm_args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
   [[ "$enforce_eager" == "1" ]] && vllm_args+=(--enforce-eager)
   [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]] && vllm_args+=(--reasoning-parser "$REASONING_PARSER")
   [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] && vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
   if [[ "${MTP_ENABLED:-0}" == "1" ]]; then
-    mtp_spec="$(resolve_mtp_speculative_config)"
-    vllm_args+=(--speculative-config "$mtp_spec")
+    if [[ "${vllm_speculation_passthrough:-0}" != "1" ]]; then
+      mtp_spec="$(resolve_mtp_speculative_config)"
+      vllm_args+=(--speculative-config "$mtp_spec")
+    fi
     set_vllm_flag_value --max-num-batched-tokens "$(resolve_batched_tokens SPARK_MTP_MAX_NUM_BATCHED_TOKENS 32768)"
     if stream_interval="$(resolve_stream_interval 2>/dev/null)"; then
       add_vllm_flag_once --stream-interval "$stream_interval"
@@ -3415,6 +3442,7 @@ build_launch() {
     && add_vllm_flag_once --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER"
   [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] \
     && add_vllm_flag_once --limit-mm-per-prompt '{"image":0}'
+  [[ ${#vllm_passthrough_args[@]} -eq 0 ]] || vllm_args+=("${vllm_passthrough_args[@]}")
 
   # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
   # set higher (by the provisioned swap) so the LOAD-time peak — the loader transiently needs ~2x the
@@ -3517,7 +3545,7 @@ run_backend_vllm() {
   [[ -z "$port" ]] || is_port "$port" || die "Invalid --port value: $port" "Expected an integer from 1 to 65535"
   [[ -z "$mem" ]] || is_mem_util "$mem" || die "Invalid --mem value: $mem" "Expected a number from 0.0 to 1.0"
   [[ -z "$max_len" ]] || is_positive_int "$max_len" || die "Invalid --max-len value: $max_len" "Expected a positive integer"
-  [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto or fp8"
+  [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|bfloat16|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto, bfloat16, or fp8"
   [[ -z "$max_num_seqs" ]] || is_positive_int "$max_num_seqs" || die "Invalid --max-num-seqs value: $max_num_seqs" "Expected a positive integer"
 
   local mtp_env_was_set=0 MTP_DECIDED=0
@@ -3859,7 +3887,7 @@ cmd_calibrate_help() {
     --passes <int>         Passes per configuration; default 5.
     --max-tokens <int>     Generated tokens per request; default 256.
     --max-num-seqs <int>   Candidate baseline concurrency; default inferred.
-    --kv-cache-dtype fp8   Include FP8 KV cache explicitly. Default: auto only.
+    --kv-cache-dtype <dt>  Include auto, bfloat16, or fp8 KV cache candidates.
     --port <int>           Benchmark API port; default auto-selects from 8000.
     --prompt <text>        Prompt used for calibration.
     --dry-run              Print candidate configs only.
@@ -3967,7 +3995,7 @@ cmd_calibrate() {
   is_positive_int "$max_tokens" || die "Invalid --max-tokens value: $max_tokens"
   [[ -z "$max_num_seqs" ]] || is_positive_int "$max_num_seqs" || die "Invalid --max-num-seqs value: $max_num_seqs"
   [[ -z "$port" ]] || is_port "$port" || die "Invalid --port value: $port"
-  [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto or fp8"
+  [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|bfloat16|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto, bfloat16, or fp8"
 
   local cname existing model_path base_seqs candidates
   cname=$(container_name_for_model "$model")
@@ -15797,7 +15825,7 @@ cmd_help() {
     --mem <float>          Force GPU memory fraction (0.0-1.0); bypasses auto-sizing
     --no-mem-limit         Do not set a cgroup memory cap on unified-memory backends
     --max-len <int>        Force context length; affects KV cache memory
-    --kv-cache-dtype fp8   Reduce KV cache memory
+    --kv-cache-dtype <dt>  KV cache dtype: auto, bfloat16, or fp8
     --max-num-seqs <int>   Force max concurrent requests; higher uses more memory
     --mtp / --no-mtp       Enable or disable MTP speculative decoding
     --enforce-eager        Disable CUDA graphs; lower startup peak, slower inference

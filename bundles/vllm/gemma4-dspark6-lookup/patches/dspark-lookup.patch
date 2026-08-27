@@ -1,0 +1,96 @@
+diff -ruN -x *.orig -x *.rej -x __pycache__ a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py	2026-08-26 00:00:00
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py	2026-08-26 00:00:00
+@@ -20,6 +20,7 @@
+ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
+ backbone forward AND the sequential Markov sampling.
+ """
++import os
+ 
+ from typing import Any
+ 
+@@ -31,5 +32,9 @@
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++from vllm.v1.worker.gpu.spec_decode.dspark.lookup import (
++    fuse_lookup,
++    suffix_lookup,
++)
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
+ 
+@@ -78,6 +83,37 @@
+             self.draft_model_config.hf_config, "dspark_draft_topk", None
+         )
+ 
++        # Lookup is greedy-only. Sampled decoding keeps DSpark's original
++        # proposal so its rejection distribution remains exact.
++        self._lookup = os.environ.get("VLLM_DSPARK_LOOKUP", "0") == "1"
++        self._lookup_nmin = int(os.environ.get("VLLM_DSPARK_LOOKUP_NMIN", "6"))
++        self._lookup_nmax = int(os.environ.get("VLLM_DSPARK_LOOKUP_NMAX", "12"))
++        self._lookup_nstrong = int(
++            os.environ.get("VLLM_DSPARK_LOOKUP_NSTRONG", "8")
++        )
++        self._lookup_agree = int(
++            os.environ.get("VLLM_DSPARK_LOOKUP_AGREE", "2")
++        )
++        self._lookup_search = int(
++            os.environ.get("VLLM_DSPARK_LOOKUP_SEARCH", str(1 << 30))
++        )
++        self._req_states = None
++        self._lookup_tokens = torch.zeros(
++            (self.max_num_reqs, self.num_speculative_steps),
++            dtype=torch.int32,
++            device=device,
++        )
++        self._lookup_len = torch.zeros(
++            self.max_num_reqs, dtype=torch.int32, device=device
++        )
++        self._lookup_valid = torch.zeros(
++            self.max_num_reqs, dtype=torch.int32, device=device
++        )
++        self._lookup_hits = torch.zeros((), dtype=torch.int64, device=device)
++
++    def set_req_states(self, req_states) -> None:
++        self._req_states = req_states
++
+     def load_draft_model(
+         self,
+         target_model: torch.nn.Module,
+@@ -220,3 +256,36 @@
+             cudagraph_runtime_mode,
+         )
+         self._sample_sequential(num_reqs, head_hidden)
++        self._apply_lookup(num_reqs)
++
++    def _apply_lookup(self, num_reqs: int) -> None:
++        if not self._lookup or self._req_states is None or self.draft_logits is not None:
++            return
++        tokens, match_len, valid = suffix_lookup(
++            self._req_states.all_token_ids.gpu,
++            self._req_states.total_len.gpu,
++            self.sample_idx_mapping,
++            num_reqs,
++            self.num_speculative_steps,
++            idx_mapping_stride=self.num_speculative_steps,
++            nmax=self._lookup_nmax,
++            nmin=self._lookup_nmin,
++            search_max=self._lookup_search,
++            out_tokens=self._lookup_tokens[:num_reqs],
++            out_len=self._lookup_len[:num_reqs],
++            out_valid=self._lookup_valid[:num_reqs],
++        )
++        fuse_lookup(
++            self.draft_tokens[:num_reqs],
++            tokens,
++            match_len,
++            valid,
++            self.sample_idx_mapping,
++            self._lookup_hits,
++            num_reqs,
++            self.num_speculative_steps,
++            idx_mapping_stride=self.num_speculative_steps,
++            nmin=self._lookup_nmin,
++            nstrong=self._lookup_nstrong,
++            agree_min=self._lookup_agree,
++        )

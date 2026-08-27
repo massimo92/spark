@@ -2449,15 +2449,20 @@ test_alias_backend_mismatch_fails_closed() {
 
 test_bundle_catalog_embeds_and_validates_builtin() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin list show
+  local tmp fake_bin list show gemma_show
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   list=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle list --json 2>&1)
   show=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle show qwen38-dflash2-lookup 2>&1)
+  gemma_show=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle show gemma4-dspark6-lookup 2>&1)
   local ok=0
   jq -e '.[] | select(.name == "qwen38-dflash2-lookup" and .source == "built-in")' <<<"$list" >/dev/null || ok=1
+  jq -e '.[] | select(.name == "gemma4-dspark6-lookup" and .source == "built-in")' <<<"$list" >/dev/null || ok=1
   [[ "$show" == *"DFlash2 W4A16"* && "$show" == *"--lookup"* ]] || ok=1
+  [[ "$gemma_show" == *"DSpark k6"* && "$gemma_show" == *"--lookup"* ]] || ok=1
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate \
     "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" >/dev/null 2>&1 || ok=1
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate \
+    "${ROOT_DIR}/bundles/vllm/gemma4-dspark6-lookup" >/dev/null 2>&1 || ok=1
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
 }
@@ -2498,8 +2503,8 @@ test_bundle_sync_checks_git_catalog() {
   check_output=$(cd "$ROOT_DIR" && HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     "$SPARK" bundle sync --check 2>&1)
   local ok=0
-  [[ "$output" == *"Synchronized 1 built-in bundle(s) into spark"* ]] || ok=1
-  [[ "$check_output" == *"Built-in bundles are synchronized (1)"* ]] || ok=1
+  [[ "$output" == *"Synchronized 2 built-in bundle(s) into spark"* ]] || ok=1
+  [[ "$check_output" == *"Built-in bundles are synchronized (2)"* ]] || ok=1
 
   standalone="${tmp}/standalone-spark"
   outside="${tmp}/outside"
@@ -2672,12 +2677,14 @@ test_bundle_run_resolves_defaults_and_dynamic_options() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
   output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
-    "$SPARK" run qwen38-dflash2-lookup --dry-run --max-len 32768 --lookup false 2>&1)
+    "$SPARK" run qwen38-dflash2-lookup --dry-run --max-len 32768 --lookup false \
+      --disable-log-stats 2>&1)
   local ok=0
   [[ "$output" == *"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"* ]] || ok=1
   [[ "$output" == *"--max-model-len 32768"* ]] || ok=1
   [[ "$output" == *"--speculative-config"* && "$output" == *"num_speculative_tokens"* ]] || ok=1
   [[ "$output" == *"VLLM_DFLASH2_LOOKUP=0"* ]] || ok=1
+  [[ "$output" == *"--disable-log-stats"* ]] || ok=1
   [[ "$output" == *"spark.bundle.name=qwen38-dflash2-lookup"* ]] || ok=1
   [[ "$output" != *"VLLM_SPEC_DECODE_ATTN"* ]] || ok=1
   unbuilt_output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
@@ -2693,7 +2700,7 @@ test_alias_create_from_bundle_stores_bundle_and_adjustments() {
   local tmp fake_bin aliases output create_output
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
-  if ! create_output=$(printf 'b1\n\nn\n\n\n\n\n\nn\nfalse\n\n\n\n' | \
+  if ! create_output=$(printf 'b2\n\nn\n\n\n\n\n\nn\nfalse\n\n\n\n' | \
     HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
     "$SPARK" alias create qwen-bundle-alias 2>&1); then
     printf '%s\n' "$create_output" >&2
@@ -8473,6 +8480,67 @@ test_hf_mtp_auto_enables_when_supported() {
     [[ "$without_mtp" != *"MTP: auto-enable"* ]]
 }
 
+test_run_forwards_unknown_vllm_arguments() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Passthrough" "$KV_CONFIG"
+  meta=$(hf_inspect_json false false 32768 false dense nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/Passthrough --dry-run --no-mtp \
+      --max-num-batched-tokens 12345 --disable-log-stats </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--max-num-batched-tokens 12345 --disable-log-stats"* ]]
+}
+
+test_run_forwards_vllm_arguments_after_separator() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/PassthroughSeparator" "$KV_CONFIG"
+  meta=$(hf_inspect_json false false 32768 false dense nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/PassthroughSeparator --dry-run --no-mtp -- \
+      --future-vllm-flag future-value </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--future-vllm-flag future-value"* ]]
+}
+
+test_run_passthrough_speculation_replaces_spark_mtp_default() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta spec count
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/DSpark" "$KV_CONFIG"
+  meta=$(hf_inspect_json true false 32768 false dense nvfp4)
+  spec='{"method":"dspark","model":"Org/DSpark-Draft","num_speculative_tokens":6}'
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/DSpark --dry-run --speculative-config "$spec" </dev/null 2>&1 || true)
+  count=$(grep -o -- '--speculative-config' <<<"$out" | wc -l | tr -d ' ')
+  rm -rf "$tmp"
+  if [[ "$count" == "1" ]] && [[ "$out" == *"Org/DSpark-Draft"* ]] && [[ "$out" != *'method\":\"mtp'* ]]; then
+    return 0
+  fi
+  printf '%s\n' "$out"
+  return 1
+}
+
+test_run_accepts_explicit_bfloat16_kv_cache() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out meta
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/BF16KV" "$KV_CONFIG"
+  meta=$(hf_inspect_json false false 32768 false dense nvfp4)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    SPARK_HF_MODEL_INSPECT_JSON="$meta" FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Org/BF16KV --dry-run --no-mtp \
+      --kv-cache-dtype bfloat16 </dev/null 2>&1 || true)
+  rm -rf "$tmp"
+  [[ "$out" == *"--kv-cache-dtype bfloat16"* ]]
+}
+
 test_hf_mtp_raises_memory_floor() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out meta
@@ -9608,6 +9676,10 @@ run_test "Gemma4 uses gemma4 reasoning and tool parsers" test_gemma4_uses_gemma4
 run_test "text-only uses vLLM JSON multimodal limit" test_text_only_uses_vllm_json_multimodal_limit
 run_test "HF card recommended context wins" test_hf_card_context_wins
 run_test "HF MTP auto-enables when supported" test_hf_mtp_auto_enables_when_supported
+run_test "run forwards unknown vLLM arguments" test_run_forwards_unknown_vllm_arguments
+run_test "run forwards vLLM arguments after separator" test_run_forwards_vllm_arguments_after_separator
+run_test "passthrough speculation replaces Spark MTP default" test_run_passthrough_speculation_replaces_spark_mtp_default
+run_test "run accepts explicit bfloat16 KV cache" test_run_accepts_explicit_bfloat16_kv_cache
 run_test "HF MTP raises memory floor" test_hf_mtp_raises_memory_floor
 run_test "HF recommended command maps stream interval" test_hf_stream_interval_from_recommended_command
 run_test "HF recommended command maps quantization" test_hf_quantization_from_recommended_command

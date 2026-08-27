@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "name": "gemma4-dspark6-lookup",
+  "description": "Gemma 4 26B NVFP4 with DSpark k6 and complementary greedy suffix lookup on NVIDIA GB10.",
+  "defaults": {
+    "target_model": {
+      "id": "nvidia/Gemma-4-26B-A4B-NVFP4",
+      "revision": "a19cfe00be84568a6867111c9a68c9c44fdcffe6"
+    },
+    "draft_model": {
+      "id": "makora-ai/gemma4-26b-a4b-dspark",
+      "revision": "e6f739231e892fe4512c470136490d5441ffe62f"
+    },
+    "speculative_tokens": 6,
+    "vllm_args": [
+      "vllm",
+      "serve",
+      "nvidia/Gemma-4-26B-A4B-NVFP4",
+      "--revision",
+      "a19cfe00be84568a6867111c9a68c9c44fdcffe6",
+      "--trust-remote-code",
+      "--gpu-memory-utilization",
+      "0.78",
+      "--kv-cache-dtype",
+      "bfloat16",
+      "--max-model-len",
+      "131072",
+      "--max-num-seqs",
+      "4",
+      "--port",
+      "8000",
+      "--enable-chunked-prefill",
+      "--enable-prefix-caching",
+      "--moe-backend",
+      "marlin",
+      "--reasoning-parser",
+      "gemma4",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser",
+      "gemma4",
+      "--max-num-batched-tokens",
+      "32768",
+      "--speculative-config",
+      "{\"method\":\"dspark\",\"model\":\"makora-ai/gemma4-26b-a4b-dspark\",\"revision\":\"e6f739231e892fe4512c470136490d5441ffe62f\",\"num_speculative_tokens\":6}"
+    ]
+  },
+  "options": {
+    "lookup": {
+      "description": "Fuse strong same-request suffix matches into the greedy DSpark proposal.",
+      "type": "boolean",
+      "default": true,
+      "env": "VLLM_DSPARK_LOOKUP"
+    },
+    "lookup-nmin": {
+      "description": "Minimum suffix match length considered by lookup.",
+      "type": "integer",
+      "default": 6,
+      "env": "VLLM_DSPARK_LOOKUP_NMIN"
+    },
+    "lookup-nstrong": {
+      "description": "Suffix length that can override DSpark without agreement.",
+      "type": "integer",
+      "default": 8,
+      "env": "VLLM_DSPARK_LOOKUP_NSTRONG"
+    },
+    "lookup-agree": {
+      "description": "Leading DSpark tokens that must agree for a shorter match.",
+      "type": "integer",
+      "default": 2,
+      "env": "VLLM_DSPARK_LOOKUP_AGREE"
+    }
+  },
+  "patches": [
+    {
+      "file": "patches/model-runner-req-states.patch",
+      "description": "Exposes live request token history to speculators that opt into lookup."
+    },
+    {
+      "file": "patches/dspark-lookup.patch",
+      "description": "Fuses safe greedy lookup proposals into DSpark after sequential Markov sampling."
+    }
+  ]
+}
