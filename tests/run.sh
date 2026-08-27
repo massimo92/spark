@@ -1040,6 +1040,7 @@ test_suite_includes() {
     test_alias_capture_rejects_secret_flags|\
     test_alias_backend_mismatch_fails_closed|\
     test_bundle_catalog_embeds_and_validates_builtin|\
+    test_bundle_remove_accepts_multiple_names|\
     test_bundle_validation_requires_declared_applied_patches|\
     test_bundle_sync_checks_git_catalog|\
     test_bundle_submit_dry_run_prepares_new_and_updated_changes|\
@@ -2629,6 +2630,34 @@ test_bundle_catalog_embeds_and_validates_builtin() {
     "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" >/dev/null 2>&1 || ok=1
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate \
     "${ROOT_DIR}/bundles/vllm/gemma4-dspark6-lookup" >/dev/null 2>&1 || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_remove_accepts_multiple_names() {
+  local tmp imported out blocked_out duplicate_out status=0 ok=0
+  tmp=$(mktemp -d)
+  imported="${tmp}/home/.local/share/spark/bundles/imported"
+  mkdir -p "${imported}/alpha" "${imported}/beta" "${imported}/keep"
+  printf 'alpha\n' > "${imported}/alpha/marker"
+  printf 'beta\n' > "${imported}/beta/marker"
+
+  out=$(printf 'y\n' | HOME="${tmp}/home" "$SPARK" bundle remove alpha beta)
+  [[ "$out" == *"Remove 2 imported bundles (alpha, beta)?"* ]] || ok=1
+  [[ "$out" == *"Removed 2 bundles: alpha, beta"* ]] || ok=1
+  [[ ! -e "${imported}/alpha" && ! -e "${imported}/beta" && -d "${imported}/keep" ]] || ok=1
+
+  set +e
+  blocked_out=$(printf 'y\n' | HOME="${tmp}/home" "$SPARK" bundle remove keep qwen38-dflash2-lookup 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 && "$blocked_out" == *"Built-in bundles cannot be removed."* ]] || ok=1
+  [[ -d "${imported}/keep" ]] || ok=1
+
+  duplicate_out=$(printf 'y\n' | HOME="${tmp}/home" "$SPARK" bundle remove keep keep)
+  [[ "$duplicate_out" == *"Remove imported bundle 'keep'?"* ]] || ok=1
+  [[ "$duplicate_out" == *"Removed bundle 'keep'"* && ! -e "${imported}/keep" ]] || ok=1
+
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
 }
@@ -9781,6 +9810,7 @@ run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_central
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
 run_test "built-in bundle catalog is embedded and valid" test_bundle_catalog_embeds_and_validates_builtin
+run_test "bundle remove accepts multiple imported names" test_bundle_remove_accepts_multiple_names
 run_test "bundle validation requires every patch to be declared and applied" test_bundle_validation_requires_declared_applied_patches
 run_test "bundle sync validates the Git catalog and generated executable" test_bundle_sync_checks_git_catalog
 run_test "bundle submit previews new and updated changes" test_bundle_submit_dry_run_prepares_new_and_updated_changes
