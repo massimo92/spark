@@ -735,7 +735,7 @@ cmd_help() {
     --mem <float>          Force GPU memory fraction (0.0-1.0); bypasses auto-sizing
     --no-mem-limit         Do not set a cgroup memory cap on unified-memory backends
     --max-len <int>        Force context length; affects KV cache memory
-    --kv-cache-dtype fp8   Reduce KV cache memory
+    --kv-cache-dtype <dt>  KV cache dtype: auto, bfloat16, or fp8
     --max-num-seqs <int>   Force max concurrent requests; higher uses more memory
     --mtp / --no-mtp       Enable or disable MTP speculative decoding
     --enforce-eager        Disable CUDA graphs; lower startup peak, slower inference

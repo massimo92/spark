@@ -9,7 +9,7 @@ cmd_run_help() {
     --mem <float>          Force GPU memory fraction (0.0-1.0); bypasses auto-sizing.
     --no-mem-limit         Do not set a cgroup memory cap for unified-memory backends.
     --max-len <int>        Force context length; affects KV cache memory.
-    --kv-cache-dtype fp8   Use fp8 KV cache to reduce memory.
+    --kv-cache-dtype <dt>  KV cache dtype: auto, bfloat16, or fp8.
     --max-num-seqs <int>   Max concurrent requests; higher uses more memory.
     --mtp                  Enable MTP speculative decoding when supported.
     --no-mtp               Disable MTP speculative decoding.
@@ -27,6 +27,11 @@ cmd_run_help() {
     --tail                 Follow logs after launch.
     --force                Replace an already running instance of the model.
     --regen-profile        Recompute cached model memory profile.
+    -- <vLLM args...>      Forward all remaining arguments to vLLM unchanged.
+
+  Unknown flags after the model are also forwarded to vLLM unchanged. Spark
+  applies its defaults first, then forwarded arguments, so vLLM owns validation
+  and newly added vLLM flags work without a Spark release.
 
   Aliases keep model settings frozen and accept operational overrides only:
   --dry-run, --explain, --force, --port, --tail, --no-wait, --main.
@@ -41,12 +46,12 @@ cmd_run() {
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" alias_frozen_flags=0
-  local publish_main=0
+  local publish_main=0 vllm_speculation_passthrough=0 arg
   local ALIAS_VLLM_ARGS_JSON="" ALIAS_VLLM_IMAGE="" ALIAS_VLLM_IMAGE_ID="" ALIAS_VLLM_ENTRYPOINT="" ALIAS_VLLM_ENV_JSON=""
   local bundle_candidate="" bundle_name="" bundle_path="" bundle_manifest=""
   local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_OPTIONS_JSON='{}' BUNDLE_ACTIVE_RUN_ARGS_JSON='[]'
   local BUNDLE_OPTION_VALUES_JSON='{}'
-  local -a alias_override_args=()
+  local -a alias_override_args=() vllm_passthrough_args=()
   local -a bundle_explicit_run_args=()
 
   bundle_candidate=$(bundle_detect_run_ref "$@" 2>/dev/null || true)
@@ -79,6 +84,7 @@ cmd_run() {
       --tail)      tail_logs=1; alias_override_args+=(--tail); shift ;;
       --force)     force=1; alias_override_args+=(--force); shift ;;
       --regen-profile) regen=1; alias_frozen_flags=1; shift ;;
+      --)          shift; vllm_passthrough_args+=("$@"); [[ $# -eq 0 ]] || alias_frozen_flags=1; break ;;
       -h|--help)   cmd_run_help; return 0 ;;
       -*)
         if [[ -n "$bundle_name" ]] && bundle_option_exists_in "$bundle_manifest" "${1#--}"; then
@@ -86,13 +92,21 @@ cmd_run() {
           bundle_set_option_value "$bundle_manifest" "${1#--}" "$2"
           shift 2
         else
-          die "Unknown flag: $1" "Run 'spark run --help' for usage"
+          vllm_passthrough_args+=("$1"); alias_frozen_flags=1; shift
         fi ;;
-      *)           [[ -z "$model" ]] || die "Only one model can be specified"; model="$1"; shift ;;
+      *)           if [[ -z "$model" ]]; then model="$1"; else vllm_passthrough_args+=("$1"); alias_frozen_flags=1; fi; shift ;;
     esac
   done
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
+  for arg in "${vllm_passthrough_args[@]}"; do
+    case "${arg%%=*}" in
+      --speculative-config|-sc|--spec-method|--spec-model|--spec-tokens)
+        vllm_speculation_passthrough=1
+        [[ -n "$bundle_name" ]] || mtp_flag=1
+        ;;
+    esac
+  done
   if [[ "$publish_main" == "1" ]]; then
     [[ "$dry_run" == "0" ]] || die "Cannot combine --main with --dry-run/--explain"
     [[ "$no_wait" == "0" ]] || die "Cannot combine --main with --no-wait"
@@ -113,6 +127,7 @@ cmd_run() {
     [[ "$BACKEND" == "vllm" ]] || die "Bundle '${bundle_name}' requires the vLLM backend"
     [[ "$mtp_flag" == "auto" ]] || die "Bundles with a drafter do not accept --mtp or --no-mtp"
     bundle_prepare_run "$bundle_name" "$bundle_path"
+    [[ ${#vllm_passthrough_args[@]} -eq 0 ]] || bundle_explicit_run_args+=("${vllm_passthrough_args[@]}")
     if [[ ${#bundle_explicit_run_args[@]} -gt 0 ]]; then
       BUNDLE_ACTIVE_RUN_ARGS_JSON=$(jq -nc --args '$ARGS.positional' -- "${bundle_explicit_run_args[@]}")
     else
@@ -132,6 +147,8 @@ cmd_run() {
       fi
       ;;
     ollama)
+      [[ ${#vllm_passthrough_args[@]} -eq 0 ]] \
+        || die "vLLM arguments cannot be used with the Ollama backend"
       if [[ "$publish_main" == "1" ]]; then
         SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_ollama
         run_publish_main "$model"
@@ -484,7 +501,7 @@ alias_bundle_guided_definition() {
   alias_prompt_yes "Disable cgroup memory limit" && args+=(--no-mem-limit)
   max_len=$(alias_prompt_value "Max context length (blank = bundle default)")
   [[ -z "$max_len" ]] || args+=(--max-len "$max_len")
-  kv=$(alias_prompt_value "KV cache dtype: auto/fp8 (blank = bundle default)")
+  kv=$(alias_prompt_value "KV cache dtype: auto/bfloat16/fp8 (blank = bundle default)")
   [[ -z "$kv" ]] || args+=(--kv-cache-dtype "$kv")
   seqs=$(alias_prompt_value "Max concurrent sequences (blank = bundle default)")
   [[ -z "$seqs" ]] || args+=(--max-num-seqs "$seqs")
@@ -531,7 +548,7 @@ alias_guided_definition() {
   alias_prompt_yes "Disable cgroup memory limit" && args+=(--no-mem-limit)
   max_len=$(alias_prompt_value "Max context length (blank = auto)")
   [[ -z "$max_len" ]] || args+=(--max-len "$max_len")
-  kv=$(alias_prompt_value "KV cache dtype: auto/fp8 (blank = auto)")
+  kv=$(alias_prompt_value "KV cache dtype: auto/bfloat16/fp8 (blank = auto)")
   [[ -z "$kv" || "$kv" == "auto" ]] || args+=(--kv-cache-dtype "$kv")
   seqs=$(alias_prompt_value "Max concurrent sequences (blank = auto)")
   [[ -z "$seqs" ]] || args+=(--max-num-seqs "$seqs")
@@ -1147,13 +1164,15 @@ build_launch() {
     use_marlin_atomic=1
   fi
   add_recommended_command_flags
-  [[ "$KV_CACHE_DTYPE" == "fp8" ]] && vllm_args+=(--kv-cache-dtype fp8)
+  [[ "$KV_CACHE_DTYPE" == "auto" ]] || vllm_args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
   [[ "$enforce_eager" == "1" ]] && vllm_args+=(--enforce-eager)
   [[ -n "$REASONING_PARSER" && "$no_reasoning" != "1" ]] && vllm_args+=(--reasoning-parser "$REASONING_PARSER")
   [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] && vllm_args+=(--enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER")
   if [[ "${MTP_ENABLED:-0}" == "1" ]]; then
-    mtp_spec="$(resolve_mtp_speculative_config)"
-    vllm_args+=(--speculative-config "$mtp_spec")
+    if [[ "${vllm_speculation_passthrough:-0}" != "1" ]]; then
+      mtp_spec="$(resolve_mtp_speculative_config)"
+      vllm_args+=(--speculative-config "$mtp_spec")
+    fi
     set_vllm_flag_value --max-num-batched-tokens "$(resolve_batched_tokens SPARK_MTP_MAX_NUM_BATCHED_TOKENS 32768)"
     if stream_interval="$(resolve_stream_interval 2>/dev/null)"; then
       add_vllm_flag_once --stream-interval "$stream_interval"
@@ -1171,6 +1190,7 @@ build_launch() {
     && add_vllm_flag_once --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER"
   [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] \
     && add_vllm_flag_once --limit-mm-per-prompt '{"image":0}'
+  [[ ${#vllm_passthrough_args[@]} -eq 0 ]] || vllm_args+=("${vllm_passthrough_args[@]}")
 
   # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
   # set higher (by the provisioned swap) so the LOAD-time peak — the loader transiently needs ~2x the
@@ -1273,7 +1293,7 @@ run_backend_vllm() {
   [[ -z "$port" ]] || is_port "$port" || die "Invalid --port value: $port" "Expected an integer from 1 to 65535"
   [[ -z "$mem" ]] || is_mem_util "$mem" || die "Invalid --mem value: $mem" "Expected a number from 0.0 to 1.0"
   [[ -z "$max_len" ]] || is_positive_int "$max_len" || die "Invalid --max-len value: $max_len" "Expected a positive integer"
-  [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto or fp8"
+  [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|bfloat16|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto, bfloat16, or fp8"
   [[ -z "$max_num_seqs" ]] || is_positive_int "$max_num_seqs" || die "Invalid --max-num-seqs value: $max_num_seqs" "Expected a positive integer"
 
   local mtp_env_was_set=0 MTP_DECIDED=0
@@ -1615,7 +1635,7 @@ cmd_calibrate_help() {
     --passes <int>         Passes per configuration; default 5.
     --max-tokens <int>     Generated tokens per request; default 256.
     --max-num-seqs <int>   Candidate baseline concurrency; default inferred.
-    --kv-cache-dtype fp8   Include FP8 KV cache explicitly. Default: auto only.
+    --kv-cache-dtype <dt>  Include auto, bfloat16, or fp8 KV cache candidates.
     --port <int>           Benchmark API port; default auto-selects from 8000.
     --prompt <text>        Prompt used for calibration.
     --dry-run              Print candidate configs only.
@@ -1723,7 +1743,7 @@ cmd_calibrate() {
   is_positive_int "$max_tokens" || die "Invalid --max-tokens value: $max_tokens"
   [[ -z "$max_num_seqs" ]] || is_positive_int "$max_num_seqs" || die "Invalid --max-num-seqs value: $max_num_seqs"
   [[ -z "$port" ]] || is_port "$port" || die "Invalid --port value: $port"
-  [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto or fp8"
+  [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|bfloat16|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto, bfloat16, or fp8"
 
   local cname existing model_path base_seqs candidates
   cname=$(container_name_for_model "$model")

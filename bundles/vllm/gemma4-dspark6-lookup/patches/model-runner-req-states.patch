@@ -1,0 +1,12 @@
+diff -ruN -x *.orig -x *.rej -x __pycache__ a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-08-26 00:00:00
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-08-26 00:00:00
+@@ -263,6 +263,8 @@
+             device=self.device,
+             num_prefill_lookahead=num_prefill_lookahead,
+         )
++        if self.speculator is not None and hasattr(self.speculator, "set_req_states"):
++            self.speculator.set_req_states(self.req_states)
+         self.input_buffers = InputBuffers(
+             max_num_reqs=self.max_num_reqs,
+             max_num_tokens=self.max_num_tokens,

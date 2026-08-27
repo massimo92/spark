@@ -638,7 +638,7 @@ validate_profile_values() {
   [[ "$WEIGHTS_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: weights_gb"
   [[ "$KV_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: kv_gb"
   [[ "$NEED_GB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Invalid profile value: need_gb"
-  [[ -z "$KV_CACHE_DTYPE" || "$KV_CACHE_DTYPE" =~ ^(auto|fp8)$ ]] || die "Invalid profile value: kv_cache_dtype"
+  [[ -z "$KV_CACHE_DTYPE" || "$KV_CACHE_DTYPE" =~ ^(auto|bfloat16|fp8)$ ]] || die "Invalid profile value: kv_cache_dtype"
 }
 
 load_profile() {
@@ -1009,7 +1009,7 @@ load_launch_calibration() {
   [[ "$CALIBRATED_MTP_ENABLED" =~ ^(0|1)$ ]] || CALIBRATED_MTP_ENABLED=""
   [[ "$CALIBRATED_STREAM_INTERVAL" =~ ^[0-9]+$ ]] || CALIBRATED_STREAM_INTERVAL=""
   [[ "$CALIBRATED_MAX_NUM_BATCHED_TOKENS" =~ ^[0-9]+$ ]] || CALIBRATED_MAX_NUM_BATCHED_TOKENS=""
-  [[ "$CALIBRATED_KV_CACHE_DTYPE" =~ ^(auto|fp8)$ ]] || CALIBRATED_KV_CACHE_DTYPE=""
+  [[ "$CALIBRATED_KV_CACHE_DTYPE" =~ ^(auto|bfloat16|fp8)$ ]] || CALIBRATED_KV_CACHE_DTYPE=""
   [[ "$CALIBRATED_TOKENS_PER_SECOND" =~ ^[0-9]+([.][0-9]+)?$ ]] || CALIBRATED_TOKENS_PER_SECOND=""
 }
 
