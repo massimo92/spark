@@ -1082,10 +1082,23 @@ test_benchmark_auto_selects_single_model() {
     "$SPARK" benchmark --dry-run 2>&1)
   rm -rf "$tmp"
   [[ "$out" == *"Benchmark target: Org/Alpha (spark-vllm-alpha, port 8007)"* ]] &&
-    [[ "$out" == *"kind=huggingface,source=garage-bAInd/Open-Platypus"* ]] &&
+    [[ "$out" == *'"source":"garage-bAInd/Open-Platypus"'* ]] &&
+    [[ "$out" == *'"split":"train"'* ]] &&
     [[ "$out" == *"kind=sweep,sweep_size=5"* ]] &&
     [[ "$out" == *"ghcr.io/vllm-project/guidellm:v0.7.2"* ]] &&
     [[ "$out" == *"--network host"* ]]
+}
+
+test_mem_util_accepts_leading_decimal_point() {
+  local tmp
+  tmp=$(mktemp -d)
+  HOME="$tmp" SPARK_BACKEND=vllm bash -c '
+    source "$1"
+    is_mem_util .70
+    is_mem_util 0.70
+    ! is_mem_util 1.01
+  ' _ "$SPARK"
+  rm -rf "$tmp"
 }
 
 test_benchmark_requires_model_when_noninteractive() {
@@ -9574,6 +9587,7 @@ test_stop_ollama_unloads() {
 
 run_test "architecture command maps core boundaries" test_architecture_command_maps_core_boundaries
 run_test "benchmark auto-selects one running model" test_benchmark_auto_selects_single_model
+run_test "memory utilization accepts legacy leading decimal" test_mem_util_accepts_leading_decimal_point
 run_test "benchmark requires --model without a TTY" test_benchmark_requires_model_when_noninteractive
 run_test "benchmark interactively selects a running model" test_benchmark_interactively_selects_model
 run_test "benchmark runs GuideLLM and writes metadata" test_benchmark_runs_guidellm_and_writes_manifest

@@ -174,7 +174,8 @@ cmd_benchmark() {
   if [[ -n "$data_config" ]]; then
     :
   else
-    data_config="kind=huggingface,source=${dataset}"
+    data_config=$(jq -cn --arg source "$dataset" \
+      '{kind:"huggingface",source:$source,load_kwargs:{split:"train"}}')
   fi
   if [[ -n "$duration" ]]; then
     constraint_config="kind=max_duration,seconds=${duration}"
