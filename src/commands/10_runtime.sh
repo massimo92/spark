@@ -858,12 +858,43 @@ cmd_alias() {
       alias_definition "$name" | jq .
       ;;
     remove)
-      name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark alias remove <alias>"
-      definition=$(alias_definition "$name") || die "Alias '${name}' does not exist"
-      confirm "Remove alias '${name}'?" || { printf '    Aborted.\n'; return 0; }
-      alias_save_definition "$name" "$definition" 1
-      alias_write_file "$ALIASES_FILE" "$(jq -c --arg name "$name" 'del(.[$name])' "$ALIASES_FILE")"
-      info "Removed alias '${name}'"
+      [[ $# -gt 0 ]] || die "Usage: spark alias remove <alias> [<alias>...]"
+      local candidate existing duplicate=0 label="" updated i
+      local -a names=() definitions=()
+      for candidate in "$@"; do
+        duplicate=0
+        if (( ${#names[@]} > 0 )); then
+          for existing in "${names[@]}"; do
+            [[ "$candidate" == "$existing" ]] && { duplicate=1; break; }
+          done
+        fi
+        [[ "$duplicate" == "1" ]] && continue
+        definition=$(alias_definition "$candidate") || die "Alias '${candidate}' does not exist"
+        names+=("$candidate")
+        definitions+=("$definition")
+      done
+
+      label="${names[0]}"
+      for ((i = 1; i < ${#names[@]}; i++)); do label+=", ${names[$i]}"; done
+      if (( ${#names[@]} == 1 )); then
+        confirm "Remove alias '${names[0]}'?" || { printf '    Aborted.\n'; return 0; }
+      else
+        confirm "Remove ${#names[@]} aliases (${label})?" || { printf '    Aborted.\n'; return 0; }
+      fi
+
+      for i in "${!names[@]}"; do
+        alias_save_definition "${names[$i]}" "${definitions[$i]}" 1
+      done
+      updated=$(jq -c . "$ALIASES_FILE") || die "Cannot read aliases"
+      for name in "${names[@]}"; do
+        updated=$(jq -c --arg name "$name" 'del(.[$name])' <<<"$updated") || die "Cannot remove alias '${name}'"
+      done
+      alias_write_file "$ALIASES_FILE" "$updated"
+      if (( ${#names[@]} == 1 )); then
+        info "Removed alias '${names[0]}'"
+      else
+        info "Removed ${#names[@]} aliases: ${label}"
+      fi
       ;;
     rollback)
       name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark alias rollback <alias>"
@@ -884,7 +915,7 @@ cmd_alias() {
     edit <alias>              Recreate an alias with the guide
     list                      List local aliases
     show <alias>              Print an alias definition
-    remove <alias>            Remove an alias
+    remove <alias>...         Remove one or more aliases
     rollback <alias>          Restore its previous definition
 
   Run an alias with: spark run <alias>
