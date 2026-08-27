@@ -3525,10 +3525,12 @@ workspace_hermes_ddg_package_ready() {
   local binary
   binary=$(workspace_hermes_python_binary) || return 1
   nemohermes hermes exec --no-tty --timeout 20 -- "$binary" -c '
+import importlib.metadata
 import sys
 sys.path.insert(0, "/sandbox/.hermes/plugins/web-spark-ddgs/vendor")
 import ddgs
-  ' >/dev/null 2>&1
+raise SystemExit(0 if importlib.metadata.version("ddgs") == sys.argv[1] else 1)
+  ' "$WORKSPACE_HERMES_DDGS_VERSION" >/dev/null 2>&1
 }
 
 workspace_install_hermes_ddg_plugin() {
@@ -3581,7 +3583,8 @@ provides_web_providers:
   if ! workspace_hermes_ddg_package_ready; then
     nemohermes hermes exec --no-tty --timeout 300 -- \
       /usr/local/bin/uv pip install --link-mode copy \
-        --target "${plugin_dir}/vendor" --upgrade ddgs >/dev/null 2>&1 || return 1
+        --target "${plugin_dir}/vendor" --upgrade \
+        "ddgs==${WORKSPACE_HERMES_DDGS_VERSION}" >/dev/null 2>&1 || return 1
   fi
   workspace_hermes_ddg_package_ready
 }

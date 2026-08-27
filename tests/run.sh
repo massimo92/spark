@@ -9160,7 +9160,7 @@ test_hermes_web_provider_is_ddgs() {
     FAKE_HERMES_WEB_CONFIG_BACKEND=ddgs FAKE_HERMES_WEB_CONFIG_SEARCH=ddgs \
     bash -c 'source "$1"; workspace_hermes_web_ready' _ "$SPARK" || wrong=$?
   rm -rf "$tmp"
-  [[ "$calls" == *"uv pip install --link-mode copy --target /sandbox/.hermes/plugins/web-spark-ddgs/vendor --upgrade ddgs"* ]] &&
+  [[ "$calls" == *"uv pip install --link-mode copy --target /sandbox/.hermes/plugins/web-spark-ddgs/vendor --upgrade ddgs==9.15.0"* ]] &&
     [[ "$calls" == *"/sandbox/.hermes/plugins/web-spark-ddgs"* ]] &&
     [[ "$calls" == *"plugin.yaml"* ]] &&
     [[ "$calls" == *"hermes config set --config-accept-new-path --key plugins.enabled --value"*"web-spark-ddgs"* ]] &&
