@@ -78,10 +78,18 @@ spark list                   # downloaded HuggingFace models
 spark alias list             # saved local launch aliases
 spark alias capture <alias>  # capture a live vLLM launch exactly
 spark run <alias> --explain  # inspect its resolved, non-destructive launch plan
+spark benchmark              # public GuideLLM benchmark of a running vLLM model
 spark logs [model]           # model logs
 spark stop [model|--all]     # stop running models
 spark down                   # stop all model and gateway services
 ```
+
+`spark benchmark` uses GuideLLM and the public Open-Platypus dataset. It selects
+the only running vLLM model automatically, or asks when several are active.
+Results are saved as JSON, CSV, HTML, and a reproducibility manifest. Use
+`spark benchmark --help` for profiles, fixed request/duration limits, thinking
+control, output length, dataset overrides, and direct GuideLLM passthrough after
+`--`.
 
 ## Workspace
 

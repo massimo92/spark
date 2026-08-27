@@ -15,6 +15,7 @@ MODULES=(
   "src/00_bootstrap.sh"
   "src/commands/05_bundle.sh"
   "src/commands/10_runtime.sh"
+  "src/commands/15_benchmark.sh"
   "src/commands/20_dashboard.sh"
   "src/commands/30_status_doctor.sh"
   "src/commands/40_setup.sh"

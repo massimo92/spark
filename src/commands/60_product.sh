@@ -656,6 +656,7 @@ cmd_architecture() {
     platform      detect OS/arch/accelerator/backend and memory pool
     profile       read model metadata, compute weights/KV/need, cache JSON
     vllm          Docker launch, capacity admission, startup supervision
+    benchmark     GuideLLM workloads against running vLLM model endpoints
     ollama        native Ollama launch/pull/status path
     setup         local/remote model-server install through ctx_* target abstraction
     repair        explicit model+LiteLLM reconciliation for the model server
@@ -705,6 +706,7 @@ cmd_help() {
     down             Stop all Spark-managed model and gateway services
     alias            Save, inspect, and restore launch aliases
     calibrate <model> Measure launch configs and save the fastest one
+    benchmark         Benchmark a running vLLM model with GuideLLM
     stop [<model>]   Stop a model (no arg: the only one; --all: every one)
     pull <model>     Download a model from HuggingFace
     list             List downloaded models
@@ -764,6 +766,7 @@ cmd_help() {
   ${BOLD}Help:${NC}
     spark run --help
     spark bundle --help
+    spark benchmark --help
     spark setup --help
     spark dashboard --help
     spark doctor --help
@@ -784,6 +787,7 @@ cmd_help() {
     spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4   # second model, co-resident
     spark run --dry-run Qwen/Qwen3-30B-A3B
+    spark benchmark --profile synchronous
     spark status
     spark repair --yes
     spark ws repair --yes
