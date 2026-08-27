@@ -326,7 +326,7 @@ is_port() {
 }
 
 is_mem_util() {
-  [[ "${1:-}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]]
+  [[ "${1:-}" =~ ^((0)?\.[0-9]+|0|1(\.0+)?)$ ]]
 }
 
 is_safe_model_ref() {
@@ -4960,7 +4960,8 @@ cmd_benchmark() {
   if [[ -n "$data_config" ]]; then
     :
   else
-    data_config="kind=huggingface,source=${dataset}"
+    data_config=$(jq -cn --arg source "$dataset" \
+      '{kind:"huggingface",source:$source,load_kwargs:{split:"train"}}')
   fi
   if [[ -n "$duration" ]]; then
     constraint_config="kind=max_duration,seconds=${duration}"
