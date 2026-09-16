@@ -2313,8 +2313,10 @@ cmd_run_help() {
   applies its defaults first, then forwarded arguments, so vLLM owns validation
   and newly added vLLM flags work without a Spark release.
 
-  Aliases keep model settings frozen and accept operational overrides only:
-  --dry-run, --explain, --force, --port, --tail, --no-wait, --main.
+  Aliases keep other model settings frozen. They accept operational overrides
+  (--dry-run, --explain, --force, --port, --tail, --no-wait, --main) and
+  one-off --mem, --max-len, --max-num-seqs, and --kv-cache-dtype values that
+  apply to that run only. Save a change with: spark alias set <alias> ...
 
   Bundles declare their target, drafter, Docker build, defaults, and extra
   flags. Example: spark run qwen38-dflash2-lookup --lookup false
@@ -2331,7 +2333,7 @@ cmd_run() {
   local bundle_candidate="" bundle_name="" bundle_path="" bundle_manifest=""
   local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_OPTIONS_JSON='{}' BUNDLE_ACTIVE_RUN_ARGS_JSON='[]'
   local BUNDLE_OPTION_VALUES_JSON='{}'
-  local -a alias_override_args=() vllm_passthrough_args=()
+  local -a alias_override_args=() alias_setting_args=() vllm_passthrough_args=()
   local -a bundle_explicit_run_args=()
 
   bundle_candidate=$(bundle_detect_run_ref "$@" 2>/dev/null || true)
@@ -2343,15 +2345,15 @@ cmd_run() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; alias_frozen_flags=1; bundle_explicit_run_args+=(--mem "$2"); shift 2 ;;
+      --mem)       [[ $# -ge 2 ]] || die "Missing value for --mem"; mem="$2"; alias_setting_args+=(--mem "$2"); bundle_explicit_run_args+=(--mem "$2"); shift 2 ;;
       --no-mem-limit) no_mem_limit=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-mem-limit); shift ;;
       --enforce-eager)    enforce_eager_flag=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--enforce-eager); shift ;;
       --no-enforce-eager) enforce_eager_flag=0; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-enforce-eager); shift ;;
       --no-wait)   no_wait=1; alias_override_args+=(--no-wait); shift ;;
-      --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; alias_frozen_flags=1; bundle_explicit_run_args+=(--max-num-seqs "$2"); shift 2 ;;
-      --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; alias_frozen_flags=1; bundle_explicit_run_args+=(--max-len "$2"); shift 2 ;;
+      --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; alias_setting_args+=(--max-num-seqs "$2"); bundle_explicit_run_args+=(--max-num-seqs "$2"); shift 2 ;;
+      --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; alias_setting_args+=(--max-len "$2"); bundle_explicit_run_args+=(--max-len "$2"); shift 2 ;;
       --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; alias_override_args+=(--port "$2"); bundle_explicit_run_args+=(--port "$2"); shift 2 ;;
-      --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; alias_frozen_flags=1; bundle_explicit_run_args+=(--kv-cache-dtype "$2"); shift 2 ;;
+      --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; alias_setting_args+=(--kv-cache-dtype "$2"); bundle_explicit_run_args+=(--kv-cache-dtype "$2"); shift 2 ;;
       --mtp)       mtp_flag=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--mtp); shift ;;
       --no-mtp)    mtp_flag=0; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-mtp); shift ;;
       --tools)     tools=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--tools); shift ;;
@@ -2400,8 +2402,10 @@ cmd_run() {
   fi
   if [[ "${SPARK_ALIAS_BYPASS:-0}" != "1" ]] && alias_exists "$model"; then
     [[ "$alias_frozen_flags" == "0" ]] || die "Alias model settings are frozen" \
-      "Allowed overrides: --dry-run, --explain, --force, --port, --tail, --no-wait, --main"
-    cmd_alias_run "$model" "${alias_override_args[@]}"
+      "Allowed overrides: --dry-run, --explain, --force, --port, --tail, --no-wait, --main, --mem, --max-len, --max-num-seqs, --kv-cache-dtype"
+    cmd_alias_run "$model" \
+      ${alias_setting_args[@]+"${alias_setting_args[@]}"} \
+      ${alias_override_args[@]+"${alias_override_args[@]}"}
     return 0
   fi
   if [[ -n "$bundle_name" ]]; then
@@ -2645,6 +2649,91 @@ alias_vllm_set_value_json() {
           end)
     | .out + [$flag, $value]
   ' <<<"$args"
+}
+
+# Model settings an alias can change persistently (`spark alias set`) or for a
+# single launch (`spark run <alias> --mem 0.6`). Captured launches store the
+# equivalent vLLM flag instead of Spark's flag.
+alias_setting_vllm_flag() {
+  case "$1" in
+    --mem)            printf '%s\n' --gpu-memory-utilization ;;
+    --max-len)        printf '%s\n' --max-model-len ;;
+    --max-num-seqs)   printf '%s\n' --max-num-seqs ;;
+    --kv-cache-dtype) printf '%s\n' --kv-cache-dtype ;;
+    *) return 1 ;;
+  esac
+}
+
+alias_validate_setting() {
+  local flag="$1" value="$2"
+  case "$flag" in
+    --mem)
+      [[ "$value" =~ ^(0?[.][0-9]+|1([.]0+)?)$ ]] \
+        && awk -v v="$value" 'BEGIN { exit !(v > 0 && v <= 1) }' \
+        || die "Invalid value for --mem: ${value}" "Use a GPU memory fraction greater than 0 and at most 1."
+      ;;
+    --max-len|--max-num-seqs)
+      [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "Invalid value for ${flag}: ${value}" "Use a positive integer."
+      ;;
+    --kv-cache-dtype)
+      case "$value" in
+        auto|bfloat16|fp8) ;;
+        *) die "Invalid value for --kv-cache-dtype: ${value}" "Use auto, bfloat16, or fp8." ;;
+      esac
+      ;;
+  esac
+}
+
+# Print the stored value of one setting, reading `--flag value` or `--flag=value`.
+alias_setting_value() {
+  local definition="$1" flag="$2" kind key
+  kind=$(jq -r '.kind' <<<"$definition")
+  if [[ "$kind" == "captured-vllm" ]]; then
+    key="vllm_args"; flag=$(alias_setting_vllm_flag "$flag") || return 1
+  else
+    key="run_args"
+  fi
+  jq -r --arg key "$key" --arg flag "$flag" '
+    (.[$key] // []) as $args
+    | [range(0; $args | length) as $i
+        | if $args[$i] == $flag and $i + 1 < ($args | length) then $args[$i + 1]
+          elif ($args[$i] | startswith($flag + "=")) then ($args[$i] | ltrimstr($flag + "="))
+          else empty end]
+    | last // empty
+  ' <<<"$definition"
+}
+
+# Print a definition with model settings replaced. Arguments are Spark
+# flag/value pairs; guided and bundle aliases keep them in run_args, captured
+# launches in vllm_args under the equivalent vLLM flag.
+alias_apply_settings() {
+  local definition="$1" kind flag value target key args
+  shift
+  kind=$(jq -r '.kind' <<<"$definition")
+  case "$kind" in
+    guided|bundle) key="run_args" ;;
+    captured-vllm) key="vllm_args" ;;
+    *) die "Alias kind '${kind}' does not support setting changes" ;;
+  esac
+  while [[ $# -gt 0 ]]; do
+    flag="$1"
+    target=$(alias_setting_vllm_flag "$flag") \
+      || die "Unsupported alias setting: ${flag}" "Supported: --mem, --max-len, --max-num-seqs, --kv-cache-dtype"
+    [[ $# -ge 2 ]] || die "Missing value for ${flag}"
+    value="$2"
+    alias_validate_setting "$flag" "$value"
+    # An unchanged value keeps its position, so re-applying a setting is a no-op.
+    if [[ "$(alias_setting_value "$definition" "$flag")" == "$value" ]]; then
+      shift 2
+      continue
+    fi
+    [[ "$key" == "vllm_args" ]] || target="$flag"
+    args=$(alias_vllm_set_value_json "$(jq -c --arg key "$key" '.[$key] // []' <<<"$definition")" "$target" "$value") \
+      || die "Cannot update ${flag}"
+    definition=$(jq -c --arg key "$key" --argjson args "$args" '.[$key] = $args' <<<"$definition")
+    shift 2
+  done
+  printf '%s\n' "$definition"
 }
 
 is_safe_container_image_ref() {
@@ -3018,10 +3107,24 @@ run_captured_vllm_definition() {
 cmd_alias_run() {
   local name="$1" definition backend kind
   shift
-  local -a overrides=("$@")
+  local -a overrides=() settings=()
+  # Model settings apply to this launch only; everything else is operational.
+  while [[ $# -gt 0 ]]; do
+    if alias_setting_vllm_flag "$1" >/dev/null; then
+      [[ $# -ge 2 ]] || die "Missing value for $1"
+      settings+=("$1" "$2"); shift 2
+    else
+      overrides+=("$1"); shift
+    fi
+  done
   definition=$(alias_definition "$name") || die "Alias '${name}' does not exist"
   alias_validate_definition "$definition" || die "Alias '${name}' has an invalid or unsafe definition" \
     "Recreate it with: spark alias edit ${name}"
+  if [[ ${#settings[@]} -gt 0 ]]; then
+    definition=$(alias_apply_settings "$definition" "${settings[@]}") || exit 1
+    alias_validate_definition "$definition" || die "One-off settings make alias '${name}' invalid"
+    info "One-off settings for this run: ${settings[*]} (alias '${name}' unchanged)"
+  fi
   backend=$(jq -r '.backend' <<<"$definition")
   kind=$(jq -r '.kind' <<<"$definition")
   case "$kind" in
@@ -3032,14 +3135,14 @@ cmd_alias_run() {
       local -a run_args=()
       model=$(jq -r '.model' <<<"$definition")
       while IFS= read -r arg; do run_args+=("$arg"); done < <(jq -r '.run_args[]' <<<"$definition")
-      run_args+=("${overrides[@]}")
-      cmd_run "$model" "${run_args[@]}"
+      [[ ${#overrides[@]} -eq 0 ]] || run_args+=("${overrides[@]}")
+      cmd_run "$model" ${run_args[@]+"${run_args[@]}"}
       ;;
     captured-vllm)
       [[ "$BACKEND" == "vllm" ]] || die "Alias '${name}' captures a vLLM launch; this machine uses ${BACKEND}" \
         "Create or edit an alias for this backend: spark alias edit ${name}"
       # The captured path shares the same centralized run_backend_vllm launcher.
-      run_captured_vllm_definition "$definition" "Alias '${name}'" "${overrides[@]}"
+      run_captured_vllm_definition "$definition" "Alias '${name}'" ${overrides[@]+"${overrides[@]}"}
       ;;
     bundle)
       [[ "$BACKEND" == "vllm" ]] || die "Alias '${name}' captures a vLLM bundle; this machine uses ${BACKEND}"
@@ -3051,8 +3154,8 @@ cmd_alias_run() {
       while IFS=$'\t' read -r option_key option_value; do
         run_args+=("--${option_key}" "$option_value")
       done < <(jq -r '(.options // {}) | to_entries[] | [.key, (.value|tostring)] | @tsv' <<<"$definition")
-      run_args+=("${overrides[@]}")
-      cmd_run "$bundle" "${run_args[@]}"
+      [[ ${#overrides[@]} -eq 0 ]] || run_args+=("${overrides[@]}")
+      cmd_run "$bundle" ${run_args[@]+"${run_args[@]}"}
       ;;
     *) die "Alias '${name}' has an unsupported kind: ${kind}" ;;
   esac
@@ -3122,6 +3225,28 @@ cmd_alias() {
       definition=$(alias_guided_definition)
       alias_save_definition "$name" "$definition" 1
       info "Updated alias '${name}'"
+      ;;
+    set)
+      name="${1:-}"
+      [[ -n "$name" && $# -ge 2 ]] || die "Usage: spark alias set <alias> <flag> <value> [<flag> <value>...]" \
+        "Flags: --mem, --max-len, --max-num-seqs, --kv-cache-dtype"
+      shift
+      local current updated flag before after
+      current=$(alias_definition "$name") || die "Alias '${name}' does not exist"
+      updated=$(alias_apply_settings "$current" "$@") || exit 1
+      if jq -e --argjson a "$current" --argjson b "$updated" -n '$a == $b' >/dev/null; then
+        info "Alias '${name}' already uses these settings"
+        return 0
+      fi
+      alias_save_definition "$name" "$updated" 1
+      info "Updated alias '${name}' (previous copy: spark alias rollback ${name})"
+      while [[ $# -gt 0 ]]; do
+        flag="$1"
+        before=$(alias_setting_value "$current" "$flag")
+        after=$(alias_setting_value "$updated" "$flag")
+        [[ "$before" == "$after" ]] || printf '    %-17s %s → %s\n' "$flag" "${before:-default}" "$after"
+        shift 2
+      done
       ;;
     capture)
       name="${1:-}"; [[ -n "$name" ]] || die "Usage: spark alias capture <alias> [--force]"
@@ -3193,12 +3318,16 @@ cmd_alias() {
     create <alias>            Guided alias creation from a model or bundle
     capture <alias> [--force] Capture a live vLLM run exactly
     edit <alias>              Recreate an alias with the guide
+    set <alias> <flag> <value>...
+                              Replace model settings and keep the rest:
+                              --mem, --max-len, --max-num-seqs, --kv-cache-dtype
     list                      List local aliases
     show <alias>              Print an alias definition
     remove <alias>...         Remove one or more aliases
     rollback <alias>          Restore its previous definition
 
   Run an alias with: spark run <alias>
+  Change a setting for one run only: spark run <alias> --mem 0.6
 
 EOF
       ;;

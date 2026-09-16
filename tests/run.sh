@@ -2520,6 +2520,116 @@ test_alias_remove_accepts_multiple_names() {
   [[ "$ok" == "0" ]]
 }
 
+test_alias_set_replaces_settings_and_keeps_rollback() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp aliases backup out same_out snapshot status ok=0
+  local -a bad_args=()
+  tmp=$(mktemp -d)
+  aliases="${tmp}/home/.config/spark/aliases.json"
+  backup="${tmp}/home/.config/spark/aliases.backup.json"
+  mkdir -p "$(dirname "$aliases")"
+  printf '%s\n' '{
+    "guided":{"kind":"guided","backend":"vllm","model":"Org/Guided","run_args":["--mem","0.7","--tools"]},
+    "bundled":{"kind":"bundle","backend":"vllm","model":"sakamakismile/Qwen3.8-27B-MTP-NVFP4",
+      "bundle":"qwen38-dflash2-lookup","run_args":[],"options":{"lookup":true}},
+    "captured":{"kind":"captured-vllm","backend":"vllm","model":"Org/Captured",
+      "vllm_args":["vllm","serve","Org/Captured","--gpu-memory-utilization","0.65",
+        "--max-model-len","4096","--kv-cache-dtype=bfloat16","--port","8000"]}
+  }' > "$aliases"
+
+  out=$(HOME="${tmp}/home" "$SPARK" alias set guided --mem 0.55 --max-len 65536)
+  [[ "$out" == *"Updated alias 'guided'"* ]] || ok=1
+  [[ "$out" == *"--mem"*"0.7 → 0.55"* && "$out" == *"--max-len"*"default → 65536"* ]] || ok=1
+  jq -e '.guided.run_args == ["--tools","--mem","0.55","--max-len","65536"]' "$aliases" >/dev/null || ok=1
+  jq -e '.guided.run_args == ["--mem","0.7","--tools"]' "$backup" >/dev/null || ok=1
+
+  HOME="${tmp}/home" "$SPARK" alias set bundled --max-len 131072 >/dev/null || ok=1
+  jq -e '
+    .bundled.run_args == ["--max-len","131072"]
+    and .bundled.options == {lookup:true}
+    and .bundled.bundle == "qwen38-dflash2-lookup"
+  ' "$aliases" >/dev/null || ok=1
+
+  HOME="${tmp}/home" "$SPARK" alias set captured --mem 0.5 --kv-cache-dtype fp8 --max-num-seqs 2 >/dev/null || ok=1
+  jq -e '.captured.vllm_args == ["vllm","serve","Org/Captured","--max-model-len","4096","--port","8000",
+    "--gpu-memory-utilization","0.5","--kv-cache-dtype","fp8","--max-num-seqs","2"]' "$aliases" >/dev/null || ok=1
+
+  snapshot=$(jq -S . "$aliases")
+  while read -r -a bad_args; do
+    set +e
+    HOME="${tmp}/home" "$SPARK" alias set "${bad_args[@]}" >/dev/null 2>&1
+    status=$?
+    set -e
+    [[ "$status" -ne 0 ]] || ok=1
+  done <<'EOF'
+captured --mem 1.5
+captured --mem 0
+captured --max-len 0
+captured --max-num-seqs two
+captured --kv-cache-dtype int8
+captured --tools yes
+captured --mem
+captured
+missing --mem 0.5
+EOF
+  [[ "$(jq -S . "$aliases")" == "$snapshot" ]] || ok=1
+
+  same_out=$(HOME="${tmp}/home" "$SPARK" alias set captured --mem 0.5)
+  [[ "$same_out" == *"already uses these settings"* ]] || ok=1
+
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_alias_run_applies_one_off_settings_without_saving() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin aliases before out bundle_out run_args_label frozen_out status ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Captured" "$KV_CONFIG"
+  make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
+  aliases="${tmp}/home/.config/spark/aliases.json"
+  mkdir -p "$(dirname "$aliases")"
+  jq -n '{
+    replay: {kind:"captured-vllm", backend:"vllm", model:"Org/Captured",
+      image:"eugr/spark-vllm:latest", image_id:("sha256:" + ("a" * 64)),
+      vllm_entrypoint:true, env:{},
+      vllm_args:["vllm","serve","Org/Captured","--gpu-memory-utilization","0.65",
+        "--max-model-len","4096","--port","8000"]},
+    unified: {kind:"bundle", backend:"vllm", model:"sakamakismile/Qwen3.8-27B-MTP-NVFP4",
+      bundle:"qwen38-dflash2-lookup", run_args:["--max-len","131072"], options:{lookup:true}}
+  }' > "$aliases"
+  before=$(jq -S . "$aliases")
+
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run replay --mem 0.5 --max-len 8192 --dry-run </dev/null 2>&1) || ok=1
+  [[ "$out" == *"One-off settings for this run: --mem 0.5 --max-len 8192 (alias 'replay' unchanged)"* ]] || ok=1
+  [[ "$out" == *"--gpu-memory-utilization 0.5"* && "$out" == *"--max-model-len 8192"* ]] || ok=1
+  [[ "$out" != *"--gpu-memory-utilization 0.65"* && "$out" != *"--max-model-len 4096"* ]] || ok=1
+
+  bundle_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run unified --max-len 32768 --dry-run </dev/null 2>&1) || ok=1
+  [[ "$bundle_out" == *"--max-model-len 32768"* && "$bundle_out" != *"--max-model-len 131072"* ]] || ok=1
+  run_args_label=$(printf '%s\n' "$bundle_out" | grep -o 'spark\.bundle\.run_args=[^ ]*' | head -1)
+  [[ "$run_args_label" == *32768* && "$run_args_label" != *131072* ]] || ok=1
+
+  set +e
+  frozen_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run replay --tools --dry-run </dev/null 2>&1)
+  status=$?
+  set -e
+  [[ "$status" -ne 0 && "$frozen_out" == *"Alias model settings are frozen"* ]] || ok=1
+  set +e
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run replay --mem 2 --dry-run </dev/null >/dev/null 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || ok=1
+
+  [[ "$(jq -S . "$aliases")" == "$before" ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
 test_alias_capture_replays_image_env_and_operational_overrides() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin inspect managed out stop_file run_file
@@ -9805,6 +9915,8 @@ run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wi
 run_test "alias create preserves dash-prefixed arguments" test_alias_create_preserves_dash_prefixed_args
 run_test "alias list renders a sorted aligned table" test_alias_list_renders_aligned_sorted_table
 run_test "alias remove accepts multiple names atomically" test_alias_remove_accepts_multiple_names
+run_test "alias set replaces settings and keeps rollback" test_alias_set_replaces_settings_and_keeps_rollback
+run_test "alias run applies one-off settings without saving" test_alias_run_applies_one_off_settings_without_saving
 run_test "captured alias pins image/env and accepts safe overrides" test_alias_capture_replays_image_env_and_operational_overrides
 run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_centralized
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
