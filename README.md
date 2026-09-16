@@ -77,6 +77,8 @@ spark models recommend       # model suggestions for current hardware
 spark list                   # downloaded HuggingFace models
 spark alias list             # saved local launch aliases
 spark alias capture <alias>  # capture a live vLLM launch exactly
+spark alias set <alias> --mem 0.65  # replace saved settings, keep the rest
+spark run <alias> --mem 0.6  # change a setting for this run only
 spark run <alias> --explain  # inspect its resolved, non-destructive launch plan
 spark benchmark              # public GuideLLM benchmark of a running vLLM model
 spark logs [model]           # model logs
