@@ -2555,6 +2555,18 @@ test_alias_set_replaces_settings_and_keeps_rollback() {
   jq -e '.captured.vllm_args == ["vllm","serve","Org/Captured","--max-model-len","4096","--port","8000",
     "--gpu-memory-utilization","0.5","--kv-cache-dtype","fp8","--max-num-seqs","2"]' "$aliases" >/dev/null || ok=1
 
+  HOME="${tmp}/home" "$SPARK" alias set captured --kv-cache-memory-bytes 12G \
+    --max-num-batched-tokens=8192 --enforce-eager >/dev/null || ok=1
+  jq -e '.captured.vllm_args[-5:] == ["--kv-cache-memory-bytes","12G","--max-num-batched-tokens","8192","--enforce-eager"]' \
+    "$aliases" >/dev/null || ok=1
+  out=$(HOME="${tmp}/home" "$SPARK" alias set captured --no-enforce-eager)
+  [[ "$out" == *"--no-enforce-eager: on → default"* ]] || ok=1
+  jq -e '(.captured.vllm_args | index("--enforce-eager")) == null' "$aliases" >/dev/null || ok=1
+
+  HOME="${tmp}/home" "$SPARK" alias set guided --gpu-memory-utilization 0.6 --no-enforce-eager >/dev/null || ok=1
+  HOME="${tmp}/home" "$SPARK" alias set guided --enforce-eager >/dev/null || ok=1
+  jq -e '.guided.run_args == ["--tools","--max-len","65536","--mem","0.6","--enforce-eager"]' "$aliases" >/dev/null || ok=1
+
   snapshot=$(jq -S . "$aliases")
   while read -r -a bad_args; do
     set +e
@@ -2568,15 +2580,19 @@ captured --mem 0
 captured --max-len 0
 captured --max-num-seqs two
 captured --kv-cache-dtype int8
-captured --tools yes
+captured --tools
 captured --mem
+captured --api-key secret
+captured --hf-token=secret
+captured --dry-run
+captured positional
 captured
 missing --mem 0.5
 EOF
   [[ "$(jq -S . "$aliases")" == "$snapshot" ]] || ok=1
 
   same_out=$(HOME="${tmp}/home" "$SPARK" alias set captured --mem 0.5)
-  [[ "$same_out" == *"already uses these settings"* ]] || ok=1
+  [[ "$same_out" == *"already uses these arguments"* ]] || ok=1
 
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
@@ -2602,23 +2618,26 @@ test_alias_run_applies_one_off_settings_without_saving() {
   before=$(jq -S . "$aliases")
 
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
-    "$SPARK" run replay --mem 0.5 --max-len 8192 --dry-run </dev/null 2>&1) || ok=1
-  [[ "$out" == *"One-off settings for this run: --mem 0.5 --max-len 8192 (alias 'replay' unchanged)"* ]] || ok=1
+    "$SPARK" run replay --mem 0.5 --max-len 8192 --kv-cache-memory-bytes 12G --max-num-batched-tokens 8192 \
+    --dry-run </dev/null 2>&1) || ok=1
+  [[ "$out" == *"One-off arguments for this run: --mem 0.5 --max-len 8192 --kv-cache-memory-bytes 12G --max-num-batched-tokens 8192 (alias 'replay' unchanged)"* ]] || ok=1
+  [[ "$out" == *"--kv-cache-memory-bytes 12G --max-num-batched-tokens 8192"* ]] || ok=1
   [[ "$out" == *"--gpu-memory-utilization 0.5"* && "$out" == *"--max-model-len 8192"* ]] || ok=1
   [[ "$out" != *"--gpu-memory-utilization 0.65"* && "$out" != *"--max-model-len 4096"* ]] || ok=1
 
   bundle_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
-    "$SPARK" run unified --max-len 32768 --dry-run </dev/null 2>&1) || ok=1
+    "$SPARK" run unified --max-len 32768 --max-num-batched-tokens 8192 --dry-run </dev/null 2>&1) || ok=1
   [[ "$bundle_out" == *"--max-model-len 32768"* && "$bundle_out" != *"--max-model-len 131072"* ]] || ok=1
   run_args_label=$(printf '%s\n' "$bundle_out" | grep -o 'spark\.bundle\.run_args=[^ ]*' | head -1)
-  [[ "$run_args_label" == *32768* && "$run_args_label" != *131072* ]] || ok=1
+  [[ "$run_args_label" == *32768* && "$run_args_label" != *131072* && "$run_args_label" == *8192* ]] || ok=1
+  [[ "$bundle_out" == *"--max-num-batched-tokens 8192"* ]] || ok=1
 
   set +e
   frozen_out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     "$SPARK" run replay --tools --dry-run </dev/null 2>&1)
   status=$?
   set -e
-  [[ "$status" -ne 0 && "$frozen_out" == *"Alias model settings are frozen"* ]] || ok=1
+  [[ "$status" -ne 0 && "$frozen_out" == *"Alias launch policy is fixed"* ]] || ok=1
   set +e
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     "$SPARK" run replay --mem 2 --dry-run </dev/null >/dev/null 2>&1
@@ -9960,8 +9979,8 @@ run_test "SPARK_VLLM_IMAGE overrides detected image" test_vllm_image_override_wi
 run_test "alias create preserves dash-prefixed arguments" test_alias_create_preserves_dash_prefixed_args
 run_test "alias list renders a sorted aligned table" test_alias_list_renders_aligned_sorted_table
 run_test "alias remove accepts multiple names atomically" test_alias_remove_accepts_multiple_names
-run_test "alias set replaces settings and keeps rollback" test_alias_set_replaces_settings_and_keeps_rollback
-run_test "alias run applies one-off settings without saving" test_alias_run_applies_one_off_settings_without_saving
+run_test "alias set replaces any launch argument and keeps rollback" test_alias_set_replaces_settings_and_keeps_rollback
+run_test "alias run applies one-off arguments without saving" test_alias_run_applies_one_off_settings_without_saving
 run_test "captured alias pins image/env and accepts safe overrides" test_alias_capture_replays_image_env_and_operational_overrides
 run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_centralized
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
