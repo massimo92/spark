@@ -61,8 +61,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Install jq and a comma-decimal locale
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq locales
+          sudo locale-gen es_ES.UTF-8
 
       - name: Run tests
         env:

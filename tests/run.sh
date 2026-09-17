@@ -1036,6 +1036,7 @@ test_suite_includes() {
     test_alias_create_preserves_dash_prefixed_args|\
     test_alias_list_renders_aligned_sorted_table|\
     test_alias_remove_accepts_multiple_names|\
+    test_numeric_output_ignores_comma_decimal_locale|\
     test_alias_capture_replays_image_env_and_operational_overrides|\
     test_alias_capture_rejects_secret_flags|\
     test_alias_backend_mismatch_fails_closed|\
@@ -9094,6 +9095,50 @@ test_calibrate_saves_best_and_run_uses_it() {
     [[ "$run" == *"--stream-interval 64"* ]]
 }
 
+# Print the first installed locale whose decimal separator is a comma, if any.
+comma_decimal_locale() {
+  local candidate
+  for candidate in es_ES.UTF-8 es_ES.utf8 de_DE.UTF-8 de_DE.utf8 fr_FR.UTF-8 fr_FR.utf8; do
+    if [[ "$(LC_ALL="$candidate" bash -c 'printf "%.1f" 1' 2>/dev/null)" == "1,0" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Profiles, jq, and awk use a dot decimal separator. Spark must print and parse
+# those numbers the same way whatever the host locale is, including LC_ALL.
+test_numeric_output_ignores_comma_decimal_locale() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local locale_name tmp fake_bin meta out run status ok=0 var
+  locale_name=$(comma_decimal_locale) || { printf "skip - no comma-decimal locale installed\n"; return 0; }
+  for var in LANG LC_ALL; do
+    tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+    make_model "${tmp}/home" "Org/Calibrate" "$MOE_CONFIG"
+    meta=$(hf_inspect_json true false 262144 false moe nvfp4)
+    set +e
+    out=$(env -u LC_ALL -u LC_NUMERIC "${var}=${locale_name}" \
+      HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+      SPARK_HF_MODEL_INSPECT_JSON="$meta" SPARK_CALIBRATE_FAKE_TPS="10.5 20.25 41.22 30.75 12.5" \
+      FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.05-py3" "$SPARK" calibrate Org/Calibrate --passes 1 --force </dev/null 2>&1)
+    status=$?
+    set -e
+    [[ "$status" -eq 0 && "$out" == *"41.22 tok/s"* && "$out" != *"41,"* ]] || ok=1
+    [[ "$(jq -r '.calibration.best.tokens_per_second // empty' "${tmp}/home/.config/spark/profiles/Org--Calibrate.json" 2>/dev/null)" == "41.22" ]] || ok=1
+    set +e
+    run=$(env -u LC_ALL -u LC_NUMERIC "${var}=${locale_name}" \
+      HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+      FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.05-py3" "$SPARK" run Org/Calibrate --dry-run --explain </dev/null 2>&1)
+    status=$?
+    set -e
+    [[ "$status" -eq 0 && "$run" == *"Calib:     41.22 tok/s"* && "$run" == *"Docker command that would be executed"* ]] || ok=1
+    [[ "$run" != *"número no válido"* && "$run" != *"invalid number"* ]] || ok=1
+    rm -rf "$tmp"
+  done
+  [[ "$ok" == "0" ]]
+}
+
 # A cached profile from an older spark (no schema_version, missing fields like is_moe) is refreshed
 # automatically on the next run — so decisions that depend on the new fields work without user action.
 test_profile_schema_autoregen() {
@@ -10065,6 +10110,7 @@ run_test "dry-run explain shows HF source and flags" test_dry_run_explain_shows_
 run_test "CLI overrides win over HF metadata" test_hf_metadata_cli_overrides_win
 run_test "calibrate dry-run lists candidate configs" test_calibrate_dry_run_lists_candidates
 run_test "calibrate saves best config and run uses it" test_calibrate_saves_best_and_run_uses_it
+run_test "numeric output ignores comma-decimal locale" test_numeric_output_ignores_comma_decimal_locale
 run_test "stale profile schema auto-refreshes on run" test_profile_schema_autoregen
 run_test "CUDA-graph calibration: try / stay-eager / use-graphs" test_cudagraph_calibration
 run_test "warmup cache migrates legacy single-peak entries" test_warmup_legacy_migration
