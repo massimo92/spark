@@ -4,6 +4,17 @@ set -euo pipefail
 # spark — CLI tool for serving LLMs with vLLM on NVIDIA DGX Spark
 # https://github.com/massimo92/spark
 
+# Profiles, jq, and awk always use a dot decimal separator. Bash's printf and
+# child tools parse numbers with LC_NUMERIC, so a comma-decimal locale (es_ES,
+# de_DE, ...) would reject "41.22" and abort under `set -e`. Keep the user's
+# language for text and pin only numbers. LC_ALL overrides every category, so
+# its value moves to LANG first.
+if [[ -n "${LC_ALL:-}" ]]; then
+  export LANG="$LC_ALL"
+  unset LC_ALL
+fi
+export LC_NUMERIC=C
+
 # Ensure common user bin paths are in PATH
 for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
