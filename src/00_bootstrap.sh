@@ -776,14 +776,21 @@ compute_kv_gb() {
     'BEGIN{ printf "%.1f", (2*L*H*D*B*T)/1073741824 }')
 }
 
+# Known non-KV runtime overhead, shared by sizing and capacity advice.
+profile_runtime_overhead_gb() {
+  local extra="${BUNDLE_RUNTIME_OVERHEAD_GB:-0}"
+  [[ "${IS_MULTIMODAL:-false}" == "true" ]] && extra="${SPARK_MM_ENCODER_OVERHEAD_GB:-8}"
+  awk -v x="$extra" 'BEGIN{exit !(x+0>=0)}' || extra=8
+  printf '%s\n' "$extra"
+}
+
 # Combine weights + KV + cushion into the absolute need (GB) and the vLLM fraction.
 # The fraction is need / total_system_memory — it reflects what the model asks for,
 # NOT the free space. Sets NEED_GB and GPU_MEM_UTIL.
 compute_need_and_fraction() {
   [[ -z "${BUNDLE_WEIGHTS_GB:-}" ]] || WEIGHTS_GB="$BUNDLE_WEIGHTS_GB"
-  local mm_extra="${BUNDLE_RUNTIME_OVERHEAD_GB:-0}"
-  [[ "${IS_MULTIMODAL:-false}" == "true" ]] && mm_extra="${SPARK_MM_ENCODER_OVERHEAD_GB:-8}"
-  awk -v x="$mm_extra" 'BEGIN{exit !(x+0>=0)}' || mm_extra=8
+  local mm_extra
+  mm_extra=$(profile_runtime_overhead_gb)
   NEED_GB=$(awk -v w="$WEIGHTS_GB" -v k="$KV_GB" -v x="$mm_extra" -v h="$MEM_HEADROOM_PCT" \
     'BEGIN{ printf "%.1f", (w+k+x)*(1+h/100) }')
   GPU_MEM_UTIL=$(awk -v n="$NEED_GB" -v T="$TOTAL_MEM_GB" \
@@ -1336,7 +1343,7 @@ print_fit_suggestion() {
 is_interactive() { [[ -t 0 || -n "${SPARK_ASSUME_INTERACTIVE:-}" ]]; }
 
 # Check the model fits in the free budget. If it does not:
-#  - --mem set: suggest the largest --mem that fits, then abort (context can't help a fixed --mem).
+#  - --mem set: show the available reservation ceiling, then abort; engine fit is separate.
 #  - interactive: offer a context menu (auto vs fp8); the choice updates MAX_MODEL_LEN/KV_CACHE_DTYPE
 #    and memory, and the launch continues.
 #  - non-interactive: print the fitting options + command, then abort.
@@ -1394,11 +1401,24 @@ verify_capacity() {
     printf "      %-32s %s GB  (port %s)\n" "$m" "${need:-?}" "${port:-?}"
   done < <(list_managed_containers)
 
-  # Manual --mem: reducing context won't change a fixed reservation; suggest a smaller --mem.
+  # Manual --mem fixes the reservation. A smaller reservation may not fit the
+  # weights or requested context; do not advertise its budget ceiling as a fit.
   if [[ -n "$mem" ]]; then
-    local maxmem
-    maxmem=$(awk -v f="$free" -v T="$TOTAL_MEM_GB" 'BEGIN{ x=f/T; if(x<0)x=0; printf "%.2f", x }')
-    printf "    → Fits with --mem ≤ %s:  ${BOLD}spark run %s --mem %s${NC}\n" "$maxmem" "$model" "$maxmem"
+    local maxmem minneed maxneed launch_ref
+    maxmem=$(awk -v f="$free" -v T="$TOTAL_MEM_GB" \
+      'BEGIN{ x=int(f/T*100)/100; if(x<0)x=0; if(x>0.99)x=0.99; printf "%.2f", x }')
+    minneed=$(awk -v w="${WEIGHTS_GB:-0}" -v x="$(profile_runtime_overhead_gb)" \
+      -v h="${MEM_HEADROOM_PCT:-8}" 'BEGIN{ printf "%.1f", (w+x)*(1+h/100) }')
+    if awk -v m="$maxmem" -v T="$TOTAL_MEM_GB" -v n="$minneed" \
+        'BEGIN{ exit !(m>0 && m*T>=n) }'; then
+      maxneed=$(awk -v m="$maxmem" -v T="$TOTAL_MEM_GB" 'BEGIN{ printf "%.1f", m*T }')
+      launch_ref="${RUN_REQUESTED_REF:-${BUNDLE_ACTIVE_NAME:-$model}}"
+      printf "    Available reservation ceiling: --mem %s (%s GB)\n" "$maxmem" "$maxneed"
+      printf "    Try: ${BOLD}spark run %s --mem %s${NC}\n" "$launch_ref" "$maxmem"
+      printf '    The engine must still validate weights and context at this lower budget.\n'
+    else
+      printf '    Known weights and runtime need at least %s GB; lowering --mem cannot make them fit.\n' "$minneed"
+    fi
     printf "    Or free memory:  ${BOLD}spark stop <model>${NC}\n"
     [[ "$dry_run" == "1" ]] && return 0
     exit 1

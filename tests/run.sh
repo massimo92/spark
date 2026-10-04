@@ -8644,7 +8644,52 @@ test_mem_override_suggests_mem() {
   status=$?
   set -e
   rm -rf "$tmp"
-  [[ "$status" -ne 0 ]] && [[ "$out" == *"Fits with --mem ≤ 0.21"* ]] && [[ "$out" != *"--max-len"* ]]
+  [[ "$status" -ne 0 ]] && [[ "$out" == *"Available reservation ceiling: --mem 0.21"* ]] && [[ "$out" != *"--max-len"* ]]
+}
+
+test_mem_override_cannot_fit_weights() {
+  local tmp fake_bin out status=0 config
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  config=$(jq '.num_parameters=160000000000' <<<"$KV_CONFIG")
+  make_model "$tmp/home" Org/Huge "$config"
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_MANAGED="$RESERVE_85" \
+    "$SPARK" run Org/Huge --mem 0.9 </dev/null 2>&1) || status=$?
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 && "$out" == *"Known weights and runtime need at least"* \
+    && "$out" != *"Available reservation ceiling"* && "$out" != *"Fits with --mem"* ]]
+}
+
+test_mem_override_cannot_fit_bundle_overhead() {
+  local tmp fake_bin out status=0
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  make_prepared_bundle "$tmp/bundle"
+  jq 'del(.model_source,.initializer) | .resources.runtime_overhead_gb=30' \
+    "$tmp/bundle/bundle.json" > "$tmp/new.json"
+  mv "$tmp/new.json" "$tmp/bundle/bundle.json"
+  make_model "$tmp/home" Org/Prepared "$KV_CONFIG" abcdef1
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle import "$tmp/bundle" >/dev/null 2>&1
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_MANAGED="$RESERVE_85" "$SPARK" run prepared-test --mem 0.9 --no-wait </dev/null 2>&1) || status=$?
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 && "$out" == *"Known weights and runtime need at least 33.5 GB"* \
+    && "$out" != *"Available reservation ceiling"* && "$out" != *"Fits with --mem"* ]]
+}
+
+test_mem_ceiling_rounds_down_and_preserves_alias() {
+  local tmp fake_bin out status=0
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  make_model "$tmp/home" Org/Budget "$KV_CONFIG"
+  mkdir -p "$tmp/home/.config/spark"
+  printf '%s\n' '{"budget-alias":{"kind":"guided","backend":"vllm","model":"Org/Budget","run_args":["--mem","0.9"]}}' \
+    > "$tmp/home/.config/spark/aliases.json"
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_RAM_AVAIL_GB=87 \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run budget-alias </dev/null 2>&1) || status=$?
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 && "$out" == *"Available reservation ceiling: --mem 0.71"* \
+    && "$out" == *"spark run budget-alias --mem 0.71"* \
+    && "$out" != *"spark run Org/Budget --mem"* && "$out" != *"Fits with --mem"* ]]
 }
 
 # --- Per-container hard memory limit (--memory) ---
@@ -9500,7 +9545,7 @@ test_budget_blocks_single_model() {
   status=$?
   set -e
   rm -rf "$tmp"
-  [[ "$status" -eq 0 ]] && [[ "$out" == *"Not enough memory"* ]] && [[ "$out" == *"Fits with --mem"* ]]
+  [[ "$status" -eq 0 ]] && [[ "$out" == *"Not enough memory"* ]] && [[ "$out" == *"Available reservation ceiling"* ]]
 }
 
 # Discrete GPUs get a smaller OS reserve (2 → budget 119): the full-context stacking case fits.
@@ -10314,6 +10359,9 @@ run_test "menu: choosing auto relaunches at the auto context" test_menu_choose_a
 run_test "menu: cancel aborts without starting" test_menu_cancel_aborts
 run_test "auto-pull menu downloads + starts at chosen context" test_autopull_menu_downloads_at_choice
 run_test "--mem too high suggests a smaller --mem" test_mem_override_suggests_mem
+run_test "--mem advice refuses budgets smaller than model weights" test_mem_override_cannot_fit_weights
+run_test "--mem advice includes declared bundle overhead" test_mem_override_cannot_fit_bundle_overhead
+run_test "--mem ceiling rounds down and retains the requested alias" test_mem_ceiling_rounds_down_and_preserves_alias
 run_test "per-container --memory limit present on unified" test_mem_limit_present_unified
 run_test "per-container --memory limit absent on discrete" test_mem_limit_absent_discrete
 run_test "per-container --memory limit absent with --no-mem-limit" test_mem_limit_absent_with_flag
