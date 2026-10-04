@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -2892,9 +2893,9 @@ test_engine_memory_observations_expire_after_restart() {
 
 test_bundle_catalog_embeds_and_validates_builtin() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
-  local tmp fake_bin list show gemma_show
+  local tmp fake_bin list show gemma_show assets
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
-  list=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle list --json 2>&1)
+  list=$(umask 077; HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle list --json 2>&1)
   show=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle show qwen38-dflash2-lookup 2>&1)
   gemma_show=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle show gemma4-dspark6-lookup 2>&1)
   local ok=0
@@ -2902,6 +2903,12 @@ test_bundle_catalog_embeds_and_validates_builtin() {
   jq -e '.[] | select(.name == "gemma4-dspark6-lookup" and .source == "built-in")' <<<"$list" >/dev/null || ok=1
   [[ "$show" == *"DFlash2 W4A16"* && "$show" == *"--lookup"* ]] || ok=1
   [[ "$gemma_show" == *"DSpark k6"* && "$gemma_show" == *"--lookup"* ]] || ok=1
+  assets="${tmp}/home/.local/share/spark/bundles/builtin"
+  # Docker COPY retains source modes: all public assets must be readable and
+  # directories traversable by the image's non-root runtime, even under 077.
+  [[ -z "$(find "$assets" -type f ! -perm -004 -print)" ]] || ok=1
+  [[ -z "$(find "$assets" -type d ! -perm -005 -print)" ]] || ok=1
+  [[ -x "${assets}/vllm/qwen38-flash-ultrafast/model-build/build.sh" ]] || ok=1
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate \
     "${ROOT_DIR}/bundles/vllm/qwen38-dflash2-lookup" >/dev/null 2>&1 || ok=1
   HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" bundle validate \
