@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,13 +32,15 @@ cleanup() { [[ -z "${tmp:-}" ]] || rm -f "$tmp"; }
 trap cleanup EXIT
 
 emit_builtin_bundle_assets() {
-  local root="${ROOT_DIR}/bundles" asset rel encoded index
+  local root="${ROOT_DIR}/bundles" asset rel mode encoded index
   index="$(mktemp)"
   if [[ -d "$root" ]]; then
     while IFS= read -r asset; do
       rel="${asset#"${root}"/}"
+      mode=644
+      [[ ! -x "$asset" ]] || mode=755
       encoded=$(base64 < "$asset" | tr -d '\n')
-      printf '%s\t%s\n' "$rel" "$encoded" >> "$index"
+      printf '%s\t%s\t%s\n' "$rel" "$mode" "$encoded" >> "$index"
     done < <(find "$root" -type f | LC_ALL=C sort)
   fi
   {

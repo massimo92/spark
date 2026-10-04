@@ -1,3 +1,4 @@
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
 # --- vLLM bundles ---
 
 is_safe_bundle_name() {
@@ -16,19 +17,24 @@ bundle_decode_base64() {
 # directory once per process so an updated release immediately replaces them.
 bundle_materialize_builtins() {
   [[ "${BUNDLE_BUILTINS_READY:-0}" == "1" ]] && return 0
-  local root="${BUNDLES_DIR}/builtin" rel encoded target tmp
+  local root="${BUNDLES_DIR}/builtin" rel mode encoded target tmp
   mkdir -p "$root" || die "Cannot create bundle store"
-  while IFS=$'\t' read -r rel encoded; do
+  while IFS=$'\t' read -r rel mode encoded; do
     [[ -n "$rel" ]] || continue
     [[ "$rel" =~ ^[A-Za-z0-9._/-]+$ && "$rel" != /* && "$rel" != *..* ]] \
       || die "Unsafe built-in bundle path: ${rel}"
+    [[ "$mode" == "644" || "$mode" == "755" ]] || die "Invalid bundle asset permissions: ${rel}"
     target="${root}/${rel}"
     mkdir -p "$(dirname "$target")" || die "Cannot extract bundle asset"
     tmp=$(mktemp "${target}.tmp.XXXXXX") || die "Cannot create bundle asset"
     printf '%s' "$encoded" | bundle_decode_base64 > "$tmp" \
       || { rm -f "$tmp"; die "Cannot decode bundle asset: ${rel}"; }
+    # Public recipe files must stay readable after Docker COPY to a non-root
+    # runtime. mktemp otherwise publishes mode 600; retain executable assets.
+    chmod "$mode" "$tmp" || { rm -f "$tmp"; die "Cannot set bundle asset permissions: ${rel}"; }
     mv "$tmp" "$target" || { rm -f "$tmp"; die "Cannot install bundle asset: ${rel}"; }
   done < <(spark_builtin_bundle_assets)
+  find "$root" -type d -exec chmod 755 {} + || die "Cannot set bundle directory permissions"
   BUNDLE_BUILTINS_READY=1
 }
 
