@@ -3700,6 +3700,47 @@ test_run_main_publishes_alias_target() {
     [[ "$output" == *"restart"* ]]
 }
 
+test_run_main_reuses_ready_vllm_target() {
+  local previous tmp fake_bin output status saved stops runs managed ok=0
+  for previous in stale running; do
+    tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+    mkdir -p "$tmp/home/.config/spark"
+    printf '%s\n' '{"enabled":true,"port":4000,"main":{"provider":"vllm","model":"Org/Old"},"providers":{"vllm":{"enabled":true,"port":8000}}}' \
+      > "$tmp/home/.config/spark/gateway.json"
+    managed='spark-vllm-next\tOrg/Next\t8007\t20\t10\t10\n'
+    [[ "$previous" != "running" ]] || managed+='spark-vllm-old\tOrg/Old\t8000\t20\t10\t10\n'
+    status=0
+    output=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_MANAGED="$managed" FAKE_NAMES='spark-litellm\n' \
+      FAKE_DOCKER_STOP_FILE="$tmp/stops.log" FAKE_DOCKER_ARGS_FILE="$tmp/runs.log" \
+      "$SPARK" run Org/Next --main </dev/null 2>&1) || status=$?
+    saved=$(jq -r '.main.model' "$tmp/home/.config/spark/gateway.json")
+    stops=$(cat "$tmp/stops.log" 2>/dev/null || true)
+    runs=$(cat "$tmp/runs.log" 2>/dev/null || true)
+    [[ "$status" == "0" && "$saved" == "Org/Next" && "$output" == *"LiteLLM main now targets vllm/Org/Next"* \
+      && "$stops" != *"spark-vllm"* && "$runs" != *"--gpus all"* ]] || ok=1
+    [[ "$ok" == "0" ]] || printf '%s\n' "$output" >&2
+    rm -rf "$tmp"
+  done
+  [[ "$ok" == "0" ]]
+}
+
+test_run_main_does_not_publish_unready_target() {
+  local tmp fake_bin output status=0 saved stops
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "$tmp/home/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"main":{"provider":"vllm","model":"Org/Old"},"providers":{"vllm":{"enabled":true,"port":8000}}}' \
+    > "$tmp/home/.config/spark/gateway.json"
+  output=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_VLLM_READY=0 \
+    FAKE_MANAGED='spark-vllm-next\tOrg/Next\t8007\t20\t10\t10\n' \
+    FAKE_DOCKER_STOP_FILE="$tmp/stops.log" \
+    "$SPARK" run Org/Next --main </dev/null 2>&1) || status=$?
+  saved=$(jq -r '.main.model' "$tmp/home/.config/spark/gateway.json")
+  stops=$(cat "$tmp/stops.log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" != "0" && "$saved" == "Org/Old" && "$stops" != *"spark-vllm"* \
+    && "$output" != *"LiteLLM main now targets"* ]]
+}
+
 test_run_main_replaces_current_vllm_main() {
   local out
   out=$(bash -c '
@@ -10302,6 +10343,8 @@ run_test "dashboard web writes product UI" test_dashboard_web_once_writes_produc
 run_test "dashboard terminal renders product snapshot" test_dashboard_terminal_still_renders_snapshot
 run_test "gateway add/remove toggles a provider" test_gateway_add_remove_provider
 run_test "spark run --main publishes an alias target" test_run_main_publishes_alias_target
+run_test "spark run --main reuses a ready target with stale or running previous main" test_run_main_reuses_ready_vllm_target
+run_test "spark run --main leaves an unready target unpublished" test_run_main_does_not_publish_unready_target
 run_test "spark run --main replaces the current vLLM main" test_run_main_replaces_current_vllm_main
 run_test "spark run --main checks capacity after stopping current main" test_run_main_checks_capacity_after_stopping_current_main
 run_test "spark run --main offers rollback after failure" test_run_main_failure_offers_and_accepts_rollback
