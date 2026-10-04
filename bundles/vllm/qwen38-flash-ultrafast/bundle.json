@@ -1,0 +1,98 @@
+{
+  "schema_version": 2,
+  "name": "qwen38-flash-ultrafast",
+  "description": "Qwen3.8 Flash Next on GB10: UltraFast v16b image, integrated T80 dense-MTP g32, reduced draft vocabulary and NVMe PLE.",
+  "defaults": {
+    "target_model": {
+      "id": "Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid",
+      "revision": "8b82f0b7abe3d1150a7827d298c75e86267636ae"
+    },
+    "speculative_tokens": 3,
+    "vllm_args": [
+      "vllm",
+      "serve",
+      "Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid",
+      "--revision",
+      "8b82f0b7abe3d1150a7827d298c75e86267636ae",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "8000",
+      "--served-model-name",
+      "Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid",
+      "--load-format",
+      "fastsafetensors",
+      "--gpu-memory-utilization",
+      "0.78",
+      "--max-model-len",
+      "262144",
+      "--max-num-seqs",
+      "8",
+      "--enable-prefix-caching",
+      "--enable-chunked-prefill",
+      "--max-num-batched-tokens",
+      "8192",
+      "-cc.cudagraph_mode=PIECEWISE",
+      "-cc.splitting_ops=[\"vllm::unified_attention_with_output\",\"vllm::unified_mla_attention_with_output\",\"vllm::mamba_mixer2\",\"vllm::mamba_mixer\",\"vllm::short_conv\",\"vllm::qwen3_8_flash_next_ple_short_conv\",\"vllm::qwen3_8_flash_next_qsa_with_output\",\"vllm::linear_attention\",\"vllm::qwen_gdn_attention_core\",\"vllm::qwen_gdn_attention_core_fused_norm_packed\",\"vllm::sparse_attn_indexer\",\"vllm::ple_mmap_lookup\"]",
+      "--no-enable-flashinfer-autotune",
+      "--kv-cache-dtype",
+      "auto",
+      "--enable-prompt-tokens-details",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser",
+      "qwen3_xml",
+      "--reasoning-parser",
+      "qwen3",
+      "--speculative-config",
+      "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"rejection_sample_method\":\"block\",\"draft_sample_method\":\"probabilistic\"}"
+    ]
+  },
+  "model_source": {
+    "type": "prepared",
+    "path": "model"
+  },
+  "initializer": {
+    "command": [
+      "python3",
+      "/opt/spark/initialize.py"
+    ],
+    "version": "t80-g32-v1",
+    "memory_gb": 8,
+    "minimum_free_disk_gb": 6,
+    "gpu": false
+  },
+  "runtime": {
+    "env": {
+      "VLLM_PLE_MMAP": "1",
+      "VLLM_PLE_MMAP_DIR": "{artifact_dir}/ple-table",
+      "VLLM_PLE_MMAP_WORKERS": "32",
+      "VLLM_PLE_MMAP_PREWARM": "1",
+      "VLLM_PLE_MMAP_PREFETCH": "0",
+      "VLLM_PLE_MMAP_MADV_RANDOM": "1",
+      "VLLM_PLE_MMAP_FAST_ROWS": "16",
+      "VLLM_PLE_MMAP_CHUNK": "8",
+      "VLLM_PLE_MMAP_FAST_PATH": "1",
+      "VLLM_PLE_MMAP_FAST_MAX_ROWS": "262144",
+      "VLLM_MTP_DRAFT_VOCAB": "/opt/spark/draft-vocab.txt",
+      "VLLM_DRAFTER_EXPERTS_FP8": "1",
+      "QWEN38NEXT_LOW_LATENCY_GEMM": "1",
+      "QWEN38NEXT_LLG_PDL": "0",
+      "VLLM_VERIFY_TOPK_TRITON": "1",
+      "VLLM_KEEP_DRAFT_BLOCKS": "1",
+      "VLLM_HIT_DEBUG": "0",
+      "VLLM_STEP_PROFILE": "0",
+      "VLLM_MARLIN_USE_ATOMIC_ADD": "1",
+      "VLLM_FP8_HYBRID": "1",
+      "VLLM_USE_DEEP_GEMM": "0",
+      "VLLM_USE_FLASHINFER_SAMPLER": "1",
+      "CUDA_LAUNCH_BLOCKING": "0"
+    }
+  },
+  "resources": {
+    "weights_gb": 71,
+    "runtime_overhead_gb": 4,
+    "kv_estimator": "engine"
+  },
+  "options": {},
+  "patches": []
+}

@@ -189,6 +189,19 @@ ${stdin_payload}"
     esac
     ;;
   run)
+    if [[ "$args" == *"--entrypoint"* && -n "${FAKE_INITIALIZER_CONFIG:-}" ]]; then
+      root="" mount="" prev=""
+      for arg in "$@"; do
+        [[ "$prev" != "-v" || "$arg" != *":/tmp/huggingface" ]] || mount="${arg%:/tmp/huggingface}"
+        case "$arg" in SPARK_BUNDLE_DIR=*) root="${arg#SPARK_BUNDLE_DIR=/tmp/huggingface}" ;; esac
+        prev="$arg"
+      done
+      [[ -n "${FAKE_INITIALIZER_FILE:-}" ]] && printf '%s\n' "$args" >> "$FAKE_INITIALIZER_FILE"
+      [[ "${FAKE_INITIALIZER_EXIT:-0}" == "0" ]] || exit "$FAKE_INITIALIZER_EXIT"
+      mkdir -p "${mount}${root}/model"
+      printf '%s\n' "$FAKE_INITIALIZER_CONFIG" > "${mount}${root}/model/config.json"
+      exit 0
+    fi
     [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_DOCKER_ARGS_FILE}"
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
     ;;
@@ -2429,7 +2442,12 @@ test_corrupt_profile_reports_error() {
 # Write a model snapshot with the given config.json contents; echoes HOME dir.
 make_model() {
   local home="$1" ref="$2" config="$3"
-  local dir="${home}/.cache/huggingface/hub/models--${ref//\//--}/snapshots/1"
+  local revision="${4:-1}"
+  case "$ref" in
+    sakamakismile/Qwen3.8-27B-MTP-NVFP4) revision=6d98dc1f1d5259c9582794014b73852baf20f805 ;;
+    nvidia/Gemma-4-26B-A4B-NVFP4) revision=$(jq -r '.defaults.target_model.revision' "${ROOT_DIR}/bundles/vllm/gemma4-dspark6-lookup/bundle.json") ;;
+  esac
+  local dir="${home}/.cache/huggingface/hub/models--${ref//\//--}/snapshots/${revision}"
   mkdir -p "$dir"
   printf '%s\n' "$config" > "${dir}/config.json"
 }
@@ -2744,6 +2762,134 @@ test_alias_backend_mismatch_fails_closed() {
   [[ "$status" -ne 0 && "$out" == *"targets vllm; this machine uses ollama"* ]]
 }
 
+
+make_prepared_bundle() {
+  local directory="$1"
+  mkdir -p "$directory"
+  cat > "$directory/bundle.json" <<'EOF'
+{"schema_version":2,"name":"prepared-test","description":"Test image-owned model preparation",
+"defaults":{"target_model":{"id":"Org/Prepared","revision":"abcdef1"},"speculative_tokens":3,
+"vllm_args":["vllm","serve","Org/Prepared","--revision","abcdef1","--gpu-memory-utilization","0.1","--max-model-len","4096","--max-num-seqs","1","--served-model-name","Org/Prepared","--speculative-config","{\"method\":\"mtp\",\"num_speculative_tokens\":3}"]},
+"model_source":{"type":"prepared","path":"model"},"initializer":{"command":["python3","/initialize.py"],"version":"one","memory_gb":1},
+"runtime":{"env":{"VLLM_EXTRA_DIR":"{artifact_dir}/extra"}},"resources":{"kv_estimator":"engine","weights_gb":1},"options":{},"patches":[]}
+EOF
+  printf 'FROM example/runtime:1\n' > "$directory/Dockerfile"
+  printf 'Fixture\n' > "$directory/README.md"
+}
+
+test_bundle_v2_accepts_integrated_and_no_speculation() {
+  local tmp fake_bin out status=0 ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_prepared_bundle "$tmp/bundle"
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle validate "$tmp/bundle" >/dev/null 2>&1 || ok=1
+  jq 'del(.defaults.speculative_tokens) | .defaults.vllm_args = .defaults.vllm_args[0:-2]' "$tmp/bundle/bundle.json" > "$tmp/new.json"
+  mv "$tmp/new.json" "$tmp/bundle/bundle.json"
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle validate "$tmp/bundle" >/dev/null 2>&1 || ok=1
+  jq '.model_source.path="../outside"' "$tmp/bundle/bundle.json" > "$tmp/new.json"
+  mv "$tmp/new.json" "$tmp/bundle/bundle.json"
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle validate "$tmp/bundle" 2>&1) || status=$?
+  [[ "$status" != "0" && "$out" == *"Invalid bundle runtime"* ]] || ok=1
+  rm -rf "$tmp"; [[ "$ok" == "0" ]]
+}
+
+test_bundle_initializer_reuses_artifact_and_dry_run_is_read_only() {
+  local tmp fake_bin dry out one two ready ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_prepared_bundle "$tmp/bundle"
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle import "$tmp/bundle" >/dev/null 2>&1
+  dry=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_INITIALIZER_FILE="$tmp/init.log" \
+    "$SPARK" run prepared-test --dry-run 2>&1) || ok=1
+  [[ "$dry" == *"Initialization required"* && ! -s "$tmp/init.log" && ! -d "$tmp/home/.cache/huggingface/bundles" ]] || ok=1
+  one=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_INITIALIZER_CONFIG="$KV_CONFIG" FAKE_INITIALIZER_FILE="$tmp/init.log" FAKE_DOCKER_ARGS_FILE="$tmp/serve.log" \
+    "$SPARK" run prepared-test --no-wait 2>&1) || ok=1
+  two=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_INITIALIZER_CONFIG="$KV_CONFIG" FAKE_INITIALIZER_FILE="$tmp/init.log" FAKE_DOCKER_ARGS_FILE="$tmp/serve.log" \
+    "$SPARK" run prepared-test --no-wait --max-len 2048 2>&1) || ok=1
+  [[ "$(wc -l < "$tmp/init.log" | tr -d ' ')" == "1" && "$two" == *"Reusing prepared model"* ]] || ok=1
+  [[ "$(cat "$tmp/init.log")" != *"--gpus"* ]] || ok=1
+  [[ "$(cat "$tmp/serve.log")" == *"/model"* && "$(cat "$tmp/serve.log")" != *"--revision"* ]] || ok=1
+  [[ "$(cat "$tmp/serve.log")" == *"spark.model=Org/Prepared"* ]] || ok=1
+  [[ "$(cat "$tmp/serve.log")" == *"VLLM_EXTRA_DIR=/tmp/huggingface/bundles/"* ]] || ok=1
+  ready=$(find "$tmp/home/.cache/huggingface/bundles" -name .spark-ready.json)
+  [[ -n "$ready" ]] || ok=1
+  if [[ "$ok" != "0" ]]; then printf '%s\n%s\n%s\n' "$dry" "$one" "$two" >&2; fi
+  rm -rf "$tmp"; [[ "$ok" == "0" ]]
+}
+
+test_bundle_initializer_failure_preserves_running_service_and_can_retry() {
+  local tmp fake_bin out status=0 ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_prepared_bundle "$tmp/bundle"
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle import "$tmp/bundle" >/dev/null 2>&1
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_MANAGED=$'spark-vllm-Org--Prepared\tOrg/Prepared\t8000\t12\t1\t1\n' \
+    FAKE_INITIALIZER_CONFIG="$KV_CONFIG" FAKE_INITIALIZER_EXIT=42 FAKE_DOCKER_STOP_FILE="$tmp/stop.log" \
+    "$SPARK" run prepared-test --force --no-wait 2>&1) || status=$?
+  [[ "$status" != "0" && "$out" == *"initialization failed"* && ! -s "$tmp/stop.log" ]] || ok=1
+  [[ -z "$(find "$tmp/home/.cache/huggingface/bundles" -name .spark-ready.json -o -name .spark-init.lock)" ]] || ok=1
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_INITIALIZER_CONFIG="$KV_CONFIG" "$SPARK" run prepared-test --no-wait >/dev/null 2>&1 || ok=1
+  rm -rf "$tmp"; [[ "$ok" == "0" ]]
+}
+
+test_model_resolution_honors_requested_revision() {
+  local tmp out ok=0
+  tmp=$(mktemp -d)
+  make_model "$tmp/home" Org/Revision "$KV_CONFIG" abc1234
+  make_model "$tmp/home" Org/Revision "$KV_CONFIG" def5678
+  out=$(HOME="$tmp/home" bash -c 'source "$1"; resolve_model_path Org/Revision abc1234; ! resolve_model_path Org/Revision deadbeef' _ "$SPARK") || ok=1
+  [[ "$out" == *"/snapshots/abc1234"* && "$out" != *"def5678"* ]] || ok=1
+  rm -rf "$tmp"; [[ "$ok" == "0" ]]
+}
+
+
+test_prepared_bundle_alias_replays_pinned_revision_and_local_path() {
+  local tmp fake_bin ready artifact load_path hash inspect out replay ok=0
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  make_prepared_bundle "$tmp/bundle"
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle import "$tmp/bundle" >/dev/null 2>&1
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_INITIALIZER_CONFIG="$KV_CONFIG" \
+    "$SPARK" run prepared-test --no-wait >/dev/null 2>&1 || ok=1
+  ready=$(find "$tmp/home/.cache/huggingface/bundles" -name .spark-ready.json)
+  artifact=$(basename "$(dirname "$ready")")
+  hash=$(find "$tmp/home/.local/share/spark/bundles/revisions/prepared-test" -mindepth 1 -maxdepth 1 -type d | head -1)
+  hash=$(basename "$hash")
+  load_path="/tmp/huggingface/bundles/prepared-test/$artifact/model"
+  inspect=$(jq -nc --arg path "$load_path" --arg hash "$hash" '[{
+    State:{Running:true},Path:"vllm",Args:["serve",$path],
+    Config:{Entrypoint:["vllm","serve"],Cmd:[$path],Image:"spark/bundle-prepared-test:latest",Env:[],
+      Labels:{"spark.model":"Org/Prepared","spark.model.load_path":$path,"spark.bundle.name":"prepared-test","spark.bundle.hash":$hash}},
+    Image:("sha256:"+("a"*64))}]')
+  out=$(printf '1\n' | HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+    FAKE_MANAGED=$'spark-vllm-prepared\tOrg/Prepared\t8000\t12\t1\t0\n' FAKE_CONTAINER_INSPECT_JSON="$inspect" \
+    "$SPARK" alias capture prepared-replay 2>&1) || ok=1
+  jq -e --arg hash "$hash" '."prepared-replay".bundle_hash == $hash and ."prepared-replay".model == "Org/Prepared" and ."prepared-replay".image_id == ("sha256:"+("a"*64))' \
+    "$tmp/home/.config/spark/aliases.json" >/dev/null || ok=1
+  jq '.initializer.version="two" | .runtime.env.VLLM_EXTRA_DIR="changed"' "$tmp/bundle/bundle.json" > "$tmp/new.json"
+  mv "$tmp/new.json" "$tmp/bundle/bundle.json"
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle import "$tmp/bundle" --force >/dev/null 2>&1
+  replay=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run prepared-replay --dry-run --gpu-memory-utilization=0.2 --max-model-len 2048 2>&1) || ok=1
+  [[ "$replay" == *"Reusing prepared model"* && "$replay" == *"$load_path"* && "$replay" == *"--gpu-memory-utilization 0.2"* && "$replay" == *"--max-model-len 2048"* ]] || ok=1
+  [[ "$replay" != *"VLLM_EXTRA_DIR=changed"* ]] || ok=1
+  if [[ "$ok" != "0" ]]; then printf '%s\n%s\n' "$out" "$replay" >&2; fi
+  rm -rf "$tmp"; [[ "$ok" == "0" ]]
+}
+
+test_engine_memory_observations_expire_after_restart() {
+  local tmp fake_bin out old ok=0
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_STARTED_AT=first \
+    FAKE_DOCKER_LOGS=$'INFO Available KV cache memory: 14.90 GiB\nINFO GPU KV cache size: 131,072 tokens' \
+    bash -c 'source "$1"; engine_memory_json spark-vllm-test' _ "$SPARK") || ok=1
+  jq -e '.kv_gib == 14.9 and .kv_tokens == 131072 and .source == "vllm-startup-log"' <<<"$out" >/dev/null || ok=1
+  old=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_STARTED_AT=second \
+    bash -c 'source "$1"; engine_memory_json spark-vllm-test' _ "$SPARK") || ok=1
+  [[ "$old" == "null" ]] || ok=1
+  rm -rf "$tmp"; [[ "$ok" == "0" ]]
+}
+
 test_bundle_catalog_embeds_and_validates_builtin() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin list show gemma_show
@@ -2828,8 +2974,8 @@ test_bundle_sync_checks_git_catalog() {
   check_output=$(cd "$ROOT_DIR" && HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     "$SPARK" bundle sync --check 2>&1)
   local ok=0
-  [[ "$output" == *"Synchronized 2 built-in bundle(s) into spark"* ]] || ok=1
-  [[ "$check_output" == *"Built-in bundles are synchronized (2)"* ]] || ok=1
+  [[ "$output" == *"Synchronized 3 built-in bundle(s) into spark"* ]] || ok=1
+  [[ "$check_output" == *"Built-in bundles are synchronized (3)"* ]] || ok=1
 
   standalone="${tmp}/standalone-spark"
   outside="${tmp}/outside"
@@ -9985,6 +10131,12 @@ run_test "captured alias pins image/env and accepts safe overrides" test_alias_c
 run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_centralized
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
+run_test "v2 bundles support integrated speculation and no speculation" test_bundle_v2_accepts_integrated_and_no_speculation
+run_test "initializers reuse artifacts and dry-run stays read-only" test_bundle_initializer_reuses_artifact_and_dry_run_is_read_only
+run_test "initializer failure preserves services and retry succeeds" test_bundle_initializer_failure_preserves_running_service_and_can_retry
+run_test "model resolver honors pinned revisions" test_model_resolution_honors_requested_revision
+run_test "prepared aliases retain recipe revision and local model source" test_prepared_bundle_alias_replays_pinned_revision_and_local_path
+run_test "engine KV observations expire after restart" test_engine_memory_observations_expire_after_restart
 run_test "built-in bundle catalog is embedded and valid" test_bundle_catalog_embeds_and_validates_builtin
 run_test "bundle remove accepts multiple imported names" test_bundle_remove_accepts_multiple_names
 run_test "bundle validation requires every patch to be declared and applied" test_bundle_validation_requires_declared_applied_patches

@@ -55,6 +55,9 @@ cmd_run() {
   local bundle_candidate="" bundle_name="" bundle_path="" bundle_manifest=""
   local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_OPTIONS_JSON='{}' BUNDLE_ACTIVE_RUN_ARGS_JSON='[]'
   local BUNDLE_OPTION_VALUES_JSON='{}'
+  local BUNDLE_ACTIVE_HASH="" BUNDLE_TARGET_REVISION="" BUNDLE_MODEL_PATH="" BUNDLE_MODEL_LOAD_PATH=""
+  local BUNDLE_INITIALIZATION_PENDING=0
+  local BUNDLE_ARTIFACT_KEY="" BUNDLE_KV_ESTIMATOR="" BUNDLE_WEIGHTS_GB="" BUNDLE_RUNTIME_OVERHEAD_GB=""
   local -a alias_override_args=() alias_setting_args=() vllm_passthrough_args=()
   local -a bundle_explicit_run_args=()
 
@@ -134,9 +137,15 @@ cmd_run() {
   if [[ -n "$bundle_name" ]]; then
     [[ "$model" == "$bundle_name" ]] || die "Only one launch target can be specified"
     [[ "$BACKEND" == "vllm" ]] || die "Bundle '${bundle_name}' requires the vLLM backend"
-    [[ "$mtp_flag" == "auto" ]] || die "Bundles with a drafter do not accept --mtp or --no-mtp"
-    bundle_prepare_run "$bundle_name" "$bundle_path"
+    [[ "$mtp_flag" == "auto" ]] || die "Bundle speculation is configured by --speculative-config"
     [[ ${#vllm_passthrough_args[@]} -eq 0 ]] || bundle_explicit_run_args+=("${vllm_passthrough_args[@]}")
+    bundle_prepare_run "$bundle_name" "$bundle_path"
+    if [[ "$dry_run" == "1" && "$BUNDLE_INITIALIZATION_PENDING" == "1" ]]; then
+      printf '  Memory budget: %s of total; context: %s; concurrency: %s.\n' "$mem" "$max_len" "$max_num_seqs"
+      printf '  Model path after initialization: %s\n' "$BUNDLE_MODEL_LOAD_PATH"
+      printf '  Weight/KV capacity cannot be verified until initialization finishes.\n'
+      return 0
+    fi
     if [[ ${#bundle_explicit_run_args[@]} -gt 0 ]]; then
       BUNDLE_ACTIVE_RUN_ARGS_JSON=$(jq -nc --args '$ARGS.positional' -- "${bundle_explicit_run_args[@]}")
     else
@@ -188,7 +197,11 @@ rollback_main_vllm() {
     warn "Non-interactive run: rolling back the previous main model automatically"
   fi
 
-  if ! (SPARK_SKIP_GATEWAY_REFRESH=1 run_captured_vllm_definition "$definition" "main rollback" --force); then
+  if ! (if [[ "$(jq -r '.kind' <<<"$definition")" == "bundle" ]]; then
+      SPARK_SKIP_GATEWAY_REFRESH=1 run_bundle_alias_definition "$definition" --force
+    else
+      SPARK_SKIP_GATEWAY_REFRESH=1 run_captured_vllm_definition "$definition" "main rollback" --force
+    fi); then
     err "Rollback failed: could not restart previous main model '${model}'"
     return 1
   fi
@@ -647,6 +660,8 @@ alias_validate_definition() {
         and (.run_args | type == "array" and all(.[]; type == "string"))
         and (.run_args | all(.[]; ([explode[] | select(. < 32 or . == 127)] | length) == 0))
         and ((.options // {}) | type == "object")
+        and ((.bundle_hash // null) == null or (.bundle_hash | type == "string" and test("^[a-f0-9]{64}$")))
+        and ((.image_id // null) == null or (.image_id | type == "string" and test("^sha256:[a-f0-9]{64}$")))
       ' >/dev/null <<<"$definition" || return 1
       is_safe_model_ref "$model" || return 1
       ;;
@@ -809,6 +824,14 @@ alias_capture_definition() {
   ' <<<"$inspect" 2>/dev/null) || die "Container '${cname}' does not run a direct vllm serve command"
   model=$(jq -er '.[2] | select(type == "string" and length > 0)' <<<"$args" 2>/dev/null) \
     || die "Cannot identify the vLLM model in ${cname}"
+  local bundle_hash="" load_path="$model"
+  bundle_name=$(jq -r '.[0].Config.Labels["spark.bundle.name"] // empty' <<<"$inspect")
+  if [[ -n "$bundle_name" ]]; then
+    [[ "$(jq -r '.[0].Config.Labels["spark.model.load_path"] // empty' <<<"$inspect")" == "$load_path" || "$load_path" == "$expected_model" ]]       || die "Container model path does not match its load-path label"
+    model=$(jq -r '.[0].Config.Labels["spark.model"] // empty' <<<"$inspect")
+    [[ -n "$model" ]] || model="$load_path"
+    bundle_hash=$(jq -r '.[0].Config.Labels["spark.bundle.hash"] // empty' <<<"$inspect")
+  fi
   is_safe_model_ref "$model" || die "Unsafe model reference in ${cname}: ${model}"
   [[ -z "$expected_model" || "$model" == "$expected_model" ]] \
     || die "Container model mismatch" "Label says '${expected_model}', command serves '${model}'."
@@ -820,12 +843,17 @@ alias_capture_definition() {
     is_safe_bundle_name "$bundle_name" || die "Container has an invalid Spark bundle label"
     jq -e 'type == "object"' >/dev/null 2>&1 <<<"$bundle_options" || die "Container has invalid bundle options"
     jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 <<<"$bundle_run_args" || die "Container has invalid bundle run arguments"
+    local SPARK_BUNDLE_PIN="$bundle_hash"
     bundle_resolve "$bundle_name" || die "Bundle '${bundle_name}' for ${cname} is not installed"
     [[ "$(jq -r '.defaults.target_model.id' "${BUNDLE_PATH}/bundle.json")" == "$model" ]] \
       || die "Container bundle target does not match its served model"
     definition=$(jq -nc --arg model "$model" --arg bundle "$bundle_name" \
       --argjson args "$bundle_run_args" --argjson options "$bundle_options" \
       '{kind:"bundle",backend:"vllm",model:$model,bundle:$bundle,run_args:$args,options:$options}')
+    if [[ -n "$bundle_hash" ]]; then
+      image_id=$(jq -r '.[0].Image' <<<"$inspect")
+      definition=$(jq -c --arg hash "$bundle_hash" --arg image "$image_id" '.bundle_hash = $hash | .image_id = $image' <<<"$definition")
+    fi
     alias_validate_definition "$definition" || die "Invalid bundle alias captured from ${cname}"
     printf '%s\n' "$definition"
     return 0
@@ -889,6 +917,9 @@ run_captured_vllm_definition() {
   local model port mem max_len kv_dtype tools=0 text_only=0 no_reasoning=0 dry_run=0 explain=0 tail_logs=0
   local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" publish_main=0
   local ALIAS_VLLM_ARGS_JSON ALIAS_VLLM_IMAGE ALIAS_VLLM_IMAGE_ID ALIAS_VLLM_ENTRYPOINT ALIAS_VLLM_ENV_JSON override_port=""
+  local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_HASH="" BUNDLE_TARGET_REVISION=""
+  local BUNDLE_MODEL_PATH="" BUNDLE_MODEL_LOAD_PATH="" BUNDLE_ARTIFACT_KEY=""
+  local BUNDLE_KV_ESTIMATOR="" BUNDLE_WEIGHTS_GB="" BUNDLE_RUNTIME_OVERHEAD_GB=""
 
   alias_validate_definition "$definition" || die "${label} has an invalid or unsafe vLLM definition"
   [[ "$(jq -r '.kind' <<<"$definition")" == "captured-vllm" ]] \
@@ -942,6 +973,23 @@ run_captured_vllm_definition() {
   fi
 }
 
+run_bundle_alias_definition() {
+  local definition="$1" name="bundle launch"
+  shift
+  local bundle option_key option_value SPARK_ALIAS_BYPASS=1 SPARK_BUNDLE_PIN SPARK_BUNDLE_IMAGE_PIN
+  SPARK_BUNDLE_IMAGE_PIN=$(jq -r '.image_id // empty' <<<"$definition")
+  SPARK_BUNDLE_PIN=$(jq -r '.bundle_hash // empty' <<<"$definition")
+  local -a run_args=()
+  bundle=$(jq -r '.bundle' <<<"$definition")
+  bundle_resolve "$bundle" || die "Bundle '${bundle}' for alias '${name}' is not installed"
+  while IFS= read -r arg; do run_args+=("$arg"); done < <(jq -r '.run_args[]' <<<"$definition")
+  while IFS=$'\t' read -r option_key option_value; do
+    run_args+=("--${option_key}" "$option_value")
+  done < <(jq -r '(.options // {}) | to_entries[] | [.key, (.value|tostring)] | @tsv' <<<"$definition")
+  [[ $# -eq 0 ]] || run_args+=("$@")
+  cmd_run "$bundle" ${run_args[@]+"${run_args[@]}"}
+}
+
 cmd_alias_run() {
   local name="$1" definition backend kind
   shift
@@ -987,16 +1035,7 @@ cmd_alias_run() {
       ;;
     bundle)
       [[ "$BACKEND" == "vllm" ]] || die "Alias '${name}' captures a vLLM bundle; this machine uses ${BACKEND}"
-      local bundle option_key option_value SPARK_ALIAS_BYPASS=1
-      local -a run_args=()
-      bundle=$(jq -r '.bundle' <<<"$definition")
-      bundle_resolve "$bundle" || die "Bundle '${bundle}' for alias '${name}' is not installed"
-      while IFS= read -r arg; do run_args+=("$arg"); done < <(jq -r '.run_args[]' <<<"$definition")
-      while IFS=$'\t' read -r option_key option_value; do
-        run_args+=("--${option_key}" "$option_value")
-      done < <(jq -r '(.options // {}) | to_entries[] | [.key, (.value|tostring)] | @tsv' <<<"$definition")
-      [[ ${#overrides[@]} -eq 0 ]] || run_args+=("${overrides[@]}")
-      cmd_run "$bundle" ${run_args[@]+"${run_args[@]}"}
+      run_bundle_alias_definition "$definition" ${overrides[@]+"${overrides[@]}"}
       ;;
     *) die "Alias '${name}' has an unsupported kind: ${kind}" ;;
   esac
@@ -1514,6 +1553,14 @@ build_launch() {
     while IFS= read -r arg; do vllm_args+=("$arg"); done < <(jq -r '.[]' <<<"$ALIAS_VLLM_ARGS_JSON")
     use_marlin_atomic=0
   fi
+  if [[ -n "${BUNDLE_MODEL_LOAD_PATH:-}" ]]; then
+    vllm_args[2]="$BUNDLE_MODEL_LOAD_PATH"
+    local resolved_args
+    resolved_args=$(jq -nc --args '$ARGS.positional' -- "${vllm_args[@]}")
+    resolved_args=$(bundle_vllm_remove_flag_json "$resolved_args" --revision)
+    vllm_args=()
+    while IFS= read -r arg; do vllm_args+=("$arg"); done < <(jq -r '.[]' <<<"$resolved_args")
+  fi
   [[ "$tools" == "1" && -n "$TOOL_CALL_PARSER" ]] \
     && add_vllm_flag_once --enable-auto-tool-choice --tool-call-parser "$TOOL_CALL_PARSER"
   [[ "$text_only" == "1" && "$IS_MULTIMODAL" == "true" ]] \
@@ -1538,7 +1585,7 @@ build_launch() {
     --ipc=host
     --user "$(id -u):$(id -g)"
     --workdir /tmp
-    -e HOME=/tmp
+    -e HOME=/tmp -e USER=spark -e LOGNAME=spark
     -e HF_HOME=/tmp/huggingface
     -e HF_HUB_CACHE=/tmp/huggingface/hub
     --ulimit memlock=-1
@@ -1566,6 +1613,10 @@ build_launch() {
   if [[ "${BUNDLE_ACTIVE:-0}" == "1" ]]; then
     docker_cmd+=(
       --label "spark.bundle.name=${BUNDLE_ACTIVE_NAME}"
+      --label "spark.bundle.hash=${BUNDLE_ACTIVE_HASH}"
+      --label "spark.model.load_path=${BUNDLE_MODEL_LOAD_PATH:-$model}"
+      --label "spark.bundle.artifact=${BUNDLE_ARTIFACT_KEY}"
+      --label "spark.kv.estimated=$([[ "$KV_UNCERTAIN" == "1" ]] && printf false || printf true)"
       --label "spark.bundle.options=${BUNDLE_ACTIVE_OPTIONS_JSON}"
       --label "spark.bundle.run_args=${BUNDLE_ACTIVE_RUN_ARGS_JSON}")
   fi
@@ -1633,7 +1684,7 @@ run_backend_vllm() {
     0) MTP_ENABLED=0; MTP_DECIDED=1 ;;
   esac
 
-  local cname
+  local cname CAPACITY_RECLAIM_GB=0
   cname=$(container_name_for_model "$model")
 
   # Is this model already running? (matched by label, not just by name)
@@ -1642,8 +1693,8 @@ run_backend_vllm() {
   [[ -z "$existing" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$" && existing="$cname"
   if [[ -n "$existing" && "$dry_run" != "1" ]]; then
     if [[ "$force" == "1" ]]; then
-      docker stop "$existing" >/dev/null 2>&1 || true
-      docker rm "$existing" >/dev/null 2>&1 || true
+      CAPACITY_RECLAIM_GB=$(list_managed_containers | awk -F'\t' -v c="$existing" '$1 == c {print $4; exit}')
+      CAPACITY_RECLAIM_GB="${CAPACITY_RECLAIM_GB:-0}"
     else
       err "Model '${model}' is already running (container '${existing}')"
       printf "    Stop it first with: spark stop %s\n" "$model"
@@ -1653,14 +1704,14 @@ run_backend_vllm() {
   fi
 
   # Dry-runs never remove containers; cleanup happens only for a real launch.
-  if [[ "$dry_run" != "1" ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$"; then
-    docker rm "$cname" >/dev/null 2>&1 || true
-  fi
+
 
   # Resolve model path. If it is not downloaded, fetch just the metadata so we can
   # size it and decide whether to pull the full weights (capacity-first).
   local model_path needs_download=0
-  if ! model_path=$(resolve_model_path "$model"); then
+  if [[ -n "${BUNDLE_MODEL_PATH:-}" ]]; then
+    model_path="$BUNDLE_MODEL_PATH"
+  elif ! model_path=$(resolve_model_path "$model" "${BUNDLE_TARGET_REVISION:-}"); then
     # Only offer to download interactively (a TTY, or SPARK_ASSUME_INTERACTIVE).
     if [[ "$dry_run" == "1" || "$no_pull" == "1" || ( ! -t 0 && -z "${SPARK_ASSUME_INTERACTIVE:-}" ) ]]; then
       err "Model '${model}' not found in HF cache"
@@ -1772,7 +1823,7 @@ run_backend_vllm() {
   # Assign a port (auto unless --port given). Reject collisions with live models.
   if [[ -z "$port" ]]; then
     port=$(next_free_port "$DEFAULT_PORT")
-  elif list_managed_containers | awk -F'\t' -v p="$port" '$3 == p {found=1} END {exit !found}'; then
+  elif list_managed_containers | awk -F'\t' -v p="$port" -v c="$existing" '$3 == p && $1 != c {found=1} END {exit !found}'; then
     if [[ "$dry_run" == "1" ]]; then
       warn "Port ${port} is currently used; a real launch would require a free port."
     else
@@ -1833,6 +1884,12 @@ run_backend_vllm() {
     return 0
   fi
 
+  if [[ -n "$existing" && "$force" == "1" ]]; then
+    docker stop "$existing" >/dev/null 2>&1 || true
+    docker rm "$existing" >/dev/null 2>&1 || true
+    CAPACITY_RECLAIM_GB=0
+    verify_capacity "$NEED_GB" "$cname" 0 "$mem" "$model" "${model_path}/config.json"
+  fi
   info "Serving up to ${seqs} concurrent requests. Raise with --max-num-seqs N (uses more memory)."
 
   # Supervised adaptive launch: start the container, wait until it serves, and auto-retry
@@ -1930,6 +1987,7 @@ run_backend_vllm() {
   if [[ "$serve_state" == "ready" ]]; then
     local measured
     measured=$(container_peak_gb "$cname")
+    record_engine_memory "$cname"
     [[ -n "$measured" ]] && save_warmup_peak "$model" "$measured" "$enforce_eager" "$cudagraph_oomed"
   fi
 
@@ -2680,10 +2738,10 @@ status_models_json() {
       state=$(status_model_runtime_state "$name" "$port" || true)
       if gateway_model_routed vllm "$model"; then routed=true; else routed=false; fi
       now=$(container_current_gb "$name"); pk=$(container_peak_gb "$name")
-      printf '{"name":"%s","engine":"vllm","state":"%s","endpoint":"http://localhost:%s/v1","gateway_model":"vllm/%s","gateway_routed":%s,"reserved_gb":%s,"live_gb":%s,"peak_gb":%s}' \
+      printf '{"name":"%s","engine":"vllm","state":"%s","endpoint":"http://localhost:%s/v1","gateway_model":"vllm/%s","gateway_routed":%s,"reserved_gb":%s,"live_gb":%s,"peak_gb":%s,"live_memory_scope":"cgroup","engine_memory":%s}' \
         "$(status_json_escape "${model:-unknown}")" "$state" "$(status_json_escape "$port")" \
         "$(status_json_escape "${model:-unknown}")" "$routed" "$(status_json_number "$need")" \
-        "$(status_json_number "$now")" "$(status_json_number "$pk")"
+        "$(status_json_number "$now")" "$(status_json_number "$pk")" "$(engine_memory_json "$name")"
     done < <(list_managed_containers)
   fi
   printf ']'

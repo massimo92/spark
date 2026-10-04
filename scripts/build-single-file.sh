@@ -14,6 +14,7 @@ esac
 MODULES=(
   "src/00_bootstrap.sh"
   "src/commands/05_bundle.sh"
+  "src/commands/06_bundle_runtime.sh"
   "src/commands/10_runtime.sh"
   "src/commands/15_benchmark.sh"
   "src/commands/20_dashboard.sh"
