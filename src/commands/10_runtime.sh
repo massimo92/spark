@@ -48,6 +48,7 @@ EOF
 }
 
 cmd_run() {
+  local RUN_REQUESTED_REF="${RUN_REQUESTED_REF:-}"
   local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" alias_frozen_flags=0
@@ -107,6 +108,7 @@ cmd_run() {
   done
 
   [[ -z "$model" ]] && die "No model specified" "Usage: spark run <model> [flags]"
+  [[ -n "$RUN_REQUESTED_REF" ]] || RUN_REQUESTED_REF="$model"
   if [[ ${#vllm_passthrough_args[@]} -gt 0 ]]; then
     for arg in "${vllm_passthrough_args[@]}"; do
       case "${arg%%=*}" in
