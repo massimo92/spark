@@ -342,6 +342,13 @@ bundle_image_entrypoint() {
 # layers when the Dockerfile and every copied patch are unchanged.
 bundle_build_for_run() {
   local name="$1" dry="${2:-0}" tag id
+  if [[ -n "${SPARK_BUNDLE_IMAGE_PIN:-}" ]]; then
+    docker image inspect "$SPARK_BUNDLE_IMAGE_PIN" >/dev/null 2>&1 \
+      || die "Pinned bundle image is unavailable: ${SPARK_BUNDLE_IMAGE_PIN}" "Restore that image or recapture the alias after rebuilding."
+    BUNDLE_BUILT_IMAGE="$SPARK_BUNDLE_IMAGE_PIN"
+    info "Reusing pinned bundle image: ${SPARK_BUNDLE_IMAGE_PIN}"
+    return 0
+  fi
   tag=$(bundle_image_tag "$name")
   BUNDLE_BUILT_IMAGE="$tag"
   if [[ "$dry" == "1" ]]; then
