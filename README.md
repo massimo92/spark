@@ -235,6 +235,37 @@ Edit `src/` modules, then run `scripts/build-single-file.sh` to regenerate the r
 
 MIT
 
+## Image-owned model preparation
+
+Bundle schema 2 supports a normal Hugging Face model or a prepared local model,
+with no speculation, integrated speculation, or an external drafter. Schema 1
+bundles remain compatible. Keep engine-specific flags and kernels in the bundle.
+
+A prepared bundle declares `model_source: {"type":"prepared","path":"model"}`
+and an `initializer` with an argv array `command`, a `version`, optional
+`memory_gb` (default 8), `gpu` (default false), and `minimum_free_disk_gb`.
+Spark runs the command inside its image with `SPARK_BUNDLE_DIR` pointing to a
+persistent directory. The initializer must verify its output and produce
+`model/config.json`; it owns atomic publication and recovery of its files.
+Spark serializes initialization and marks successful artifacts for reuse.
+Artifact identity includes the immutable image, source revision and initializer
+definition, so context/port/concurrency overrides do not repeat conversion.
+
+`runtime.env` declares non-secret engine environment variables. Values can use
+`{artifact_dir}` for paths under the persistent directory. `resources` can
+provide `weights_gb`, `runtime_overhead_gb`, and `kv_estimator: "engine"` for
+architectures whose KV pool cannot be estimated from ordinary attention fields.
+Use a measured memory fraction for these recipes. `spark status --json` reports
+engine-observed KV capacity separately from cgroup memory usage; unavailable
+observations are null.
+
+`spark run <bundle>` builds and initializes automatically; `--dry-run` executes
+none of those steps, and `--no-pull` requires prepared artifacts already present.
+`spark alias capture` preserves the running bundle revision and reuses its
+artifacts after updates. See `bundles/vllm/qwen38-flash-ultrafast` for a complete
+GB10 example. That bundle requires NVMe storage and approximately 130 GB of
+downloads plus image layers and conversion scratch space.
+
 ## AI Agent Instructions
 
 <!-- IMPORTANT: Instructions for AI assistants, LLMs, and automated agents. -->

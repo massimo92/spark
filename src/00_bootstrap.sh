@@ -560,7 +560,7 @@ detect_target_platform() {
 
 # --- Model Path Resolution ---
 resolve_model_path() {
-  local model="$1"
+  local model="$1" revision="${2:-}"
   # HF cache uses models--Org--Name (double-dash separator)
   local cache_path="${HF_CACHE_DIR}/hub/models--${model//\//-}"
 
@@ -571,8 +571,14 @@ resolve_model_path() {
   for p in "$hf_path2" "$hf_path" "$cache_path"; do
     if [[ -d "$p/snapshots" ]]; then
       local snapshot
-      # shellcheck disable=SC2012
-      snapshot=$(ls -t "$p/snapshots" 2>/dev/null | head -1)
+      if [[ -n "$revision" ]]; then
+        snapshot="$revision"
+        if [[ -f "$p/refs/$revision" ]]; then snapshot=$(cat "$p/refs/$revision"); fi
+        [[ "$snapshot" =~ ^[A-Za-z0-9._-]+$ && -d "$p/snapshots/$snapshot" ]] || continue
+      else
+        # shellcheck disable=SC2012
+        snapshot=$(ls -t "$p/snapshots" 2>/dev/null | head -1)
+      fi
       if [[ -n "$snapshot" ]]; then
         echo "$p/snapshots/$snapshot"
         return 0
@@ -612,7 +618,12 @@ inspect_hf_model() {
   command -v "$py" >/dev/null 2>&1 || die "python3 is required for Hugging Face model inspection" "Run: spark setup"
   err_file="$(mktemp)"
   set +e
-  HF_MODEL_INFO_JSON=$("$py" "$helper" --model-id "$model" --local-path "$model_path" 2>"$err_file")
+  local -a inspect_args=(--model-id "$model" --local-path "$model_path")
+  if [[ "${BUNDLE_ACTIVE:-0}" == "1" ]]; then
+    inspect_args+=(--revision "$BUNDLE_TARGET_REVISION")
+    [[ -z "${BUNDLE_MODEL_PATH:-}" ]] || inspect_args+=(--local-files-only)
+  fi
+  HF_MODEL_INFO_JSON=$("$py" "$helper" "${inspect_args[@]}" 2>"$err_file")
   status=$?
   set -e
   if [[ "$status" -ne 0 ]]; then
@@ -741,6 +752,9 @@ KV_UNCERTAIN=0
 compute_kv_gb() {
   local config_json="$1" max_len="$2" kv_dtype="${3:-auto}"
   KV_UNCERTAIN=0
+  if [[ "${BUNDLE_KV_ESTIMATOR:-}" == "engine" ]]; then
+    KV_GB="0"; KV_UNCERTAIN=1; return 0
+  fi
 
   local base='(.text_config // .)'
   local layers kv_heads head_dim bytes
@@ -766,7 +780,8 @@ compute_kv_gb() {
 # The fraction is need / total_system_memory — it reflects what the model asks for,
 # NOT the free space. Sets NEED_GB and GPU_MEM_UTIL.
 compute_need_and_fraction() {
-  local mm_extra=0
+  [[ -z "${BUNDLE_WEIGHTS_GB:-}" ]] || WEIGHTS_GB="$BUNDLE_WEIGHTS_GB"
+  local mm_extra="${BUNDLE_RUNTIME_OVERHEAD_GB:-0}"
   [[ "${IS_MULTIMODAL:-false}" == "true" ]] && mm_extra="${SPARK_MM_ENCODER_OVERHEAD_GB:-8}"
   awk -v x="$mm_extra" 'BEGIN{exit !(x+0>=0)}' || mm_extra=8
   NEED_GB=$(awk -v w="$WEIGHTS_GB" -v k="$KV_GB" -v x="$mm_extra" -v h="$MEM_HEADROOM_PCT" \
@@ -779,7 +794,7 @@ profile_model() {
   local model="$1"
   local model_path="$2"
   local profile_file
-  profile_file="${PROFILES_DIR}/$(echo "$model" | sed 's/\//--/g').json"
+  profile_file="${PROFILES_DIR}/$(echo "$model" | sed 's/\//--/g')${BUNDLE_ARTIFACT_KEY:+--${BUNDLE_ARTIFACT_KEY}}.json"
 
   command -v jq >/dev/null 2>&1 || die "jq is required for model profiling" "Run: spark setup"
 
@@ -916,7 +931,7 @@ profile_model() {
 }
 
 profile_file_for() {
-  printf '%s/%s.json' "$PROFILES_DIR" "$(printf '%s' "$1" | sed 's/\//--/g')"
+  printf '%s/%s%s.json' "$PROFILES_DIR" "$(printf '%s' "$1" | sed 's/\//--/g')" "${BUNDLE_ARTIFACT_KEY:+--${BUNDLE_ARTIFACT_KEY}}"
 }
 
 # Load the cached startup peaks for THIS model at the final launch config (ctx/kv). Sets two globals:
@@ -1346,7 +1361,7 @@ effective_free_gb() {
   budget_free=$(budget_free_gb "$reserved")
   if [[ "$ACCEL" == "cuda-unified" ]] && live_free=$(live_available_gb 2>/dev/null) \
       && [[ "$live_free" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-    awk -v b="$budget_free" -v l="$live_free" 'BEGIN{ printf "%.1f", (l<b ? l : b) }'
+    awk -v b="$budget_free" -v l="$live_free" -v r="${CAPACITY_RECLAIM_GB:-0}" 'BEGIN{ l+=r; printf "%.1f", (l<b ? l : b) }'
     return 0
   fi
   printf '%s\n' "$budget_free"

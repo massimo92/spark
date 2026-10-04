@@ -35,7 +35,10 @@ bundle_materialize_builtins() {
 bundle_vllm_value() {
   local vllm_json="$1" flag="$2"
   jq -r --arg flag "$flag" '
-    . as $args | range(0; length - 1) as $i | select($args[$i] == $flag) | $args[$i + 1]
+    . as $args | range(0; length) as $i
+    | if $args[$i] == $flag then $args[$i + 1] // empty
+      elif ($args[$i] | startswith($flag + "=")) then $args[$i][($flag|length)+1:]
+      else empty end
   ' <<<"$vllm_json" | tail -1
 }
 
@@ -170,15 +173,19 @@ bundle_validate_dir() {
   fi
   jq -e '
     type == "object"
-    and .schema_version == 1
+    and (.schema_version == 1 or .schema_version == 2)
     and (.name | type == "string" and test("^[a-z0-9][a-z0-9._-]{0,63}$"))
     and (.description | type == "string" and length > 0)
     and (.defaults | type == "object")
     and (.defaults.target_model.id | type == "string" and length > 0)
     and (.defaults.target_model.revision | type == "string" and test("^[A-Fa-f0-9]{7,64}$"))
-    and (.defaults.draft_model.id | type == "string" and length > 0)
-    and (.defaults.draft_model.revision | type == "string" and test("^[A-Fa-f0-9]{7,64}$"))
-    and (.defaults.speculative_tokens | type == "number" and floor == . and . > 0)
+    and (if .schema_version == 1 or .defaults.draft_model != null then
+      (.defaults.draft_model.id | type == "string" and length > 0)
+      and (.defaults.draft_model.revision | type == "string" and test("^[A-Fa-f0-9]{7,64}$"))
+      else true end)
+    and (if .schema_version == 1 or .defaults.speculative_tokens != null then
+      (.defaults.speculative_tokens | type == "number" and floor == . and . > 0)
+      else true end)
     and (.defaults.vllm_args | type == "array" and length >= 3 and all(.[]; type == "string"))
     and (.defaults.vllm_args[0] == "vllm")
     and (.defaults.vllm_args[1] == "serve")
@@ -226,7 +233,7 @@ bundle_validate_dir() {
     actual="${actual#"${dir}/"}"
     jq -e --arg file "$actual" 'any(.patches[]; .file == $file)' "$manifest" >/dev/null 2>&1 \
       || { err "Patch file is not declared in bundle.json: ${actual}"; return 1; }
-  done < <(find "${dir}/patches" -type f -name '*.patch' | LC_ALL=C sort)
+  done < <(find "$dir" -type f -name '*.patch' | LC_ALL=C sort)
 
   while IFS=$'\t' read -r key type default; do
     bundle_core_flag_reserved "$key" && { err "Bundle option conflicts with spark run: --${key}"; return 1; }
@@ -237,16 +244,24 @@ bundle_validate_dir() {
   vllm_json=$(jq -c '.defaults.vllm_args' "$manifest")
   target=$(jq -r '.defaults.target_model.id' "$manifest")
   target_rev=$(jq -r '.defaults.target_model.revision' "$manifest")
-  drafter=$(jq -r '.defaults.draft_model.id' "$manifest")
-  drafter_rev=$(jq -r '.defaults.draft_model.revision' "$manifest")
-  tokens=$(jq -r '.defaults.speculative_tokens' "$manifest")
+  drafter=$(jq -r '.defaults.draft_model.id // empty' "$manifest")
+  drafter_rev=$(jq -r '.defaults.draft_model.revision // empty' "$manifest")
+  tokens=$(jq -r '.defaults.speculative_tokens // 0' "$manifest")
   revision=$(bundle_vllm_value "$vllm_json" --revision)
   [[ "$revision" == "$target_rev" ]] || { err "vLLM --revision does not match target revision"; return 1; }
   spec=$(bundle_vllm_value "$vllm_json" --speculative-config)
-  jq -e --arg model "$drafter" --arg revision "$drafter_rev" --argjson tokens "$tokens" '
-    .model == $model and .revision == $revision and .num_speculative_tokens == $tokens
-  ' <<<"$spec" >/dev/null 2>&1 || { err "Speculative config does not match bundle drafter/defaults"; return 1; }
-  is_safe_bundle_name "$name"
+  if [[ -n "$spec" ]]; then
+    jq -e --arg model "$drafter" --arg revision "$drafter_rev" --argjson tokens "$tokens" '
+      type == "object" and (.method | type == "string" and length > 0)
+      and (if $tokens > 0 then .num_speculative_tokens == $tokens else true end)
+      and (if $model != "" then .model == $model and .revision == $revision
+           else (.model // null) == null end)
+    ' <<<"$spec" >/dev/null 2>&1 || { err "Speculative config does not match bundle drafter/defaults"; return 1; }
+  elif [[ -n "$drafter" || "$tokens" != "0" ]]; then
+    err "Bundle declares speculation without --speculative-config"; return 1
+  fi
+  bundle_validate_runtime "$manifest" || return 1
+  is_safe_model_ref "$target" && is_safe_bundle_name "$name"
 }
 
 bundle_resolve() {
@@ -254,6 +269,14 @@ bundle_resolve() {
   BUNDLE_PATH="" BUNDLE_SOURCE=""
   is_safe_bundle_name "$name" || return 1
   bundle_materialize_builtins
+  if [[ -n "${SPARK_BUNDLE_PIN:-}" ]]; then
+    [[ "$SPARK_BUNDLE_PIN" =~ ^[a-f0-9]{64}$ ]] || return 1
+    if [[ -d "${BUNDLES_DIR}/revisions/${name}/${SPARK_BUNDLE_PIN}" ]]; then
+      BUNDLE_PATH="${BUNDLES_DIR}/revisions/${name}/${SPARK_BUNDLE_PIN}" BUNDLE_SOURCE="pinned"
+      return 0
+    fi
+    return 1
+  fi
   imported="${BUNDLES_DIR}/imported/${name}"
   builtin="${BUNDLES_DIR}/builtin/vllm/${name}"
   if [[ -d "$imported" ]]; then
@@ -334,21 +357,49 @@ bundle_prepare_run() {
   esac
   [[ "$no_reasoning" != "1" ]] || vllm_json=$(bundle_vllm_remove_flag_json "$vllm_json" --reasoning-parser)
 
+  if [[ ${#vllm_passthrough_args[@]} -gt 0 ]]; then
+    local extra effective flag value
+    extra=$(jq -nc --args '$ARGS.positional' -- "${vllm_passthrough_args[@]}")
+    effective=$(jq -nc --argjson base "$vllm_json" --argjson extra "$extra" '$base + $extra')
+    for flag in --gpu-memory-utilization --max-model-len --max-num-seqs --port --kv-cache-dtype; do
+      value=$(bundle_vllm_value "$effective" "$flag")
+      [[ -n "$value" ]] || continue
+      vllm_json=$(alias_vllm_set_value_json "$vllm_json" "$flag" "$value")
+      extra=$(bundle_vllm_remove_flag_json "$extra" "$flag")
+      case "$flag" in
+        --gpu-memory-utilization) mem="$value" ;;
+        --max-model-len) max_len="$value" ;;
+        --max-num-seqs) max_num_seqs="$value" ;;
+        --port) port="$value" ;;
+        --kv-cache-dtype) kv_dtype="$value" ;;
+      esac
+    done
+    vllm_passthrough_args=()
+    while IFS= read -r arg; do vllm_passthrough_args+=("$arg"); done < <(jq -r '.[]' <<<"$extra")
+  fi
   BUNDLE_PATH="$path"
+  BUNDLE_ACTIVE_HASH=$(bundle_content_hash "$path")
+  if [[ "$dry_run" != "1" ]]; then bundle_archive_revision "$name" "$path" "$BUNDLE_ACTIVE_HASH"; fi
   bundle_build_for_run "$name" "$dry_run"
   image="$BUNDLE_BUILT_IMAGE"
   id=$(bundle_image_id "$image" || true)
   [[ -n "$id" ]] || id="$image"
+  if [[ -n "${SPARK_BUNDLE_IMAGE_PIN:-}" ]]; then
+    docker image inspect "$SPARK_BUNDLE_IMAGE_PIN" >/dev/null 2>&1 || die "Pinned bundle image is unavailable: ${SPARK_BUNDLE_IMAGE_PIN}" "Restore that image or recapture the alias after rebuilding."
+    id="$SPARK_BUNDLE_IMAGE_PIN"
+  fi
   ALIAS_VLLM_ARGS_JSON="$vllm_json"
   ALIAS_VLLM_IMAGE="$image"
   ALIAS_VLLM_IMAGE_ID="$id"
   if bundle_image_entrypoint "$image"; then ALIAS_VLLM_ENTRYPOINT=true; else ALIAS_VLLM_ENTRYPOINT=false; fi
   ALIAS_VLLM_ENV_JSON=$(bundle_options_env_json "$manifest" "$BUNDLE_OPTION_VALUES_JSON")
+  ALIAS_VLLM_ENV_JSON=$(jq -c --argjson options "$ALIAS_VLLM_ENV_JSON" '(.runtime.env // {}) + $options' "$manifest")
   BUNDLE_ACTIVE=1
   BUNDLE_ACTIVE_NAME="$name"
   BUNDLE_ACTIVE_OPTIONS_JSON="$BUNDLE_OPTION_VALUES_JSON"
   MTP_ENABLED=0
   mtp_flag=0
+  bundle_initialize "$manifest" "$id" "$dry_run" "$no_pull"
 }
 
 bundle_collect() {
@@ -401,8 +452,8 @@ cmd_bundle_show() {
   printf '\n  %s%s%s\n\n' "$BOLD" "$name" "$NC"
   printf '  %s\n\n' "$(jq -r '.description' "$manifest")"
   printf '  Target:   %s\n' "$(jq -r '.defaults.target_model.id' "$manifest")"
-  printf '  Drafter:  %s\n' "$(jq -r '.defaults.draft_model.id' "$manifest")"
-  printf '  Tokens:   %s\n' "$(jq -r '.defaults.speculative_tokens' "$manifest")"
+  printf '  Drafter:  %s\n' "$(jq -r '.defaults.draft_model.id // "integrated / none"' "$manifest")"
+  printf '  Tokens:   %s\n' "$(jq -r '.defaults.speculative_tokens // 0' "$manifest")"
   printf '  Source:   %s\n' "$BUNDLE_SOURCE"
   printf '\n  Options:\n'
   jq -r '(.options // {}) | to_entries[] | "    --\(.key) <\(.value.type)>  default=\(.value.default)\n      \(.value.description)"' "$manifest"
@@ -568,8 +619,8 @@ cmd_bundle_submit() {
   manifest="${source}/bundle.json"
   name=$(jq -r '.name' "$manifest")
   target=$(jq -r '.defaults.target_model.id' "$manifest")
-  drafter=$(jq -r '.defaults.draft_model.id' "$manifest")
-  tokens=$(jq -r '.defaults.speculative_tokens' "$manifest")
+  drafter=$(jq -r '.defaults.draft_model.id // "integrated / none"' "$manifest")
+  tokens=$(jq -r '.defaults.speculative_tokens // 0' "$manifest")
 
   target_repo="${SPARK_BUNDLE_SUBMIT_GITHUB_REPO:-$GITHUB_REPO}"
   base="${SPARK_BUNDLE_SUBMIT_BASE:-main}"

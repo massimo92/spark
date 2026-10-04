@@ -1,0 +1,20 @@
+{
+  "src/draft_vocab_common.py": "d319b19937734e3390c96d2be761c2da818da5f9e123f18cf7c8bcedc68bed2e",
+  "src/mamba_utils_guarded.py": "18be29f43147d93b9ac50b38a640bb7fdb9da1926a312b985cba00d1353bcddb",
+  "src/patch_block_drop.py": "37ebc561fca3c7592c8754f2a3f136e44cdfe2beb559a5b6c141fba260a4ec5e",
+  "src/patch_hit_debug.py": "1c000b0996509240a5d74cb13ad42c2d2adf0ae30211f6ba5e10a73349cba77f",
+  "src/patch_in_proj_ba_gemv.py": "8e2215828411855f24a3fc918c46773e8ab374c3de2de6e19e0cda42c69477b3",
+  "src/patch_low_latency_gemm_sm12x.py": "16987b82b4cc187b3da3620adf52e6d5f39f75403d12108fd9ac17d44bcdfb50",
+  "src/patch_mamba_align_split.py": "8850ddab02527a64a17f1694e658a2b682a3ff7422f15b732b98c9c2026e24a7",
+  "src/patch_measure_draft_mass.py": "d39c79eb7988e9941364c71515d5939014251e4582fc76e6bd66b4c7a247addb",
+  "src/patch_never_evict.py": "39b434d84a58f5aae048b0d586b58fabf3a82de1c39a58f1eee2eb701b2159a3",
+  "src/patch_ple_rendezvous.py": "0818a605fb3457ddc411812cc2216ca85d31f0ec22584749b7877ec0353aa0f7",
+  "src/patch_r7_logger.py": "6d54ad7fdeb5f20d767d7b8f416a7b9fe54343e1ebae767bacbc1bd2096c655f",
+  "src/patch_short_conv_async_h2d.py": "f77a55c4828e825d7c3402b155bd545638a8ec8862589f0735e582abc2ad6fe2",
+  "src/patch_step_profile.py": "f898231ae3834f821ca494cdcdf7911281aeb9485f2f7f2616ad7a2743f6a560",
+  "src/patch_verify_topk_pivot.py": "e2a77f428984e781a818b4263ab71d612ccddd15199f7f5e884c4cb814666122",
+  "src/vllm_fp8_hybrid.py": "d2fbdb49261132fe7602edeaa4b5da1855dddd626565a455af9e05b292d3c8f5",
+  "src/vllm_inproj_ba_gemv.py": "9fc2a904fded1d03589e88fcb9e33abe27443a5ad51c5420562d538249412140",
+  "src/vllm_mtp_draft_vocab.py": "b61ad4673a3f8b54791eb47f98b86a145140ecbbe01b26d4d4e9c7413372c1d0",
+  "src/vllm_ple_mmap.py": "312bb571677706531bafbae67bd752abea6fc1685081ef91e5f2a5f14a7f9a2a"
+}
