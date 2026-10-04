@@ -2660,7 +2660,7 @@ cmd_run_help() {
     --max-num-seqs <int>   Max concurrent requests; higher uses more memory.
     --mtp                  Enable MTP speculative decoding when supported.
     --no-mtp               Disable MTP speculative decoding.
-    --main                 Replace LiteLLM main after readiness; rollback if startup fails.
+    --main                 Publish a ready server as LiteLLM main; otherwise replace with rollback.
     --enforce-eager        Disable CUDA graphs; lower startup peak, slower inference.
     --no-enforce-eager     Force CUDA graphs on.
     --port <int>           Direct model API port; default auto-selects from 8000.
@@ -2875,6 +2875,17 @@ run_main_replacement_vllm() {
   old_model=$(jq -r '.main.model // empty' <<<"$config" 2>/dev/null || true)
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     gateway_was_running=1
+  fi
+
+  # Publishing a target that already serves needs no replacement or memory
+  # allocation. It is also safe when the previous route names a stopped server.
+  if [[ "${force:-0}" != "1" ]]; then
+    while IFS=$'\t' read -r name scan_model port rest; do
+      if [[ "$scan_model" == "$target_model" && "$port" =~ ^[0-9]+$ ]] && model_api_ready "$port"; then
+        run_publish_main "$target_model"
+        return 0
+      fi
+    done < <(list_managed_containers)
   fi
 
   # A vLLM main target is replaceable only when it maps to a live, managed
