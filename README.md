@@ -262,7 +262,10 @@ observations are null.
 `spark run <bundle>` builds and initializes automatically; `--dry-run` executes
 none of those steps, and `--no-pull` requires prepared artifacts already present.
 `spark alias capture` preserves the running bundle revision and reuses its
-artifacts after updates. See `bundles/vllm/qwen38-flash-ultrafast` for a complete
+artifacts after updates. Supervised startup adjustments update the executed
+memory, context, concurrency and graph settings; capture reads these settings
+from the live engine command, so a restart keeps the successful adjustment.
+See `bundles/vllm/qwen38-flash-ultrafast` for a complete
 GB10 example. That bundle requires NVMe storage and approximately 130 GB of
 downloads plus image layers and conversion scratch space.
 

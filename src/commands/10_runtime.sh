@@ -1,3 +1,4 @@
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
 # --- Commands ---
 
 cmd_run_help() {
@@ -843,6 +844,7 @@ alias_capture_definition() {
     is_safe_bundle_name "$bundle_name" || die "Container has an invalid Spark bundle label"
     jq -e 'type == "object"' >/dev/null 2>&1 <<<"$bundle_options" || die "Container has invalid bundle options"
     jq -e 'type == "array" and all(.[]; type == "string")' >/dev/null 2>&1 <<<"$bundle_run_args" || die "Container has invalid bundle run arguments"
+    bundle_run_args=$(bundle_capture_effective_run_args "$bundle_run_args" "$args")
     local SPARK_BUNDLE_PIN="$bundle_hash"
     bundle_resolve "$bundle_name" || die "Bundle '${bundle_name}' for ${cname} is not installed"
     [[ "$(jq -r '.defaults.target_model.id' "${BUNDLE_PATH}/bundle.json")" == "$model" ]] \
@@ -915,7 +917,7 @@ run_captured_vllm_definition() {
   shift 2 || true
   local -a overrides=("$@")
   local model port mem max_len kv_dtype tools=0 text_only=0 no_reasoning=0 dry_run=0 explain=0 tail_logs=0
-  local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" publish_main=0
+  local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="0" mtp_flag="auto" publish_main=0
   local ALIAS_VLLM_ARGS_JSON ALIAS_VLLM_IMAGE ALIAS_VLLM_IMAGE_ID ALIAS_VLLM_ENTRYPOINT ALIAS_VLLM_ENV_JSON override_port=""
   local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_HASH="" BUNDLE_TARGET_REVISION=""
   local BUNDLE_MODEL_PATH="" BUNDLE_MODEL_LOAD_PATH="" BUNDLE_ARTIFACT_KEY=""
@@ -1266,6 +1268,7 @@ set_vllm_flag_value() {
       skip=1
       continue
     fi
+    [[ "$arg" != "$flag="* ]] || continue
     next+=("$arg")
   done
   vllm_args=("${next[@]}" "$flag" "$value")
@@ -1552,6 +1555,19 @@ build_launch() {
     vllm_args=()
     while IFS= read -r arg; do vllm_args+=("$arg"); done < <(jq -r '.[]' <<<"$ALIAS_VLLM_ARGS_JSON")
     use_marlin_atomic=0
+    # Runtime fitting/retries can adjust these fields after the recipe was
+    # resolved. The executed argv must match its admission budget and plan.
+    set_vllm_flag_value --gpu-memory-utilization "$GPU_MEM_UTIL"
+    set_vllm_flag_value --max-model-len "$MAX_MODEL_LEN"
+    set_vllm_flag_value --max-num-seqs "$seqs"
+    set_vllm_flag_value --port "$port"
+    set_vllm_flag_value --kv-cache-dtype "$KV_CACHE_DTYPE"
+    local -a graph_args=()
+    for arg in "${vllm_args[@]}"; do
+      [[ "$arg" == "--enforce-eager" ]] || graph_args+=("$arg")
+    done
+    vllm_args=("${graph_args[@]}")
+    [[ "$enforce_eager" != "1" ]] || vllm_args+=(--enforce-eager)
   fi
   if [[ -n "${BUNDLE_MODEL_LOAD_PATH:-}" ]]; then
     vllm_args[2]="$BUNDLE_MODEL_LOAD_PATH"
