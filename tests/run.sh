@@ -1055,6 +1055,9 @@ test_suite_includes() {
     test_alias_capture_rejects_secret_flags|\
     test_alias_backend_mismatch_fails_closed|\
     test_bundle_catalog_embeds_and_validates_builtin|\
+    test_bundle_revision_hash_tracks_permissions|\
+    test_bundle_archive_preserves_metadata|\
+    test_bundle_pin_reuses_image_without_build|\
     test_bundle_remove_accepts_multiple_names|\
     test_bundle_validation_requires_declared_applied_patches|\
     test_bundle_sync_checks_git_catalog|\
@@ -2778,6 +2781,66 @@ make_prepared_bundle() {
 EOF
   printf 'FROM example/runtime:1\n' > "$directory/Dockerfile"
   printf 'Fixture\n' > "$directory/README.md"
+}
+
+test_bundle_revision_hash_tracks_permissions() {
+  local tmp before executable directory
+  tmp=$(mktemp -d); mkdir "$tmp/recipe"
+  printf '#!/bin/sh\nexit 0\n' > "$tmp/recipe/setup.sh"
+  chmod 755 "$tmp/recipe"; chmod 644 "$tmp/recipe/setup.sh"
+  before=$(bash -c 'source "$1"; bundle_content_hash "$2"' _ "$SPARK" "$tmp/recipe")
+  chmod 755 "$tmp/recipe/setup.sh"
+  executable=$(bash -c 'source "$1"; bundle_content_hash "$2"' _ "$SPARK" "$tmp/recipe")
+  chmod 700 "$tmp/recipe"
+  directory=$(bash -c 'source "$1"; bundle_content_hash "$2"' _ "$SPARK" "$tmp/recipe")
+  rm -rf "$tmp"
+  [[ "$before" != "$executable" && "$executable" != "$directory" ]]
+}
+
+test_bundle_archive_preserves_metadata() {
+  local tmp output status=0
+  tmp=$(mktemp -d); mkdir -p "$tmp/recipe/bin"
+  printf '#!/bin/sh\nexit 0\n' > "$tmp/recipe/bin/setup.sh"
+  printf '{}\n' > "$tmp/recipe/settings.json"
+  ln -s settings.json "$tmp/recipe/settings-link"
+  chmod 755 "$tmp/recipe" "$tmp/recipe/bin" "$tmp/recipe/bin/setup.sh"
+  chmod 644 "$tmp/recipe/settings.json"
+  output=$(HOME="$tmp/home" bash -c '
+    source "$1"
+    umask 077
+    hash=$(bundle_content_hash "$2")
+    bundle_archive_revision metadata-test "$2" "$hash"
+    dest="$BUNDLES_DIR/revisions/metadata-test/$hash"
+    [[ "$hash" == "$(bundle_content_hash "$dest")" ]] || exit 1
+    [[ -z "$(find "$dest" -type f ! -perm -004 -print)" ]] || exit 1
+    [[ -z "$(find "$dest" -type d ! -perm -001 -print)" ]] || exit 1
+    [[ "$(readlink "$dest/settings-link")" == "settings.json" ]] || exit 1
+    printf "preserved\n"
+  ' _ "$SPARK" "$tmp/recipe" 2>&1) || status=$?
+  rm -rf "$tmp"
+  [[ "$status" == "0" && "$output" == "preserved" ]]
+}
+
+test_bundle_pin_reuses_image_without_build() {
+  local tmp fake_bin output status=0 pin runs
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  make_prepared_bundle "$tmp/bundle"
+  jq 'del(.model_source,.initializer)' "$tmp/bundle/bundle.json" > "$tmp/new.json"
+  mv "$tmp/new.json" "$tmp/bundle/bundle.json"
+  make_model "$tmp/home" Org/Prepared "$KV_CONFIG" abcdef1
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle import "$tmp/bundle" >/dev/null 2>&1
+  pin="sha256:$(printf '%064d' 1)"
+  mkdir -p "$tmp/home/.config/spark"
+  jq -n --arg pin "$pin" '{frozen:{kind:"bundle",backend:"vllm",bundle:"prepared-test",
+    model:"Org/Prepared",image_id:$pin,options:{},run_args:[]}}' > "$tmp/home/.config/spark/aliases.json"
+  output=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_BUILD_EXIT=99 FAKE_DOCKER_BUILD_FILE="$tmp/build.log" \
+    FAKE_DOCKER_ARGS_FILE="$tmp/run.log" "$SPARK" run frozen --no-wait </dev/null 2>&1) || status=$?
+  runs=$(cat "$tmp/run.log" 2>/dev/null || true)
+  local built=0; [[ ! -s "$tmp/build.log" ]] || built=1
+  rm -rf "$tmp"
+  [[ "$status" == "0" && "$built" == "0" && "$runs" == *"$pin"* \
+    && "$output" == *"Reusing pinned bundle image"* ]]
 }
 
 test_bundle_v2_accepts_integrated_and_no_speculation() {
@@ -10290,6 +10353,9 @@ run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_central
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
 run_test "v2 bundles support integrated speculation and no speculation" test_bundle_v2_accepts_integrated_and_no_speculation
+run_test "bundle revision identity includes file and directory permissions" test_bundle_revision_hash_tracks_permissions
+run_test "bundle archives preserve permissions and symlinks under a restrictive umask" test_bundle_archive_preserves_metadata
+run_test "bundle aliases reuse an available immutable image without rebuilding" test_bundle_pin_reuses_image_without_build
 run_test "bundle retries execute the adjusted concurrency and graph mode" test_bundle_startup_retries_use_effective_arguments
 run_test "bundle capture replays live settings after runtime adjustment" test_bundle_capture_uses_live_arguments_after_adjustment
 run_test "initializers reuse artifacts and dry-run stays read-only" test_bundle_initializer_reuses_artifact_and_dry_run_is_read_only

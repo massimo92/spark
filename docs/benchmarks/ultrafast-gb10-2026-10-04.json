@@ -1,0 +1,147 @@
+{
+  "attribution": "Spark by Massimo Angelini - https://github.com/massimo92/spark",
+  "date": "2026-10-04",
+  "hardware": {
+    "gpu": "NVIDIA GB10",
+    "reported_system_gib": 121,
+    "other_model_services_stopped": true
+  },
+  "runtime": {
+    "model": "Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid",
+    "target_revision": "8b82f0b7abe3d1150a7827d298c75e86267636ae",
+    "ple_revision": "50511b0a41aa1d34b8beb7e5d4bb06a0b650dc14",
+    "image_id": "sha256:81306148eec60a8173dce98c9aede8bb73deb9e8d2bd53ff3e9992bb8aee6b10",
+    "gpu_memory_utilization": 0.78,
+    "kv_sizing": "automatic",
+    "kv_dtype": "auto",
+    "max_model_len": 262144,
+    "max_num_seqs": 8,
+    "speculative_tokens": 3,
+    "draft_vocab": 65536,
+    "engine_weights_gib": 69.11,
+    "engine_kv_gib": 10.23,
+    "engine_kv_tokens": 354248
+  },
+  "copy_benchmark": {
+    "spark_version": "0.1.124",
+    "upstream_revision": "0c391a3e74b6a775cfe248691ca7fd855b1876a5",
+    "script": "recipe/benchmarks/bench_copy_streams.py",
+    "script_sha256": "92e535f282b9d13e7dda170bb44a971bd453e91af110d4d69c2eb676090d454e",
+    "rounds": 24,
+    "measured_requests": 108,
+    "prompt_tokens": 7114,
+    "max_tokens": 1500,
+    "effort": "low",
+    "idle_check_passed": true,
+    "complete": true,
+    "errors": [],
+    "reference": "https://github.com/dime-online/qwen3.8-Flash-DGX-UltraFast/blob/main/docs/BENCHMARKS.md",
+    "workload": "generated public copy tasks",
+    "comparisons": [
+      {
+        "streams": 1,
+        "published_median_tok_s": 69.61,
+        "measured_median_tok_s": 74.9478255112534,
+        "measured_percent_of_published": 107.67,
+        "measured_tokens_per_step": 3.9682539682539684,
+        "measured_median_ttft_s": 1.263201736845076
+      },
+      {
+        "streams": 2,
+        "published_median_tok_s": 108.52,
+        "measured_median_tok_s": 112.72648069615322,
+        "measured_percent_of_published": 103.88,
+        "measured_tokens_per_step": 3.9669312169312168,
+        "measured_median_ttft_s": 0.9431604001438245
+      },
+      {
+        "streams": 3,
+        "published_median_tok_s": 130.93,
+        "measured_median_tok_s": 139.95648388124,
+        "measured_percent_of_published": 106.89,
+        "measured_tokens_per_step": 3.9577836411609497,
+        "measured_median_ttft_s": 1.2337700880598277
+      },
+      {
+        "streams": 4,
+        "published_median_tok_s": 152.93,
+        "measured_median_tok_s": 171.5931702601139,
+        "measured_percent_of_published": 112.2,
+        "measured_tokens_per_step": 3.9741721854304637,
+        "measured_median_ttft_s": 1.5549779164139181
+      },
+      {
+        "streams": 5,
+        "published_median_tok_s": 168.98,
+        "measured_median_tok_s": 201.79692601227563,
+        "measured_percent_of_published": 119.42,
+        "measured_tokens_per_step": 3.9703703703703703,
+        "measured_median_ttft_s": 1.7985723409801722
+      },
+      {
+        "streams": 6,
+        "published_median_tok_s": 190.83,
+        "measured_median_tok_s": 219.78951383246675,
+        "measured_percent_of_published": 115.18,
+        "measured_tokens_per_step": 3.9691494050242397,
+        "measured_median_ttft_s": 2.3375771100400016
+      },
+      {
+        "streams": 7,
+        "published_median_tok_s": 201.8,
+        "measured_median_tok_s": 226.7406898502791,
+        "measured_percent_of_published": 112.36,
+        "measured_tokens_per_step": 3.965269913174783,
+        "measured_median_ttft_s": 2.3670570391695946
+      },
+      {
+        "streams": 8,
+        "published_median_tok_s": 211.49,
+        "measured_median_tok_s": 255.5618114494269,
+        "measured_percent_of_published": 120.84,
+        "measured_tokens_per_step": 3.966280991735537,
+        "measured_median_ttft_s": 3.9112766726175323
+      }
+    ],
+    "note": "Percentages describe performance; they do not establish identical workloads or output quality."
+  },
+  "context_capacity": {
+    "spark_version": "0.1.125",
+    "model": "Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid",
+    "client_sha256": "c4c0ce1ffea8f1795814045608be0b4ea804042046fdd7f36dd0d50f8c00b9fb",
+    "complete": true,
+    "cases": [
+      {
+        "requested_prompt_tokens": 131072,
+        "usage": {
+          "prompt_tokens": 131072,
+          "total_tokens": 131088,
+          "completion_tokens": 16,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "ttft_s": 61.02992425300181,
+        "wall_s": 61.15558754419908,
+        "finish_reason": "length",
+        "passed": true
+      },
+      {
+        "requested_prompt_tokens": 262080,
+        "usage": {
+          "prompt_tokens": 262080,
+          "total_tokens": 262096,
+          "completion_tokens": 16,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "ttft_s": 131.56303032697178,
+        "wall_s": 131.64881905098446,
+        "finish_reason": "length",
+        "passed": true
+      }
+    ],
+    "purpose": "Context capacity, using synthetic token prompts; not a quality or cold-prefill benchmark."
+  }
+}

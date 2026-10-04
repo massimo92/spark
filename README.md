@@ -265,9 +265,13 @@ none of those steps, and `--no-pull` requires prepared artifacts already present
 artifacts after updates. Supervised startup adjustments update the executed
 memory, context, concurrency and graph settings; capture reads these settings
 from the live engine command, so a restart keeps the successful adjustment.
+Recipe identity includes file and directory permissions plus symlink targets;
+archives preserve these attributes. An available captured image is reused directly.
 See `bundles/vllm/qwen38-flash-ultrafast` for a complete
 GB10 example. That bundle requires NVMe storage and approximately 130 GB of
 downloads plus image layers and conversion scratch space.
+See [measured GB10 results](docs/ultrafast-gb10-validation.md) for throughput,
+actual 128k/256k context requests and comparison limits.
 
 ## AI Agent Instructions
 

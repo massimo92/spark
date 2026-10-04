@@ -37,12 +37,33 @@ bundle_sha256() {
   else shasum -a 256 | awk '{print $1}'; fi
 }
 
+bundle_path_mode() {
+  local mode
+  mode=$(stat -c '%a' "$1" 2>/dev/null) || mode=$(stat -f '%Lp' "$1" 2>/dev/null) || return 1
+  [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+  printf '%s\n' "$mode"
+}
+
 bundle_content_hash() {
-  local dir="$1" file
-  while IFS= read -r file; do
-    printf '%s\n' "${file#"${dir}/"}"
-    bundle_sha256 < "$file"
-  done < <(find "$dir" -type f | LC_ALL=C sort) | bundle_sha256
+  local dir="$1" file relative mode
+  {
+    printf 'spark-bundle-revision-v2\n'
+    while IFS= read -r file; do
+      relative="${file#"${dir}/"}"
+      [[ "$file" != "$dir" ]] || relative='.'
+      if [[ -L "$file" ]]; then
+        printf 'link\t%s\t%s\n' "$relative" "$(readlink "$file")"
+      else
+        mode=$(bundle_path_mode "$file") || return 1
+        if [[ -d "$file" ]]; then
+          printf 'directory\t%s\t%s\n' "$relative" "$mode"
+        else
+          printf 'file\t%s\t%s\n' "$relative" "$mode"
+          bundle_sha256 < "$file"
+        fi
+      fi
+    done < <(find "$dir" \( -type f -o -type d -o -type l \) | LC_ALL=C sort)
+  } | bundle_sha256
 }
 
 bundle_archive_revision() {
@@ -51,7 +72,7 @@ bundle_archive_revision() {
   [[ -d "$dest" ]] && return 0
   mkdir -p "$(dirname "$dest")"
   tmp=$(mktemp -d "$(dirname "$dest")/.revision.XXXXXX")
-  cp -R "${source}/." "$tmp/" || { rm -rf "$tmp"; die "Cannot preserve bundle revision"; }
+  cp -pR "${source}/." "$tmp/" || { rm -rf "$tmp"; die "Cannot preserve bundle revision"; }
   if ! mv "$tmp" "$dest" 2>/dev/null; then
     rm -rf "$tmp"
     [[ -d "$dest" ]] || die "Cannot preserve bundle revision"
