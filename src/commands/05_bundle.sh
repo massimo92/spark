@@ -143,6 +143,29 @@ bundle_vllm_add_switch_json() {
   jq -ce --arg flag "$flag" 'if index($flag) == null then . + [$flag] else . end' <<<"$vllm_json"
 }
 
+# Capture the settings that the live engine actually received, including any
+# supervised startup adjustment. Keep unrelated recipe/user flags intact.
+bundle_capture_effective_run_args() {
+  local saved="$1" live="$2" mapping engine core value
+  for mapping in --gpu-memory-utilization:--mem --max-model-len:--max-len \
+      --max-num-seqs:--max-num-seqs --port:--port --kv-cache-dtype:--kv-cache-dtype; do
+    engine="${mapping%%:*}"; core="${mapping#*:}"
+    value=$(bundle_vllm_value "$live" "$engine")
+    [[ -n "$value" || "$engine" != "--kv-cache-dtype" ]] || value=auto
+    [[ -n "$value" ]] || continue
+    saved=$(bundle_vllm_remove_flag_json "$saved" "$core")
+    [[ "$engine" == "$core" ]] || saved=$(bundle_vllm_remove_flag_json "$saved" "$engine")
+    saved=$(jq -ce --arg flag "$core" --arg value "$value" '. + [$flag,$value]' <<<"$saved")
+  done
+  saved=$(bundle_vllm_remove_switch_json "$saved" --enforce-eager)
+  saved=$(bundle_vllm_remove_switch_json "$saved" --no-enforce-eager)
+  if alias_vllm_has "$live" --enforce-eager; then
+    bundle_vllm_add_switch_json "$saved" --enforce-eager
+  else
+    bundle_vllm_add_switch_json "$saved" --no-enforce-eager
+  fi
+}
+
 bundle_dockerfile_instructions() {
   awk '
     /^[[:space:]]*#/ { next }
@@ -395,6 +418,12 @@ bundle_prepare_run() {
     id="$SPARK_BUNDLE_IMAGE_PIN"
   fi
   ALIAS_VLLM_ARGS_JSON="$vllm_json"
+  # A complete recipe owns its graph mode; omitted eager means graphs on.
+  # Preserve that choice instead of applying the generic MoE-first heuristic.
+  if [[ "$enforce_eager_flag" == "auto" ]]; then
+    enforce_eager_flag=0
+    alias_vllm_has "$vllm_json" --enforce-eager && enforce_eager_flag=1
+  fi
   ALIAS_VLLM_IMAGE="$image"
   ALIAS_VLLM_IMAGE_ID="$id"
   if bundle_image_entrypoint "$image"; then ALIAS_VLLM_ENTRYPOINT=true; else ALIAS_VLLM_ENTRYPOINT=false; fi

@@ -1063,6 +1063,8 @@ test_suite_includes() {
     test_bundle_submit_uses_fork_without_write_permission|\
     test_bundle_imports_external_folder_and_run_builds_with_docker_cache|\
     test_bundle_run_resolves_defaults_and_dynamic_options|\
+    test_bundle_startup_retries_use_effective_arguments|\
+    test_bundle_capture_uses_live_arguments_after_adjustment|\
     test_alias_create_from_bundle_stores_bundle_and_adjustments|\
     test_total_mem_detection_positive|\
     test_port_auto_skips_busy|\
@@ -2790,6 +2792,69 @@ test_bundle_v2_accepts_integrated_and_no_speculation() {
   mv "$tmp/new.json" "$tmp/bundle/bundle.json"
   out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle validate "$tmp/bundle" 2>&1) || status=$?
   [[ "$status" != "0" && "$out" == *"Invalid bundle runtime"* ]] || ok=1
+  rm -rf "$tmp"; [[ "$ok" == "0" ]]
+}
+
+test_bundle_startup_retries_use_effective_arguments() {
+  local mode tmp fake_bin out last first ok=0
+  for mode in mamba oom; do
+    tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+    make_prepared_bundle "$tmp/bundle"
+    jq 'del(.model_source,.initializer) | .defaults.vllm_args +=
+      ["--max-num-seqs=8","-cc.cudagraph_mode=PIECEWISE","--disable-log-stats"]' \
+      "$tmp/bundle/bundle.json" > "$tmp/new.json"
+    mv "$tmp/new.json" "$tmp/bundle/bundle.json"
+    make_model "$tmp/home" Org/Prepared "$KV_CONFIG" abcdef1
+    HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle import "$tmp/bundle" >/dev/null 2>&1
+    out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+      FAKE_RETRY="$mode" FAKE_MAMBA_N=2 FAKE_DOCKER_ARGS_FILE="$tmp/run.log" \
+      "$SPARK" run prepared-test </dev/null 2>&1) || ok=1
+    first=$(grep '^run ' "$tmp/run.log" | head -1)
+    last=$(grep '^run ' "$tmp/run.log" | tail -1)
+    [[ "$(grep -c '^run ' "$tmp/run.log")" == "2" && "$out" == *"serving"* ]] || ok=1
+    [[ "$first" != *"--enforce-eager"* ]] || ok=1
+    [[ "$last" == *"-cc.cudagraph_mode=PIECEWISE"* && "$last" == *"--disable-log-stats"* ]] || ok=1
+    if [[ "$mode" == "mamba" ]]; then
+      [[ "$last" == *"--max-num-seqs 2"* && "$last" != *"--max-num-seqs=8"* && "$last" != *"--max-num-seqs 1"* ]] || ok=1
+    else
+      [[ "$last" == *"--enforce-eager"* ]] || ok=1
+    fi
+    [[ "$ok" == "0" ]] || printf '%s\n%s\n' "$out" "$last" >&2
+    rm -rf "$tmp"
+  done
+  [[ "$ok" == "0" ]]
+}
+
+test_bundle_capture_uses_live_arguments_after_adjustment() {
+  local tmp fake_bin inspect definition replay ok=0
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  make_prepared_bundle "$tmp/bundle"
+  jq 'del(.model_source,.initializer)' "$tmp/bundle/bundle.json" > "$tmp/new.json"
+  mv "$tmp/new.json" "$tmp/bundle/bundle.json"
+  make_model "$tmp/home" Org/Prepared "$KV_CONFIG" abcdef1
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle import "$tmp/bundle" >/dev/null 2>&1
+  inspect='[{"State":{"Running":true},"Path":"vllm",
+    "Args":["serve","Org/Prepared","--gpu-memory-utilization=0.2","--max-model-len","2048",
+      "--max-num-seqs=2","--port","8007","--enforce-eager"],
+    "Config":{"Labels":{"spark.model":"Org/Prepared","spark.bundle.name":"prepared-test",
+      "spark.bundle.run_args":"[\"--max-num-seqs\",\"8\",\"--max-num-seqs=9\",\"--no-enforce-eager\",\"--disable-log-stats\"]"}}}]'
+  definition=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_CONTAINER_INSPECT_JSON="$inspect" \
+    bash -c 'source "$1"; alias_capture_definition spark-vllm-prepared Org/Prepared' _ "$SPARK") || ok=1
+  jq -e '
+    .kind == "bundle" and .model == "Org/Prepared"
+    and (.run_args | index("--disable-log-stats") != null)
+    and (.run_args | index("--max-num-seqs=9") == null and index("--no-enforce-eager") == null)
+    and (.run_args as $a | ($a | index("--max-num-seqs")) as $i | $a[$i+1] == "2")
+    and (.run_args as $a | ($a | index("--mem")) as $i | $a[$i+1] == "0.2")
+    and (.run_args | index("--enforce-eager") != null)
+  ' <<<"$definition" >/dev/null || ok=1
+  mkdir -p "$tmp/home/.config/spark"
+  jq -n --argjson d "$definition" '{retry:$d}' > "$tmp/home/.config/spark/aliases.json"
+  replay=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run retry --dry-run 2>&1) || ok=1
+  [[ "$replay" == *"--max-num-seqs 2"* && "$replay" == *"--gpu-memory-utilization 0.2"* &&
+    "$replay" == *"--max-model-len 2048"* && "$replay" == *"--port 8007"* && "$replay" == *"--enforce-eager"* ]] || ok=1
+  [[ "$ok" == "0" ]] || printf '%s\n%s\n' "$definition" "$replay" >&2
   rm -rf "$tmp"; [[ "$ok" == "0" ]]
 }
 
@@ -10139,6 +10204,8 @@ run_test "vLLM launch paths stay centralized" test_vllm_launch_paths_are_central
 run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_rejects_secret_flags
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
 run_test "v2 bundles support integrated speculation and no speculation" test_bundle_v2_accepts_integrated_and_no_speculation
+run_test "bundle retries execute the adjusted concurrency and graph mode" test_bundle_startup_retries_use_effective_arguments
+run_test "bundle capture replays live settings after runtime adjustment" test_bundle_capture_uses_live_arguments_after_adjustment
 run_test "initializers reuse artifacts and dry-run stays read-only" test_bundle_initializer_reuses_artifact_and_dry_run_is_read_only
 run_test "initializer failure preserves services and retry succeeds" test_bundle_initializer_failure_preserves_running_service_and_can_retry
 run_test "model resolver honors pinned revisions" test_model_resolution_honors_requested_revision
