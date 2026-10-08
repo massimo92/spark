@@ -512,6 +512,7 @@ cmd_doctor() {
     doctor_skip "Gateway" "LiteLLM" "not configured"
   fi
 
+  doctor_checks_gateway_security
   failed=$(doctor_count fail)
   if [[ "$json_mode" == "1" ]]; then
     doctor_print_json
@@ -519,4 +520,26 @@ cmd_doctor() {
     doctor_print_human "$verbose"
   fi
   [[ "$failed" -eq 0 ]]
+}
+
+
+doctor_checks_gateway_security() {
+  gateway_configured || return 0
+  if gateway_auth_ready; then doctor_pass Gateway "Gateway token" configured; else doctor_fail Gateway "Gateway token" migration-required 'spark gateway start'; fi
+  if gateway_api_ready; then
+    if gateway_wait_ready; then doctor_pass Gateway "Authenticated API" 'valid token accepted; absent/invalid token rejected'; else doctor_fail Gateway "Authenticated API" 'authentication verification failed' 'spark gateway start'; fi
+  else
+    doctor_fail Gateway "Authenticated API" unavailable 'spark gateway start'
+  fi
+  local p findings config
+  config=$(gateway_load_config)
+  for p in chatgpt github_copilot xai; do
+    [[ "$(printf '%s\n' "$config" | jq -r --arg p "$p" '.providers[$p].enabled and (.providers[$p].auth=="oauth")')" == true ]] || continue
+    if [[ "$(gateway_oauth_status "$p")" == credentials-present ]]; then doctor_pass Gateway "$p OAuth" 'credentials present; account access checked on requests'; else doctor_fail Gateway "$p OAuth" login-required "spark gateway login $p"; fi
+  done
+  findings=$(gateway_exposure_findings)
+  if [[ -n "$findings" ]]; then doctor_fail Exposure "Direct model access" "$findings" 'spark gateway access protect; restart existing model aliases'; else doctor_pass Exposure "Direct model access" 'no detected public backend listeners or direct Serve routes'; fi
+  if [[ "$(printf '%s\n' "$config" | jq -r '.access.enabled // false')" == true ]]; then
+    if [[ "$(printf '%s\n' "$config" | jq -r '.access.policy_status')" == verified ]]; then doctor_pass Exposure "Tailnet policy" "verified at $(printf '%s\n' "$config" | jq -r '.access.verified_at')"; else doctor_skip Exposure "Tailnet policy" 'verification pending; apply policy tests, then spark gateway access verify'; fi
+  fi
 }

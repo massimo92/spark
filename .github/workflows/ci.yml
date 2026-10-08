@@ -26,7 +26,7 @@ jobs:
         run: scripts/build-single-file.sh --check
 
       - name: Check shell syntax
-        run: bash -n spark install.sh tests/run.sh scripts/build-single-file.sh
+        run: bash -n spark install.sh tests/run.sh tests/gateway.sh tests/gateway-integration.sh scripts/build-single-file.sh
 
       - name: Run ShellCheck
         run: shellcheck --exclude=SC2059,SC2015,SC2016 spark install.sh tests/run.sh scripts/build-single-file.sh
@@ -66,11 +66,24 @@ jobs:
           sudo apt-get update && sudo apt-get install -y jq locales
           sudo locale-gen es_ES.UTF-8
 
+      - name: Run gateway security regression tests
+        run: bash tests/gateway.sh
+
       - name: Run tests
         env:
           SPARK_TEST_SHARD_INDEX: ${{ matrix.shard }}
           SPARK_TEST_SHARD_TOTAL: 4
         run: bash tests/run.sh
+
+  gateway-integration:
+    name: Authenticated LiteLLM integration
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y jq
+      - run: docker pull ghcr.io/berriai/litellm:main-latest
+      - run: bash tests/gateway-integration.sh
 
   macos-portability:
     name: macOS portability smoke

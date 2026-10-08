@@ -1,7 +1,8 @@
 # --- Main ---
 main() {
+  GATEWAY_PORT=$(gateway_configured_port)
   case "${1:-}:${2:-}" in
-    status:--json|status:--quiet|ws:status|doctor:*|ws:doctor) ;;
+    status:--json|status:--quiet|ws:status|doctor:*|ws:doctor|gateway:auth|gateway:login|gateway:logout|gateway:capabilities|gateway:access) ;;
     *) check_for_updates ;;
   esac
 

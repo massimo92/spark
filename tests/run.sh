@@ -9,6 +9,7 @@ SPARK_VERSION="$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$SPARK" | head -1)"
 # These tests target the vLLM/NVIDIA path; default detection to it so the no-GPU CI
 # runners don't fall through to the Ollama backend. Backend-specific tests override
 # SPARK_BACKEND/SPARK_ACCEL inline, or clear them per-invocation with `env -u`.
+export SPARK_GATEWAY_READY_ATTEMPTS=1
 export SPARK_BACKEND="${SPARK_BACKEND:-vllm}"
 export SPARK_ACCEL="${SPARK_ACCEL:-cuda-unified}"
 
@@ -43,6 +44,11 @@ esac
 make_fake_bin() {
   local dir="$1"
   mkdir -p "$dir"
+  # Existing runtime fixtures represent an authenticated installation.
+  local fixture_config="${dir%/bin}/home/.config/spark"
+  mkdir -p "$fixture_config"; chmod 700 "$fixture_config"
+  printf 'LITELLM_MASTER_KEY=sk-%064d\n' 1 > "$fixture_config/gateway.env"
+  chmod 600 "$fixture_config/gateway.env"
 
   cat > "${dir}/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -171,13 +177,18 @@ ${stdin_payload}"
   ps)
     # Managed-container listing (TSV rows via FAKE_MANAGED); plain name listing otherwise.
     if [[ "$args" == *"label=spark.managed=1"* ]]; then
-      [[ -n "${FAKE_MANAGED:-}" ]] && printf '%b' "${FAKE_MANAGED}"
+      { [[ ! -f "$HOME/.config/spark/test-launched-models.tsv" ]] || cat "$HOME/.config/spark/test-launched-models.tsv";
+        [[ -z "${FAKE_MANAGED:-}" ]] || printf '%b' "$FAKE_MANAGED";
+      } | awk -F '\t' '!seen[$1]++'
     elif [[ "$args" == *"-q"* ]]; then
       [[ -n "${FAKE_DOCKER_IDS:-}" ]] && printf '%b' "${FAKE_DOCKER_IDS}"
     elif [[ "$args" == *'{{.Ports}}'* ]]; then
       [[ -n "${FAKE_DOCKER_PORTS:-}" ]] && printf '%b' "${FAKE_DOCKER_PORTS}"
     elif [[ "$args" == *'{{.Names}}'* ]]; then
-      [[ -n "${FAKE_NAMES:-}" ]] && printf '%b' "${FAKE_NAMES}"
+      if [[ -f "$HOME/.config/spark/test-gateway-state" ]]; then
+        [[ -z "${FAKE_NAMES:-}" ]] || printf '%b' "$FAKE_NAMES" | sed '/^spark-litellm$/d'
+        [[ "$(cat "$HOME/.config/spark/test-gateway-state")" != 1 ]] || printf 'spark-litellm\n'
+      else [[ -z "${FAKE_NAMES:-}" ]] || printf '%b' "$FAKE_NAMES"; fi
     fi
     ;;
   pull)
@@ -190,6 +201,18 @@ ${stdin_payload}"
     esac
     ;;
   run)
+    if [[ "${FAKE_DOCKER_RUN_EXIT:-0}" == 0 ]]; then
+      if [[ "$args" == *"--name spark-litellm "* ]]; then printf '1\n' > "$HOME/.config/spark/test-gateway-state"; fi
+      if [[ "$args" == *"--label spark.managed=1"* ]]; then
+        model='' port='' name='' previous=''
+        for arg in "$@"; do
+          [[ "$previous" != --name ]] || name="$arg"
+          case "$arg" in spark.model=*) model="${arg#spark.model=}" ;; spark.port=*) port="${arg#spark.port=}" ;; esac
+          previous="$arg"
+        done
+        printf '%s\t%s\t%s\t1\t1\t0\n' "$name" "$model" "$port" >> "$HOME/.config/spark/test-launched-models.tsv"
+      fi
+    fi
     if [[ "$args" == *"--entrypoint"* && -n "${FAKE_INITIALIZER_CONFIG:-}" ]]; then
       root="" mount="" prev=""
       for arg in "$@"; do
@@ -207,6 +230,13 @@ ${stdin_payload}"
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
     ;;
   stop|rm|rename)
+    if [[ "${FAKE_DOCKER_STOP_EXIT:-0}" == 0 && -f "$HOME/.config/spark/test-launched-models.tsv" ]]; then
+      for name in "${@:2}"; do
+        awk -F '\t' -v n="$name" '$1!=n' "$HOME/.config/spark/test-launched-models.tsv" > "$HOME/.config/spark/test-models.tmp"
+        mv "$HOME/.config/spark/test-models.tmp" "$HOME/.config/spark/test-launched-models.tsv"
+      done
+    fi
+    if [[ "$args" == *"spark-litellm"* && "${FAKE_DOCKER_STOP_EXIT:-0}" == 0 ]]; then printf '0\n' > "$HOME/.config/spark/test-gateway-state"; fi
     [[ -n "${FAKE_DOCKER_STOP_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_DOCKER_STOP_FILE}"
     exit "${FAKE_DOCKER_STOP_EXIT:-0}"
     ;;
@@ -221,7 +251,7 @@ ${stdin_payload}"
     fi
     # Adaptive-startup tests: vary by attempt (= number of `run` lines captured so far).
     _att=0
-    [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run ' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
+    [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run .*--label spark.managed=1' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
     case "$args" in
       *State.Running*) echo "${FAKE_STATE_RUNNING:-true}" ;;
       *State.StartedAt*) echo "${FAKE_STARTED_AT:-}" ;;
@@ -238,7 +268,7 @@ ${stdin_payload}"
     ;;
   logs)
     _att=0
-    [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run ' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
+    [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run .*--label spark.managed=1' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
     if [[ "${FAKE_RETRY:-}" == "mamba" && "${_att}" -le 1 ]]; then
       echo "ValueError: max_num_seqs (100) exceeds available Mamba cache blocks (${FAKE_MAMBA_N:-64}). Lower max_num_seqs to at most ${FAKE_MAMBA_N:-64} or increase gpu_memory_utilization."
     elif [[ "${FAKE_RETRY:-}" == "kv-memory" && "${_att}" -le 1 ]]; then
@@ -338,7 +368,7 @@ EOF
 cat > "${dir}/curl" <<'EOF'
 #!/usr/bin/env bash
 stdin_payload=""
-[[ "$*" == *"@-"* ]] && stdin_payload=$(cat || true)
+[[ "$*" == *"@-"* || "$*" == *"--config -"* ]] && stdin_payload=$(cat || true)
 args="$*
 ${stdin_payload}"
 output_file=""
@@ -443,13 +473,24 @@ case "$args" in
   *:8642/health*) echo "${FAKE_HERMES_HEALTH:-{\"status\":\"ok\"}}"; exit "${FAKE_HERMES_LOCAL_API_EXIT:-0}" ;;
   *:8642/v1/models*) echo "${FAKE_HERMES_MODELS:-{\"data\":[{\"id\":\"hermes-agent\"}]}"; exit "${FAKE_HERMES_LOCAL_API_EXIT:-0}" ;;
   *:18789/*) exit "${FAKE_HERMES_DASHBOARD_EXIT:-0}" ;;
-  */v1/chat/completions*) [[ "${FAKE_LITELLM_SMOKE_EXIT:-0}" == "0" ]] && { echo "${FAKE_LITELLM_SMOKE_JSON:-{\"choices\":[{\"message\":{\"content\":\"ok\"}}],\"usage\":{\"completion_tokens\":1}}}"; exit 0; }; exit "${FAKE_LITELLM_SMOKE_EXIT:-1}" ;;
+  */v1/chat/completions*)
+    [[ "${FAKE_LITELLM_SMOKE_EXIT:-0}" == 0 ]] || exit "${FAKE_LITELLM_SMOKE_EXIT:-1}"
+    if [[ -n "${FAKE_LITELLM_SMOKE_JSON:-}" ]]; then printf '%s\n' "$FAKE_LITELLM_SMOKE_JSON";
+    else printf '%s\n' '{"choices":[{"message":{"content":"ok"}}],"usage":{"completion_tokens":1}}'; fi
+    exit 0 ;;
   */v1/models*)
-    if [[ "${FAKE_VLLM_READY:-1}" == "1" ]]; then
+    if [[ "$args" == *":4000/v1/models"* && "$write_status" == 1 && ( "$stdin_payload" != *"Authorization: Bearer sk-"* || "$stdin_payload" == *"sk-invalid"* ) ]]; then printf 401; exit 0; fi
+    ready="${FAKE_VLLM_READY:-1}"
+    [[ "$args" != *":4000/v1/models"* ]] || ready="${FAKE_GATEWAY_READY:-1}"
+    if [[ "$ready" == "1" ]]; then
       if [[ -n "${FAKE_LITELLM_MODELS:-}" ]]; then
         printf '%s\n' "$FAKE_LITELLM_MODELS"
       else
-        printf '%s\n' '{"data":[{"id":"main"},{"id":"vllm/Org/Alpha"}]}'
+        if [[ -f "$HOME/.config/spark/litellm_config.yaml" ]]; then
+          { sed -n 's/.*model_name: "\([^"]*\)".*/\1/p' "$HOME/.config/spark/litellm_config.yaml";
+            sed -n 's/^  - {/{/p' "$HOME/.config/spark/litellm_config.yaml" | jq -r '.model_name';
+          } | jq -Rn '{data:[inputs | {id:.}]}'
+        else printf '%s\n' '{"data":[{"id":"main"},{"id":"vllm/Org/Alpha"}]}'; fi
       fi
       exit 0
     fi
@@ -1099,6 +1140,8 @@ run_test() {
 
   discovered=$((discovered + 1))
   test_suite_includes "$test_id" || return 0
+  # shellcheck disable=SC2053 # A glob intentionally selects test functions.
+  [[ -z "${SPARK_TEST_FILTER:-}" || "$test_id" == ${SPARK_TEST_FILTER} ]] || return 0
   eligible=$((eligible + 1))
   test_number=$((eligible - 1))
   (( test_number % test_shard_total == test_shard_index )) || return 0
@@ -2872,9 +2915,9 @@ test_bundle_startup_retries_use_effective_arguments() {
     out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
       FAKE_RETRY="$mode" FAKE_MAMBA_N=2 FAKE_DOCKER_ARGS_FILE="$tmp/run.log" \
       "$SPARK" run prepared-test </dev/null 2>&1) || ok=1
-    first=$(grep '^run ' "$tmp/run.log" | head -1)
-    last=$(grep '^run ' "$tmp/run.log" | tail -1)
-    [[ "$(grep -c '^run ' "$tmp/run.log")" == "2" && "$out" == *"serving"* ]] || ok=1
+    first=$(grep '^run .*--label spark.managed=1' "$tmp/run.log" | head -1)
+    last=$(grep '^run .*--label spark.managed=1' "$tmp/run.log" | tail -1)
+    [[ "$(grep -c '^run .*--label spark.managed=1' "$tmp/run.log")" == "2" && "$out" == *"backend ready"* ]] || ok=1
     [[ "$first" != *"--enforce-eager"* ]] || ok=1
     [[ "$last" == *"-cc.cudagraph_mode=PIECEWISE"* && "$last" == *"--disable-log-stats"* ]] || ok=1
     if [[ "$mode" == "mamba" ]]; then
@@ -2934,7 +2977,7 @@ test_bundle_initializer_reuses_artifact_and_dry_run_is_read_only() {
     "$SPARK" run prepared-test --no-wait 2>&1) || ok=1
   two=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
     FAKE_INITIALIZER_CONFIG="$KV_CONFIG" FAKE_INITIALIZER_FILE="$tmp/init.log" FAKE_DOCKER_ARGS_FILE="$tmp/serve.log" \
-    "$SPARK" run prepared-test --no-wait --max-len 2048 2>&1) || ok=1
+    "$SPARK" run prepared-test --force --no-wait --max-len 2048 2>&1) || ok=1
   [[ "$(wc -l < "$tmp/init.log" | tr -d ' ')" == "1" && "$two" == *"Reusing prepared model"* ]] || ok=1
   [[ "$(cat "$tmp/init.log")" != *"--gpus"* ]] || ok=1
   [[ "$(cat "$tmp/serve.log")" == *"/model"* && "$(cat "$tmp/serve.log")" != *"--revision"* ]] || ok=1
@@ -3488,7 +3531,7 @@ EOF
     [[ "$yaml" == *'model_name: "vllm/org/B"'* ]] &&
     [[ "$main_block" == *'model: "openai/org/B"'* ]] &&
     [[ "$main_block" == *'api_base: "http://localhost:8001/v1"'* ]] &&
-    [[ "$yaml" == *'model_name: "vllm/*"'* ]]
+    [[ "$yaml" != *'model_name: "vllm/*"'* ]]
 }
 
 test_missing_model_no_pull_errors() {
@@ -3754,7 +3797,9 @@ test_run_main_publishes_alias_target() {
       gateway_load_config() { printf "%s\n" "{\"enabled\":true}"; }
       run_backend_ollama() { printf "run:%s\n" "$model"; }
       gateway_set_main_model() { printf "main:%s:%s\n" "$1" "$2"; }
-      gateway_restart() { printf "restart\n"; }
+      gateway_sync() { printf "restart\n"; }
+      gateway_model_routed() { return 0; }
+      gateway_route_smoke() { return 0; }
       cmd_run fast --main
     ' _ "$SPARK" 2>&1)
   rm -rf "$tmp"
@@ -3980,7 +4025,7 @@ test_ollama_run_pulls_and_enables_gateway() {
   pulls=$(cat "${tmp}/pulls.txt" 2>/dev/null || echo "")
   cfg=$(jq -r '.providers.ollama.enabled' "${tmp}/home/.config/spark/gateway.json" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$pulls" == *"qwen3:30b"* ]] && [[ "$cfg" == "true" ]] && [[ "$out" == *"ready via Ollama"* ]]
+  [[ "$pulls" == *"qwen3:30b"* ]] && [[ "$cfg" == "true" ]] && [[ "$out" == *"Model: ollama_chat/"* ]]
 }
 
 # --- spark setup --host (local setup; --check goes straight to local in non-TTY) ---
@@ -4663,6 +4708,7 @@ test_workspace_bridge_waits_for_delayed_readiness() {
   out=$(HOME="${tmp}/home" bash -c '
     source "$1"
     probes=0
+    gateway_curl() { curl "$@"; }
     workspace_openshell_bridge_ip() { printf "172.19.0.1\n"; }
     docker() {
       case "${1:-}" in
@@ -5001,7 +5047,7 @@ test_workspace_setup_waits_for_model() {
     "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha 2>&1 || true)
   rm -rf "$tmp"
   [[ "$out" == *"Container '"*"started"* ]] &&
-    [[ "$out" == *"started. "*"serving"* ]] &&
+    [[ "$out" == *"started. "*"backend ready"* ]] &&
     [[ "$out" == *"waiting for it to serve"* ]]
 }
 
@@ -8574,7 +8620,7 @@ test_ollama_oversized_continue_yes() {
     FAKE_OLLAMA_SHOW="block_count 80\nattention.head_count_kv 8\nattention.key_length 128\n" \
     "$SPARK" run big:latest 2>&1 || true)
   rm -rf "$tmp"
-  [[ "$out" == *"offload layers to CPU"* ]] && [[ "$out" == *"ready via Ollama"* ]]
+  [[ "$out" == *"offload layers to CPU"* ]] && [[ "$out" == *"Model: ollama_chat/"* ]]
 }
 
 # --- Gateway networking per OS ---
@@ -8582,7 +8628,7 @@ test_ollama_oversized_continue_yes() {
 write_ollama_gateway_config() {
   local home="$1"
   mkdir -p "${home}/.config/spark"
-  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"ollama":{"enabled":true}}}' \
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"ollama":{"enabled":true,"models":["qwen3:30b"]}}}' \
     > "${home}/.config/spark/gateway.json"
 }
 
@@ -8597,7 +8643,7 @@ test_gateway_ollama_route_mac() {
   yaml=$(cat "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || echo "")
   dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$yaml" == *"ollama_chat/*"* ]] && [[ "$yaml" == *"host.docker.internal:11434"* ]] &&
+  [[ "$yaml" == *"ollama_chat/qwen3:30b"* ]] && [[ "$yaml" == *"host.docker.internal:11434"* ]] &&
     [[ "$dargs" == *"-p 127.0.0.1:4000:4000"* ]]
 }
 
@@ -8612,7 +8658,7 @@ test_gateway_ollama_route_linux() {
   yaml=$(cat "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || echo "")
   dargs=$(cat "${tmp}/dargs.txt" 2>/dev/null || echo "")
   rm -rf "$tmp"
-  [[ "$yaml" == *"ollama_chat/*"* ]] && [[ "$yaml" == *"http://localhost:11434"* ]] &&
+  [[ "$yaml" == *"ollama_chat/qwen3:30b"* ]] && [[ "$yaml" == *"http://localhost:11434"* ]] &&
     [[ "$dargs" == *"--network host"* ]] && [[ "$dargs" == *"--host 127.0.0.1"* ]]
 }
 
@@ -8912,11 +8958,11 @@ test_startup_retry_mamba() {
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
     FAKE_RETRY=mamba FAKE_MAMBA_N=2 \
     "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1 || true)
-  last=$(tail -1 "${tmp}/d.txt" 2>/dev/null || echo "")
-  local nruns; nruns=$(grep -c '^run ' "${tmp}/d.txt" 2>/dev/null || echo 0)
+  last=$(grep '^run .*--label spark.managed=1' "${tmp}/d.txt" | tail -1 || true)
+  local nruns; nruns=$(grep -c '^run .*--label spark.managed=1' "${tmp}/d.txt" 2>/dev/null || echo 0)
   rm -rf "$tmp"
   [[ "$nruns" -eq 2 ]] && [[ "$last" == *"--max-num-seqs 2"* ]] &&
-    [[ "$out" == *"retrying with --max-num-seqs 2"* ]] && [[ "$out" == *"serving"* ]]
+    [[ "$out" == *"retrying with --max-num-seqs 2"* ]] && [[ "$out" == *"backend ready"* ]]
 }
 
 test_startup_retry_kv_memory() {
@@ -8928,15 +8974,15 @@ test_startup_retry_kv_memory() {
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
     FAKE_RETRY=kv-memory \
     "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1 || true)
-  first=$(grep '^run ' "${tmp}/d.txt" 2>/dev/null | head -1 || true)
-  last=$(grep '^run ' "${tmp}/d.txt" 2>/dev/null | tail -1 || true)
+  first=$(grep '^run .*--label spark.managed=1' "${tmp}/d.txt" 2>/dev/null | head -1 || true)
+  last=$(grep '^run .*--label spark.managed=1' "${tmp}/d.txt" 2>/dev/null | tail -1 || true)
   first_util=$(sed -n 's/.*--gpu-memory-utilization \([^ ]*\).*/\1/p' <<< "$first")
   last_util=$(sed -n 's/.*--gpu-memory-utilization \([^ ]*\).*/\1/p' <<< "$last")
-  nruns=$(grep -c '^run ' "${tmp}/d.txt" 2>/dev/null || echo 0)
+  nruns=$(grep -c '^run .*--label spark.managed=1' "${tmp}/d.txt" 2>/dev/null || echo 0)
   rm -rf "$tmp"
   [[ "$nruns" -eq 2 ]] &&
     awk -v a="$first_util" -v b="$last_util" 'BEGIN { exit !(b > a) }' &&
-    [[ "$out" == *"KV cache reservation too small"* ]] && [[ "$out" == *"serving"* ]]
+    [[ "$out" == *"KV cache reservation too small"* ]] && [[ "$out" == *"backend ready"* ]]
 }
 
 # Warmup OOM → raise the cgroup margin (25%→50%) within the cap and retry.
@@ -8949,10 +8995,10 @@ test_startup_retry_oom() {
     FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
     FAKE_RETRY=oom \
     "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1 || true)
-  last=$(tail -1 "${tmp}/d.txt" 2>/dev/null || echo "")
+  last=$(grep '^run .*--label spark.managed=1' "${tmp}/d.txt" | tail -1 || true)
   rm -rf "$tmp"
   # The warmup-OOM lever is now --enforce-eager (removes the CUDA-graph peak), not a margin bump.
-  [[ "$last" == *"--enforce-eager"* ]] && [[ "$out" == *"--enforce-eager"* ]] && [[ "$out" == *"serving"* ]]
+  [[ "$last" == *"--enforce-eager"* ]] && [[ "$out" == *"--enforce-eager"* ]] && [[ "$out" == *"backend ready"* ]]
 }
 
 # An unrecognized startup crash aborts without retrying.
@@ -8967,7 +9013,7 @@ test_startup_unrecoverable_aborts() {
     FAKE_STATE_STATUS=exited FAKE_DOCKER_LOGS="RuntimeError: unrelated fatal error" \
     "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1)
   set -e
-  nruns=$(grep -c '^run ' "${tmp}/d.txt" 2>/dev/null || echo 0)
+  nruns=$(grep -c '^run .*--label spark.managed=1' "${tmp}/d.txt" 2>/dev/null || echo 0)
   rm -rf "$tmp"
   [[ "$nruns" -eq 1 ]] && [[ "$out" == *"failed to start"* ]]
 }
@@ -9993,7 +10039,7 @@ EOF
     [[ "$nemo_log" == *"NEMOCLAW_MODEL=main"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_NO_GPU=1"* ]] &&
     [[ "$nemo_log" == *"NEMOCLAW_SANDBOX_GPU=0"* ]] &&
-    [[ "$nemo_log" == *"COMPATIBLE_API_KEY=dummy"* ]]
+    [[ "$nemo_log" == *"COMPATIBLE_API_KEY=sk-"* ]]
 }
 
 test_update_skips_images_already_at_remote_digest() {
@@ -10188,7 +10234,7 @@ HERMES_MODEL=main
 HERMES_CONTEXT_LENGTH=65536
 HERMES_MAX_TOKENS=512
 HERMES_REASONING_EFFORT=none
-HERMES_LITELLM_BASE_URL=http://127.0.0.1:4000/v1
+HERMES_LITELLM_BASE_URL=https://external.example/v1
 COMPATIBLE_API_KEY=stored-compatible-key
 ENV
   cat > "${fake_bin}/curl" <<EOF
@@ -10274,14 +10320,14 @@ test_gateway_status_running() {
   printf '%s\n' '{"enabled":true,"port":4000,"providers":{"vllm":{"enabled":true}}}' > "${tmp}/home/.config/spark/gateway.json"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NAMES='spark-litellm\n' "$SPARK" gateway status 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"gateway running"* ]] && [[ "$out" == *"vLLM"* ]]
+  [[ "$out" == *"LiteLLM: ready"* ]] && [[ "$out" == *"Provider: vllm"* ]]
 }
 
 test_status_ollama_lists() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   mkdir -p "${tmp}/home/.config/spark"
-  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"ollama":{"enabled":true}}}' > "${tmp}/home/.config/spark/gateway.json"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"ollama":{"enabled":true,"models":["qwen3:30b"]}}}' > "${tmp}/home/.config/spark/gateway.json"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama \
     FAKE_DOCKER_INFO_EXIT=0 FAKE_NAMES='spark-litellm\n' FAKE_OLLAMA_UP=1 \
     FAKE_LITELLM_MODELS='{"data":[{"id":"ollama_chat/qwen3:30b"}]}' \
@@ -10394,7 +10440,7 @@ run_test "KV cache read from nested text_config" test_text_config_nested
 run_test "missing KV fields warns without aborting" test_missing_kv_fields_warns_not_aborts
 run_test "capacity verification aborts when it does not fit" test_capacity_verification_aborts
 run_test "port auto-assignment skips a busy port" test_port_auto_skips_busy
-run_test "gateway YAML has per-model entries plus wildcard" test_gateway_yaml_per_model
+run_test "gateway YAML has isolated per-model entries" test_gateway_yaml_per_model
 run_test "missing model with --no-pull errors clearly" test_missing_model_no_pull_errors
 run_test "missing model with --dry-run errors clearly" test_missing_model_dry_run_errors
 run_test "auto-pull: fits → downloads and starts" test_autopull_fits_downloads_and_starts

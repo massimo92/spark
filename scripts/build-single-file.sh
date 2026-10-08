@@ -24,6 +24,8 @@ MODULES=(
   "src/commands/50_workspace.sh"
   "src/commands/60_product.sh"
   "src/lib/70_gateway_update.sh"
+  "src/lib/75_gateway_security.sh"
+  "src/lib/76_gateway_access.sh"
   "src/90_main.sh"
 )
 

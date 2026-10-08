@@ -512,15 +512,19 @@ workspace_ensure_gateway() {
       '{enabled:true, port:$port, providers:{
         vllm:{enabled:$vllm_en, port:8000},
         ollama:{enabled:$ollama_en},
-        openrouter:{enabled:false, api_key:""},
-        zen:{enabled:false, api_key:""},
-        together:{enabled:false, api_key:""}
+        openrouter:{enabled:false},
+        zen:{enabled:false},
+        together:{enabled:false}
       }}')
     gateway_save_config "$gw_json"
     info "Configured LiteLLM gateway"
   fi
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    info "LiteLLM gateway: running"
+  if [[ "$check_only" != 1 ]]; then
+    gateway_prepare_runtime "$prov" || { setup_fail 'Could not configure gateway authentication'; return 1; }
+    gateway_sync || { setup_fail 'Could not synchronize authenticated gateway'; return 1; }
+  fi
+  if gateway_api_ready; then
+    info "LiteLLM gateway: authenticated and ready"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "LiteLLM gateway not running"
   elif [[ "$auto_yes" == "1" ]] || confirm "Start the LiteLLM gateway now?"; then
@@ -3763,6 +3767,8 @@ workspace_start_hermes_host_proxy() {
   local container="$1" listen_port="$2" target_port="$3" health_path="$4" host_header="${5:-}" attempts="${6:-30}"
   local bridge_ip proxy_script attempt curl_args=(-fsS --max-time 2)
   [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=30
+  local gateway_health=0
+  [[ "$container" != "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" ]] || gateway_health=1
   bridge_ip=$(workspace_openshell_bridge_ip) || return 1
   proxy_script="${WORKSPACE_CONFIG_DIR}/hermes-host-proxy.py"
   mkdir -p "$WORKSPACE_CONFIG_DIR"
@@ -3832,7 +3838,11 @@ PY
     >/dev/null 2>&1 || return 1
   [[ -z "$host_header" ]] || curl_args+=(-H "Host: ${host_header}")
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    curl "${curl_args[@]}" "http://${bridge_ip}:${listen_port}${health_path}" >/dev/null 2>&1 && return 0
+    if [[ "$gateway_health" == 1 ]]; then
+      gateway_curl "${curl_args[@]}" "http://${bridge_ip}:${listen_port}${health_path}" >/dev/null 2>&1 && return 0
+    else
+      curl "${curl_args[@]}" "http://${bridge_ip}:${listen_port}${health_path}" >/dev/null 2>&1 && return 0
+    fi
     [[ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]] || return 1
     sleep 1
   done
@@ -4686,7 +4696,7 @@ workspace_setup_hermes() {
       NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
-      COMPATIBLE_API_KEY=dummy \
+      COMPATIBLE_API_KEY="$(gateway_auth_key)" \
       CHAT_UI_URL="$hermes_url" \
       nemohermes onboard --non-interactive --yes-i-accept-third-party-software \
         --yes \
@@ -4720,7 +4730,7 @@ workspace_setup_hermes() {
       NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
-      COMPATIBLE_API_KEY=dummy \
+      COMPATIBLE_API_KEY="$(gateway_auth_key)" \
       CHAT_UI_URL="$hermes_url" \
       bash -c 'curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash' || true
     if command -v nemohermes >/dev/null 2>&1 && workspace_start_hermes_gateway_proxy; then
@@ -6742,7 +6752,7 @@ workspace_litellm_model_routed() {
   litellm_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   [[ -n "$litellm_model" ]] || return 1
   command -v curl >/dev/null 2>&1 || return 1
-  out=$(curl -fsS --max-time 5 "http://127.0.0.1:${GATEWAY_PORT}/v1/models" 2>/dev/null) || return 1
+  out=$(gateway_curl -fsS --max-time 5 "http://127.0.0.1:${GATEWAY_PORT}/v1/models" 2>/dev/null) || return 1
   printf '%s\n' "$out" | grep -Fq "\"${litellm_model}\""
 }
 
@@ -6766,7 +6776,7 @@ workspace_litellm_model_smoke() {
   command -v curl >/dev/null 2>&1 || return 1
   escaped_model=$(printf '%s' "$litellm_model" | sed 's/\\/\\\\/g; s/"/\\"/g')
   payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply with ok."}],"max_tokens":1,"temperature":0}' "$escaped_model")
-  out=$(curl -fsS --max-time "${SPARK_WORKSPACE_LITELLM_SMOKE_TIMEOUT:-60}" \
+  out=$(gateway_curl -fsS --max-time "${SPARK_WORKSPACE_LITELLM_SMOKE_TIMEOUT:-60}" \
     -H 'Content-Type: application/json' \
     -d "$payload" \
     "http://127.0.0.1:${GATEWAY_PORT}/v1/chat/completions" 2>/dev/null) || return 1

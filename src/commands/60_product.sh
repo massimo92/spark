@@ -83,7 +83,6 @@ nemohermes_rebuild_with_workspace_env() {
 
   compatible_api_key="${COMPATIBLE_API_KEY:-}"
   [[ -n "$compatible_api_key" ]] || compatible_api_key=$(workspace_read_env COMPATIBLE_API_KEY 2>/dev/null || true)
-  [[ -n "$compatible_api_key" ]] || compatible_api_key=dummy
 
   base_url="${NEMOCLAW_ENDPOINT_URL:-$(workspace_read_env HERMES_LITELLM_BASE_URL 2>/dev/null || true)}"
   [[ -n "$base_url" ]] || base_url="http://host.openshell.internal:${GATEWAY_PORT}/v1"
@@ -93,6 +92,11 @@ nemohermes_rebuild_with_workspace_env() {
     "http://localhost:${GATEWAY_PORT}"*)
       base_url="http://host.openshell.internal:${GATEWAY_PORT}${base_url#http://localhost:"${GATEWAY_PORT}"}" ;;
   esac
+  case "$base_url" in
+    "http://host.openshell.internal:$(gateway_configured_port)/v1"*)
+      compatible_api_key=$(gateway_auth_key) || return 1 ;;
+  esac
+  [[ -n "$compatible_api_key" ]] || { err 'Compatible API key missing'; return 1; }
   if [[ "$SPARK_OS" == "Linux" ]]; then
     workspace_start_hermes_gateway_proxy || return 1
   fi
@@ -121,12 +125,11 @@ nemohermes_rebuild_with_workspace_env() {
     "NEMOCLAW_SANDBOX_READY_TIMEOUT=${NEMOCLAW_SANDBOX_READY_TIMEOUT:-600}"
     "NEMOCLAW_NO_GPU=${NEMOCLAW_NO_GPU:-1}"
     "NEMOCLAW_SANDBOX_GPU=${NEMOCLAW_SANDBOX_GPU:-0}"
-    "COMPATIBLE_API_KEY=${compatible_api_key}"
   )
   [[ -n "$model" ]] && env_args+=("NEMOCLAW_MODEL=${model}")
   [[ -n "$chat_ui_url" ]] && env_args+=("CHAT_UI_URL=${chat_ui_url}")
 
-  env "${env_args[@]}" nemohermes hermes rebuild "$@"
+  (export COMPATIBLE_API_KEY="$compatible_api_key"; env "${env_args[@]}" nemohermes hermes rebuild "$@")
 }
 
 docker_image_update_available() {
@@ -712,7 +715,7 @@ cmd_help() {
     list             List downloaded models
     rm <model> [...] Remove downloaded model(s)
     logs [<model>]   Show container logs (-f to follow)
-    gateway          Manage LiteLLM gateway and providers
+    gateway          Manage authenticated LiteLLM, providers, OAuth and private node access
     reinstall        Remove Spark state and run setup again
     uninstall        Remove Spark-managed runtime/config/data
     update [targets] Check and apply only real Spark, model, gateway, workspace, and NemoHermes updates
