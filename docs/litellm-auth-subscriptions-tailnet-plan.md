@@ -1,0 +1,31 @@
+# Cambios de Spark CLI para autenticación suscripciones y acceso privado
+
+Lista de implementación para proteger LiteLLM, configurar proveedores en setup y permitir acceso desde nodos Tailscale concretos. Rama: `feat/litellm-auth-subscriptions-tailnet`. Los comandos indicados son propuestas; aún no existen.
+
+Built with [spark](https://github.com/massimo92/spark) by Massimo Angelini.
+
+1. [ ] **Token obligatorio del gateway.** Generar `sk-` más 32 bytes aleatorios en instalaciones nuevas. Guardar secretos separados de `gateway.json`, con directorio `0700`, archivo `0600` y escritura atómica. Pasarlos mediante `--env-file`; generar `master_key: os.environ/LITELLM_MASTER_KEY`. Conservar el token en setup, repair, update y reinicios; no imprimirlo en logs, dashboard ni JSON de estado.
+
+2. [ ] **Gestión de autenticación.** Añadir `spark gateway auth status`, `show` y `rotate`. Mostrar el token únicamente por petición explícita; rotación con actualización de clientes gestionados y comprobación de salud. Migrar instalaciones existentes con copia recuperable y rollback si fallan los clientes. No regenerar secretos silenciosamente ni aceptar acceso sin autenticación como solución a errores.
+
+3. [ ] **Proveedores en setup y gateway.** Ampliar el registro común usado por setup, add/remove, YAML, estado y ayuda. Ofrecer OpenAI API, ChatGPT por suscripción, GitHub Copilot, xAI API y xAI OAuth para SuperGrok; mantener proveedores actuales. Pedir API keys con entrada oculta y configurar modelos explícitos compatibles con la cuenta y el endpoint. Diferenciar API de suscripción en las preguntas del asistente.
+
+4. [ ] **Login OAuth persistente.** Añadir `spark gateway login <proveedor>`, estado de sesión y logout para ChatGPT, Copilot y xAI. Ejecutar el autenticador compatible con la misma versión de LiteLLM antes de activar modelos. Montar directorios persistentes con escritura para renovación de tokens. Para xAI usar `model: xai/<modelo>` y `use_xai_oauth: true`; evitar que una API key configurada prevalezca accidentalmente en ese modo. Resolver el callback localhost por túnel SSH en setup remoto y verificar la dirección y puerto realmente usados. Nunca mostrar contenido de archivos OAuth.
+
+5. [ ] **Compatibilidad de LiteLLM y límites de integración.** Detectar versión/capacidades de la imagen ejecutada; el tag `main-latest` no demuestra soporte. Fallar con instrucciones claras si falta login o routing requerido. No ofrecer Claude Pro/Max como API general del gateway: mantener Anthropic mediante API key como alternativa. La integración técnica de un proveedor no demuestra autorización ni acceso de una cuenta.
+
+6. [ ] **Publicación privada mediante Tailscale.** Mantener LiteLLM en localhost. Añadir configuración y comandos `spark gateway access ...` para Serve HTTPS, por defecto en `8443`, separado del `443` ya usado en GX10. Gestionar únicamente la publicación del gateway, de forma idempotente; conservar Hermes, n8n y tasks. Resolver conflictos de puerto y comprobar que Funnel no publique el gateway.
+
+7. [ ] **Lista de nodos autorizados.** Permitir seleccionar nodos por nombre/IP y guardar su resolución IPv4/IPv6. Generar un fragmento de política grants y pruebas de acceso permitido/denegado para el puerto del gateway. Aplicar la restricción en la política administrativa Tailscale: la lista local y Serve por sí solos no restringen nodos. Revisar grants/ACL amplios existentes; no sustituir toda la política ni modificar acceso SSH u otros servicios. Mostrar estado pendiente hasta verificar acceso desde nodos autorizados y rechazados.
+
+8. [ ] **Evitar rutas que eludan LiteLLM.** Diagnosticar vLLM escuchando en todas las interfaces y Serve directo al backend: en GX10 se observaron `:8000` y HTTPS `:443 → :8000`. Ofrecer migración controlada a acceso protegido o restricción explícita del backend. Conservar acceso operativo local y bridges necesarios; no cerrar rutas existentes sin comprobar dependencias.
+
+9. [ ] **Clientes y comprobaciones autenticadas.** Actualizar Hermes/NemoHermes, bridge, repair, health checks y ejemplos para usar el token del gateway. Mantener `dummy` únicamente donde corresponda a backends locales sin autenticación. Doctor/status/dashboard deben informar autenticación, proveedores, estado OAuth y URL privada sin secretos. Distinguir servicio arrancado de gateway utilizable y política de acceso verificada.
+
+10. [ ] **Pruebas y documentación.** Verificar rechazo de token ausente/incorrecto y aceptación del correcto; persistencia y rotación; ausencia de secretos en salidas; setup local/remoto; OAuth, refresh y callback; selección API/OAuth; compatibilidad de imagen; acceso Tailscale y preservación de servicios existentes. Probar migración/rollback y que repair/update conserven proveedores y autenticación. Actualizar ayuda y README; regenerar `spark` desde `src` y comprobar sincronización.
+
+Orden: token y clientes → proveedores y OAuth → publicación y política Tailscale → migración, pruebas y documentación. Claves virtuales por cliente con PostgreSQL quedan para una fase posterior; no son necesarias para el token único solicitado.
+
+Archivos principales: `src/lib/70_gateway_update.sh`, `src/commands/40_setup.sh`, `src/commands/50_workspace.sh`, `src/commands/60_product.sh`, `src/commands/30_status_doctor.sh`, `src/commands/20_dashboard.sh`, `src/00_bootstrap.sh`, `tests/run.sh`, `README.md` y el ejecutable generado `spark`.
+
+Fuentes: [ChatGPT en LiteLLM](https://docs.litellm.ai/docs/providers/chatgpt), [Copilot](https://docs.litellm.ai/docs/providers/github_copilot), [xAI OAuth PR 29866](https://github.com/BerriAI/litellm/pull/29866), [implementación xAI actual](https://github.com/BerriAI/litellm/blob/main/litellm/llms/xai/chat/transformation.py), [restricciones Anthropic](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use), [Tailscale grants](https://tailscale.com/docs/reference/syntax/grants).
