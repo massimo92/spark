@@ -9,6 +9,7 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 passed=0
 check() {
   local label="$1"; shift
+  [[ -z "${SPARK_GATEWAY_TEST_FILTER:-}" || "$1" == "$SPARK_GATEWAY_TEST_FILTER" ]] || return 0
   local sandbox
   sandbox=$(mktemp -d "$TEST_ROOT/case.XXXXXX")
   local result=0
@@ -126,7 +127,7 @@ node_policy() {
   }
   gateway_access_allow allowed > /dev/null
   gateway_access_policy > "$SPARK_CONFIG_DIR/policy.json"
-  jq -e '.grants[0].src==["100.64.0.2","fd7a:115c:a1e0::2"] and .grants[0].ip==["tcp:8443"] and any(.tests[]; .src=="100.64.0.3" and has("deny"))' "$SPARK_CONFIG_DIR/policy.json" >/dev/null
+  jq -e '.grants[0].src==["100.64.0.2","fd7a:115c:a1e0::2"] and .grants[0].ip==["tcp:443"] and .grants[1].ip==["tcp:22"] and any(.tests[]; .src=="100.64.0.3" and has("deny"))' "$SPARK_CONFIG_DIR/policy.json" >/dev/null
   ! gateway_access_allow unknown
   jq -e '.access.policy_status=="pending"' "$GATEWAY_CONFIG" >/dev/null
 }
@@ -134,7 +135,9 @@ serve_ownership() {
   gateway_prepare_runtime vllm
   gateway_save_config '{"enabled":true,"port":4000,"access":{"sources":["100.64.0.2"]},"providers":{"vllm":{"enabled":true}}}'
   gateway_wait_ready() { return 0; }
+  gateway_access_https_ready() { return 0; }
   tailscale_funnel_status_active() { return 1; }
+  list_managed_containers() { printf 'alpha\tOrg/A\t8000\n'; }
   tailscale() {
     case "$*" in
       'status --json') printf '{"Self":{"DNSName":"gx.example.ts.net."}}\n' ;;
@@ -142,12 +145,18 @@ serve_ownership() {
       *) printf '%s\n' "$*" >> "$SPARK_CONFIG_DIR/serve.calls" ;;
     esac
   }
-  printf '{"TCP":{"8443":{"HTTPS":true}},"Web":{"gx.example.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://localhost:3456"}}}}}\n' > "$SPARK_CONFIG_DIR/serve.json"
+  printf '{"TCP":{"443":{"HTTPS":true}},"Web":{"gx.example.ts.net:443":{"Handlers":{"/":{"Proxy":"http://localhost:3456"}}}}}\n' > "$SPARK_CONFIG_DIR/serve.json"
   ! gateway_access_enable
   [[ ! -f "$SPARK_CONFIG_DIR/serve.calls" ]]
-  printf '{"TCP":{"443":{"HTTPS":true}},"Web":{"gx.example.ts.net:443":{"Handlers":{"/":{"Proxy":"http://localhost:3456"}}}}}\n' > "$SPARK_CONFIG_DIR/serve.json"
+  cat > "$SPARK_CONFIG_DIR/serve.json" <<'JSON'
+{"TCP":{"443":{"HTTPS":true},"8443":{"HTTPS":true},"9443":{"HTTPS":true}},"Web":{"gx.example.ts.net:443":{"Handlers":{"/":{"Proxy":"http://localhost:8000"}}},"gx.example.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:4000"}}},"gx.example.ts.net:9443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8000"}}},"gx.example.ts.net:5678":{"Handlers":{"/":{"Proxy":"http://localhost:5678"}}}},"Services":{"svc:n8n":{"TCP":{"443":{"HTTPS":true}}}}}
+JSON
   gateway_access_enable
-  [[ "$(cat "$SPARK_CONFIG_DIR/serve.calls")" == *'--https=8443'* && "$(cat "$SPARK_CONFIG_DIR/serve.calls")" != *reset* ]]
+  local calls
+  calls=$(cat "$SPARK_CONFIG_DIR/serve.calls")
+  [[ "$calls" == *'--https=443 http://127.0.0.1:4000'* && "$calls" == *'--https=8443 off'* && "$calls" == *'--https=9443 off'* && "$calls" != *reset* && "$calls" != *'--https=22'* && "$calls" != *'--https=5678'* ]]
+  jq -e '.access.port==443 and .access.ssh_port==22 and .access.policy_status=="pending"' "$GATEWAY_CONFIG" >/dev/null
+  ! gateway_access_enable --port 8443
   ! gateway_access_disable
 }
 publication_failure() {
@@ -155,7 +164,9 @@ publication_failure() {
   gateway_sync() { return 0; }
   gateway_model_routed() { return 1; }
   ! gateway_publish_model vllm Org/A 1
-  gateway_publish_model vllm Org/A 0 | grep -q pending
+  local output
+  output=$(gateway_publish_model vllm Org/A 0)
+  [[ "$output" == *pending* ]]
 }
 client_scope() {
   gateway_prepare_runtime vllm
@@ -171,6 +182,7 @@ client_scope() {
   [[ "$(workspace_read_env COMPATIBLE_API_KEY)" == "$(gateway_auth_key)" ]]
 }
 http_auth() {
+  trap 'printf "HTTP authorization test failed near line %s (status %s)\n" "$LINENO" "$?" >&2' ERR
   gateway_prepare_runtime vllm
   local pid old code port attempt
   python3 "$ROOT/tests/fixtures/gateway_http.py" "$(gateway_secrets_path)" "$SPARK_CONFIG_DIR/http.port" > "$SPARK_CONFIG_DIR/http.log" 2>&1 & pid=$!
@@ -190,6 +202,12 @@ http_auth() {
   code=$(printf 'header = "Authorization: Bearer %s"\n' "$old" | curl --config - -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/v1/models")
   [[ "$code" == 401 ]]
   gateway_route_smoke vllm Test/Alpha
+  old=$(gateway_auth_key)
+  docker() { return 0; }
+  gateway_auth_command reset
+  code=$(printf 'header = "Authorization: Bearer %s"\n' "$old" | curl --config - -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/v1/models")
+  [[ "$code" == 401 ]]
+  gateway_route_smoke vllm Test/Alpha
   gateway_running_state() { return 0; }
   tailscale() { return 1; }
   local output key
@@ -198,14 +216,16 @@ http_auth() {
 }
 verified_access() {
   gateway_prepare_runtime vllm
-  tailscale() { printf '%s\n' '{"Self":{"DNSName":"gx.test.ts.net."},"Peer":{"a":{"HostName":"allowed","TailscaleIPs":["100.64.0.2"]},"b":{"HostName":"denied","TailscaleIPs":["100.64.0.3"]}}}'; }
-  gateway_save_config '{"enabled":true,"port":4000,"providers":{},"access":{"enabled":true,"sources":["100.64.0.2"],"port":8443}}'
+  tailscale() { printf '%s\n' '{"Self":{"DNSName":"gx.test.ts.net.","TailscaleIPs":["100.64.0.1"]},"Peer":{"a":{"HostName":"allowed","TailscaleIPs":["100.64.0.2"]},"b":{"HostName":"denied","TailscaleIPs":["100.64.0.3"]}}}'; }
+  gateway_save_config '{"enabled":true,"port":4000,"providers":{},"access":{"enabled":true,"sources":["100.64.0.2"],"port":443}}'
   gateway_wait_ready() { return 0; }
   ssh() {
     local input
     input=$(cat)
+    local command="${!#}"
+    printf '%s' "$command" | python3 -c 'import ast, shlex, sys; command=shlex.split(sys.stdin.read()); assert command[:2]==["python3","-c"]; ast.parse(command[2])'
     [[ "$*" != *"$(gateway_auth_key)"* ]]
-    printf '%s\n' "$input" | jq -e '.url=="https://gx.test.ts.net:8443/v1" and ((.mode=="allowed" and (.token|startswith("sk-"))) or (.mode=="denied" and (has("token")|not)))' >/dev/null
+    printf '%s\n' "$input" | jq -e '.url=="https://gx.test.ts.net/v1" and ((.mode=="allowed" and (.token|startswith("sk-"))) or (.mode=="denied" and (has("token")|not)))' >/dev/null
   }
   gateway_access_verify --allowed allowed --denied denied
   jq -e '.access.policy_status=="verified" and (.access.verified_at|type)=="string"' "$GATEWAY_CONFIG" >/dev/null
@@ -282,6 +302,99 @@ invalid_token_repair() {
   gateway_auth_rotate
   gateway_auth_ready
 }
+migration_cleanup_verified() {
+  gateway_prepare_runtime vllm
+  local original=$'previous routes\ngeneral_settings:\n  master_key: os.environ/LITELLM_MASTER_KEY'
+  printf '%s\n' "$original" > "$SPARK_CONFIG_DIR/litellm_config.yaml"
+  gateway_save_config '{"enabled":true,"port":4000,"providers":{"openai":{"enabled":true,"api_key":"old-test-key","models":["Old"]}}}'
+  gateway_auth_ensure
+  [[ -f "$SPARK_CONFIG_DIR/gateway-migration/gateway.env" ]]
+  gateway_save_config "$(gateway_load_config | jq '.providers.openai.models=["New"]')"
+  list_managed_containers() { :; }
+  gateway_running_state() { return 0; }
+  gateway_api_ready() { return 1; }
+  docker() { [[ "$1" != inspect ]] || printf 'sha256:previous\n'; }
+  gateway_wait_ready() { return 0; }
+  gateway_sync_clients() { return 0; }
+  gateway_start_container() { [[ "${GATEWAY_RESTORE_IMAGE:-}" == sha256:previous ]]; }
+  ! gateway_sync
+  [[ ! -d "$SPARK_CONFIG_DIR/gateway-migration" ]]
+  jq -e '.providers.openai.models==["Old"] and (.providers.openai|has("api_key")|not)' "$GATEWAY_CONFIG" >/dev/null
+  [[ "$(gateway_env_get OPENAI_API_KEY)" == old-test-key ]]
+  # A subsequent successful migration also removes its recovery copy.
+  gateway_save_config '{"enabled":true,"port":4000,"providers":{"openai":{"enabled":true,"api_key":"new-test-key","models":["New"]}}}'
+  gateway_auth_ensure
+  gateway_start_container() { return 0; }
+  gateway_sync
+  [[ ! -d "$SPARK_CONFIG_DIR/gateway-migration" ]]
+}
+migration_retains_failed_recovery() {
+  gateway_prepare_runtime vllm
+  printf 'general_settings:\n  master_key: os.environ/LITELLM_MASTER_KEY\n' > "$SPARK_CONFIG_DIR/litellm_config.yaml"
+  gateway_save_config '{"enabled":true,"port":4000,"providers":{"openai":{"enabled":true,"api_key":"test-key","models":["Old"]}}}'
+  gateway_auth_ensure
+  list_managed_containers() { :; }
+  gateway_running_state() { return 0; }
+  gateway_api_ready() { return 1; }
+  gateway_start_container() { return 1; }
+  docker() { return 0; }
+  ! gateway_sync
+  [[ -f "$SPARK_CONFIG_DIR/gateway-migration/gateway.json" ]]
+}
+compromised_token_reset() {
+  gateway_prepare_runtime vllm
+  local old
+  old=$(gateway_auth_key)
+  gateway_running_state() { return 0; }
+  docker() { printf '%s\n' "$1" >> "$SPARK_CONFIG_DIR/container.calls"; }
+  gateway_sync_locked() { return 1; }
+  ! gateway_auth_command reset
+  gateway_auth_ready
+  [[ "$(gateway_auth_key)" != "$old" ]]
+  [[ "$(grep -c stop "$SPARK_CONFIG_DIR/container.calls")" -ge 2 ]]
+  old=$(gateway_auth_key)
+  docker() { return 1; }
+  ! gateway_auth_command reset
+  [[ "$(gateway_auth_key)" == "$old" ]]
+}
+remote_oauth_no_tunnel() {
+  local controller="$SPARK_CONFIG_DIR" remote_root="$SPARK_CONFIG_DIR/remote" out
+  gateway_capabilities() { return 0; }
+  gateway_login_local() {
+    local dir
+    dir=$(gateway_oauth_dir "$1"); mkdir -p "$dir"
+    printf '%s\n' '{"access_token":"local-secret-test","refresh_token":"refresh-secret-test","token_endpoint":"https://auth.x.ai/oauth/token"}' > "$dir/auth.json"
+  }
+  docker() { return 0; }
+  ssh() {
+    [[ "$*" != *'-L'* && "$*" != *'local-secret-test'* && "$*" == *'gateway import-session xai'* ]]
+    SPARK_CONFIG_DIR="$remote_root" GATEWAY_CONFIG="$remote_root/gateway.json" gateway_import_session xai
+  }
+  out=$(gateway_login_remote xai admin@gx10)
+  [[ "$out" != *local-secret-test* && -f "$remote_root/oauth/xai/auth.json" ]]
+  private_mode "$remote_root/oauth/xai/auth.json" 600
+  [[ -z "$(find "$controller" -maxdepth 1 -name 'oauth-transfer.*')" && ! -d "$controller/oauth" ]]
+}
+headless_oauth_guidance() {
+  SSH_CONNECTION='100.64.0.2 1234 100.64.0.1 22' gateway_login_local xai > "$SPARK_CONFIG_DIR/headless.out" 2>&1 && return 1
+  grep -q -- '--remote USER@SERVER' "$SPARK_CONFIG_DIR/headless.out"
+  ! grep -q -- 'ssh -N\|-L 56121' "$SPARK_CONFIG_DIR/headless.out"
+}
+oauth_refresh_stopped_before_replace() {
+  gateway_save_config '{"enabled":true,"port":4000,"providers":{"xai":{"enabled":true,"auth":"oauth"}}}'
+  local session_path
+  session_path="$(gateway_oauth_dir xai)/auth.json"
+  mkdir -p "$(dirname "$session_path")"
+  printf '%s\n' '{"access_token":"old-account"}' > "$session_path"
+  gateway_capabilities() { return 0; }
+  gateway_running_state() { return 0; }
+  docker() { [[ "$1" != stop ]] || grep -q old-account "$session_path"; }
+  gateway_sync_locked() { grep -q new-account "$session_path"; }
+  printf '%s\n' '{"access_token":"new-account","refresh_token":"refresh-test","token_endpoint":"https://auth.x.ai/oauth/token"}' | gateway_import_session xai
+  grep -q new-account "$session_path"
+  private_mode "$session_path" 600
+  [[ -z "$(find "$(dirname "$session_path")" -name '*.tmp.*')" ]]
+}
 check 'private token persists across setup; rejects dotenv injection' token_persistence
 check 'failed client rotation restores token; successful rotation changes it' token_rotation_rollback
 check 'legacy API keys migrate privately with recoverable config' migrate
@@ -302,4 +415,10 @@ check 'xAI rejects fallback callback ports; login/logout preserve private permis
 check 'failed migration never restores an anonymous gateway' anonymous_rollback_forbidden
 check 'concurrent registry updates keep both routes and release their locks' concurrent_registry
 check 'explicit rotation repairs an invalid stored token' invalid_token_repair
+check 'verified migration and verified rollback remove private backups' migration_cleanup_verified
+check 'unverified recovery retains its private backup' migration_retains_failed_recovery
+check 'incident reset never reactivates a leaked token; stop failure reports no revocation' compromised_token_reset
+check 'remote OAuth transfers credentials via stdin and removes local temporary sessions' remote_oauth_no_tunnel
+check 'headless OAuth requests local browser login without creating a tunnel' headless_oauth_guidance
+check 'OAuth refresh stops before another account session is installed' oauth_refresh_stopped_before_replace
 printf '%s gateway checks passed\n' "$passed"

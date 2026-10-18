@@ -3,22 +3,29 @@
 gateway_access_status() {
   local config dns port state
   config=$(gateway_load_config)
-  port=$(printf '%s\n' "$config" | jq -r '.access.port // 8443')
-  state=$(printf '%s\n' "$config" | jq -r 'if .access.enabled then (if .access.policy_status=="verified" then "verified" else "policy-verification-pending" end) else "local-only" end')
+  port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
+  state=$(printf '%s\n' "$config" | jq -r 'if .access.enabled and .access.port!=443 then "migration-required" elif .access.enabled then (if .access.policy_status=="verified" then "verified" else "policy-verification-pending" end) else "local-only" end')
   printf 'Private access: %s\n' "$state"
   if [[ "$state" != local-only ]] && command -v tailscale >/dev/null 2>&1; then
     dns=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // "" | rtrimstr(".")')
-    [[ -z "$dns" ]] || printf 'Private API: https://%s:%s/v1\n' "$dns" "$port"
+    [[ -z "$dns" ]] || printf 'Private API: https://%s%s/v1\n' "$dns" "$([[ "$port" == 443 ]] || printf ':%s' "$port")"
   fi
 }
 gateway_access_nodes() {
   tailscale status --json | jq -r '([.Self] + [.Peer[]?])[] | [.HostName,.DNSName,(.TailscaleIPs|join(",")),(.Online|tostring)] | @tsv'
 }
 gateway_access_allow() {
-  local requested_port=''
-  if [[ "${1:-}" == --port ]]; then [[ $# -ge 3 ]] || return 1; requested_port="$2"; shift 2; fi
-  [[ $# -gt 0 ]] || { err 'Usage: spark gateway access allow [--port 8443] <node-name|IP> ...'; return 1; }
-  [[ -z "$requested_port" ]] || { [[ "$requested_port" =~ ^[0-9]+$ && "$requested_port" -gt 1024 && "$requested_port" -le 65535 ]] || return 1; }
+  local ssh_port
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) [[ $# -ge 2 && "$2" == 443 ]] || { err 'The private API uses HTTPS port 443 only'; return 1; }; shift 2 ;;
+      --ssh-port) [[ $# -ge 2 ]] || return 1; ssh_port="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  [[ "$ssh_port" =~ ^[0-9]+$ && "$ssh_port" -ge 1 && "$ssh_port" -le 65535 && "$ssh_port" != 443 ]] || return 1
+  [[ $# -gt 0 ]] || { err 'Usage: spark gateway access allow [--ssh-port 22] <node-name|IP> ...'; return 1; }
   local status selector matches count ips='[]' names_json='[]' config
   status=$(tailscale status --json) || return 1
   for selector in "$@"; do
@@ -29,60 +36,62 @@ gateway_access_allow() {
     names_json=$(printf '%s\n' "$names_json" | jq --arg name "$selector" '. + [$name]') || return 1
   done
   config=$(gateway_load_config)
-  if [[ -n "$requested_port" ]]; then
-    if [[ "$(printf '%s\n' "$config" | jq -r '.access.enabled // false')" == true && "$(printf '%s\n' "$config" | jq -r '.access.port // 8443')" != "$requested_port" ]]; then err 'Disable the current publication before changing its port'; return 1; fi
-    config=$(printf '%s\n' "$config" | jq --argjson port "$requested_port" '.access.port=$port') || return 1
-  fi
-  config=$(printf '%s\n' "$config" | jq --argjson ips "$ips" --argjson names "$names_json" '.access.sources=$ips | .access.nodes=$names | .access.policy_status="pending" | del(.access.verified_at)') || return 1
+  config=$(printf '%s\n' "$config" | jq --argjson ips "$ips" --argjson names "$names_json" --argjson ssh "$ssh_port" '
+    if .access.port!=null and .access.port!=443 then .access.enabled=false else . end |
+    .access.port=443 | .access.ssh_port=$ssh | .access.sources=$ips | .access.nodes=$names |
+    .access.policy_status="pending" | del(.access.verified_at)') || return 1
   gateway_save_config "$config" || return 1
   info 'Selected source nodes; apply the grants fragment in Tailscale before enabling access'
   gateway_access_policy
 }
 gateway_access_policy() {
-  local status config addresses sources port tests output
+  local status config addresses sources ssh_port blocked output
   status=$(tailscale status --json) || return 1
-  config=$(gateway_load_config)
+  config=$(gateway_load_config) || return 1
   addresses=$(printf '%s\n' "$status" | jq -c '.Self.TailscaleIPs') || return 1
-  sources=$(printf '%s\n' "$config" | jq -c '.access.sources // []')
+  sources=$(printf '%s\n' "$config" | jq -c '.access.sources // []') || return 1
   [[ "$(printf '%s\n' "$sources" | jq length)" -gt 0 ]] || { err 'Select nodes with spark gateway access allow first'; return 1; }
-  port=$(printf '%s\n' "$config" | jq -r '.access.port // 8443')
-  tests=$(jq -nc --argjson status "$status" --argjson sources "$sources" --argjson dst "$addresses" --arg port "$port" '
-    [ $sources[] | {src:.,accept:[$dst[0]+":"+$port]} ] +
-    [ $status.Peer[]?.TailscaleIPs[0] | select(. as $ip | $sources | index($ip) | not) | {src:.,deny:[$dst[0]+":"+$port]} ]') || return 1
-  output=$(jq -n --argjson src "$sources" --argjson dst "$addresses" --arg port "$port" --argjson tests "$tests" '{grants:[{src:$src,dst:$dst,ip:["tcp:"+$port]}],tests:$tests}') || return 1
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  blocked=$(gateway_access_blocked_ports) || return 1
+  output=$(jq -n --argjson src "$sources" --argjson dst "$addresses" --argjson ssh "$ssh_port" --argjson blocked "$blocked" --argjson status "$status" '
+    def host: if contains(":") then "["+.+"]" else . end;
+    def destinations($ports): [$dst[] | host as $h | $ports[] | $h+":"+(.|tostring)];
+    {grants:[{src:$src,dst:$dst,ip:["tcp:443"]},{src:$src,dst:$dst,ip:["tcp:"+($ssh|tostring)]}],
+     tests:([$src[] | {src:.,proto:"tcp",accept:destinations([443,$ssh]),deny:destinations($blocked)}] +
+            [$src[] | {src:.,proto:"udp",deny:destinations(($blocked+[443,$ssh])|unique)}] +
+            [$status.Peer[]?.TailscaleIPs[] | select(. as $ip | $src | index($ip) | not) | {src:.,proto:"tcp",deny:destinations([443])}])}') || return 1
   printf '%s\n' "$output"
-  printf 'Merge this fragment in the Tailscale admin policy; remove overlapping broad grants/ACLs for this destination/port. Preserve SSH and other services. Run these tests there, then probe from allowed and denied nodes. Source list is a snapshot; refresh it after replacing a node.\n' >&2
+  printf 'Merge these grants and tests in the tailnet admin policy. Keep administrative SSH/key authentication. Remove overlapping broad API grants for these clients: only TCP/443 (LiteLLM) and TCP/%s (SSH) should remain reachable on this node. Other administrators keep their SSH rules. Tests cover both IP families and current/common service ports; refresh after adding listeners or replacing a node.\n' "$ssh_port" >&2
 }
 gateway_access_enable() {
-  local port config status dns serve
-  config=$(gateway_load_config) || return 1
-  port=$(printf '%s\n' "$config" | jq -r '.access.port // 8443')
-  if [[ $# -gt 0 ]]; then [[ $# == 2 && "$1" == --port ]] || return 1; port="$2"; fi
-  [[ "$port" =~ ^[0-9]+$ && "$port" -gt 1024 && "$port" -le 65535 ]] || { err 'Use an unprivileged HTTPS port (default 8443)'; return 1; }
-  [[ "$port" == "$(printf '%s\n' "$config" | jq -r '.access.port // 8443')" ]] || { err 'Generate the policy for this port first: spark gateway access allow --port PORT NODE...'; return 1; }
+  local config status dns serve key target current port
+  [[ $# == 0 || ( $# == 2 && "$1" == --port && "$2" == 443 ) ]] || { err 'The private API uses HTTPS port 443 only'; return 1; }
   gateway_auth_ready && gateway_wait_ready || { err 'Start an authenticated gateway first'; return 1; }
-  config=$(gateway_load_config)
+  config=$(gateway_load_config) || return 1
   [[ "$(printf '%s\n' "$config" | jq '.access.sources // [] | length')" -gt 0 ]] || { err 'Select nodes and apply their Tailscale policy first'; return 1; }
   tailscale_funnel_status_active && { err 'Funnel active; resolve public exposure before enabling private gateway access'; return 1; }
   status=$(tailscale status --json) || return 1
-  dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")')
+  dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName // "" | rtrimstr(".")')
   [[ -n "$dns" ]] || return 1
+  key="$dns:443"; target="http://127.0.0.1:$(gateway_configured_port)"
   serve=$(tailscale serve status --json) || return 1
-  # Do not overwrite another service, any subpath, or a TCP forwarder.
-  if ! printf '%s\n' "$serve" | jq -e --arg key "$dns:$port" --arg port "$port" --arg target "http://127.0.0.1:$(gateway_configured_port)" '
-    ((.TCP[$port] == null) and (.Web[$key] == null)) or
-    (.TCP[$port].HTTPS == true and (.Web[$key].Handlers | keys)==["/"] and .Web[$key].Handlers["/"].Proxy==$target)' >/dev/null; then
-    err "Tailscale port ${port} belongs to another service"; return 1
+  if ! printf '%s\n' "$serve" | jq -e --arg key "$key" '(.TCP["443"]==null and .Web[$key]==null)' >/dev/null; then
+    printf '%s\n' "$serve" | jq -e --arg key "$key" '.TCP["443"].HTTPS==true and ((.Web[$key].Handlers // {})|keys)==["/"]' >/dev/null || { err 'Port 443 has another handler or TCP service; no services changed'; return 1; }
+    current=$(printf '%s\n' "$serve" | jq -r --arg key "$key" '.Web[$key].Handlers["/"].Proxy // ""')
+    gateway_access_owned_target "$current" || { err 'Port 443 belongs to another service; no services changed'; return 1; }
   fi
-  tailscale serve --bg --https="$port" "http://127.0.0.1:$(gateway_configured_port)" || return 1
-  tailscale_funnel_status_active && { tailscale serve --https="$port" off; err 'Public exposure detected'; return 1; }
-  config=$(printf '%s\n' "$config" | jq --argjson port "$port" '.access.enabled=true | .access.port=$port | .access.policy_status="pending" | del(.access.verified_at)') || return 1
+  tailscale serve --bg --https=443 "$target" || return 1
+  tailscale_funnel_status_active && { tailscale serve --https=443 off; err 'Public exposure detected'; return 1; }
+  config=$(printf '%s\n' "$config" | jq --argjson ssh "$(gateway_access_ssh_port)" '.access.enabled=true | .access.port=443 | .access.ssh_port=$ssh | .protected=true | .access.policy_status="pending" | del(.access.verified_at)') || return 1
   gateway_save_config "$config" || return 1
+  gateway_access_https_ready "$dns" || { err 'HTTPS 443 not ready; authenticated target kept, policy verification pending'; return 1; }
+  # Retire only Spark API/backends on this hostname; never reset Serve or touch SSH.
+  gateway_access_remove_direct "$dns" "$serve" || return 1
   gateway_access_status
 }
 gateway_access_disable() {
   local config port status dns key
-  config=$(gateway_load_config); port=$(printf '%s\n' "$config" | jq -r '.access.port // 8443')
+  config=$(gateway_load_config); port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
   status=$(tailscale status --json) || return 1
   dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")'); key="$dns:$port"
   # Only remove the exact root handler owned by Spark, never reset all Serve.
@@ -91,29 +100,21 @@ gateway_access_disable() {
   gateway_save_config "$(printf '%s\n' "$config" | jq '.access.enabled=false')"
 }
 gateway_access_protect() {
-  local config status entry target dns port count=0 name model backend_port rest
+  local config status dns
   config=$(gateway_load_config)
   gateway_wait_ready && [[ "$(printf '%s\n' "$config" | jq -r '.access.enabled and (.access.policy_status=="verified")')" == true ]] || { err 'Verify private gateway access before removing legacy direct Serve routes'; return 1; }
   gateway_save_config "$(printf '%s\n' "$config" | jq '.protected=true')" || return 1
-  # Protect new launches. Existing backends need an explicit restart with their
-  # launch aliases; do not silently interrupt inference or rewrite recipes.
-  printf 'New vLLM launches bind localhost. Existing models need restarting with their launch aliases.\n'
-  if command -v tailscale >/dev/null 2>&1; then
-    status=$(tailscale serve status --json) || return 1
-    while IFS=$'\t' read -r name model backend_port rest; do
-      [[ -n "$backend_port" ]] || continue
-      while IFS= read -r entry; do
-        target=$(printf '%s\n' "$entry" | jq -r '.target')
-        port=$(printf '%s\n' "$entry" | jq -r '.port')
-        [[ "$port" =~ ^[0-9]+$ ]] || return 1
-        if [[ "$target" == "http://127.0.0.1:$backend_port" || "$target" == "http://localhost:$backend_port" ]]; then
-          tailscale serve --https="$port" off || return 1
-          count=$((count+1))
-        fi
-      done < <(printf '%s\n' "$status" | jq -c '.Web // {} | to_entries[] | select(.value.Handlers | keys==["/"]) | {port:(.key|split(":")|last),target:.value.Handlers["/"].Proxy}')
-    done < <(list_managed_containers)
+  status=$(tailscale status --json) || return 1
+  dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName // "" | rtrimstr(".")')
+  gateway_access_remove_direct "$dns" "$(tailscale serve status --json)" || return 1
+  local findings
+  findings=$(gateway_exposure_findings)
+  if [[ -n "$findings" ]]; then
+    err 'Existing inference listeners still accept non-local connections; restart those model aliases to apply localhost binding'
+    printf '%s\n' "$findings" >&2; return 1
   fi
-  printf 'Removed %s direct backend Serve entries. Enable the private gateway after applying its policy.\n' "$count"
+  printf 'Inference APIs are local; node clients use HTTPS/443. Administrative SSH is unchanged.\n'
+
 }
 gateway_access_probe() {
   local url="${1:-}" kind="${2:-allowed}" key code
@@ -145,12 +146,12 @@ gateway_access_command() {
     allow) gateway_with_lock gateway_access_allow "$@" ;; policy) gateway_access_policy ;;
     enable) gateway_with_lock gateway_access_enable "$@" ;; disable) gateway_with_lock gateway_access_disable ;;
     protect) gateway_with_lock gateway_access_protect ;; probe) gateway_access_probe "$@" ;; verify) gateway_with_lock gateway_access_verify "$@" ;;
-    *) err 'Usage: spark gateway access <nodes|allow NODE...|policy|enable [--port 8443]|disable|status|protect|probe URL [allowed|denied]|verify --allowed NODE --denied NODE>'; return 1 ;;
+    *) err 'Usage: spark gateway access <nodes|allow NODE...|policy|enable [--port 443]|disable|status|protect|probe URL [allowed|denied]|verify --allowed NODE --denied NODE>'; return 1 ;;
   esac
 }
 
 gateway_access_json() {
-  gateway_load_config | jq -c '{enabled:(.access.enabled // false),port:(.access.port // 8443),policy_status:(.access.policy_status // "not-configured"),verified_at:(.access.verified_at // null),nodes:(.access.nodes // []),protected:(.protected != false)}'
+  gateway_load_config | jq -c '{enabled:(.access.enabled // false),port:(.access.port // 443),ssh_port:(.access.ssh_port // 22),policy_status:(.access.policy_status // "not-configured"),verified_at:(.access.verified_at // null),nodes:(.access.nodes // []),protected:(.protected != false)}'
 }
 # Read-only evidence; configuration alone does not prove backend isolation.
 gateway_exposure_findings() {
@@ -171,7 +172,7 @@ gateway_exposure_findings() {
 
 # SSH probes establish evidence from two live nodes without storing the token there.
 gateway_access_verify() {
-  local allowed='' denied='' config status dns port key mode node selector matches ips selected script quoted payload
+  local allowed='' denied='' config status dns port key mode node selector matches ips selected script quoted payload blocked addresses ssh_port
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --allowed) [[ $# -ge 2 ]] || return 1; allowed="$2"; shift 2 ;;
@@ -185,10 +186,15 @@ gateway_access_verify() {
   config=$(printf '%s\n' "$config" | jq '.access.policy_status="pending" | del(.access.verified_at)') || return 1
   gateway_save_config "$config" || return 1
   gateway_wait_ready || return 1
+  [[ "$(printf '%s\n' "$config" | jq -r '.access.port // 443')" == 443 ]] || { err 'Migrate the private API to HTTPS/443 first'; return 1; }
   status=$(tailscale status --json) || return 1
   dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")')
-  port=$(printf '%s\n' "$config" | jq -r '.access.port // 8443')
+  port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
   key=$(gateway_auth_key) || return 1
+  blocked=$(gateway_access_blocked_ports) || return 1
+  addresses=$(printf '%s\n' "$status" | jq -c '.Self.TailscaleIPs // []') || return 1
+  [[ "$(printf '%s\n' "$addresses" | jq length)" -gt 0 ]] || return 1
+  ssh_port=$(gateway_access_ssh_port) || return 1
   script=$(cat <<'PY'
 import json, socket, ssl, sys, urllib.request, urllib.error, urllib.parse
 p=json.load(sys.stdin)
@@ -205,12 +211,23 @@ if p['mode']=='allowed':
     assert status() in (401,403), 'anonymous access accepted'
     assert status('sk-invalid') in (401,403), 'invalid token accepted'
     assert status(p['token'])==200, 'valid token rejected'
+    # A reachable backend or other application would bypass the single API entry.
+    for address in p['addresses']:
+        for port in p['blocked_ports']:
+            try:
+                connection=socket.create_connection((address,port),timeout=1)
+            except OSError:
+                continue
+            connection.close()
+            raise RuntimeError('Direct application port is reachable: '+str(port))
 else:
-    try: status()
-    except urllib.error.URLError as e:
-        if isinstance(e.reason, ssl.SSLError) or not isinstance(e.reason, (TimeoutError,ConnectionError,OSError)):
-            raise
-    else: raise RuntimeError('denied node can reach the endpoint')
+    for address in p['addresses']:
+        try:
+            connection=socket.create_connection((address,443),timeout=3)
+        except OSError:
+            continue
+        connection.close()
+        raise RuntimeError('denied node can connect to HTTPS/443')
 print(p['mode']+' node probe passed')
 PY
   ) || return 1
@@ -225,10 +242,57 @@ PY
     ips=$(printf '%s\n' "$matches" | jq -c '.[0].TailscaleIPs')
     selected=$(printf '%s\n' "$config" | jq -r --argjson ips "$ips" 'any(.access.sources[]; . as $s | $ips | index($s)!=null)')
     [[ "$mode" == allowed && "$selected" == true || "$mode" == denied && "$selected" == false ]] || { err 'Probe nodes do not match the selected policy'; return 1; }
-    payload=$(jq -nc --arg url "https://$dns:$port/v1" --arg mode "$mode" '{url:$url,mode:$mode}') || return 1
+    payload=$(jq -nc --arg url "https://$dns/v1" --arg mode "$mode" --argjson blocked "$blocked" --argjson addresses "$addresses" '{url:$url,mode:$mode,blocked_ports:$blocked,addresses:$addresses}') || return 1
     if [[ "$mode" == allowed ]]; then payload="${payload%\}},\"token\":\"${key}\"}"; fi
-    printf '%s\n' "$payload" | ssh -o BatchMode=yes -o ConnectTimeout=5 "$node" "python3 -c $quoted" || { err "${mode} node verification failed; policy remains pending"; return 1; }
+    printf '%s\n' "$payload" | ssh -o BatchMode=yes -o ClearAllForwardings=yes -o ForwardAgent=no -o ConnectTimeout=5 "$node" "python3 -c $quoted" || { err "${mode} node verification failed; policy remains pending"; return 1; }
   done
   config=$(printf '%s\n' "$config" | jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.access.policy_status="verified" | .access.verified_at=$now') || return 1
   gateway_save_config "$config" && gateway_access_status
+}
+
+gateway_access_ssh_port() {
+  local port
+  port=$(gateway_load_config | jq -r '.access.ssh_port // ""') || return 1
+  if [[ -z "$port" && -n "${SSH_CONNECTION:-}" ]]; then port="${SSH_CONNECTION##* }"; fi
+  port="${port:-22}"
+  [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 && "$port" != 443 ]] || return 1
+  printf '%s\n' "$port"
+}
+gateway_access_blocked_ports() {
+  local ssh_port
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  {
+    printf '%s\n' 80 4000 8000 8001 8443 11434 3456 5678 8787 18789
+    gateway_configured_port
+    list_managed_containers 2>/dev/null | awk -F '\t' '{print $3}' || true
+    tailscale serve status --json 2>/dev/null | jq -r '.TCP // {} | keys[]' || true
+    if command -v ss >/dev/null 2>&1; then ss -H -lnt 2>/dev/null | awk '{n=$4;sub(/^.*:/,"",n);print n}' || true; fi
+  } | jq -Rn --argjson ssh "$ssh_port" '[inputs|tonumber? | select(.>=1 and .<=65535 and .!=443 and .!=$ssh)]|unique'
+}
+gateway_access_owned_target() {
+  local target="${1%/}" name model port rest
+  [[ "$target" != "http://127.0.0.1:$(gateway_configured_port)" && "$target" != "http://localhost:$(gateway_configured_port)" && "$target" != http://127.0.0.1:11434 && "$target" != http://localhost:11434 ]] || return 0
+  while IFS=$'\t' read -r name model port rest; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    [[ "$target" != "http://127.0.0.1:$port" && "$target" != "http://localhost:$port" ]] || return 0
+  done < <(list_managed_containers)
+  return 1
+}
+gateway_access_remove_direct() {
+  local dns="$1" serve="$2" entry port target ssh_port
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  while IFS= read -r entry; do
+    port=$(printf '%s\n' "$entry" | jq -r '.port')
+    target=$(printf '%s\n' "$entry" | jq -r '.target // ""')
+    [[ "$port" =~ ^[0-9]+$ && "$port" != 443 && "$port" != "$ssh_port" ]] || continue
+    if gateway_access_owned_target "$target"; then tailscale serve --https="$port" off || return 1; fi
+  done < <(printf '%s\n' "$serve" | jq -c --arg dns "$dns" '.Web // {} | to_entries[] | select(.key|startswith($dns+":")) | select((.value.Handlers // {}|keys)==["/"]) | {port:(.key|split(":")|last),target:.value.Handlers["/"].Proxy}')
+}
+gateway_access_https_ready() {
+  local dns="$1" attempt
+  for ((attempt=0; attempt<5; attempt++)); do
+    gateway_curl -fsS --connect-timeout 2 --max-time 5 "https://$dns/v1/models" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
 }

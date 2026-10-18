@@ -409,16 +409,12 @@ step_gateway() {
   ctx_run "docker image inspect '${LITELLM_IMAGE}' >/dev/null 2>&1" || ctx_run "docker pull '${LITELLM_IMAGE}'" || { setup_fail 'LiteLLM image unavailable'; return 0; }
   [[ "$auto_yes" != 1 ]] || args='--yes'
   if [[ "$SETUP_TARGET" == remote ]]; then
-    # xAI uses a browser callback on the target. Forward it before the remote wizard.
-    local callback_forwarded=0
-    if [[ "$auto_yes" != 1 ]] && ssh -o ControlPath="$REMOTE_CONTROL" -O forward -L 56121:127.0.0.1:56121 "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null; then
-      callback_forwarded=1
-    elif [[ "$auto_yes" != 1 ]]; then
-      printf 'xAI callback requires another terminal: ssh -N -L 56121:127.0.0.1:56121 %s@%s\n' "$REMOTE_USER" "$REMOTE_HOST"
+    # Native OAuth runs beside the browser. SSH transfers its session, never forwards a port.
+    if [[ "$auto_yes" != 1 ]] && confirm 'Configure xAI subscription OAuth in this computer browser for the remote server?'; then
+      gateway_login_remote xai "${REMOTE_USER}@${REMOTE_HOST}" || { setup_fail 'Local xAI OAuth failed'; return 0; }
     fi
     local rc=0
     remote_in "\"\$HOME/.local/bin/spark\" gateway setup ${args}" || rc=$?
-    if [[ "$callback_forwarded" == 1 ]]; then ssh -o ControlPath="$REMOTE_CONTROL" -O cancel -L 56121:127.0.0.1:56121 "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null || true; fi
     [[ "$rc" == 0 ]] || setup_fail 'Gateway setup failed on target'
   else
     if [[ "$auto_yes" == 1 ]]; then gateway_setup_local --yes || setup_fail 'Gateway setup failed'; else gateway_setup_local || setup_fail 'Gateway setup failed'; fi

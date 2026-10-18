@@ -78,7 +78,8 @@ ports. `--dry-run` changes no services.
 spark gateway setup                   # interactive setup; setup --yes preserves settings
 spark gateway auth status
 spark gateway auth show               # explicitly reveal the private token
-spark gateway auth rotate             # rotate, verify and update managed Hermes clients
+spark gateway auth rotate             # routine rotation with rollback on failure
+spark gateway auth reset              # lost/leaked token: replace, never reactivate it
 spark gateway capabilities            # installed container version
 spark gateway capabilities xai        # inspect OAuth implementation support
 spark gateway add openai --model MODEL_ID
@@ -86,7 +87,8 @@ spark gateway login chatgpt
 spark gateway add chatgpt --model MODEL_ID
 spark gateway login github_copilot
 spark gateway add github_copilot --model MODEL_ID
-spark gateway login xai
+spark gateway login xai                # OAuth on the computer running your browser
+spark gateway login xai --remote USER@SERVER  # login locally; transfer session, no tunnel
 spark gateway add xai --auth oauth --model MODEL_ID
 spark gateway add xai --auth api --model MODEL_ID
 spark gateway logout xai               # disable routes before deleting that session
@@ -110,8 +112,17 @@ The gateway token and API keys live in `~/.config/spark/gateway.env` (`0600`);
 OAuth sessions live in `~/.config/spark/oauth/<provider>/` (`0700`) and remain
 writable for refresh. Config/rendered YAML contain references, not keys. Legacy
 provider keys migrate with a private recoverable config under `gateway-migration/`.
-Setup, repair and gateway restarts preserve credentials. Failed token rotation
-restores the old token. Unmanaged clients must update their own token.
+Spark deletes that backup after checking the migrated gateway and managed clients,
+or after checking a successful restoration. An unverified recovery retains its
+private backup for repair. Setup, repair and restarts preserve credentials.
+
+You never need to remember the previous gateway token: `auth show` reads it from
+the private file; `auth rotate` generates another. For a lost or leaked token,
+use `auth reset`: it stops the old proxy, stores a new token and never restores
+the revoked one. If activation fails, the gateway remains stopped with the new
+token preserved. It aborts if the old proxy cannot be stopped or inspected.
+Routine `auth rotate` can restore a previous valid token on failure. Unmanaged
+clients must update their own token; neither command prints it automatically.
 
 Use a client that reads the token from its private environment, for example:
 
@@ -124,12 +135,17 @@ response = client.chat.completions.create(
     model="vllm/ORG/MODEL", messages=[{"role": "user", "content": "Hola"}])
 ```
 
-On a remote server, xAI requires an SSH callback tunnel on `56121`.
-Remote setup attempts to forward it through its SSH connection; manual login needs:
-`ssh -N -L 56121:127.0.0.1:56121 USER@SERVER` in another terminal.
-Login rejects a callback on a different host/port. ChatGPT and Copilot use their
-installed LiteLLM login flows. An OAuth integration does not establish provider
-permission for every use; follow your account's terms.
+OAuth already authorizes the subscriptions; an SSH tunnel is not part of OAuth.
+xAI's current flow needs a browser callback, so Spark runs that login on the
+computer with your browser. For a remote server use `gateway login xai --remote
+USER@SERVER`: ordinary key-authenticated SSH installs the session through stdin;
+no port is forwarded, no callback listener is opened on the remote server, and
+the temporary local session is deleted after transfer (also on failure).
+The browser computer needs Docker and the compatible LiteLLM image. Remote setup
+offers this local login before its remote provider wizard. Direct xAI login in a
+headless SSH session returns instructions instead of establishing a tunnel.
+ChatGPT and Copilot keep their installed device/login flows. An integration does
+not establish provider permission for every use; follow your account's terms.
 
 ## Private access by Tailscale node
 
@@ -137,7 +153,7 @@ permission for every use; follow your account's terms.
 spark gateway access nodes
 spark gateway access allow laptop desktop   # outputs grants + accept/deny tests
 # Merge that fragment into the tailnet admin policy and run its policy tests.
-spark gateway access enable                 # HTTPS 8443, independent of existing 443
+spark gateway access enable                 # HTTPS 443 -> authenticated LiteLLM
 spark gateway access verify --allowed USER@laptop --denied USER@other-node
 spark gateway access status
 spark gateway access protect                # migrate legacy direct backend Serve routes
@@ -146,20 +162,32 @@ spark gateway access protect                # migrate legacy direct backend Serv
 [Serve](https://tailscale.com/docs/reference/tailscale-cli/serve) publishes the
 endpoint; the [tailnet grants policy](https://tailscale.com/docs/reference/syntax/grants)
 restricts source nodes. Spark cannot edit the admin policy from local configuration.
-Remove overlapping broad grants/ACLs for this destination/port while preserving
-SSH and other services. Selection records both IPv4 and IPv6; refresh the fragment
-when replacing a node. For another HTTPS port, select it first with
-`access allow --port 9443 NODE...`, apply that policy, then enable.
+Replace overlapping broad API grants/ACLs for these clients. The generated grants
+permit TCP/443 for LiteLLM and a separate TCP/22 rule for administrative SSH.
+SSH still requires your configured keys/credentials; Spark does not alter sshd,
+authorized keys, or other administrators' SSH rules. Selection records both IPv4
+and IPv6; refresh the fragment
+when replacing a node. The private API uses port 443 exclusively. With a custom
+SSH port, use `access allow --ssh-port 2222 NODE...`; the default is 22 (or the
+port of the current SSH session). Denial tests include current/common application
+ports, both IP families, and UDP. Update the policy when adding listeners.
 
 Status stays pending until `access verify` succeeds from an allowed and denied
 node. That command requires SSH and Python 3 on both nodes, passes the token through
-SSH stdin without saving it there, and records verification time. Reverify after
-policy changes. Individual nodes can also run `access probe URL allowed|denied`;
+SSH stdin without saving it there, and records verification time. Allowed-node
+checks also reject reachable direct
+backend/application ports, excluding administrative SSH. These are probes of
+known listeners, not an exhaustive port scan; the restrictive admin policy is
+the enforcement. Reverify after policy or listener changes. Individual nodes can
+also run `access probe URL allowed|denied`;
 an allowed probe reads `SPARK_GATEWAY_TOKEN_FILE` (a private env file), while an
 unreachable denied probe alone does not establish that the policy caused denial.
 
-Spark manages only its HTTPS port and refuses another service's handler. Funnel
-must be disabled. Existing Hermes, n8n and task services keep their publications.
+On the node hostname, HTTPS/443 points only to LiteLLM. Spark can replace a root
+Serve handler targeting a known Spark backend, then retire legacy gateway/backend
+Serve ports on that hostname. It refuses unrelated services or extra handlers;
+service virtual hosts such as Hermes/n8n remain untouched. Funnel must be disabled.
+The API policy restricts client access to other node ports while preserving SSH.
 Before `access protect`, verify the private endpoint, update external clients and
 save model launch aliases. Protect removes direct backend root Serve entries;
 restart existing models through their aliases to replace public listeners.

@@ -7163,16 +7163,12 @@ step_gateway() {
   ctx_run "docker image inspect '${LITELLM_IMAGE}' >/dev/null 2>&1" || ctx_run "docker pull '${LITELLM_IMAGE}'" || { setup_fail 'LiteLLM image unavailable'; return 0; }
   [[ "$auto_yes" != 1 ]] || args='--yes'
   if [[ "$SETUP_TARGET" == remote ]]; then
-    # xAI uses a browser callback on the target. Forward it before the remote wizard.
-    local callback_forwarded=0
-    if [[ "$auto_yes" != 1 ]] && ssh -o ControlPath="$REMOTE_CONTROL" -O forward -L 56121:127.0.0.1:56121 "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null; then
-      callback_forwarded=1
-    elif [[ "$auto_yes" != 1 ]]; then
-      printf 'xAI callback requires another terminal: ssh -N -L 56121:127.0.0.1:56121 %s@%s\n' "$REMOTE_USER" "$REMOTE_HOST"
+    # Native OAuth runs beside the browser. SSH transfers its session, never forwards a port.
+    if [[ "$auto_yes" != 1 ]] && confirm 'Configure xAI subscription OAuth in this computer browser for the remote server?'; then
+      gateway_login_remote xai "${REMOTE_USER}@${REMOTE_HOST}" || { setup_fail 'Local xAI OAuth failed'; return 0; }
     fi
     local rc=0
     remote_in "\"\$HOME/.local/bin/spark\" gateway setup ${args}" || rc=$?
-    if [[ "$callback_forwarded" == 1 ]]; then ssh -o ControlPath="$REMOTE_CONTROL" -O cancel -L 56121:127.0.0.1:56121 "${REMOTE_USER}@${REMOTE_HOST}" 2>/dev/null || true; fi
     [[ "$rc" == 0 ]] || setup_fail 'Gateway setup failed on target'
   else
     if [[ "$auto_yes" == 1 ]]; then gateway_setup_local --yes || setup_fail 'Gateway setup failed'; else gateway_setup_local || setup_fail 'Gateway setup failed'; fi
@@ -17676,9 +17672,15 @@ gateway_auth_ensure() {
     gateway_env_set LITELLM_MASTER_KEY "$key" || return 1
   fi
   config=$(gateway_load_config) || return 1
-  # Keep one private recoverable snapshot before removing legacy credentials.
+  [[ ! -L "$SPARK_CONFIG_DIR/gateway-migration" ]] || { err 'Recovery folder must not be a symlink'; return 1; }
+  # Keep credentials recoverable until the new gateway or a rollback is verified.
   if [[ ! -d "$SPARK_CONFIG_DIR/gateway-migration" ]] && { [[ -f "$GATEWAY_CONFIG" ]] && grep -q '"api_key"' "$GATEWAY_CONFIG"; }; then
-    (umask 077; mkdir "$SPARK_CONFIG_DIR/gateway-migration"; cp "$GATEWAY_CONFIG" "$SPARK_CONFIG_DIR/gateway-migration/gateway.json") || return 1
+    (umask 077
+      mkdir "$SPARK_CONFIG_DIR/gateway-migration" &&
+      cp "$GATEWAY_CONFIG" "$SPARK_CONFIG_DIR/gateway-migration/gateway.json" &&
+      cp "$(gateway_secrets_path)" "$SPARK_CONFIG_DIR/gateway-migration/gateway.env" &&
+      { [[ ! -f "$SPARK_CONFIG_DIR/litellm_config.yaml" ]] || cp "$SPARK_CONFIG_DIR/litellm_config.yaml" "$SPARK_CONFIG_DIR/gateway-migration/litellm_config.yaml"; }
+    ) || return 1
   fi
   # Migrate old provider keys without displaying or passing them to Docker argv.
   for p in openrouter zen together openai xai anthropic; do
@@ -17795,8 +17797,11 @@ gateway_capabilities() {
   esac
   docker run --rm --entrypoint python "$image" -c "$script" 2>/dev/null
 }
-gateway_login() {
+gateway_login_local() {
   local p="${1:-}" dir env_key script net_args=()
+  if [[ "$p" == xai && -n "${SSH_CONNECTION:-}" ]]; then
+    err 'Run xAI OAuth on the computer with your browser: spark gateway login xai --remote USER@SERVER (no tunnel)'; return 1
+  fi
   env_key=$(gateway_oauth_env "$p") || { err 'Login providers: chatgpt, github_copilot, xai'; return 1; }
   gateway_capabilities "$p" >/dev/null || { err "Installed LiteLLM lacks ${p} login; run spark update --litellm"; return 1; }
   dir=$(gateway_oauth_dir "$p")
@@ -17818,7 +17823,7 @@ def fixed_callback(self, state):
     return server, uri
 XAIOAuthAuthenticator._start_callback_server = fixed_callback
 XAIOAuthAuthenticator().login(no_browser=True)'
-      printf 'For a remote browser, first open another terminal: ssh -N -L 56121:127.0.0.1:56121 <user@server>\nThe login URL must use callback port 56121; cancel if a different port is selected.\n' ;;
+      printf 'OAuth opens a callback on this computer only (127.0.0.1:56121). Complete the login in your local browser.\n' ;;
   esac
   docker run --rm -i --user "$(id -u):$(id -g)" -e HOME=/tmp ${net_args[@]+"${net_args[@]}"} -v "${dir}:/tokens" -e "${env_key}=/tokens" --entrypoint python "$LITELLM_IMAGE" -c "$script" || return 1
   [[ "$(gateway_oauth_status "$p")" == credentials-present ]] || { err 'Login produced no credentials'; return 1; }
@@ -17843,10 +17848,10 @@ gateway_sync_locked() {
   gateway_auth_ensure && gateway_preflight || return 1
   [[ -f "$path" ]] && previous=$(cat "$path")
   yaml=$(gateway_generate_litellm_yaml) || return 1
+  previous_image=$(docker inspect "$GATEWAY_CONTAINER" --format '{{.Image}}' 2>/dev/null || true)
   if gateway_running_state; then
     running=1
-    previous_image=$(docker inspect "$GATEWAY_CONTAINER" --format '{{.Image}}' 2>/dev/null || true)
-    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then gateway_wait_ready && gateway_sync_clients; return $?; fi
+    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then gateway_wait_ready && gateway_sync_clients && gateway_migration_cleanup; return $?; fi
   fi
   tmp=$(umask 077; mktemp "${path}.tmp.XXXXXX") || return 1
   printf '%s\n' "$yaml" > "$tmp"
@@ -17854,7 +17859,7 @@ gateway_sync_locked() {
   if [[ "$running" == 1 ]]; then
     docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || return 1
   fi
-  if gateway_start_container && gateway_wait_ready && gateway_sync_clients; then return 0; fi
+  if gateway_start_container && gateway_wait_ready && gateway_sync_clients; then gateway_migration_cleanup; return $?; fi
   err 'Gateway update failed; restoring the previous rendered routes'
   docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
   # Never restore anonymous access during the first migration.
@@ -17867,7 +17872,11 @@ gateway_sync_locked() {
     printf '%s\n' "$previous" > "$tmp"
     chmod 600 "$tmp" && mv "$tmp" "$path" || return 1
     docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
-    GATEWAY_RESTORE_IMAGE="$previous_image" gateway_start_container && gateway_wait_ready || err 'Previous gateway routes could not be restored'
+    if gateway_migration_restore_config && GATEWAY_RESTORE_IMAGE="$previous_image" gateway_start_container && gateway_wait_ready && gateway_sync_clients; then
+      gateway_migration_cleanup || return 1
+    else
+      err 'Previous gateway routes could not be verified; private recovery backup retained'
+    fi
   fi
   return 1
 }
@@ -17951,8 +17960,9 @@ gateway_auth_command() {
   case "${1:-status}" in
     status) gateway_auth_ready && printf 'authentication: configured\n' || { printf 'authentication: migration-required\n'; return 1; } ;;
     show) gateway_auth_ready || return 1; gateway_auth_key ;;
-    rotate) gateway_auth_rotate ;;
-    *) err 'Usage: spark gateway auth <status|show|rotate>'; return 1 ;;
+    rotate) [[ $# == 1 ]] || return 1; gateway_auth_rotate ;;
+    reset) [[ $# == 1 ]] || return 1; gateway_with_lock gateway_auth_reset_locked ;;
+    *) err 'Usage: spark gateway auth <status|show|rotate|reset>'; return 1 ;;
   esac
 }
 gateway_add() { gateway_with_lock gateway_add_locked "$@"; }
@@ -18031,14 +18041,17 @@ cmd_gateway() {
   case "$cmd" in
     setup) gateway_setup_local "$@" ;; start) gateway_start ;; stop) gateway_with_lock gateway_stop ;; status) gateway_status ;; logs) gateway_logs "$@" ;;
     add) gateway_add "$@" ;; remove) gateway_remove "$@" ;; auth) gateway_auth_command "$@" ;;
-    login) gateway_with_lock gateway_login "$@" ;; logout) gateway_with_lock gateway_logout "$@" ;;
+    login) gateway_with_lock gateway_login "$@" ;; import-session) gateway_with_lock gateway_import_session "$@" ;; logout) gateway_with_lock gateway_logout "$@" ;;
     capabilities) gateway_capabilities "${1:-base}" "$(gateway_runtime_image)" ;; access) gateway_access_command "$@" ;;
     help|--help|-h)
       cat <<'HELP'
 Usage: spark gateway <setup|start|stop|status|logs|add|remove|auth|login|logout|capabilities|access>
   setup [--yes]             Configure local providers, authentication and access
   auth status|show|rotate     Manage the private gateway token
-  login|logout PROVIDER      chatgpt, github_copilot, xai (interactive login)
+  auth reset                 Revoke a lost/leaked token; never restore it on failure
+  login PROVIDER [--remote USER@HOST]
+                             OAuth login on this computer, optionally install remotely
+  logout PROVIDER            Disable the provider and remove its session
   add PROVIDER [--auth api|oauth] [--model ID ...]
                              openai, chatgpt, github_copilot, xai, anthropic,
                              openrouter, ollama, zen, together
@@ -18113,7 +18126,7 @@ gateway_setup_local() {
         xai) if confirm 'Use xAI / SuperGrok subscription login instead of an API key?'; then mode=oauth; fi ;;
       esac
       confirm "Configure ${p} (${mode})?" || continue
-      if [[ "$mode" == oauth ]]; then gateway_with_lock gateway_login "$p" || return 1; fi
+      if [[ "$mode" == oauth && "$(gateway_oauth_status "$p")" != credentials-present ]]; then gateway_with_lock gateway_login "$p" || return 1; fi
       gateway_add "$p" --auth "$mode" || return 1
     done
   fi
@@ -18152,27 +18165,76 @@ gateway_provider_status_json() {
   done < <(gateway_load_config | jq -r '.providers // {} | to_entries[] | select(.value.enabled) | [.key,(.value.auth // "local")] | @tsv')
   printf '%s\n' "$providers"
 }
+
+# Delete only Spark-owned recovery files after authenticated runtime/client checks.
+gateway_migration_cleanup() {
+  local backup="$SPARK_CONFIG_DIR/gateway-migration"
+  [[ -d "$backup" && ! -L "$backup" ]] || return 0
+  rm -f "$backup/gateway.json" "$backup/gateway.env" "$backup/litellm_config.yaml" || return 1
+  rmdir "$backup" || { err 'Recovery folder contains unexpected files; inspect it manually'; return 1; }
+}
+gateway_migration_restore_config() {
+  local backup="$SPARK_CONFIG_DIR/gateway-migration/gateway.json" restored p key env_key
+  [[ -f "$backup" ]] || return 0
+  restored=$(jq '.' "$backup") || return 1
+  for p in openrouter zen together openai xai anthropic; do
+    key=$(printf '%s\n' "$restored" | jq -r --arg p "$p" '.providers[$p].api_key // ""') || return 1
+    if [[ -n "$key" ]]; then
+      env_key=$(gateway_provider_env "$p") || return 1
+      gateway_env_set "$env_key" "$key" || return 1
+    fi
+  done
+  restored=$(printf '%s\n' "$restored" | jq 'if .providers then del(.providers[].api_key) else . end') || return 1
+  gateway_save_config "$restored"
+}
+# Incident recovery: regenerate without knowing the old token, fail closed.
+gateway_auth_reset_locked() {
+  local running=0 key
+  docker info >/dev/null 2>&1 || { err 'Cannot inspect LiteLLM; the previous token has NOT been revoked'; return 1; }
+  gateway_running_state && running=1
+  key="sk-$(openssl rand -hex 32)" || return 1
+  if [[ "$running" == 1 ]] && ! docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1; then
+    err 'Could not stop LiteLLM; the previous token has NOT been revoked'; return 1
+  fi
+  gateway_env_set LITELLM_MASTER_KEY "$key" && gateway_auth_ensure || return 1
+  if [[ "$running" == 1 ]]; then
+    if ! gateway_sync_locked; then
+      docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+      err 'Previous token revoked; replacement kept private, gateway stopped. Fix the error and run spark gateway start'; return 1
+    fi
+  elif ! gateway_sync_clients; then
+    err 'Previous token replaced; update managed clients before starting LiteLLM'; return 1
+  fi
+  info 'Gateway token regenerated; the previous token is revoked. Update unmanaged clients (auth show reveals the new token)'
+}
 # Based on spark by Massimo Angelini - https://github.com/massimo92/spark
 # Serve exposes a service; only the tailnet policy restricts source nodes.
 gateway_access_status() {
   local config dns port state
   config=$(gateway_load_config)
-  port=$(printf '%s\n' "$config" | jq -r '.access.port // 8443')
-  state=$(printf '%s\n' "$config" | jq -r 'if .access.enabled then (if .access.policy_status=="verified" then "verified" else "policy-verification-pending" end) else "local-only" end')
+  port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
+  state=$(printf '%s\n' "$config" | jq -r 'if .access.enabled and .access.port!=443 then "migration-required" elif .access.enabled then (if .access.policy_status=="verified" then "verified" else "policy-verification-pending" end) else "local-only" end')
   printf 'Private access: %s\n' "$state"
   if [[ "$state" != local-only ]] && command -v tailscale >/dev/null 2>&1; then
     dns=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // "" | rtrimstr(".")')
-    [[ -z "$dns" ]] || printf 'Private API: https://%s:%s/v1\n' "$dns" "$port"
+    [[ -z "$dns" ]] || printf 'Private API: https://%s%s/v1\n' "$dns" "$([[ "$port" == 443 ]] || printf ':%s' "$port")"
   fi
 }
 gateway_access_nodes() {
   tailscale status --json | jq -r '([.Self] + [.Peer[]?])[] | [.HostName,.DNSName,(.TailscaleIPs|join(",")),(.Online|tostring)] | @tsv'
 }
 gateway_access_allow() {
-  local requested_port=''
-  if [[ "${1:-}" == --port ]]; then [[ $# -ge 3 ]] || return 1; requested_port="$2"; shift 2; fi
-  [[ $# -gt 0 ]] || { err 'Usage: spark gateway access allow [--port 8443] <node-name|IP> ...'; return 1; }
-  [[ -z "$requested_port" ]] || { [[ "$requested_port" =~ ^[0-9]+$ && "$requested_port" -gt 1024 && "$requested_port" -le 65535 ]] || return 1; }
+  local ssh_port
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) [[ $# -ge 2 && "$2" == 443 ]] || { err 'The private API uses HTTPS port 443 only'; return 1; }; shift 2 ;;
+      --ssh-port) [[ $# -ge 2 ]] || return 1; ssh_port="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  [[ "$ssh_port" =~ ^[0-9]+$ && "$ssh_port" -ge 1 && "$ssh_port" -le 65535 && "$ssh_port" != 443 ]] || return 1
+  [[ $# -gt 0 ]] || { err 'Usage: spark gateway access allow [--ssh-port 22] <node-name|IP> ...'; return 1; }
   local status selector matches count ips='[]' names_json='[]' config
   status=$(tailscale status --json) || return 1
   for selector in "$@"; do
@@ -18183,60 +18245,62 @@ gateway_access_allow() {
     names_json=$(printf '%s\n' "$names_json" | jq --arg name "$selector" '. + [$name]') || return 1
   done
   config=$(gateway_load_config)
-  if [[ -n "$requested_port" ]]; then
-    if [[ "$(printf '%s\n' "$config" | jq -r '.access.enabled // false')" == true && "$(printf '%s\n' "$config" | jq -r '.access.port // 8443')" != "$requested_port" ]]; then err 'Disable the current publication before changing its port'; return 1; fi
-    config=$(printf '%s\n' "$config" | jq --argjson port "$requested_port" '.access.port=$port') || return 1
-  fi
-  config=$(printf '%s\n' "$config" | jq --argjson ips "$ips" --argjson names "$names_json" '.access.sources=$ips | .access.nodes=$names | .access.policy_status="pending" | del(.access.verified_at)') || return 1
+  config=$(printf '%s\n' "$config" | jq --argjson ips "$ips" --argjson names "$names_json" --argjson ssh "$ssh_port" '
+    if .access.port!=null and .access.port!=443 then .access.enabled=false else . end |
+    .access.port=443 | .access.ssh_port=$ssh | .access.sources=$ips | .access.nodes=$names |
+    .access.policy_status="pending" | del(.access.verified_at)') || return 1
   gateway_save_config "$config" || return 1
   info 'Selected source nodes; apply the grants fragment in Tailscale before enabling access'
   gateway_access_policy
 }
 gateway_access_policy() {
-  local status config addresses sources port tests output
+  local status config addresses sources ssh_port blocked output
   status=$(tailscale status --json) || return 1
-  config=$(gateway_load_config)
+  config=$(gateway_load_config) || return 1
   addresses=$(printf '%s\n' "$status" | jq -c '.Self.TailscaleIPs') || return 1
-  sources=$(printf '%s\n' "$config" | jq -c '.access.sources // []')
+  sources=$(printf '%s\n' "$config" | jq -c '.access.sources // []') || return 1
   [[ "$(printf '%s\n' "$sources" | jq length)" -gt 0 ]] || { err 'Select nodes with spark gateway access allow first'; return 1; }
-  port=$(printf '%s\n' "$config" | jq -r '.access.port // 8443')
-  tests=$(jq -nc --argjson status "$status" --argjson sources "$sources" --argjson dst "$addresses" --arg port "$port" '
-    [ $sources[] | {src:.,accept:[$dst[0]+":"+$port]} ] +
-    [ $status.Peer[]?.TailscaleIPs[0] | select(. as $ip | $sources | index($ip) | not) | {src:.,deny:[$dst[0]+":"+$port]} ]') || return 1
-  output=$(jq -n --argjson src "$sources" --argjson dst "$addresses" --arg port "$port" --argjson tests "$tests" '{grants:[{src:$src,dst:$dst,ip:["tcp:"+$port]}],tests:$tests}') || return 1
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  blocked=$(gateway_access_blocked_ports) || return 1
+  output=$(jq -n --argjson src "$sources" --argjson dst "$addresses" --argjson ssh "$ssh_port" --argjson blocked "$blocked" --argjson status "$status" '
+    def host: if contains(":") then "["+.+"]" else . end;
+    def destinations($ports): [$dst[] | host as $h | $ports[] | $h+":"+(.|tostring)];
+    {grants:[{src:$src,dst:$dst,ip:["tcp:443"]},{src:$src,dst:$dst,ip:["tcp:"+($ssh|tostring)]}],
+     tests:([$src[] | {src:.,proto:"tcp",accept:destinations([443,$ssh]),deny:destinations($blocked)}] +
+            [$src[] | {src:.,proto:"udp",deny:destinations(($blocked+[443,$ssh])|unique)}] +
+            [$status.Peer[]?.TailscaleIPs[] | select(. as $ip | $src | index($ip) | not) | {src:.,proto:"tcp",deny:destinations([443])}])}') || return 1
   printf '%s\n' "$output"
-  printf 'Merge this fragment in the Tailscale admin policy; remove overlapping broad grants/ACLs for this destination/port. Preserve SSH and other services. Run these tests there, then probe from allowed and denied nodes. Source list is a snapshot; refresh it after replacing a node.\n' >&2
+  printf 'Merge these grants and tests in the tailnet admin policy. Keep administrative SSH/key authentication. Remove overlapping broad API grants for these clients: only TCP/443 (LiteLLM) and TCP/%s (SSH) should remain reachable on this node. Other administrators keep their SSH rules. Tests cover both IP families and current/common service ports; refresh after adding listeners or replacing a node.\n' "$ssh_port" >&2
 }
 gateway_access_enable() {
-  local port config status dns serve
-  config=$(gateway_load_config) || return 1
-  port=$(printf '%s\n' "$config" | jq -r '.access.port // 8443')
-  if [[ $# -gt 0 ]]; then [[ $# == 2 && "$1" == --port ]] || return 1; port="$2"; fi
-  [[ "$port" =~ ^[0-9]+$ && "$port" -gt 1024 && "$port" -le 65535 ]] || { err 'Use an unprivileged HTTPS port (default 8443)'; return 1; }
-  [[ "$port" == "$(printf '%s\n' "$config" | jq -r '.access.port // 8443')" ]] || { err 'Generate the policy for this port first: spark gateway access allow --port PORT NODE...'; return 1; }
+  local config status dns serve key target current port
+  [[ $# == 0 || ( $# == 2 && "$1" == --port && "$2" == 443 ) ]] || { err 'The private API uses HTTPS port 443 only'; return 1; }
   gateway_auth_ready && gateway_wait_ready || { err 'Start an authenticated gateway first'; return 1; }
-  config=$(gateway_load_config)
+  config=$(gateway_load_config) || return 1
   [[ "$(printf '%s\n' "$config" | jq '.access.sources // [] | length')" -gt 0 ]] || { err 'Select nodes and apply their Tailscale policy first'; return 1; }
   tailscale_funnel_status_active && { err 'Funnel active; resolve public exposure before enabling private gateway access'; return 1; }
   status=$(tailscale status --json) || return 1
-  dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")')
+  dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName // "" | rtrimstr(".")')
   [[ -n "$dns" ]] || return 1
+  key="$dns:443"; target="http://127.0.0.1:$(gateway_configured_port)"
   serve=$(tailscale serve status --json) || return 1
-  # Do not overwrite another service, any subpath, or a TCP forwarder.
-  if ! printf '%s\n' "$serve" | jq -e --arg key "$dns:$port" --arg port "$port" --arg target "http://127.0.0.1:$(gateway_configured_port)" '
-    ((.TCP[$port] == null) and (.Web[$key] == null)) or
-    (.TCP[$port].HTTPS == true and (.Web[$key].Handlers | keys)==["/"] and .Web[$key].Handlers["/"].Proxy==$target)' >/dev/null; then
-    err "Tailscale port ${port} belongs to another service"; return 1
+  if ! printf '%s\n' "$serve" | jq -e --arg key "$key" '(.TCP["443"]==null and .Web[$key]==null)' >/dev/null; then
+    printf '%s\n' "$serve" | jq -e --arg key "$key" '.TCP["443"].HTTPS==true and ((.Web[$key].Handlers // {})|keys)==["/"]' >/dev/null || { err 'Port 443 has another handler or TCP service; no services changed'; return 1; }
+    current=$(printf '%s\n' "$serve" | jq -r --arg key "$key" '.Web[$key].Handlers["/"].Proxy // ""')
+    gateway_access_owned_target "$current" || { err 'Port 443 belongs to another service; no services changed'; return 1; }
   fi
-  tailscale serve --bg --https="$port" "http://127.0.0.1:$(gateway_configured_port)" || return 1
-  tailscale_funnel_status_active && { tailscale serve --https="$port" off; err 'Public exposure detected'; return 1; }
-  config=$(printf '%s\n' "$config" | jq --argjson port "$port" '.access.enabled=true | .access.port=$port | .access.policy_status="pending" | del(.access.verified_at)') || return 1
+  tailscale serve --bg --https=443 "$target" || return 1
+  tailscale_funnel_status_active && { tailscale serve --https=443 off; err 'Public exposure detected'; return 1; }
+  config=$(printf '%s\n' "$config" | jq --argjson ssh "$(gateway_access_ssh_port)" '.access.enabled=true | .access.port=443 | .access.ssh_port=$ssh | .protected=true | .access.policy_status="pending" | del(.access.verified_at)') || return 1
   gateway_save_config "$config" || return 1
+  gateway_access_https_ready "$dns" || { err 'HTTPS 443 not ready; authenticated target kept, policy verification pending'; return 1; }
+  # Retire only Spark API/backends on this hostname; never reset Serve or touch SSH.
+  gateway_access_remove_direct "$dns" "$serve" || return 1
   gateway_access_status
 }
 gateway_access_disable() {
   local config port status dns key
-  config=$(gateway_load_config); port=$(printf '%s\n' "$config" | jq -r '.access.port // 8443')
+  config=$(gateway_load_config); port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
   status=$(tailscale status --json) || return 1
   dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")'); key="$dns:$port"
   # Only remove the exact root handler owned by Spark, never reset all Serve.
@@ -18245,29 +18309,21 @@ gateway_access_disable() {
   gateway_save_config "$(printf '%s\n' "$config" | jq '.access.enabled=false')"
 }
 gateway_access_protect() {
-  local config status entry target dns port count=0 name model backend_port rest
+  local config status dns
   config=$(gateway_load_config)
   gateway_wait_ready && [[ "$(printf '%s\n' "$config" | jq -r '.access.enabled and (.access.policy_status=="verified")')" == true ]] || { err 'Verify private gateway access before removing legacy direct Serve routes'; return 1; }
   gateway_save_config "$(printf '%s\n' "$config" | jq '.protected=true')" || return 1
-  # Protect new launches. Existing backends need an explicit restart with their
-  # launch aliases; do not silently interrupt inference or rewrite recipes.
-  printf 'New vLLM launches bind localhost. Existing models need restarting with their launch aliases.\n'
-  if command -v tailscale >/dev/null 2>&1; then
-    status=$(tailscale serve status --json) || return 1
-    while IFS=$'\t' read -r name model backend_port rest; do
-      [[ -n "$backend_port" ]] || continue
-      while IFS= read -r entry; do
-        target=$(printf '%s\n' "$entry" | jq -r '.target')
-        port=$(printf '%s\n' "$entry" | jq -r '.port')
-        [[ "$port" =~ ^[0-9]+$ ]] || return 1
-        if [[ "$target" == "http://127.0.0.1:$backend_port" || "$target" == "http://localhost:$backend_port" ]]; then
-          tailscale serve --https="$port" off || return 1
-          count=$((count+1))
-        fi
-      done < <(printf '%s\n' "$status" | jq -c '.Web // {} | to_entries[] | select(.value.Handlers | keys==["/"]) | {port:(.key|split(":")|last),target:.value.Handlers["/"].Proxy}')
-    done < <(list_managed_containers)
+  status=$(tailscale status --json) || return 1
+  dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName // "" | rtrimstr(".")')
+  gateway_access_remove_direct "$dns" "$(tailscale serve status --json)" || return 1
+  local findings
+  findings=$(gateway_exposure_findings)
+  if [[ -n "$findings" ]]; then
+    err 'Existing inference listeners still accept non-local connections; restart those model aliases to apply localhost binding'
+    printf '%s\n' "$findings" >&2; return 1
   fi
-  printf 'Removed %s direct backend Serve entries. Enable the private gateway after applying its policy.\n' "$count"
+  printf 'Inference APIs are local; node clients use HTTPS/443. Administrative SSH is unchanged.\n'
+
 }
 gateway_access_probe() {
   local url="${1:-}" kind="${2:-allowed}" key code
@@ -18299,12 +18355,12 @@ gateway_access_command() {
     allow) gateway_with_lock gateway_access_allow "$@" ;; policy) gateway_access_policy ;;
     enable) gateway_with_lock gateway_access_enable "$@" ;; disable) gateway_with_lock gateway_access_disable ;;
     protect) gateway_with_lock gateway_access_protect ;; probe) gateway_access_probe "$@" ;; verify) gateway_with_lock gateway_access_verify "$@" ;;
-    *) err 'Usage: spark gateway access <nodes|allow NODE...|policy|enable [--port 8443]|disable|status|protect|probe URL [allowed|denied]|verify --allowed NODE --denied NODE>'; return 1 ;;
+    *) err 'Usage: spark gateway access <nodes|allow NODE...|policy|enable [--port 443]|disable|status|protect|probe URL [allowed|denied]|verify --allowed NODE --denied NODE>'; return 1 ;;
   esac
 }
 
 gateway_access_json() {
-  gateway_load_config | jq -c '{enabled:(.access.enabled // false),port:(.access.port // 8443),policy_status:(.access.policy_status // "not-configured"),verified_at:(.access.verified_at // null),nodes:(.access.nodes // []),protected:(.protected != false)}'
+  gateway_load_config | jq -c '{enabled:(.access.enabled // false),port:(.access.port // 443),ssh_port:(.access.ssh_port // 22),policy_status:(.access.policy_status // "not-configured"),verified_at:(.access.verified_at // null),nodes:(.access.nodes // []),protected:(.protected != false)}'
 }
 # Read-only evidence; configuration alone does not prove backend isolation.
 gateway_exposure_findings() {
@@ -18325,7 +18381,7 @@ gateway_exposure_findings() {
 
 # SSH probes establish evidence from two live nodes without storing the token there.
 gateway_access_verify() {
-  local allowed='' denied='' config status dns port key mode node selector matches ips selected script quoted payload
+  local allowed='' denied='' config status dns port key mode node selector matches ips selected script quoted payload blocked addresses ssh_port
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --allowed) [[ $# -ge 2 ]] || return 1; allowed="$2"; shift 2 ;;
@@ -18339,10 +18395,15 @@ gateway_access_verify() {
   config=$(printf '%s\n' "$config" | jq '.access.policy_status="pending" | del(.access.verified_at)') || return 1
   gateway_save_config "$config" || return 1
   gateway_wait_ready || return 1
+  [[ "$(printf '%s\n' "$config" | jq -r '.access.port // 443')" == 443 ]] || { err 'Migrate the private API to HTTPS/443 first'; return 1; }
   status=$(tailscale status --json) || return 1
   dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")')
-  port=$(printf '%s\n' "$config" | jq -r '.access.port // 8443')
+  port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
   key=$(gateway_auth_key) || return 1
+  blocked=$(gateway_access_blocked_ports) || return 1
+  addresses=$(printf '%s\n' "$status" | jq -c '.Self.TailscaleIPs // []') || return 1
+  [[ "$(printf '%s\n' "$addresses" | jq length)" -gt 0 ]] || return 1
+  ssh_port=$(gateway_access_ssh_port) || return 1
   script=$(cat <<'PY'
 import json, socket, ssl, sys, urllib.request, urllib.error, urllib.parse
 p=json.load(sys.stdin)
@@ -18359,12 +18420,23 @@ if p['mode']=='allowed':
     assert status() in (401,403), 'anonymous access accepted'
     assert status('sk-invalid') in (401,403), 'invalid token accepted'
     assert status(p['token'])==200, 'valid token rejected'
+    # A reachable backend or other application would bypass the single API entry.
+    for address in p['addresses']:
+        for port in p['blocked_ports']:
+            try:
+                connection=socket.create_connection((address,port),timeout=1)
+            except OSError:
+                continue
+            connection.close()
+            raise RuntimeError('Direct application port is reachable: '+str(port))
 else:
-    try: status()
-    except urllib.error.URLError as e:
-        if isinstance(e.reason, ssl.SSLError) or not isinstance(e.reason, (TimeoutError,ConnectionError,OSError)):
-            raise
-    else: raise RuntimeError('denied node can reach the endpoint')
+    for address in p['addresses']:
+        try:
+            connection=socket.create_connection((address,443),timeout=3)
+        except OSError:
+            continue
+        connection.close()
+        raise RuntimeError('denied node can connect to HTTPS/443')
 print(p['mode']+' node probe passed')
 PY
   ) || return 1
@@ -18379,18 +18451,136 @@ PY
     ips=$(printf '%s\n' "$matches" | jq -c '.[0].TailscaleIPs')
     selected=$(printf '%s\n' "$config" | jq -r --argjson ips "$ips" 'any(.access.sources[]; . as $s | $ips | index($s)!=null)')
     [[ "$mode" == allowed && "$selected" == true || "$mode" == denied && "$selected" == false ]] || { err 'Probe nodes do not match the selected policy'; return 1; }
-    payload=$(jq -nc --arg url "https://$dns:$port/v1" --arg mode "$mode" '{url:$url,mode:$mode}') || return 1
+    payload=$(jq -nc --arg url "https://$dns/v1" --arg mode "$mode" --argjson blocked "$blocked" --argjson addresses "$addresses" '{url:$url,mode:$mode,blocked_ports:$blocked,addresses:$addresses}') || return 1
     if [[ "$mode" == allowed ]]; then payload="${payload%\}},\"token\":\"${key}\"}"; fi
-    printf '%s\n' "$payload" | ssh -o BatchMode=yes -o ConnectTimeout=5 "$node" "python3 -c $quoted" || { err "${mode} node verification failed; policy remains pending"; return 1; }
+    printf '%s\n' "$payload" | ssh -o BatchMode=yes -o ClearAllForwardings=yes -o ForwardAgent=no -o ConnectTimeout=5 "$node" "python3 -c $quoted" || { err "${mode} node verification failed; policy remains pending"; return 1; }
   done
   config=$(printf '%s\n' "$config" | jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.access.policy_status="verified" | .access.verified_at=$now') || return 1
   gateway_save_config "$config" && gateway_access_status
+}
+
+gateway_access_ssh_port() {
+  local port
+  port=$(gateway_load_config | jq -r '.access.ssh_port // ""') || return 1
+  if [[ -z "$port" && -n "${SSH_CONNECTION:-}" ]]; then port="${SSH_CONNECTION##* }"; fi
+  port="${port:-22}"
+  [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 && "$port" != 443 ]] || return 1
+  printf '%s\n' "$port"
+}
+gateway_access_blocked_ports() {
+  local ssh_port
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  {
+    printf '%s\n' 80 4000 8000 8001 8443 11434 3456 5678 8787 18789
+    gateway_configured_port
+    list_managed_containers 2>/dev/null | awk -F '\t' '{print $3}' || true
+    tailscale serve status --json 2>/dev/null | jq -r '.TCP // {} | keys[]' || true
+    if command -v ss >/dev/null 2>&1; then ss -H -lnt 2>/dev/null | awk '{n=$4;sub(/^.*:/,"",n);print n}' || true; fi
+  } | jq -Rn --argjson ssh "$ssh_port" '[inputs|tonumber? | select(.>=1 and .<=65535 and .!=443 and .!=$ssh)]|unique'
+}
+gateway_access_owned_target() {
+  local target="${1%/}" name model port rest
+  [[ "$target" != "http://127.0.0.1:$(gateway_configured_port)" && "$target" != "http://localhost:$(gateway_configured_port)" && "$target" != http://127.0.0.1:11434 && "$target" != http://localhost:11434 ]] || return 0
+  while IFS=$'\t' read -r name model port rest; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    [[ "$target" != "http://127.0.0.1:$port" && "$target" != "http://localhost:$port" ]] || return 0
+  done < <(list_managed_containers)
+  return 1
+}
+gateway_access_remove_direct() {
+  local dns="$1" serve="$2" entry port target ssh_port
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  while IFS= read -r entry; do
+    port=$(printf '%s\n' "$entry" | jq -r '.port')
+    target=$(printf '%s\n' "$entry" | jq -r '.target // ""')
+    [[ "$port" =~ ^[0-9]+$ && "$port" != 443 && "$port" != "$ssh_port" ]] || continue
+    if gateway_access_owned_target "$target"; then tailscale serve --https="$port" off || return 1; fi
+  done < <(printf '%s\n' "$serve" | jq -c --arg dns "$dns" '.Web // {} | to_entries[] | select(.key|startswith($dns+":")) | select((.value.Handlers // {}|keys)==["/"]) | {port:(.key|split(":")|last),target:.value.Handlers["/"].Proxy}')
+}
+gateway_access_https_ready() {
+  local dns="$1" attempt
+  for ((attempt=0; attempt<5; attempt++)); do
+    gateway_curl -fsS --connect-timeout 2 --max-time 5 "https://$dns/v1/models" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
+# Native OAuth beside the browser; session transfer uses ordinary authenticated SSH.
+gateway_login() {
+  local p="${1:-}"
+  [[ $# -gt 0 ]] || return 1; shift
+  if [[ $# == 0 ]]; then gateway_login_local "$p"; return $?; fi
+  [[ $# == 2 && "$1" == --remote ]] || { err 'Usage: spark gateway login PROVIDER [--remote USER@HOST]'; return 1; }
+  gateway_login_remote "$p" "$2"
+}
+gateway_login_remote() (
+  local p="$1" target="$2" transfer cleanup file
+  gateway_oauth_env "$p" >/dev/null || return 1
+  # Keep SSH options and remote command syntax out of user-supplied hostnames.
+  [[ "$target" =~ ^[A-Za-z0-9_][A-Za-z0-9_.@:-]*$ ]] || { err 'Use an SSH alias or USER@HOST'; return 1; }
+  [[ -z "${SSH_CONNECTION:-}" || "$p" != xai ]] || { err 'Start this command on the computer with your browser'; return 1; }
+  docker info >/dev/null 2>&1 || { err 'Local OAuth requires Docker on the computer with the browser'; return 1; }
+  docker image inspect "$LITELLM_IMAGE" >/dev/null 2>&1 || docker pull "$LITELLM_IMAGE" >/dev/null || return 1
+  mkdir -p "$SPARK_CONFIG_DIR" && chmod 700 "$SPARK_CONFIG_DIR" || return 1
+  transfer=$(umask 077; mktemp -d "$SPARK_CONFIG_DIR/oauth-transfer.XXXXXX") || return 1
+  printf -v cleanup 'rm -rf -- %q' "$transfer"
+  # shellcheck disable=SC2064 # Capture the quoted private path before function scope ends.
+  trap "$cleanup" EXIT
+  SPARK_CONFIG_DIR="$transfer" gateway_login_local "$p" || return 1
+  file="$transfer/oauth/$p/$(gateway_oauth_file "$p")"
+  # Never place credentials in command arguments, stdout, or a controller backup.
+  ssh -o BatchMode=yes -o ClearAllForwardings=yes -o ForwardAgent=no -o ConnectTimeout=10 "$target" "\"\$HOME/.local/bin/spark\" gateway import-session $p" < "$file" || return 1
+  info "OAuth session installed on ${target}; temporary local credentials removed on exit"
+)
+gateway_import_session() {
+  local p="${1:-}" file dir content old='' running=0 mode
+  [[ $# == 1 ]] || return 1
+  file=$(gateway_oauth_file "$p") || return 1
+  content=$(head -c 65537) || return 1
+  [[ -n "$content" && ${#content} -le 65536 ]] || { err 'Invalid or oversized OAuth session'; return 1; }
+  if [[ "$p" == github_copilot ]]; then
+    [[ "$content" =~ ^[A-Za-z0-9_.~+/=-]+$ ]] || return 1
+  else
+    printf '%s\n' "$content" | jq -e 'type=="object"' >/dev/null || return 1
+    if [[ "$p" == xai ]]; then
+      printf '%s\n' "$content" | jq -e '(.access_token|type=="string" and length>0) and (.refresh_token|type=="string" and length>0) and (.token_endpoint|type=="string" and startswith("https://auth.x.ai/"))' >/dev/null || return 1
+    fi
+  fi
+  gateway_capabilities "$p" >/dev/null || { err 'Remote LiteLLM image does not support this OAuth provider'; return 1; }
+  dir=$(gateway_oauth_dir "$p")
+  mkdir -p "$dir" && chmod 700 "$SPARK_CONFIG_DIR" "$SPARK_CONFIG_DIR/oauth" "$dir" || return 1
+  mode=$(gateway_load_config | jq -r --arg p "$p" 'if .providers[$p].enabled and .providers[$p].auth=="oauth" then "oauth" else "inactive" end') || return 1
+  if [[ "$mode" == oauth ]] && gateway_running_state; then
+    running=1
+    # Stop refresh workers before reading/replacing credentials from another account.
+    docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || { err 'Could not stop OAuth refresh; session left unchanged'; return 1; }
+  fi
+  [[ ! -f "$dir/$file" ]] || old=$(cat "$dir/$file")
+  if ! gateway_session_write "$dir/$file" "$content"; then
+    [[ "$running" == 0 ]] || gateway_sync_locked || err 'Could not restart the previous OAuth session'
+    return 1
+  fi
+  [[ "$p" != github_copilot ]] || rm -f "$dir/api-key.json"
+  if [[ "$running" == 1 ]] && ! gateway_sync_locked; then
+    docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || { err 'Could not stop the replacement session; inspect gateway status'; return 1; }
+    if [[ -n "$old" ]]; then gateway_session_write "$dir/$file" "$old" || return 1; else rm -f "$dir/$file"; fi
+    gateway_sync_locked || err 'Previous OAuth session could not be restored'
+    return 1
+  fi
+  [[ "$running" == 1 ]] || info "${p} OAuth session installed; enable its models with spark gateway add ${p}"
+}
+gateway_session_write() {
+  local file="$1" content="$2" tmp
+  tmp=$(umask 077; mktemp "${file}.tmp.XXXXXX") || return 1
+  if printf '%s\n' "$content" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file"; then return 0; fi
+  rm -f "$tmp"; return 1
 }
 # --- Main ---
 main() {
   GATEWAY_PORT=$(gateway_configured_port)
   case "${1:-}:${2:-}" in
-    status:--json|status:--quiet|ws:status|doctor:*|ws:doctor|gateway:auth|gateway:login|gateway:logout|gateway:capabilities|gateway:access) ;;
+    status:--json|status:--quiet|ws:status|doctor:*|ws:doctor|gateway:auth|gateway:login|gateway:import-session|gateway:logout|gateway:capabilities|gateway:access) ;;
     *) check_for_updates ;;
   esac
 

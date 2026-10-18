@@ -26,6 +26,7 @@ MODULES=(
   "src/lib/70_gateway_update.sh"
   "src/lib/75_gateway_security.sh"
   "src/lib/76_gateway_access.sh"
+  "src/lib/77_gateway_oauth.sh"
   "src/90_main.sh"
 )
 

@@ -49,8 +49,9 @@ for ((attempt=0; attempt<30; attempt++)); do [[ ! -s "$TEST_ROOT/ports.json" ]] 
 alpha=$(jq -r '.[0]' "$TEST_ROOT/ports.json"); beta=$(jq -r '.[1]' "$TEST_ROOT/ports.json")
 proxy_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 list_managed_containers() { printf 'alpha\tTest/Alpha\t%s\nbeta\tTest/Beta\t%s\n' "$alpha" "$beta"; }
-gateway_save_config "$(jq -nc --argjson port "$proxy_port" '{enabled:true,protected:true,port:$port,providers:{vllm:{enabled:true}},main:{provider:"vllm",model:"Test/Beta"}}')"
+gateway_save_config "$(jq -nc --argjson port "$proxy_port" '{enabled:true,protected:true,port:$port,providers:{vllm:{enabled:true},openai:{enabled:false,api_key:"unused-test-key"}},main:{provider:"vllm",model:"Test/Beta"}}')"
 gateway_start
+[[ ! -d "$SPARK_CONFIG_DIR/gateway-migration" ]]
 # Real HTTP checks: anonymous/wrong token rejected, correct token accepted.
 gateway_wait_ready
 gateway_route_smoke vllm Test/Alpha
@@ -60,9 +61,14 @@ gateway_auth_rotate
 code=$(printf 'header = "Authorization: Bearer %s"\n' "$old" | curl --config - -sS --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$proxy_port/v1/models")
 [[ "$code" == 401 || "$code" == 403 ]]
 gateway_route_smoke vllm Test/Alpha
+old=$(gateway_auth_key)
+gateway_auth_command reset
+code=$(printf 'header = "Authorization: Bearer %s"\n' "$old" | curl --config - -sS --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$proxy_port/v1/models")
+[[ "$code" == 401 || "$code" == 403 ]]
+gateway_route_smoke vllm Test/Alpha
 list_managed_containers() { printf 'alpha\tTest/Alpha\t%s\n' "$alpha"; }
 gateway_sync
 ! gateway_model_routed vllm Test/Beta
 gateway_route_smoke vllm Test/Alpha
 jq -e '.main.model=="Test/Beta"' "$GATEWAY_CONFIG" >/dev/null
-printf 'ok - real LiteLLM: authenticated inference, two upstream ports, rotation, route removal\n'
+printf 'ok - real LiteLLM: authenticated inference, two upstream ports, rotation, revocation, migration cleanup, route removal\n'

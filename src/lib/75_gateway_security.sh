@@ -31,9 +31,15 @@ gateway_auth_ensure() {
     gateway_env_set LITELLM_MASTER_KEY "$key" || return 1
   fi
   config=$(gateway_load_config) || return 1
-  # Keep one private recoverable snapshot before removing legacy credentials.
+  [[ ! -L "$SPARK_CONFIG_DIR/gateway-migration" ]] || { err 'Recovery folder must not be a symlink'; return 1; }
+  # Keep credentials recoverable until the new gateway or a rollback is verified.
   if [[ ! -d "$SPARK_CONFIG_DIR/gateway-migration" ]] && { [[ -f "$GATEWAY_CONFIG" ]] && grep -q '"api_key"' "$GATEWAY_CONFIG"; }; then
-    (umask 077; mkdir "$SPARK_CONFIG_DIR/gateway-migration"; cp "$GATEWAY_CONFIG" "$SPARK_CONFIG_DIR/gateway-migration/gateway.json") || return 1
+    (umask 077
+      mkdir "$SPARK_CONFIG_DIR/gateway-migration" &&
+      cp "$GATEWAY_CONFIG" "$SPARK_CONFIG_DIR/gateway-migration/gateway.json" &&
+      cp "$(gateway_secrets_path)" "$SPARK_CONFIG_DIR/gateway-migration/gateway.env" &&
+      { [[ ! -f "$SPARK_CONFIG_DIR/litellm_config.yaml" ]] || cp "$SPARK_CONFIG_DIR/litellm_config.yaml" "$SPARK_CONFIG_DIR/gateway-migration/litellm_config.yaml"; }
+    ) || return 1
   fi
   # Migrate old provider keys without displaying or passing them to Docker argv.
   for p in openrouter zen together openai xai anthropic; do
@@ -150,8 +156,11 @@ gateway_capabilities() {
   esac
   docker run --rm --entrypoint python "$image" -c "$script" 2>/dev/null
 }
-gateway_login() {
+gateway_login_local() {
   local p="${1:-}" dir env_key script net_args=()
+  if [[ "$p" == xai && -n "${SSH_CONNECTION:-}" ]]; then
+    err 'Run xAI OAuth on the computer with your browser: spark gateway login xai --remote USER@SERVER (no tunnel)'; return 1
+  fi
   env_key=$(gateway_oauth_env "$p") || { err 'Login providers: chatgpt, github_copilot, xai'; return 1; }
   gateway_capabilities "$p" >/dev/null || { err "Installed LiteLLM lacks ${p} login; run spark update --litellm"; return 1; }
   dir=$(gateway_oauth_dir "$p")
@@ -173,7 +182,7 @@ def fixed_callback(self, state):
     return server, uri
 XAIOAuthAuthenticator._start_callback_server = fixed_callback
 XAIOAuthAuthenticator().login(no_browser=True)'
-      printf 'For a remote browser, first open another terminal: ssh -N -L 56121:127.0.0.1:56121 <user@server>\nThe login URL must use callback port 56121; cancel if a different port is selected.\n' ;;
+      printf 'OAuth opens a callback on this computer only (127.0.0.1:56121). Complete the login in your local browser.\n' ;;
   esac
   docker run --rm -i --user "$(id -u):$(id -g)" -e HOME=/tmp ${net_args[@]+"${net_args[@]}"} -v "${dir}:/tokens" -e "${env_key}=/tokens" --entrypoint python "$LITELLM_IMAGE" -c "$script" || return 1
   [[ "$(gateway_oauth_status "$p")" == credentials-present ]] || { err 'Login produced no credentials'; return 1; }
@@ -198,10 +207,10 @@ gateway_sync_locked() {
   gateway_auth_ensure && gateway_preflight || return 1
   [[ -f "$path" ]] && previous=$(cat "$path")
   yaml=$(gateway_generate_litellm_yaml) || return 1
+  previous_image=$(docker inspect "$GATEWAY_CONTAINER" --format '{{.Image}}' 2>/dev/null || true)
   if gateway_running_state; then
     running=1
-    previous_image=$(docker inspect "$GATEWAY_CONTAINER" --format '{{.Image}}' 2>/dev/null || true)
-    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then gateway_wait_ready && gateway_sync_clients; return $?; fi
+    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then gateway_wait_ready && gateway_sync_clients && gateway_migration_cleanup; return $?; fi
   fi
   tmp=$(umask 077; mktemp "${path}.tmp.XXXXXX") || return 1
   printf '%s\n' "$yaml" > "$tmp"
@@ -209,7 +218,7 @@ gateway_sync_locked() {
   if [[ "$running" == 1 ]]; then
     docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || return 1
   fi
-  if gateway_start_container && gateway_wait_ready && gateway_sync_clients; then return 0; fi
+  if gateway_start_container && gateway_wait_ready && gateway_sync_clients; then gateway_migration_cleanup; return $?; fi
   err 'Gateway update failed; restoring the previous rendered routes'
   docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
   # Never restore anonymous access during the first migration.
@@ -222,7 +231,11 @@ gateway_sync_locked() {
     printf '%s\n' "$previous" > "$tmp"
     chmod 600 "$tmp" && mv "$tmp" "$path" || return 1
     docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
-    GATEWAY_RESTORE_IMAGE="$previous_image" gateway_start_container && gateway_wait_ready || err 'Previous gateway routes could not be restored'
+    if gateway_migration_restore_config && GATEWAY_RESTORE_IMAGE="$previous_image" gateway_start_container && gateway_wait_ready && gateway_sync_clients; then
+      gateway_migration_cleanup || return 1
+    else
+      err 'Previous gateway routes could not be verified; private recovery backup retained'
+    fi
   fi
   return 1
 }
@@ -306,8 +319,9 @@ gateway_auth_command() {
   case "${1:-status}" in
     status) gateway_auth_ready && printf 'authentication: configured\n' || { printf 'authentication: migration-required\n'; return 1; } ;;
     show) gateway_auth_ready || return 1; gateway_auth_key ;;
-    rotate) gateway_auth_rotate ;;
-    *) err 'Usage: spark gateway auth <status|show|rotate>'; return 1 ;;
+    rotate) [[ $# == 1 ]] || return 1; gateway_auth_rotate ;;
+    reset) [[ $# == 1 ]] || return 1; gateway_with_lock gateway_auth_reset_locked ;;
+    *) err 'Usage: spark gateway auth <status|show|rotate|reset>'; return 1 ;;
   esac
 }
 gateway_add() { gateway_with_lock gateway_add_locked "$@"; }
@@ -386,14 +400,17 @@ cmd_gateway() {
   case "$cmd" in
     setup) gateway_setup_local "$@" ;; start) gateway_start ;; stop) gateway_with_lock gateway_stop ;; status) gateway_status ;; logs) gateway_logs "$@" ;;
     add) gateway_add "$@" ;; remove) gateway_remove "$@" ;; auth) gateway_auth_command "$@" ;;
-    login) gateway_with_lock gateway_login "$@" ;; logout) gateway_with_lock gateway_logout "$@" ;;
+    login) gateway_with_lock gateway_login "$@" ;; import-session) gateway_with_lock gateway_import_session "$@" ;; logout) gateway_with_lock gateway_logout "$@" ;;
     capabilities) gateway_capabilities "${1:-base}" "$(gateway_runtime_image)" ;; access) gateway_access_command "$@" ;;
     help|--help|-h)
       cat <<'HELP'
 Usage: spark gateway <setup|start|stop|status|logs|add|remove|auth|login|logout|capabilities|access>
   setup [--yes]             Configure local providers, authentication and access
   auth status|show|rotate     Manage the private gateway token
-  login|logout PROVIDER      chatgpt, github_copilot, xai (interactive login)
+  auth reset                 Revoke a lost/leaked token; never restore it on failure
+  login PROVIDER [--remote USER@HOST]
+                             OAuth login on this computer, optionally install remotely
+  logout PROVIDER            Disable the provider and remove its session
   add PROVIDER [--auth api|oauth] [--model ID ...]
                              openai, chatgpt, github_copilot, xai, anthropic,
                              openrouter, ollama, zen, together
@@ -468,7 +485,7 @@ gateway_setup_local() {
         xai) if confirm 'Use xAI / SuperGrok subscription login instead of an API key?'; then mode=oauth; fi ;;
       esac
       confirm "Configure ${p} (${mode})?" || continue
-      if [[ "$mode" == oauth ]]; then gateway_with_lock gateway_login "$p" || return 1; fi
+      if [[ "$mode" == oauth && "$(gateway_oauth_status "$p")" != credentials-present ]]; then gateway_with_lock gateway_login "$p" || return 1; fi
       gateway_add "$p" --auth "$mode" || return 1
     done
   fi
@@ -506,4 +523,46 @@ gateway_provider_status_json() {
     providers=$(printf '%s\n' "$providers" | jq -c --arg p "$p" --argjson entry "$entry" '.[$p]=$entry') || return 1
   done < <(gateway_load_config | jq -r '.providers // {} | to_entries[] | select(.value.enabled) | [.key,(.value.auth // "local")] | @tsv')
   printf '%s\n' "$providers"
+}
+
+# Delete only Spark-owned recovery files after authenticated runtime/client checks.
+gateway_migration_cleanup() {
+  local backup="$SPARK_CONFIG_DIR/gateway-migration"
+  [[ -d "$backup" && ! -L "$backup" ]] || return 0
+  rm -f "$backup/gateway.json" "$backup/gateway.env" "$backup/litellm_config.yaml" || return 1
+  rmdir "$backup" || { err 'Recovery folder contains unexpected files; inspect it manually'; return 1; }
+}
+gateway_migration_restore_config() {
+  local backup="$SPARK_CONFIG_DIR/gateway-migration/gateway.json" restored p key env_key
+  [[ -f "$backup" ]] || return 0
+  restored=$(jq '.' "$backup") || return 1
+  for p in openrouter zen together openai xai anthropic; do
+    key=$(printf '%s\n' "$restored" | jq -r --arg p "$p" '.providers[$p].api_key // ""') || return 1
+    if [[ -n "$key" ]]; then
+      env_key=$(gateway_provider_env "$p") || return 1
+      gateway_env_set "$env_key" "$key" || return 1
+    fi
+  done
+  restored=$(printf '%s\n' "$restored" | jq 'if .providers then del(.providers[].api_key) else . end') || return 1
+  gateway_save_config "$restored"
+}
+# Incident recovery: regenerate without knowing the old token, fail closed.
+gateway_auth_reset_locked() {
+  local running=0 key
+  docker info >/dev/null 2>&1 || { err 'Cannot inspect LiteLLM; the previous token has NOT been revoked'; return 1; }
+  gateway_running_state && running=1
+  key="sk-$(openssl rand -hex 32)" || return 1
+  if [[ "$running" == 1 ]] && ! docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1; then
+    err 'Could not stop LiteLLM; the previous token has NOT been revoked'; return 1
+  fi
+  gateway_env_set LITELLM_MASTER_KEY "$key" && gateway_auth_ensure || return 1
+  if [[ "$running" == 1 ]]; then
+    if ! gateway_sync_locked; then
+      docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+      err 'Previous token revoked; replacement kept private, gateway stopped. Fix the error and run spark gateway start'; return 1
+    fi
+  elif ! gateway_sync_clients; then
+    err 'Previous token replaced; update managed clients before starting LiteLLM'; return 1
+  fi
+  info 'Gateway token regenerated; the previous token is revoked. Update unmanaged clients (auth show reveals the new token)'
 }
