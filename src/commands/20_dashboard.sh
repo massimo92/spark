@@ -75,10 +75,14 @@ dashboard_setup_html() {
 
 dashboard_services_html() {
   local gw_state="stopped" gw_detail ws_count
-  gateway_running_state && gw_state="running"
-  gw_detail="port $(gateway_configured_port) · providers $(gateway_provider_list)"
+  gateway_api_ready && gw_state="ready" || { gateway_running_state && gw_state="not-ready" || true; }
+  gw_detail="port $(gateway_configured_port) · auth $(gateway_auth_ready && printf configured || printf migration-required) · providers $(gateway_provider_list) · access $(gateway_access_json | jq -r .policy_status)"
   dashboard_panel_open "Services" "runtime"
   dashboard_row_html "$gw_state" "LiteLLM gateway" "$gw_detail"
+  local oauth_provider
+  for oauth_provider in chatgpt github_copilot xai; do
+    if [[ "$(gateway_load_config | jq -r --arg p "$oauth_provider" '.providers[$p].enabled and (.providers[$p].auth=="oauth")')" == true ]]; then dashboard_row_html "$gw_state" "$oauth_provider OAuth" "$(gateway_oauth_status "$oauth_provider")"; fi
+  done
   if docker_running; then dashboard_row_html ok "Docker" "running"; else dashboard_row_html missing "Docker" "not running"; fi
   if workspace_configured; then
     ws_count=$(workspace_service_count)
@@ -206,7 +210,7 @@ dashboard_write_html() {
   timestamp=$(date '+%Y-%m-%d %H:%M:%S')
   setup_summary=$(setup_status_summary)
   setup_state="partial"; [[ "$setup_summary" == */* && "$setup_summary" != *"missing:"* ]] && setup_state="ok"
-  gw_state="stopped"; gateway_running_state && gw_state="running"
+  gw_state="stopped"; gateway_api_ready && gw_state="ready" || { gateway_running_state && gw_state="not-ready" || true; }
   ws_state="missing"; workspace_configured && ws_state="configured"
   models_state="missing"
   if [[ "$BACKEND" == "vllm" && "$(count_running_vllm_models)" -gt 0 ]]; then models_state="running"; fi

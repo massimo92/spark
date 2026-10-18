@@ -20,7 +20,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.1.127"
+VERSION="0.1.129"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -1211,15 +1211,7 @@ gateway_configured_port() {
 }
 
 gateway_provider_list() {
-  local config providers=()
-  config=$(gateway_load_config 2>/dev/null || echo '{}')
-  command -v jq >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
-  [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false' 2>/dev/null)" == "true" ]] && providers+=("vLLM")
-  [[ "$(echo "$config" | jq -r '.providers.ollama.enabled // false' 2>/dev/null)" == "true" ]] && providers+=("Ollama")
-  [[ "$(echo "$config" | jq -r '.providers.openrouter.enabled // false' 2>/dev/null)" == "true" ]] && providers+=("OpenRouter")
-  [[ "$(echo "$config" | jq -r '.providers.zen.enabled // false' 2>/dev/null)" == "true" ]] && providers+=("Zen")
-  [[ "$(echo "$config" | jq -r '.providers.together.enabled // false' 2>/dev/null)" == "true" ]] && providers+=("Together")
-  if [[ ${#providers[@]} -eq 0 ]]; then printf 'none\n'; else (IFS=', '; printf '%s\n' "${providers[*]}"); fi
+  gateway_load_config | jq -r '[.providers // {} | to_entries[] | select(.value.enabled) | .key] | if length==0 then "none" else join(", ") end'
 }
 
 count_running_vllm_models() {

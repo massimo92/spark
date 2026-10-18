@@ -20,7 +20,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.1.127"
+VERSION="0.1.129"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -1211,15 +1211,7 @@ gateway_configured_port() {
 }
 
 gateway_provider_list() {
-  local config providers=()
-  config=$(gateway_load_config 2>/dev/null || echo '{}')
-  command -v jq >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
-  [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false' 2>/dev/null)" == "true" ]] && providers+=("vLLM")
-  [[ "$(echo "$config" | jq -r '.providers.ollama.enabled // false' 2>/dev/null)" == "true" ]] && providers+=("Ollama")
-  [[ "$(echo "$config" | jq -r '.providers.openrouter.enabled // false' 2>/dev/null)" == "true" ]] && providers+=("OpenRouter")
-  [[ "$(echo "$config" | jq -r '.providers.zen.enabled // false' 2>/dev/null)" == "true" ]] && providers+=("Zen")
-  [[ "$(echo "$config" | jq -r '.providers.together.enabled // false' 2>/dev/null)" == "true" ]] && providers+=("Together")
-  if [[ ${#providers[@]} -eq 0 ]]; then printf 'none\n'; else (IFS=', '; printf '%s\n' "${providers[*]}"); fi
+  gateway_load_config | jq -r '[.providers // {} | to_entries[] | select(.value.enabled) | .key] | if length==0 then "none" else join(", ") end'
 }
 
 count_running_vllm_models() {
@@ -2978,12 +2970,10 @@ run_publish_main() {
   gateway_set_main_model "$BACKEND" "$model" || \
     die "Could not update LiteLLM main to ${model}"
 
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    if ! (gateway_restart); then
-      gateway_save_config "$old_config"
-      (gateway_restart) >/dev/null 2>&1 || true
-      die "Could not restart LiteLLM after publishing ${model} as main"
-    fi
+  if ! gateway_sync || ! gateway_model_routed "$BACKEND" "$model" || ! gateway_route_smoke "$BACKEND" "$model"; then
+    gateway_save_config "$old_config"
+    gateway_sync >/dev/null 2>&1 || true
+    die "Could not publish ${model} as LiteLLM main; previous selection restored"
   fi
   info "LiteLLM main now targets ${BACKEND}/${model}"
 }
@@ -4270,6 +4260,8 @@ build_launch() {
     && add_vllm_flag_once --limit-mm-per-prompt '{"image":0}'
   [[ ${#vllm_passthrough_args[@]} -eq 0 ]] || vllm_args+=("${vllm_passthrough_args[@]}")
 
+  if gateway_protected; then set_vllm_flag_value --host 127.0.0.1; fi
+
   # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
   # set higher (by the provisioned swap) so the LOAD-time peak — the loader transiently needs ~2x the
   # weights — can spill into host swap and complete, instead of the container cgroup-OOMing mid-load.
@@ -4406,6 +4398,8 @@ run_backend_vllm() {
     fi
   fi
 
+  # Establish private gateway credentials before changing a real backend.
+  [[ "$dry_run" == 1 ]] || gateway_prepare_runtime vllm || return 1
   # Dry-runs never remove containers; cleanup happens only for a real launch.
 
 
@@ -4697,17 +4691,15 @@ run_backend_vllm() {
   printf "\n  Container '${BOLD}%s${NC}' started." "$cname"
   case "$serve_state" in
     ready)
-      printf " ${GREEN}✓ serving${NC}\n  Test: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$port" ;;
+      printf " ${GREEN}✓ backend ready${NC}\n" ;;
     timeout)
       printf "\n  ${YELLOW}⊘${NC} Still warming up after ${STARTUP_TIMEOUT}s — it may still come up. Follow: ${BOLD}spark logs %s${NC}\n\n" "$model" ;;
     *)
-      printf "\n  Logs: ${BOLD}spark logs %s${NC}  ·  Test: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$model" "$port" ;;
+      printf "\n  Logs: ${BOLD}spark logs %s${NC}  ·  Diagnose backend: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$model" "$port" ;;
   esac
 
-  # Auto-restart gateway if running so it picks up the new model
-  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != "1" ]] && \
-      docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    gateway_restart
+  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != 1 ]]; then
+    gateway_publish_model vllm "$model" "$([[ "$serve_state" == ready ]] && printf 1 || printf 0)" || return 1
   fi
 
   if [[ "$tail_logs" == "1" ]]; then
@@ -4943,18 +4935,6 @@ ollama_arch_kv() {
   awk -v L="$layers" -v H="$kvh" -v D="$kdim" -v T="$ctx" 'BEGIN{ printf "%.1f", (2*L*H*D*2*T)/1073741824 }'
 }
 
-# Enable the Ollama provider in the gateway config and refresh it if running.
-gateway_enable_ollama() {
-  local config
-  config=$(gateway_load_config)
-  config=$(printf '%s' "$config" | jq '.providers.ollama.enabled = true' 2>/dev/null) || return 0
-  gateway_save_config "$config"
-  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != "1" ]] && \
-      docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    gateway_restart
-  fi
-}
-
 # Ollama (native) — used on Apple Silicon and CPU hosts. Reads cmd_run's flag locals.
 # Ollama multiplexes models on one port (11434) and loads them on demand, so there is
 # no per-model container, port, or GPU-memory fraction; it manages memory itself.
@@ -4979,6 +4959,7 @@ run_backend_ollama() {
     return 0
   fi
 
+  gateway_prepare_runtime ollama || return 1
   command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark setup"
   ollama_reachable || warn "Ollama service not reachable on :11434 — is it running? (try: ollama serve)"
 
@@ -5014,12 +4995,10 @@ run_backend_ollama() {
     fi
   fi
 
-  # Route it through the gateway (enable provider + refresh if running).
-  gateway_enable_ollama
-
-  printf "\n"
-  printf "  Model ${BOLD}%s${NC} ready via Ollama.\n" "$model"
-  printf "  Gateway: ${DIM}call it as ${NC}${BOLD}ollama_chat/%s${NC}${DIM} on http://localhost:%s/v1${NC}\n\n" "$model" "$GATEWAY_PORT"
+  gateway_register_ollama "$model" || return 1
+  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != 1 ]]; then
+    gateway_publish_model ollama "$model" "$([[ "$no_wait" == 1 ]] && printf 0 || printf 1)" || return 1
+  fi
 
   [[ "$tail_logs" == "1" ]] && warn "--tail has no effect on the Ollama backend (Ollama runs as a shared service)"
   return 0
@@ -5100,7 +5079,11 @@ cmd_stop() {
   [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" == "1" ]] && refresh_gateway=0
 
   if [[ "$BACKEND" == "ollama" ]]; then
-    cmd_stop_ollama "$target"
+    local loaded_before
+    loaded_before=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}')
+    cmd_stop_ollama "$target" || return 1
+    gateway_forget_ollama "$target" "$loaded_before" || return 1
+    if [[ "$refresh_gateway" == 1 ]] && gateway_running_state; then gateway_sync; fi
     return
   fi
 
@@ -5376,7 +5359,7 @@ model_api_ready() {
 
 gateway_api_ready() {
   gateway_running_state || return 1
-  curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" >/dev/null 2>&1
+  gateway_curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" >/dev/null 2>&1
 }
 
 gateway_model_routed() {
@@ -5386,7 +5369,7 @@ gateway_model_routed() {
     ollama) id="ollama_chat/${model}" ;;
     *) return 1 ;;
   esac
-  out=$(curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" 2>/dev/null) || return 1
+  out=$(gateway_curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" 2>/dev/null) || return 1
   if command -v jq >/dev/null 2>&1; then
     printf '%s\n' "$out" | jq -e --arg id "$id" 'any(.data[]?; .id == $id)' >/dev/null 2>&1
   else
@@ -5421,18 +5404,20 @@ status_operational() {
 }
 
 status_models_json() {
-  local first=1 name model port need wt kv state now pk routed
+  local first=1 name model port need wt kv state now pk routed loaded_ollama
   printf '['
   if [[ "$BACKEND" == "ollama" ]]; then
+    loaded_ollama=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
     while IFS= read -r model; do
       [[ -n "$model" ]] || continue
       [[ "$first" == "1" ]] || printf ','
       first=0
-      if ollama_reachable; then state=ready; else state=unhealthy; fi
+      state=pending
+      if printf '%s\n' "$loaded_ollama" | grep -Fxq "$model"; then if ollama_reachable; then state=ready; else state=unhealthy; fi; fi
       if gateway_model_routed ollama "$model"; then routed=true; else routed=false; fi
       printf '{"name":"%s","engine":"ollama","state":"%s","endpoint":"http://localhost:11434/api","gateway_model":"ollama_chat/%s","gateway_routed":%s}' \
         "$(status_json_escape "$model")" "$state" "$(status_json_escape "$model")" "$routed"
-    done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
+    done < <({ printf '%s\n' "$loaded_ollama"; gateway_load_config | jq -r '.providers.ollama.models[]?'; } | sed '/^$/d' | sort -u)
   else
     while IFS=$'\t' read -r name model port need wt kv; do
       [[ -n "$name" ]] || continue
@@ -5455,9 +5440,10 @@ cmd_status_json() {
   status_operational && ok=true
   if gateway_api_ready; then gateway_state=ready; elif gateway_running_state; then gateway_state=not-ready; fi
   models=$(status_models_json)
-  printf '{"ok":%s,"backend":"%s","docker":"%s","gateway":{"state":"%s","port":%s,"endpoint":"http://localhost:%s/v1"},"models":%s}\n' \
+  printf '{"ok":%s,"backend":"%s","docker":"%s","gateway":{"state":"%s","port":%s,"endpoint":"http://localhost:%s/v1","authentication":"%s","providers":%s,"access":%s},"models":%s}\n' \
     "$ok" "$(status_json_escape "$BACKEND")" "$(docker_running && printf running || printf stopped)" \
-    "$gateway_state" "$(status_json_number "$(gateway_configured_port)")" "$(gateway_configured_port)" "$models"
+    "$gateway_state" "$(status_json_number "$(gateway_configured_port)")" "$(gateway_configured_port)" \
+    "$(gateway_auth_ready && printf configured || printf migration-required)" "$(gateway_provider_status_json)" "$(gateway_access_json)" "$models"
   [[ "$ok" == "true" ]]
 }
 
@@ -5953,10 +5939,14 @@ dashboard_setup_html() {
 
 dashboard_services_html() {
   local gw_state="stopped" gw_detail ws_count
-  gateway_running_state && gw_state="running"
-  gw_detail="port $(gateway_configured_port) · providers $(gateway_provider_list)"
+  gateway_api_ready && gw_state="ready" || { gateway_running_state && gw_state="not-ready" || true; }
+  gw_detail="port $(gateway_configured_port) · auth $(gateway_auth_ready && printf configured || printf migration-required) · providers $(gateway_provider_list) · access $(gateway_access_json | jq -r .policy_status)"
   dashboard_panel_open "Services" "runtime"
   dashboard_row_html "$gw_state" "LiteLLM gateway" "$gw_detail"
+  local oauth_provider
+  for oauth_provider in chatgpt github_copilot xai; do
+    if [[ "$(gateway_load_config | jq -r --arg p "$oauth_provider" '.providers[$p].enabled and (.providers[$p].auth=="oauth")')" == true ]]; then dashboard_row_html "$gw_state" "$oauth_provider OAuth" "$(gateway_oauth_status "$oauth_provider")"; fi
+  done
   if docker_running; then dashboard_row_html ok "Docker" "running"; else dashboard_row_html missing "Docker" "not running"; fi
   if workspace_configured; then
     ws_count=$(workspace_service_count)
@@ -6084,7 +6074,7 @@ dashboard_write_html() {
   timestamp=$(date '+%Y-%m-%d %H:%M:%S')
   setup_summary=$(setup_status_summary)
   setup_state="partial"; [[ "$setup_summary" == */* && "$setup_summary" != *"missing:"* ]] && setup_state="ok"
-  gw_state="stopped"; gateway_running_state && gw_state="running"
+  gw_state="stopped"; gateway_api_ready && gw_state="ready" || { gateway_running_state && gw_state="not-ready" || true; }
   ws_state="missing"; workspace_configured && ws_state="configured"
   models_state="missing"
   if [[ "$BACKEND" == "vllm" && "$(count_running_vllm_models)" -gt 0 ]]; then models_state="running"; fi
@@ -6731,6 +6721,7 @@ cmd_doctor() {
     doctor_skip "Gateway" "LiteLLM" "not configured"
   fi
 
+  doctor_checks_gateway_security
   failed=$(doctor_count fail)
   if [[ "$json_mode" == "1" ]]; then
     doctor_print_json
@@ -6738,6 +6729,28 @@ cmd_doctor() {
     doctor_print_human "$verbose"
   fi
   [[ "$failed" -eq 0 ]]
+}
+
+
+doctor_checks_gateway_security() {
+  gateway_configured || return 0
+  if gateway_auth_ready; then doctor_pass Gateway "Gateway token" configured; else doctor_fail Gateway "Gateway token" migration-required 'spark gateway start'; fi
+  if gateway_api_ready; then
+    if gateway_wait_ready; then doctor_pass Gateway "Authenticated API" 'valid token accepted; absent/invalid token rejected'; else doctor_fail Gateway "Authenticated API" 'authentication verification failed' 'spark gateway start'; fi
+  else
+    doctor_fail Gateway "Authenticated API" unavailable 'spark gateway start'
+  fi
+  local p findings config
+  config=$(gateway_load_config)
+  for p in chatgpt github_copilot xai; do
+    [[ "$(printf '%s\n' "$config" | jq -r --arg p "$p" '.providers[$p].enabled and (.providers[$p].auth=="oauth")')" == true ]] || continue
+    if [[ "$(gateway_oauth_status "$p")" == credentials-present ]]; then doctor_pass Gateway "$p OAuth" 'credentials present; account access checked on requests'; else doctor_fail Gateway "$p OAuth" login-required "spark gateway login $p"; fi
+  done
+  findings=$(gateway_exposure_findings)
+  if [[ -n "$findings" ]]; then doctor_fail Exposure "Direct model access" "$findings" 'spark gateway access protect; restart existing model aliases'; else doctor_pass Exposure "Direct model access" 'no detected public backend listeners or direct Serve routes'; fi
+  if [[ "$(printf '%s\n' "$config" | jq -r '.access.enabled // false')" == true ]]; then
+    if [[ "$(printf '%s\n' "$config" | jq -r '.access.policy_status')" == verified ]]; then doctor_pass Exposure "Tailnet policy" "verified at $(printf '%s\n' "$config" | jq -r '.access.verified_at')"; else doctor_skip Exposure "Tailnet policy" 'verification pending; apply policy tests, then spark gateway access verify'; fi
+  fi
 }
 # --- spark setup: configure a machine (local or remote) as a model server ---
 #
@@ -7132,91 +7145,33 @@ step_tailscale_funnel() {
   done
 }
 
-# The LiteLLM gateway runs in Docker on both backends. In --check we only verify Docker;
-# otherwise we enable this backend's provider (plus optional cloud providers) and start it.
+# Configure on the target itself: credentials and model inventory never come from the controller.
 step_gateway() {
-  local auto_yes="$1" check_only="$2"
-  if ctx_run 'docker info >/dev/null 2>&1'; then
-    info "Docker: available for the gateway"
-  elif [[ "$check_only" == "1" ]]; then
-    setup_fail "Docker not available — the LiteLLM gateway needs it"; return 0
-  elif [[ "$TGT_OS" == "Darwin" ]]; then
-    setup_manual_step "Install Docker Desktop (the gateway runs in a container): https://docs.docker.com/desktop/"; return 0
-  else
-    setup_fail "Docker not running — needed for the gateway"; return 0
+  local auto_yes="$1" check_only="$2" args=''
+  if ! ctx_run 'docker info >/dev/null 2>&1'; then
+    setup_fail 'Docker unavailable; required by LiteLLM'; return 0
   fi
-  [[ "$check_only" == "1" ]] && return 0
-
-  if [[ "$auto_yes" != "1" ]] && ! confirm "Set up the LiteLLM gateway (unified API for local + cloud models)?"; then
-    setup_skip "LiteLLM gateway"; return 0
-  fi
-
-  if ctx_run "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q 'ghcr.io/berriai/litellm'"; then
-    info "LiteLLM image present"
-  elif ctx_run "docker pull ${LITELLM_IMAGE}"; then
-    info "Pulled ${LITELLM_IMAGE}"
-  else
-    setup_fail "LiteLLM image pull failed"; return 0
-  fi
-
-  local prov="vllm"; [[ "$TGT_BACKEND" == "ollama" ]] && prov="ollama"
-  local gw_or=0 gw_zen=0 gw_tg=0 or_key="" zen_key="" tg_key=""
-  if [[ "$auto_yes" != "1" ]]; then
-    if confirm "Enable OpenRouter? (cloud, needs API key)"; then
-      printf "  OpenRouter API key (blank to skip): "; read -rs or_key; printf "\n"; [[ -n "$or_key" ]] && gw_or=1
-    fi
-    if confirm "Enable Zen / OpenCode? (cloud, needs API key)"; then
-      printf "  Zen API key (blank to skip): "; read -rs zen_key; printf "\n"; [[ -n "$zen_key" ]] && gw_zen=1
-    fi
-    if confirm "Enable Together AI? (cloud, needs API key)"; then
-      printf "  Together AI API key (blank to skip): "; read -rs tg_key; printf "\n"; [[ -n "$tg_key" ]] && gw_tg=1
-    fi
-  fi
-
-  local gw_json
-  gw_json=$(jq -n \
-    --argjson port "$GATEWAY_PORT" \
-    --argjson vllm_en "$( [[ "$prov" == "vllm" ]] && echo true || echo false )" \
-    --argjson ollama_en "$( [[ "$prov" == "ollama" ]] && echo true || echo false )" \
-    --argjson or_en "$( [[ "$gw_or" == "1" ]] && echo true || echo false )" --arg or_key "$or_key" \
-    --argjson zen_en "$( [[ "$gw_zen" == "1" ]] && echo true || echo false )" --arg zen_key "$zen_key" \
-    --argjson tg_en "$( [[ "$gw_tg" == "1" ]] && echo true || echo false )" --arg tg_key "$tg_key" \
-    '{enabled:true, port:$port, providers:{
-        vllm:{enabled:$vllm_en, port:8000},
-        ollama:{enabled:$ollama_en},
-        openrouter:{enabled:$or_en, api_key:$or_key},
-        zen:{enabled:$zen_en, api_key:$zen_key},
-        together:{enabled:$tg_en, api_key:$tg_key}
-      }}')
-
-  # gateway_save_config writes the controller copy used by gateway_generate_litellm_yaml.
-  gateway_save_config "$gw_json"
-
-  if [[ "$SETUP_TARGET" == "remote" ]]; then
-    ctx_run 'mkdir -p $HOME/.config/spark && chmod 700 $HOME/.config/spark'
-    printf '%s\n' "$gw_json" | ctx_write_file '$HOME/.config/spark/gateway.json'
-    ctx_run 'chmod 600 $HOME/.config/spark/gateway.json'
-    local yaml; yaml="$(gateway_generate_litellm_yaml)"
-    if [[ -n "$yaml" ]]; then
-      printf '%s\n' "$yaml" | ctx_write_file '$HOME/.config/spark/litellm_config.yaml'
-      ctx_run 'chmod 600 $HOME/.config/spark/litellm_config.yaml'
-    fi
-    local env_flags=""
-    [[ -n "$or_key" ]] && env_flags+=" -e OPENROUTER_API_KEY='${or_key}'"
-    [[ -n "$zen_key" ]] && env_flags+=" -e ZEN_API_KEY='${zen_key}'"
-    [[ -n "$tg_key" ]] && env_flags+=" -e TOGETHER_API_KEY='${tg_key}'"
-    ctx_run "docker rm -f ${GATEWAY_CONTAINER} 2>/dev/null || true"
-    if ctx_run "docker run -d --network host -v ~/.config/spark/litellm_config.yaml:/app/config.yaml ${env_flags} --name ${GATEWAY_CONTAINER} --restart unless-stopped ${LITELLM_IMAGE} --config /app/config.yaml --host 127.0.0.1 --port ${GATEWAY_PORT}"; then
-      info "LiteLLM gateway started on :${GATEWAY_PORT}"
+  if [[ "$check_only" == 1 ]]; then
+    if [[ "$SETUP_TARGET" == remote ]]; then
+      ctx_run '"$HOME/.local/bin/spark" gateway auth status' || setup_fail 'Gateway authentication requires migration'
     else
-      setup_fail "Gateway failed to start"
+      gateway_auth_ready || setup_fail 'Gateway authentication requires migration'
     fi
+    return 0
+  fi
+  [[ "$auto_yes" == 1 ]] || confirm 'Set up the authenticated LiteLLM gateway?' || { setup_skip 'LiteLLM gateway'; return 0; }
+  ctx_run "docker image inspect '${LITELLM_IMAGE}' >/dev/null 2>&1" || ctx_run "docker pull '${LITELLM_IMAGE}'" || { setup_fail 'LiteLLM image unavailable'; return 0; }
+  [[ "$auto_yes" != 1 ]] || args='--yes'
+  if [[ "$SETUP_TARGET" == remote ]]; then
+    # Native OAuth runs beside the browser. SSH transfers its session, never forwards a port.
+    if [[ "$auto_yes" != 1 ]] && confirm 'Configure xAI subscription OAuth in this computer browser for the remote server?'; then
+      gateway_login_remote xai "${REMOTE_USER}@${REMOTE_HOST}" || { setup_fail 'Local xAI OAuth failed'; return 0; }
+    fi
+    local rc=0
+    remote_in "\"\$HOME/.local/bin/spark\" gateway setup ${args}" || rc=$?
+    [[ "$rc" == 0 ]] || setup_fail 'Gateway setup failed on target'
   else
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-      ( gateway_restart ) >/dev/null 2>&1 && info "Gateway restarted" || warn "Could not restart the gateway"
-    else
-      ( gateway_start ) && info "LiteLLM gateway started on :${GATEWAY_PORT}" || warn "Start it later: spark gateway start"
-    fi
+    if [[ "$auto_yes" == 1 ]]; then gateway_setup_local --yes || setup_fail 'Gateway setup failed'; else gateway_setup_local || setup_fail 'Gateway setup failed'; fi
   fi
 }
 
@@ -7598,7 +7553,7 @@ ensure_local_tailscale() {
 # Copy this CLI to the remote so `spark` is available there too.
 deploy_spark_binary() {
   local self helper rv
-  self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
+  self="${BASH_SOURCE[0]}"
   helper="$(hf_model_inspect_path 2>/dev/null || true)"
   # Always overwrite the remote binary with this controller's copy, so the server runs the exact
   # same spark version every setup run (no stale CLI lingering on the server).
@@ -7908,9 +7863,9 @@ model_server_ensure_gateway_config() {
     '{enabled:true, port:$port, providers:{
       vllm:{enabled:$vllm_en, port:8000},
       ollama:{enabled:$ollama_en},
-      openrouter:{enabled:false, api_key:""},
-      zen:{enabled:false, api_key:""},
-      together:{enabled:false, api_key:""}
+      openrouter:{enabled:false},
+      zen:{enabled:false},
+      together:{enabled:false}
     }}') || return 1
   gateway_save_config "$gw_json"
   info "Configured LiteLLM gateway"
@@ -8687,15 +8642,19 @@ workspace_ensure_gateway() {
       '{enabled:true, port:$port, providers:{
         vllm:{enabled:$vllm_en, port:8000},
         ollama:{enabled:$ollama_en},
-        openrouter:{enabled:false, api_key:""},
-        zen:{enabled:false, api_key:""},
-        together:{enabled:false, api_key:""}
+        openrouter:{enabled:false},
+        zen:{enabled:false},
+        together:{enabled:false}
       }}')
     gateway_save_config "$gw_json"
     info "Configured LiteLLM gateway"
   fi
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    info "LiteLLM gateway: running"
+  if [[ "$check_only" != 1 ]]; then
+    gateway_prepare_runtime "$prov" || { setup_fail 'Could not configure gateway authentication'; return 1; }
+    gateway_sync || { setup_fail 'Could not synchronize authenticated gateway'; return 1; }
+  fi
+  if gateway_api_ready; then
+    info "LiteLLM gateway: authenticated and ready"
   elif [[ "$check_only" == "1" ]]; then
     setup_fail "LiteLLM gateway not running"
   elif [[ "$auto_yes" == "1" ]] || confirm "Start the LiteLLM gateway now?"; then
@@ -11938,6 +11897,8 @@ workspace_start_hermes_host_proxy() {
   local container="$1" listen_port="$2" target_port="$3" health_path="$4" host_header="${5:-}" attempts="${6:-30}"
   local bridge_ip proxy_script attempt curl_args=(-fsS --max-time 2)
   [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=30
+  local gateway_health=0
+  [[ "$container" != "$WORKSPACE_HERMES_GATEWAY_PROXY_CONTAINER" ]] || gateway_health=1
   bridge_ip=$(workspace_openshell_bridge_ip) || return 1
   proxy_script="${WORKSPACE_CONFIG_DIR}/hermes-host-proxy.py"
   mkdir -p "$WORKSPACE_CONFIG_DIR"
@@ -12007,7 +11968,11 @@ PY
     >/dev/null 2>&1 || return 1
   [[ -z "$host_header" ]] || curl_args+=(-H "Host: ${host_header}")
   for ((attempt = 1; attempt <= attempts; attempt++)); do
-    curl "${curl_args[@]}" "http://${bridge_ip}:${listen_port}${health_path}" >/dev/null 2>&1 && return 0
+    if [[ "$gateway_health" == 1 ]]; then
+      gateway_curl "${curl_args[@]}" "http://${bridge_ip}:${listen_port}${health_path}" >/dev/null 2>&1 && return 0
+    else
+      curl "${curl_args[@]}" "http://${bridge_ip}:${listen_port}${health_path}" >/dev/null 2>&1 && return 0
+    fi
     [[ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" == "true" ]] || return 1
     sleep 1
   done
@@ -12861,7 +12826,7 @@ workspace_setup_hermes() {
       NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
-      COMPATIBLE_API_KEY=dummy \
+      COMPATIBLE_API_KEY="$(gateway_managed_client_key)" \
       CHAT_UI_URL="$hermes_url" \
       nemohermes onboard --non-interactive --yes-i-accept-third-party-software \
         --yes \
@@ -12895,7 +12860,7 @@ workspace_setup_hermes() {
       NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
-      COMPATIBLE_API_KEY=dummy \
+      COMPATIBLE_API_KEY="$(gateway_managed_client_key)" \
       CHAT_UI_URL="$hermes_url" \
       bash -c 'curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash' || true
     if command -v nemohermes >/dev/null 2>&1 && workspace_start_hermes_gateway_proxy; then
@@ -14917,7 +14882,7 @@ workspace_litellm_model_routed() {
   litellm_model=$(workspace_read_env HERMES_MODEL 2>/dev/null || true)
   [[ -n "$litellm_model" ]] || return 1
   command -v curl >/dev/null 2>&1 || return 1
-  out=$(curl -fsS --max-time 5 "http://127.0.0.1:${GATEWAY_PORT}/v1/models" 2>/dev/null) || return 1
+  out=$(gateway_curl -fsS --max-time 5 "http://127.0.0.1:${GATEWAY_PORT}/v1/models" 2>/dev/null) || return 1
   printf '%s\n' "$out" | grep -Fq "\"${litellm_model}\""
 }
 
@@ -14941,7 +14906,7 @@ workspace_litellm_model_smoke() {
   command -v curl >/dev/null 2>&1 || return 1
   escaped_model=$(printf '%s' "$litellm_model" | sed 's/\\/\\\\/g; s/"/\\"/g')
   payload=$(printf '{"model":"%s","messages":[{"role":"user","content":"Reply with ok."}],"max_tokens":1,"temperature":0}' "$escaped_model")
-  out=$(curl -fsS --max-time "${SPARK_WORKSPACE_LITELLM_SMOKE_TIMEOUT:-60}" \
+  out=$(gateway_curl -fsS --max-time "${SPARK_WORKSPACE_LITELLM_SMOKE_TIMEOUT:-60}" \
     -H 'Content-Type: application/json' \
     -d "$payload" \
     "http://127.0.0.1:${GATEWAY_PORT}/v1/chat/completions" 2>/dev/null) || return 1
@@ -16478,7 +16443,6 @@ nemohermes_rebuild_with_workspace_env() {
 
   compatible_api_key="${COMPATIBLE_API_KEY:-}"
   [[ -n "$compatible_api_key" ]] || compatible_api_key=$(workspace_read_env COMPATIBLE_API_KEY 2>/dev/null || true)
-  [[ -n "$compatible_api_key" ]] || compatible_api_key=dummy
 
   base_url="${NEMOCLAW_ENDPOINT_URL:-$(workspace_read_env HERMES_LITELLM_BASE_URL 2>/dev/null || true)}"
   [[ -n "$base_url" ]] || base_url="http://host.openshell.internal:${GATEWAY_PORT}/v1"
@@ -16488,6 +16452,11 @@ nemohermes_rebuild_with_workspace_env() {
     "http://localhost:${GATEWAY_PORT}"*)
       base_url="http://host.openshell.internal:${GATEWAY_PORT}${base_url#http://localhost:"${GATEWAY_PORT}"}" ;;
   esac
+  case "$base_url" in
+    "http://host.openshell.internal:$(gateway_configured_port)/v1"*)
+      compatible_api_key=$(gateway_managed_client_key) || return 1 ;;
+  esac
+  [[ -n "$compatible_api_key" ]] || { err 'Compatible API key missing'; return 1; }
   if [[ "$SPARK_OS" == "Linux" ]]; then
     workspace_start_hermes_gateway_proxy || return 1
   fi
@@ -16516,12 +16485,11 @@ nemohermes_rebuild_with_workspace_env() {
     "NEMOCLAW_SANDBOX_READY_TIMEOUT=${NEMOCLAW_SANDBOX_READY_TIMEOUT:-600}"
     "NEMOCLAW_NO_GPU=${NEMOCLAW_NO_GPU:-1}"
     "NEMOCLAW_SANDBOX_GPU=${NEMOCLAW_SANDBOX_GPU:-0}"
-    "COMPATIBLE_API_KEY=${compatible_api_key}"
   )
   [[ -n "$model" ]] && env_args+=("NEMOCLAW_MODEL=${model}")
   [[ -n "$chat_ui_url" ]] && env_args+=("CHAT_UI_URL=${chat_ui_url}")
 
-  env "${env_args[@]}" nemohermes hermes rebuild "$@"
+  (export COMPATIBLE_API_KEY="$compatible_api_key"; env "${env_args[@]}" nemohermes hermes rebuild "$@")
 }
 
 docker_image_update_available() {
@@ -16930,6 +16898,7 @@ EOF
     else
       docker rm -f "$CONTAINER_NAME" "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
     fi
+    gateway_database_remove "$purge" "$dry_run" || true
     if workspace_configured; then
       if [[ "$dry_run" == "1" ]]; then
         printf "  would run docker compose down -v for workspace\n"
@@ -17107,7 +17076,7 @@ cmd_help() {
     list             List downloaded models
     rm <model> [...] Remove downloaded model(s)
     logs [<model>]   Show container logs (-f to follow)
-    gateway          Manage LiteLLM gateway and providers
+    gateway          Manage authenticated LiteLLM, providers, OAuth and private node access
     reinstall        Remove Spark state and run setup again
     uninstall        Remove Spark-managed runtime/config/data
     update [targets] Check and apply only real Spark, model, gateway, workspace, and NemoHermes updates
@@ -17238,17 +17207,16 @@ gateway_load_config() {
 }
 
 gateway_save_config() {
-  mkdir -p "$SPARK_CONFIG_DIR"
-  chmod 700 "$SPARK_CONFIG_DIR" 2>/dev/null || true
-  local old_umask
-  old_umask=$(umask)
-  umask 077
-  printf '%s\n' "$1" > "$GATEWAY_CONFIG"
-  chmod 600 "$GATEWAY_CONFIG"
-  umask "$old_umask"
+  local tmp
+  mkdir -p "$SPARK_CONFIG_DIR" && chmod 700 "$SPARK_CONFIG_DIR" || return 1
+  printf '%s\n' "$1" | jq -e 'type == "object"' >/dev/null || return 1
+  tmp=$(umask 077; mktemp "${GATEWAY_CONFIG}.tmp.XXXXXX") || return 1
+  printf '%s\n' "$1" > "$tmp"
+  chmod 600 "$tmp" && mv "$tmp" "$GATEWAY_CONFIG"
 }
 
-gateway_set_main_model() {
+gateway_set_main_model() { gateway_with_lock gateway_set_main_model_locked "$@"; }
+gateway_set_main_model_locked() {
   local provider="$1" model="$2" config updated
   config=$(gateway_load_config)
   updated=$(printf '%s\n' "$config" | jq --arg provider "$provider" --arg model "$model" \
@@ -17271,13 +17239,6 @@ gateway_provider_enabled() {
   echo "$config" | jq -r --arg p "$provider" '.providers[$p].enabled // false' 2>/dev/null
 }
 
-gateway_get_api_key() {
-  local provider="$1"
-  local config
-  config=$(gateway_load_config)
-  echo "$config" | jq -r --arg p "$provider" '.providers[$p].api_key // ""' 2>/dev/null
-}
-
 gateway_generate_litellm_yaml() {
   local config
   config=$(gateway_load_config)
@@ -17290,7 +17251,7 @@ gateway_generate_litellm_yaml() {
   local has_models=0
 
   # vLLM — one explicit entry per running model (routes to its own port),
-  # plus the wildcard passthrough for backwards compatibility.
+  # no wildcard that could resurrect a stopped local model.
   if [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]]; then
     local primary_port="" primary_model="" main_match=0 name model port rest
     while IFS=$'\t' read -r name model port rest; do
@@ -17318,7 +17279,7 @@ gateway_generate_litellm_yaml() {
     done < <(list_managed_containers)
     [[ -z "$primary_port" ]] && primary_port="$vllm_port"
 
-    if [[ -n "$primary_model" ]]; then
+    if [[ -n "$primary_model" && ( "$main_provider" == vllm && "$main_match" == 1 ) ]]; then
       yaml+="
   - model_name: \"main\"
     litellm_params:
@@ -17328,13 +17289,7 @@ gateway_generate_litellm_yaml() {
       main_added=1
     fi
 
-    yaml+="
-  - model_name: \"vllm/*\"
-    litellm_params:
-      model: \"openai/*\"
-      api_base: \"http://localhost:${primary_port}/v1\"
-      api_key: \"dummy\""
-    has_models=1
+
   fi
 
   # OpenRouter
@@ -17353,20 +17308,19 @@ gateway_generate_litellm_yaml() {
   if [[ "$(echo "$config" | jq -r '.providers.ollama.enabled // false')" == "true" ]]; then
     local ollama_host="localhost"
     [[ "$SPARK_OS" == "Darwin" ]] && ollama_host="host.docker.internal"
-    yaml+="
-  - model_name: \"ollama_chat/*\"
-    litellm_params:
-      model: \"ollama_chat/*\"
-      api_base: \"http://${ollama_host}:11434\""
-    has_models=1
-    if [[ "$main_added" == "0" && "$main_provider" == "ollama" && -n "$main_model" ]]; then
+    local ollama_model
+    while IFS= read -r ollama_model; do
+      [[ -n "$ollama_model" ]] || continue
       yaml+="
-  - model_name: \"main\"
-    litellm_params:
-      model: \"ollama_chat/${main_model}\"
-      api_base: \"http://${ollama_host}:11434\""
-      main_added=1
-    fi
+  - $(jq -nc --arg name "ollama_chat/$ollama_model" --arg base "http://${ollama_host}:11434" '{model_name:$name,litellm_params:{model:$name,api_base:$base}}')"
+      has_models=1
+      if [[ "$main_added" == 0 && "$main_provider" == ollama && "$main_model" == "$ollama_model" ]]; then
+        yaml+="
+  - $(jq -nc --arg model "ollama_chat/$ollama_model" --arg base "http://${ollama_host}:11434" '{model_name:"main",litellm_params:{model:$model,api_base:$base}}')"
+        main_added=1
+      fi
+    done < <(printf '%s\n' "$config" | jq -r '.providers.ollama.models[]?')
+
   fi
 
   # Zen (OpenCode)
@@ -17390,16 +17344,34 @@ gateway_generate_litellm_yaml() {
     has_models=1
   fi
 
-  if [[ "$has_models" -eq 0 ]]; then
-    return 1
-  fi
+  local provider cloud_model mode params
+  for provider in openai anthropic xai chatgpt github_copilot; do
+    [[ "$(printf '%s\n' "$config" | jq -r --arg p "$provider" '.providers[$p].enabled // false')" == true ]] || continue
+    mode=$(printf '%s\n' "$config" | jq -r --arg p "$provider" '.providers[$p].auth // "api"')
+    while IFS= read -r cloud_model; do
+      [[ -n "$cloud_model" ]] || continue
+      # JSON quoted scalars are valid YAML and prevent model names injecting settings.
+      params=$(jq -nc --arg name "$provider/$cloud_model" --arg mode "$mode" --arg p "$provider" \
+        '{model_name:$name,litellm_params:{model:$name}} |
+        if $mode == "oauth" and $p == "xai" then .litellm_params.use_xai_oauth=true
+        elif $mode == "api" then .litellm_params.api_key=("os.environ/" + ($p|ascii_upcase) + "_API_KEY")
+        else . end |
+        if $p == "chatgpt" then .model_info.mode="responses" else . end') || return 1
+      yaml+="
+  - ${params}"
+      has_models=1
+    done < <(printf '%s\n' "$config" | jq -r --arg p "$provider" '.providers[$p].models[]?')
+  done
 
+  [[ "$has_models" -gt 0 ]] || yaml='model_list: []'
   local port
   port=$(echo "$config" | jq -r '.port // 4000' 2>/dev/null)
   yaml+="
 
 general_settings:
-  master_key: null
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: false
 
 litellm_settings:
   drop_params: true
@@ -17636,44 +17608,6 @@ EOF
 }
 
 # --- Gateway ---
-cmd_gateway() {
-  local subcmd="${1:-}"
-  case "$subcmd" in
-    ""|help|-h|--help)
-      printf "\n  ${BOLD}Usage:${NC} spark gateway <start|stop|status|logs|add|remove>\n\n"
-      printf "  ${BOLD}Subcommands:${NC}\n"
-      printf "    start     Start the LiteLLM gateway container\n"
-      printf "    stop      Stop the LiteLLM gateway container\n"
-      printf "    status    Show gateway status and providers\n"
-      printf "    logs      Show gateway logs (-f to follow)\n"
-      printf "    add       Enable a provider (openrouter|ollama|zen|together)\n"
-      printf "    remove    Disable a provider\n"
-      printf "\n"
-      return 0
-      ;;
-  esac
-  shift
-
-  case "$subcmd" in
-    start)  gateway_start ;;
-    stop)   gateway_stop ;;
-    status) gateway_status ;;
-    logs)   gateway_logs "$@" ;;
-    add)    gateway_add "$@" ;;
-    remove) gateway_remove "$@" ;;
-    *)      die "Unknown gateway command: $subcmd" "Run 'spark gateway --help' for usage" ;;
-  esac
-}
-
-gateway_restart() {
-  docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1
-  docker rm "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
-  gateway_start
-}
-
-# Docker network flags for the gateway. Linux shares the host network (localhost reaches
-# local backends); macOS Docker Desktop can't, so publish the port and let the gateway
-# reach host backends via host.docker.internal.
 gateway_net_args() {
   local port="$1"
   if [[ "$SPARK_OS" == "Darwin" ]]; then
@@ -17681,73 +17615,6 @@ gateway_net_args() {
   else
     printf '%s\n' "--network" "host"
   fi
-}
-
-gateway_start() {
-  local config
-  config=$(gateway_load_config)
-
-  if [[ "$config" == "{}" || "$(echo "$config" | jq -r '.enabled // false')" != "true" ]]; then
-    die "Gateway not configured" "Run 'spark setup' to configure LiteLLM gateway"
-  fi
-
-  # Check if already running
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    warn "Gateway already running"
-    printf "    Stop first: ${BOLD}spark gateway stop${NC}\n"
-    return 0
-  fi
-
-  # Remove stopped container
-  docker rm -f "$GATEWAY_CONTAINER" 2>/dev/null || true
-
-  # Generate config
-  local litellm_yaml
-  litellm_yaml=$(gateway_generate_litellm_yaml)
-  if [[ -z "$litellm_yaml" ]]; then
-    die "No providers enabled" "Run 'spark setup' to configure providers"
-  fi
-
-  local litellm_config_path="${SPARK_CONFIG_DIR}/litellm_config.yaml"
-  mkdir -p "$SPARK_CONFIG_DIR"
-  chmod 700 "$SPARK_CONFIG_DIR" 2>/dev/null || true
-  local old_umask
-  old_umask=$(umask)
-  umask 077
-  printf '%s\n' "$litellm_yaml" > "$litellm_config_path"
-  chmod 600 "$litellm_config_path"
-  umask "$old_umask"
-
-  # Build env flags
-  local env_args=()
-  local key
-  key=$(gateway_get_api_key "openrouter")
-  [[ -n "$key" ]] && env_args+=("-e" "OPENROUTER_API_KEY=${key}")
-  key=$(gateway_get_api_key "zen")
-  [[ -n "$key" ]] && env_args+=("-e" "ZEN_API_KEY=${key}")
-  key=$(gateway_get_api_key "together")
-  [[ -n "$key" ]] && env_args+=("-e" "TOGETHER_API_KEY=${key}")
-
-  local port
-  port=$(echo "$config" | jq -r '.port // 4000' 2>/dev/null)
-
-  local net_args=()
-  while IFS= read -r _na; do net_args+=("$_na"); done < <(gateway_net_args "$port")
-
-  # Assemble one args array (bash 3.2 on macOS errors on "${empty[@]}" under set -u,
-  # so only splice env_args in when it is non-empty).
-  local run_args=(docker run -d "${net_args[@]}" -v "${litellm_config_path}:/app/config.yaml")
-  [[ ${#env_args[@]} -gt 0 ]] && run_args+=("${env_args[@]}")
-  run_args+=(--name "$GATEWAY_CONTAINER" --restart unless-stopped "$LITELLM_IMAGE"
-    --config /app/config.yaml)
-  [[ "$SPARK_OS" == "Linux" ]] && run_args+=(--host 127.0.0.1)
-  run_args+=(--port "$port")
-
-  printf "\n"
-  "${run_args[@]}" >/dev/null 2>&1 || die "Failed to start gateway container"
-
-  info "LiteLLM gateway started on port ${port}"
-  printf "    Test: ${DIM}curl localhost:${port}/v1/models${NC}\n\n"
 }
 
 gateway_stop() {
@@ -17759,37 +17626,6 @@ gateway_stop() {
   docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1
   docker rm "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
   info "Stopped gateway"
-}
-
-gateway_status() {
-  printf "\n"
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    local config
-    config=$(gateway_load_config)
-    local port
-    port=$(echo "$config" | jq -r '.port // 4000' 2>/dev/null)
-
-    printf "  ${GREEN}●${NC} LiteLLM gateway running (${GATEWAY_CONTAINER})\n"
-    printf "    Port:     %s\n" "$port"
-    printf "    API:      http://localhost:%s/v1\n" "$port"
-
-    printf "    Providers:"
-    local providers=()
-    [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]] && providers+=("vLLM")
-    [[ "$(echo "$config" | jq -r '.providers.openrouter.enabled // false')" == "true" ]] && providers+=("OpenRouter")
-    [[ "$(echo "$config" | jq -r '.providers.ollama.enabled // false')" == "true" ]] && providers+=("Ollama")
-    [[ "$(echo "$config" | jq -r '.providers.zen.enabled // false')" == "true" ]] && providers+=("Zen")
-    [[ "$(echo "$config" | jq -r '.providers.together.enabled // false')" == "true" ]] && providers+=("Together")
-
-    if [[ ${#providers[@]} -gt 0 ]]; then
-      printf " %s\n" "$(IFS=', '; echo "${providers[*]}")"
-    else
-      printf " none\n"
-    fi
-  else
-    printf "  ${DIM}○${NC} Gateway not running. Start with: ${BOLD}spark gateway start${NC}\n"
-  fi
-  printf "\n"
 }
 
 gateway_logs() {
@@ -17806,93 +17642,1156 @@ gateway_logs() {
     docker logs "$GATEWAY_CONTAINER"
   fi
 }
-
-gateway_add() {
-  local provider="${1:-}"
-  local valid_providers="openrouter ollama zen together"
-
-  if [[ -z "$provider" ]]; then
-    printf "\n  ${BOLD}Usage:${NC} spark gateway add <provider>\n\n"
-    printf "  ${BOLD}Available providers:${NC}\n"
-    printf "    openrouter   Cloud LLM gateway (requires API key)\n"
-    printf "    ollama       Local model runner (requires ollama on DGX)\n"
-    printf "    zen          OpenCode Zen cloud gateway (requires API key)\n"
-    printf "    together     Together AI cloud inference (requires API key)\n"
-    printf "\n"
-    return 0
-  fi
-
-  # shellcheck disable=SC2076
-  [[ " $valid_providers " =~ " $provider " ]] || die "Unknown provider: $provider" "Available: ${valid_providers// /, }"
-
-  local config
-  config=$(gateway_load_config)
-  if [[ "$config" == "{}" ]]; then
-    die "Gateway not configured" "Run 'spark setup' first to install the gateway"
-  fi
-
-  local already_enabled
-  already_enabled=$(echo "$config" | jq -r --arg p "$provider" '.providers[$p].enabled // false' 2>/dev/null)
-  if [[ "$already_enabled" == "true" ]]; then
-    warn "${provider} is already enabled"
-    return 0
-  fi
-
-  local api_key=""
-  if [[ "$provider" == "openrouter" || "$provider" == "zen" || "$provider" == "together" ]]; then
-    printf "  Enter %s API key: " "$provider"
-    read -rs api_key; printf "\n"
-    [[ -z "$api_key" ]] && die "API key is required for ${provider}"
-  fi
-
-  if [[ -n "$api_key" ]]; then
-    config=$(echo "$config" | jq --arg p "$provider" --arg k "$api_key" \
-      '.providers[$p].enabled = true | .providers[$p].api_key = $k')
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
+# Credentials stay outside generated JSON/YAML and never enter status output.
+gateway_secrets_path() { printf '%s/gateway.env\n' "$SPARK_CONFIG_DIR"; }
+gateway_env_get() {
+  local key="$1" file="${2:-$(gateway_secrets_path)}"
+  [[ -f "$file" ]] || return 1
+  awk -v key="$key" 'index($0,key "=")==1 {print substr($0,length(key)+2); exit}' "$file"
+}
+gateway_env_set() {
+  local key="$1" value="$2" file="${3:-$(gateway_secrets_path)}" tmp
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || return 1
+  mkdir -p "$SPARK_CONFIG_DIR" && chmod 700 "$SPARK_CONFIG_DIR" || return 1
+  tmp=$(umask 077; mktemp "${file}.tmp.XXXXXX") || return 1
+  if [[ -f "$file" ]]; then awk -v key="$key" 'index($0,key "=")!=1' "$file" > "$tmp"; fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  chmod 600 "$tmp" && mv "$tmp" "$file"
+}
+gateway_auth_terminal() { [[ -t 2 ]]; }
+gateway_auth_present_new() {
+  # Only receive freshly generated keys. Never reveal an existing stored key.
+  if gateway_auth_terminal; then
+    printf '\nNew LiteLLM token (shown once):\n%s\nSave it now in your password manager. Lost token? Run spark gateway auth rotate.\n\n' "$1" >&2
   else
-    config=$(echo "$config" | jq --arg p "$provider" '.providers[$p].enabled = true')
-  fi
-
-  gateway_save_config "$config"
-  info "Enabled ${provider}"
-
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    printf "  Restart gateway to apply: ${BOLD}spark gateway stop && spark gateway start${NC}\n"
+    printf 'New LiteLLM client key created; only its hash is saved, no token displayed without an interactive terminal. Run spark gateway auth rotate in a terminal (ssh -t for a remote command) to generate a replacement.\n' >&2
   fi
 }
-
-gateway_remove() {
-  local provider="${1:-}"
-  local valid_providers="openrouter ollama zen together"
-
-  if [[ -z "$provider" ]]; then
-    printf "\n  ${BOLD}Usage:${NC} spark gateway remove <provider>\n\n"
-    return 0
+gateway_auth_ensure() {
+  local key p env_key config migrated=0 ollama_models
+  # Provider secrets remain private; inference credentials live only as DB hashes.
+  mkdir -p "$SPARK_CONFIG_DIR" && chmod 700 "$SPARK_CONFIG_DIR" || return 1
+  if [[ ! -f "$(gateway_secrets_path)" ]]; then (umask 077; touch "$(gateway_secrets_path)") || return 1; fi
+  config=$(gateway_load_config) || return 1
+  [[ ! -L "$SPARK_CONFIG_DIR/gateway-migration" ]] || { err 'Recovery folder must not be a symlink'; return 1; }
+  # Keep credentials recoverable until the new gateway or a rollback is verified.
+  if [[ ! -d "$SPARK_CONFIG_DIR/gateway-migration" ]] && { [[ -f "$GATEWAY_CONFIG" ]] && grep -q '"api_key"' "$GATEWAY_CONFIG"; }; then
+    (umask 077
+      mkdir "$SPARK_CONFIG_DIR/gateway-migration" &&
+      cp "$GATEWAY_CONFIG" "$SPARK_CONFIG_DIR/gateway-migration/gateway.json" &&
+      cp "$(gateway_secrets_path)" "$SPARK_CONFIG_DIR/gateway-migration/gateway.env" &&
+      { [[ ! -f "$SPARK_CONFIG_DIR/litellm_config.yaml" ]] || cp "$SPARK_CONFIG_DIR/litellm_config.yaml" "$SPARK_CONFIG_DIR/gateway-migration/litellm_config.yaml"; }
+    ) || return 1
   fi
-
-  # shellcheck disable=SC2076
-  [[ " $valid_providers " =~ " $provider " ]] || die "Unknown provider: $provider" "Available: ${valid_providers// /, }"
-  [[ "$provider" == "vllm" ]] && die "Cannot remove vLLM — it is the core local provider"
-
-  local config
+  # Migrate old provider keys without displaying or passing them to Docker argv.
+  for p in openrouter zen together openai xai anthropic; do
+    env_key=$(gateway_provider_env "$p")
+    key=$(printf '%s\n' "$config" | jq -r --arg p "$p" '.providers[$p].api_key // ""')
+    if [[ -n "$key" ]]; then gateway_env_set "$env_key" "$key" || return 1; migrated=1; fi
+  done
+  if [[ "$migrated" == 1 ]]; then
+    config=$(printf '%s\n' "$config" | jq 'del(.providers[].api_key)') || return 1
+    gateway_save_config "$config" || return 1
+  fi
+  # Adopt a legacy wildcard installation once; explicit stop registries stay empty.
+  if [[ "$(printf '%s\n' "$config" | jq -r '.providers.ollama.enabled // false')" == true ]] && ! printf '%s\n' "$config" | jq -e '.providers.ollama | has("models")' >/dev/null; then
+    ollama_models=$({ ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true;
+      printf '%s\n' "$config" | jq -r 'select(.main.provider=="ollama") | .main.model // empty';
+    } | jq -Rn '[inputs | select(length>0)] | unique') || return 1
+    config=$(printf '%s\n' "$config" | jq --argjson models "$ollama_models" '.providers.ollama.models=$models') || return 1
+    gateway_save_config "$config" || return 1
+  fi
+  chmod 600 "$(gateway_secrets_path)"
+}
+gateway_with_lock() (
+  local lock="${SPARK_CONFIG_DIR}/gateway.lock" attempt cleanup_command
+  mkdir -p "$SPARK_CONFIG_DIR" && chmod 700 "$SPARK_CONFIG_DIR" || exit 1
+  for ((attempt=0; attempt<30; attempt++)); do
+    if mkdir "$lock" 2>/dev/null; then break; fi
+    local owner
+    owner=$(cat "$lock/pid" 2>/dev/null || true)
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true
+    fi
+    sleep 1
+  done
+  [[ "$attempt" -lt 30 ]] || { err 'Gateway busy; retry when the other command finishes'; exit 1; }
+  printf '%s\n' "${BASHPID:-$$}" > "$lock/pid"
+  # Capture the escaped path now: local variables can unwind before EXIT fires.
+  # shellcheck disable=SC2064
+  printf -v cleanup_command 'rm -f -- %q/pid; rmdir -- %q 2>/dev/null || true' "$lock" "$lock"
+  # shellcheck disable=SC2064
+  trap "$cleanup_command" EXIT
+  "$@"
+)
+gateway_provider_env() {
+  case "$1" in
+    openrouter) printf OPENROUTER_API_KEY ;; zen) printf ZEN_API_KEY ;;
+    together) printf TOGETHER_API_KEY ;; openai) printf OPENAI_API_KEY ;;
+    xai) printf XAI_API_KEY ;; anthropic) printf ANTHROPIC_API_KEY ;;
+    *) return 1 ;;
+  esac
+}
+gateway_provider_valid() {
+  case "$1" in vllm|ollama|openrouter|zen|together|openai|chatgpt|github_copilot|xai|anthropic) return 0 ;; *) return 1 ;; esac
+}
+gateway_curl() {
+  local key
+  key=$(gateway_auth_key) || return 1
+  [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
+  # Read authorization via stdin config, so the token is absent from process argv.
+  printf 'header = "Authorization: Bearer %s"\n' "$key" | curl --config - "$@"
+}
+gateway_wait_ready() {
+  local attempt tries="${SPARK_GATEWAY_READY_ATTEMPTS:-30}"
+  [[ "$tries" =~ ^[1-9][0-9]*$ ]] || return 1
+  for ((attempt=0; attempt<tries; attempt++)); do
+    if gateway_api_ready; then
+      # A working token is insufficient: anonymous model enumeration must fail.
+      local status
+      status=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(gateway_configured_port)/v1/models") || status=000
+      case "$status" in
+        401|403) ;; 2??|3??) err 'Gateway accepts anonymous requests'; return 1 ;;
+        *) sleep 1; continue ;; # Database/proxy may still be restarting.
+      esac
+      status=$(printf 'header = "Authorization: Bearer sk-invalid"\n' | curl --config - -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(gateway_configured_port)/v1/models") || status=000
+      case "$status" in
+        401|403) ;; 2??|3??) err 'Gateway accepts invalid tokens'; return 1 ;;
+        *) sleep 1; continue ;;
+      esac
+      return 0
+    fi
+    sleep 1
+  done
+  err 'LiteLLM did not become ready with authentication'; return 1
+}
+gateway_prepare_runtime() { gateway_with_lock gateway_prepare_runtime_locked "$@"; }
+gateway_prepare_runtime_locked() {
+  local provider="$1" config
   config=$(gateway_load_config)
-  if [[ "$config" == "{}" ]]; then
-    die "Gateway not configured"
+  [[ "$config" != '{}' ]] || config=$(jq -n --argjson port "$GATEWAY_PORT" '{enabled:true,port:$port,providers:{},protected:true}')
+  config=$(printf '%s\n' "$config" | jq --arg p "$provider" '.enabled=true | .protected=(if has("protected") then .protected else true end) | .providers[$p].enabled=true') || return 1
+  gateway_save_config "$config" && gateway_auth_ensure && gateway_preflight
+}
+gateway_publish_model() {
+  local provider="$1" model="$2" supervised="${3:-1}"
+  gateway_sync || { err "Backend active; gateway publication failed for ${model}"; return 1; }
+  if [[ "$supervised" == 1 ]]; then
+    gateway_model_routed "$provider" "$model" && gateway_route_smoke "$provider" "$model" || { err "Backend active; LiteLLM route missing for ${model}"; return 1; }
   fi
+  printf '  Gateway: http://localhost:%s/v1\n  Model: %s/%s\n' "$(gateway_configured_port)" "$([[ "$provider" == ollama ]] && printf ollama_chat || printf vllm)" "$model"
+  [[ "$supervised" == 1 ]] || printf '  State: pending backend readiness (spark status --json)\n'
+  printf '  Authentication: Bearer token saved at creation; if lost, spark gateway auth rotate\n'
+}
+gateway_protected() { gateway_load_config | jq -e '.protected != false' >/dev/null; }
 
-  config=$(echo "$config" | jq --arg p "$provider" \
-    '.providers[$p].enabled = false | .providers[$p].api_key = ""')
+gateway_oauth_dir() { printf '%s/oauth/%s\n' "$SPARK_CONFIG_DIR" "$1"; }
+gateway_oauth_env() {
+  case "$1" in chatgpt) printf CHATGPT_TOKEN_DIR ;; github_copilot) printf GITHUB_COPILOT_TOKEN_DIR ;; xai) printf XAI_OAUTH_TOKEN_DIR ;; *) return 1 ;; esac
+}
+gateway_oauth_file() {
+  case "$1" in github_copilot) printf access-token ;; chatgpt|xai) printf auth.json ;; *) return 1 ;; esac
+}
+gateway_oauth_status() {
+  local p="$1" dir file
+  dir=$(gateway_oauth_dir "$p"); file=$(gateway_oauth_file "$p") || return 1
+  if [[ -s "$dir/$file" ]]; then printf credentials-present; else printf login-required; fi
+}
+gateway_capabilities() {
+  local p="${1:-base}" image="${2:-$LITELLM_IMAGE}" script
+  case "$p" in
+    keys) script='import prisma, litellm_proxy_extras; from litellm.proxy._types import GenerateKeyRequest; assert "allowed_routes" in GenerateKeyRequest.model_fields; assert "key" in GenerateKeyRequest.model_fields' ;;
+    base) script='import importlib.metadata; print(importlib.metadata.version("litellm"))' ;;
+    chatgpt) script='from litellm.llms.chatgpt.authenticator import Authenticator; assert callable(Authenticator().get_access_token)' ;;
+    github_copilot) script='from litellm.llms.github_copilot.authenticator import Authenticator; assert callable(Authenticator().get_access_token)' ;;
+    xai) script='import inspect; from litellm.llms.xai.oauth import XAIOAuthAuthenticator; from litellm.llms.xai.chat import transformation; assert callable(XAIOAuthAuthenticator().login); assert callable(XAIOAuthAuthenticator._start_callback_server); assert "use_xai_oauth" in inspect.getsource(transformation)' ;;
+    *) return 1 ;;
+  esac
+  docker run --rm --entrypoint python "$image" -c "$script" 2>/dev/null
+}
+gateway_login_local() {
+  local p="${1:-}" dir env_key script net_args=()
+  if [[ "$p" == xai && -n "${SSH_CONNECTION:-}" ]]; then
+    err 'Run xAI OAuth on the computer with your browser: spark gateway login xai --remote USER@SERVER (no tunnel)'; return 1
+  fi
+  env_key=$(gateway_oauth_env "$p") || { err 'Login providers: chatgpt, github_copilot, xai'; return 1; }
+  gateway_capabilities "$p" >/dev/null || { err "Installed LiteLLM lacks ${p} login; run spark update --litellm"; return 1; }
+  dir=$(gateway_oauth_dir "$p")
+  mkdir -p "$dir" && chmod 700 "$SPARK_CONFIG_DIR" "${SPARK_CONFIG_DIR}/oauth" "$dir" || return 1
+  if [[ "$p" == xai ]]; then
+    if [[ "$SPARK_OS" == Linux ]]; then net_args=(--network host); else net_args=(-p 127.0.0.1:56121:56121); fi
+  fi
+  case "$p" in
+    chatgpt) script='from litellm.llms.chatgpt.authenticator import Authenticator; Authenticator().get_access_token()' ;;
+    github_copilot) script='from litellm.llms.github_copilot.authenticator import Authenticator; Authenticator().get_access_token()' ;;
+    xai) script='from urllib.parse import urlparse
+from litellm.llms.xai.oauth import XAIOAuthAuthenticator
+original = XAIOAuthAuthenticator._start_callback_server
+def fixed_callback(self, state):
+    server, uri = original(self, state)
+    if urlparse(uri).hostname != "127.0.0.1" or urlparse(uri).port != 56121:
+        server.server_close()
+        raise RuntimeError("xAI callback must use 127.0.0.1:56121; free the port and retry")
+    return server, uri
+XAIOAuthAuthenticator._start_callback_server = fixed_callback
+XAIOAuthAuthenticator().login(no_browser=True)'
+      printf 'OAuth opens a callback on this computer only (127.0.0.1:56121). Complete the login in your local browser.\n' ;;
+  esac
+  docker run --rm -i --user "$(id -u):$(id -g)" -e HOME=/tmp ${net_args[@]+"${net_args[@]}"} -v "${dir}:/tokens" -e "${env_key}=/tokens" --entrypoint python "$LITELLM_IMAGE" -c "$script" || return 1
+  [[ "$(gateway_oauth_status "$p")" == credentials-present ]] || { err 'Login produced no credentials'; return 1; }
+  chmod 600 "$dir"/*
+  info "${p} credentials saved; enable models with spark gateway add ${p}"
+}
+gateway_logout() {
+  local p="${1:-}" dir file config
+  file=$(gateway_oauth_file "$p") || return 1
+  config=$(gateway_load_config)
+  # Disable before removing credentials; restore the previous route if sync fails.
+  gateway_save_config "$(printf '%s\n' "$config" | jq --arg p "$p" '.providers[$p].enabled=false')" || return 1
+  if gateway_running_state && ! gateway_sync_locked; then gateway_save_config "$config"; return 1; fi
+  dir=$(gateway_oauth_dir "$p")
+  rm -f "$dir/$file" "$dir/api-key.json"
+  info "${p} logged out"
+}
 
-  gateway_save_config "$config"
-  info "Disabled ${provider}"
-
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    printf "  Restart gateway to apply: ${BOLD}spark gateway stop && spark gateway start${NC}\n"
+gateway_sync() { gateway_with_lock gateway_sync_locked; }
+gateway_sync_locked() {
+  local path="${SPARK_CONFIG_DIR}/litellm_config.yaml" previous="" yaml tmp running=0 previous_image=""
+  if [[ "${SPARK_GATEWAY_DEFER_CLIENT:-0}" != 1 ]] && gateway_load_config | jq -e '.auth.recovery_required==true' >/dev/null; then
+    err 'Recover the interrupted token change first: spark gateway auth rotate'; return 1
+  fi
+  gateway_auth_ensure && gateway_preflight || return 1
+  [[ -f "$path" ]] && previous=$(cat "$path")
+  yaml=$(gateway_generate_litellm_yaml) || return 1
+  previous_image=$(docker inspect "$GATEWAY_CONTAINER" --format '{{.Image}}' 2>/dev/null || true)
+  if gateway_running_state; then
+    running=1
+    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure && gateway_migration_cleanup; return $?; fi
+  fi
+  tmp=$(umask 077; mktemp "${path}.tmp.XXXXXX") || return 1
+  printf '%s\n' "$yaml" > "$tmp"
+  chmod 600 "$tmp" && mv "$tmp" "$path" || return 1
+  if [[ "$running" == 1 ]]; then
+    docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || return 1
+  fi
+  if gateway_start_container && gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure; then gateway_migration_cleanup; return $?; fi
+  err 'Gateway update failed; restoring the previous rendered routes'
+  docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+  # Never restore anonymous access during the first migration.
+  if [[ -n "$previous" ]] && ! printf '%s\n' "$previous" | grep -Eq '^[[:space:]]*master_key: ("?os.environ/LITELLM_MASTER_KEY"?)$'; then
+    err 'Legacy anonymous gateway left stopped; fix the failure and run spark gateway start'
+    return 1
+  fi
+  if [[ -n "$previous" ]]; then
+    tmp=$(umask 077; mktemp "${path}.tmp.XXXXXX") || return 1
+    printf '%s\n' "$previous" > "$tmp"
+    chmod 600 "$tmp" && mv "$tmp" "$path" || return 1
+    docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+    if gateway_migration_restore_config && GATEWAY_RESTORE_IMAGE="$previous_image" gateway_start_container && gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure; then
+      gateway_migration_cleanup || return 1
+    else
+      err 'Previous gateway routes could not be verified; private recovery backup retained'
+    fi
+  fi
+  return 1
+}
+gateway_restart() { gateway_sync; }
+gateway_start() {
+  gateway_configured || { err 'Gateway not configured; run spark setup'; return 1; }
+  gateway_sync
+}
+gateway_start_container() {
+  local port net_args=() run_args=() p dir env_key mode config runtime_script env_file rc=0
+  config=$(gateway_load_config)
+  port=$(gateway_configured_port)
+  [[ "$port" =~ ^[0-9]+$ && "$port" -gt 0 && "$port" -le 65535 ]] || return 1
+  while IFS= read -r p; do net_args+=("$p"); done < <(gateway_net_args "$port")
+  gateway_database_prepare && gateway_database_migrate || return 1
+  run_args=()
+  for p in chatgpt github_copilot xai; do
+    mode=$(printf '%s\n' "$config" | jq -r --arg p "$p" '.providers[$p].auth // "api"')
+    if gateway_provider_enabled "$p" | grep -qx true && { [[ "$p" != xai ]] || [[ "$mode" == oauth ]]; }; then
+      gateway_capabilities "$p" >/dev/null || { err "LiteLLM image lacks ${p} authentication"; return 1; }
+      [[ "$(gateway_oauth_status "$p")" == credentials-present ]] || { err "Run spark gateway login ${p} first"; return 1; }
+      dir=$(gateway_oauth_dir "$p"); env_key=$(gateway_oauth_env "$p")
+      run_args+=(-v "${dir}:/tokens/${p}" -e "${env_key}=/tokens/${p}")
+      [[ "$p" != xai ]] || run_args+=(-e XAI_API_KEY=)
+    fi
+  done
+  # Strip the legacy administrative key before passing provider env to Docker.
+  env_file=$(umask 077; mktemp "$SPARK_CONFIG_DIR/gateway-runtime.env.XXXXXX") || return 1
+  awk 'index($0,"LITELLM_MASTER_KEY=")!=1 && index($0,"DATABASE_URL=")!=1' "$(gateway_secrets_path)" > "$env_file"
+  runtime_script='import os, secrets, sys
+os.umask(0o077)
+key = "sk-" + secrets.token_hex(32)
+with open("/run/spark/master-key", "w") as f:
+    f.write(key)
+os.environ["LITELLM_MASTER_KEY"] = key
+os.environ.pop("LITELLM_SALT_KEY", None)
+os.execvp("litellm", ["litellm"] + sys.argv[1:])'
+  run_args=(docker run -d "${net_args[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp --env-file "$env_file"
+    --ulimit core=0:0 --tmpfs "/run/spark:rw,noexec,nosuid,size=1m,mode=0700,uid=$(id -u),gid=$(id -g)"
+    -e 'DATABASE_URL=postgresql://spark@localhost/litellm?host=/var/run/postgresql'
+    -e DISABLE_SCHEMA_UPDATE=true
+    -v "$(gateway_database_name)-socket:/var/run/postgresql"
+    -v "${SPARK_CONFIG_DIR}/litellm_config.yaml:/app/config.yaml:ro" ${run_args[@]+"${run_args[@]}"})
+  docker rm "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
+  run_args+=(--name "$GATEWAY_CONTAINER" --label io.spark.auth-mode=virtual-keys --restart unless-stopped --entrypoint python "${GATEWAY_RESTORE_IMAGE:-$LITELLM_IMAGE}" -c "$runtime_script" --config /app/config.yaml)
+  [[ "$SPARK_OS" != Linux ]] || run_args+=(--host 127.0.0.1)
+  run_args+=(--port "$port")
+  "${run_args[@]}" >/dev/null 2>&1 || rc=$?
+  rm -f "$env_file"
+  [[ "$rc" == 0 ]] || { err 'LiteLLM container failed to start; inspect spark gateway logs'; return 1; }
+}
+gateway_sync_clients() {
+  local key
+  [[ -f "${WORKSPACE_ENV_FILE:-/nonexistent}" ]] || return 0
+  gateway_managed_client_endpoint "${NEMOCLAW_ENDPOINT_URL:-$(workspace_read_env HERMES_LITELLM_BASE_URL 2>/dev/null || true)}" || return 0
+  key=$(gateway_managed_client_key) || return 1
+  # Rebuild only a running managed sandbox whose token is stale. Rebuild reads
+  # the private workspace env; arbitrary external endpoints are not changed.
+  if command -v nemohermes >/dev/null 2>&1 && workspace_hermes_running; then
+    local digest marker="${SPARK_CONFIG_DIR}/hermes-gateway-token.sha256"
+    digest=$(printf '%s' "$key" | shasum -a 256 | awk '{print $1}')
+    if [[ ! -f "$marker" || "$(cat "$marker")" != "$digest" ]]; then
+      nemohermes_rebuild_with_workspace_env >/dev/null 2>&1 || { err 'Could not update Hermes gateway authentication'; return 1; }
+      printf '%s\n' "$digest" > "$marker"; chmod 600 "$marker"
+    fi
   fi
 }
+gateway_auth_command() {
+  case "${1:-status}" in
+    status) gateway_auth_ready && printf 'authentication: configured\n' || { printf 'authentication: migration-required\n'; return 1; } ;;
+    rotate) [[ $# == 1 ]] || return 1; gateway_auth_rotate ;;
+    *) err 'Usage: spark gateway auth <status|rotate>'; return 1 ;;
+  esac
+}
+gateway_add() { gateway_with_lock gateway_add_locked "$@"; }
+gateway_add_locked() {
+  local p="${1:-}" mode=api models_json='' key='' env_key config old model
+  [[ -n "$p" ]] || { printf 'Providers: ollama, openrouter, zen, together, openai, chatgpt, github_copilot, xai, anthropic\n'; return 0; }
+  gateway_provider_valid "$p" && [[ "$p" != vllm ]] || { err "Unknown provider: ${p}"; return 1; }
+  shift
+  case "$p" in chatgpt|github_copilot) mode=oauth ;; esac
+  local names=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --auth) [[ $# -ge 2 ]] || return 1; mode="$2"; shift 2 ;;
+      --model) [[ $# -ge 2 && -n "$2" ]] || return 1; names+=("$2"); shift 2 ;;
+      *) err "Unknown provider option: $1"; return 1 ;;
+    esac
+  done
+  case "$mode" in api) [[ "$p" != chatgpt && "$p" != github_copilot ]] || return 1 ;; oauth) gateway_oauth_env "$p" >/dev/null || return 1 ;; *) return 1 ;; esac
+  gateway_prepare_runtime_locked "$BACKEND" || return 1
+  config=$(gateway_load_config); old="$config"
+  if [[ "$mode" == oauth ]]; then
+    gateway_capabilities "$p" >/dev/null || { err "Image lacks ${p} OAuth support"; return 1; }
+    [[ "$(gateway_oauth_status "$p")" == credentials-present ]] || { err "Run spark gateway login ${p} first"; return 1; }
+  elif env_key=$(gateway_provider_env "$p"); then
+    key=$(gateway_env_get "$env_key" 2>/dev/null || true)
+    if [[ -z "$key" && -n "${!env_key:-}" ]]; then
+      key="${!env_key}"; gateway_env_set "$env_key" "$key" || return 1
+    fi
+    if [[ -z "$key" ]]; then
+      printf '  %s API key: ' "$p" >&2; IFS= read -rs key || return 1; printf '\n' >&2
+      [[ -n "$key" ]] && gateway_env_set "$env_key" "$key" || return 1
+    fi
+  fi
+  case "$p" in
+    openai|xai|anthropic|chatgpt|github_copilot)
+      if [[ ${#names[@]} == 0 ]]; then
+        printf '  Model ID (available in your account): ' >&2; IFS= read -r model || return 1
+        [[ -n "$model" ]] || return 1; names+=("$model")
+      fi ;;
+  esac
+  models_json=$(printf '%s\n' "$old" | jq -c --arg p "$p" '.providers[$p].models // []') || return 1
+  for model in ${names[@]+"${names[@]}"}; do
+    [[ "$model" != *$'\n'* && "$model" != *$'\r'* && "$model" != '*' && "$model" != */'*' ]] || return 1
+    models_json=$(printf '%s\n' "$models_json" | jq --arg model "${model#"$p"/}" '. + [$model] | unique') || return 1
+  done
+  config=$(printf '%s\n' "$config" | jq --arg p "$p" --arg auth "$mode" --argjson models "$models_json" '.providers[$p]={enabled:true,auth:$auth,models:$models}') || return 1
+  gateway_save_config "$config" || return 1
+  if gateway_running_state && ! gateway_sync_locked; then gateway_save_config "$old"; return 1; fi
+  info "Enabled ${p} (${mode}); start with spark gateway start"
+}
+gateway_remove() { gateway_with_lock gateway_remove_locked "$@"; }
+gateway_remove_locked() {
+  local p="${1:-}" old config
+  gateway_provider_valid "$p" && [[ "$p" != vllm ]] || { err 'Cannot remove this provider'; return 1; }
+  old=$(gateway_load_config)
+  config=$(printf '%s\n' "$old" | jq --arg p "$p" '.providers[$p].enabled=false') || return 1
+  gateway_save_config "$config" || return 1
+  if gateway_running_state && ! gateway_sync_locked; then gateway_save_config "$old"; return 1; fi
+  info "Disabled ${p}"
+}
+gateway_status() {
+  local config state=stopped
+  config=$(gateway_load_config)
+  gateway_api_ready && state=ready || { gateway_running_state && state=not-ready || true; }
+  printf 'LiteLLM: %s\nAPI: http://localhost:%s/v1\n' "$state" "$(gateway_configured_port)"
+  printf 'Authentication: %s\n' "$(gateway_auth_ready && printf configured || printf migration-required)"
+  printf '%s\n' "$config" | jq -r '.providers // {} | to_entries[] | select(.value.enabled) | "Provider: \(.key) (\(.value.auth // "local"))"'
+  local p
+  for p in chatgpt github_copilot xai; do
+    if gateway_provider_enabled "$p" | grep -qx true && { [[ "$p" != xai ]] || [[ "$(printf '%s\n' "$config" | jq -r '.providers.xai.auth')" == oauth ]]; }; then printf '%s OAuth: %s\n' "$p" "$(gateway_oauth_status "$p")"; fi
+  done
+  gateway_access_status
+}
+cmd_gateway() {
+  local cmd="${1:-help}"; [[ $# == 0 ]] || shift
+  case "$cmd" in
+    setup) gateway_setup_local "$@" ;; start) gateway_start ;; stop) gateway_with_lock gateway_stop ;; status) gateway_status ;; logs) gateway_logs "$@" ;;
+    add) gateway_add "$@" ;; remove) gateway_remove "$@" ;; auth) gateway_auth_command "$@" ;;
+    login) gateway_with_lock gateway_login "$@" ;; import-session) gateway_with_lock gateway_import_session "$@" ;; logout) gateway_with_lock gateway_logout "$@" ;;
+    capabilities) gateway_capabilities "${1:-base}" "$(gateway_runtime_image)" ;; access) gateway_access_command "$@" ;;
+    help|--help|-h)
+      cat <<'HELP'
+Usage: spark gateway <setup|start|stop|status|logs|add|remove|auth|login|logout|capabilities|access>
+  setup [--yes]             Configure local providers, authentication and access
+  auth status                Check authentication configuration
+  auth rotate                Replace the inference token (shown once)
+  login PROVIDER [--remote USER@HOST]
+                             OAuth login on this computer, optionally install remotely
+  logout PROVIDER            Disable the provider and remove its session
+  add PROVIDER [--auth api|oauth] [--model ID ...]
+                             openai, chatgpt, github_copilot, xai, anthropic,
+                             openrouter, ollama, zen, together
+  capabilities [PROVIDER]    Inspect installed LiteLLM version/login capability
+  access nodes|allow|policy|enable|disable|status|protect|probe|verify
+                             HTTPS access and Tailscale policy workflow
+Provider API keys are read with hidden input; subscriptions use a separate login.
+New gateway tokens appear once in an interactive terminal; save them immediately.
+Stored tokens cannot be displayed by the CLI. Lost token? Use auth rotate.
+Claude Pro/Max is not offered as a general gateway API.
+HELP
+      ;;
+    *) err "Unknown gateway command: $cmd"; return 1 ;;
+  esac
+}
+
+# Validate the proposed configuration before interrupting a working proxy.
+gateway_preflight() {
+  local config p mode env_key key
+  config=$(gateway_load_config) || return 1
+  gateway_capabilities keys >/dev/null || { err 'LiteLLM image lacks PostgreSQL virtual-key support'; return 1; }
+  printf '%s\n' "$config" | jq -e '.port // 4000 | type=="number" and .>0 and .<=65535' >/dev/null || return 1
+  for p in openrouter zen together openai anthropic xai chatgpt github_copilot; do
+    [[ "$(gateway_provider_enabled "$p")" == true ]] || continue
+    mode=$(printf '%s\n' "$config" | jq -r --arg p "$p" '.providers[$p].auth // (if $p=="chatgpt" or $p=="github_copilot" then "oauth" else "api" end)')
+    if [[ "$mode" == oauth ]]; then
+      gateway_capabilities "$p" >/dev/null && [[ "$(gateway_oauth_status "$p")" == credentials-present ]] || { err "Provider ${p} requires supported login: spark gateway login ${p}"; return 1; }
+    else
+      env_key=$(gateway_provider_env "$p") || return 1
+      key=$(gateway_env_get "$env_key" 2>/dev/null || true)
+      [[ -n "$key" ]] || { err "Provider ${p} needs an API key: spark gateway add ${p}"; return 1; }
+    fi
+  done
+}
+gateway_register_ollama() { gateway_with_lock gateway_register_ollama_locked "$@"; }
+gateway_register_ollama_locked() {
+  local config
+  config=$(gateway_load_config) || return 1
+  gateway_save_config "$(printf '%s\n' "$config" | jq --arg m "$1" '.providers.ollama.enabled=true | .providers.ollama.models=((.providers.ollama.models // []) + [$m] | unique)')"
+}
+gateway_forget_ollama() { gateway_with_lock gateway_forget_ollama_locked "$@"; }
+gateway_forget_ollama_locked() {
+  gateway_configured || return 0
+  local target="$1" loaded="$2" config
+  [[ -n "$target" ]] || target="$loaded"
+  config=$(gateway_load_config) || return 1
+  if [[ "$target" == --all ]]; then
+    config=$(printf '%s\n' "$config" | jq '.providers.ollama.models=[]') || return 1
+  else
+    config=$(printf '%s\n' "$config" | jq --arg m "$target" '.providers.ollama.models=((.providers.ollama.models // []) | map(select(.!=$m)))') || return 1
+  fi
+  gateway_save_config "$config"
+}
+gateway_route_smoke() {
+  local provider="$1" model="$2" id payload out
+  [[ "$provider" == ollama ]] && id="ollama_chat/$model" || id="vllm/$model"
+  payload=$(jq -nc --arg id "$id" '{model:$id,messages:[{role:"user",content:"Reply OK"}],max_tokens:1,stream:false}') || return 1
+  out=$(gateway_curl -fsS --max-time "${SPARK_GATEWAY_SMOKE_TIMEOUT:-60}" -H 'Content-Type: application/json' --data "$payload" "http://127.0.0.1:$(gateway_configured_port)/v1/chat/completions" 2>/dev/null) || return 1
+  printf '%s\n' "$out" | jq -e '(.choices | type)=="array" and (.choices|length)>0' >/dev/null
+}
+gateway_setup_local() {
+  local auto=0 p mode nodes
+  [[ $# == 0 ]] || { [[ $# == 1 && "$1" == --yes ]] || return 1; auto=1; }
+  gateway_prepare_runtime "$BACKEND" || return 1
+  # Adopt existing Ollama models on first migration; preserve an explicit registry.
+  if [[ "$BACKEND" == ollama ]] && ! gateway_load_config | jq -e '.providers.ollama | has("models")' >/dev/null; then
+    while IFS= read -r p; do [[ -z "$p" ]] || gateway_register_ollama "$p" || return 1; done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}')
+  fi
+  if [[ "$auto" == 0 ]]; then
+    printf 'API accounts and subscriptions use separate credentials. Models depend on your account.\n'
+    for p in openai chatgpt github_copilot xai anthropic openrouter zen together; do
+      mode=api
+      case "$p" in
+        chatgpt|github_copilot) mode=oauth ;;
+        xai) if confirm 'Use xAI / SuperGrok subscription login instead of an API key?'; then mode=oauth; fi ;;
+      esac
+      confirm "Configure ${p} (${mode})?" || continue
+      if [[ "$mode" == oauth && "$(gateway_oauth_status "$p")" != credentials-present ]]; then gateway_with_lock gateway_login "$p" || return 1; fi
+      gateway_add "$p" --auth "$mode" || return 1
+    done
+  fi
+  gateway_start || return 1
+  gateway_status
+  if [[ "$auto" == 0 ]] && confirm 'Select Tailscale nodes for private HTTPS access?'; then
+    gateway_access_nodes || return 1
+    printf 'Node names/IPs (space separated): ' >&2; IFS= read -r nodes || return 1
+    local selected=()
+    read -ra selected <<< "$nodes"
+    gateway_with_lock gateway_access_allow ${selected[@]+"${selected[@]}"} || return 1
+    printf 'Apply the generated policy, then: spark gateway access enable\n'
+  fi
+}
+
+gateway_managed_client_endpoint() {
+  case "$1" in
+    ''|"http://127.0.0.1:$(gateway_configured_port)/v1"|"http://localhost:$(gateway_configured_port)/v1"|"http://host.openshell.internal:$(gateway_configured_port)/v1") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+gateway_runtime_image() {
+  local image=''
+  if gateway_running_state; then image=$(docker inspect "$GATEWAY_CONTAINER" --format '{{.Image}}' 2>/dev/null || true); fi
+  printf '%s\n' "${image:-$LITELLM_IMAGE}"
+}
+gateway_provider_status_json() {
+  local providers='{}' p mode session entry
+  while IFS=$'\t' read -r p mode; do
+    [[ -n "$p" ]] || continue
+    session=not-applicable
+    [[ "$mode" != oauth ]] || session=$(gateway_oauth_status "$p") || return 1
+    entry=$(jq -nc --arg auth "$mode" --arg session "$session" '{enabled:true,auth:$auth,session:$session}') || return 1
+    providers=$(printf '%s\n' "$providers" | jq -c --arg p "$p" --argjson entry "$entry" '.[$p]=$entry') || return 1
+  done < <(gateway_load_config | jq -r '.providers // {} | to_entries[] | select(.value.enabled) | [.key,(.value.auth // "local")] | @tsv')
+  printf '%s\n' "$providers"
+}
+
+# Delete only Spark-owned recovery files after authenticated runtime/client checks.
+gateway_migration_cleanup() {
+  local backup="$SPARK_CONFIG_DIR/gateway-migration"
+  [[ -d "$backup" && ! -L "$backup" ]] || return 0
+  rm -f "$backup/gateway.json" "$backup/gateway.env" "$backup/litellm_config.yaml" || return 1
+  rmdir "$backup" || { err 'Recovery folder contains unexpected files; inspect it manually'; return 1; }
+}
+gateway_migration_restore_config() {
+  local backup="$SPARK_CONFIG_DIR/gateway-migration/gateway.json" restored p key env_key
+  [[ -f "$backup" ]] || return 0
+  restored=$(jq '.' "$backup") || return 1
+  for p in openrouter zen together openai xai anthropic; do
+    key=$(printf '%s\n' "$restored" | jq -r --arg p "$p" '.providers[$p].api_key // ""') || return 1
+    if [[ -n "$key" ]]; then
+      env_key=$(gateway_provider_env "$p") || return 1
+      gateway_env_set "$env_key" "$key" || return 1
+    fi
+  done
+  restored=$(printf '%s\n' "$restored" | jq 'if .providers then del(.providers[].api_key) else . end') || return 1
+  gateway_save_config "$restored"
+}
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
+# Serve exposes a service; only the tailnet policy restricts source nodes.
+gateway_access_status() {
+  local config dns port state
+  config=$(gateway_load_config)
+  port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
+  state=$(printf '%s\n' "$config" | jq -r 'if .access.enabled and .access.port!=443 then "migration-required" elif .access.enabled then (if .access.policy_status=="verified" then "verified" else "policy-verification-pending" end) else "local-only" end')
+  printf 'Private access: %s\n' "$state"
+  if [[ "$state" != local-only ]] && command -v tailscale >/dev/null 2>&1; then
+    dns=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // "" | rtrimstr(".")')
+    [[ -z "$dns" ]] || printf 'Private API: https://%s%s/v1\n' "$dns" "$([[ "$port" == 443 ]] || printf ':%s' "$port")"
+  fi
+}
+gateway_access_nodes() {
+  tailscale status --json | jq -r '([.Self] + [.Peer[]?])[] | [.HostName,.DNSName,(.TailscaleIPs|join(",")),(.Online|tostring)] | @tsv'
+}
+gateway_access_allow() {
+  local ssh_port
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) [[ $# -ge 2 && "$2" == 443 ]] || { err 'The private API uses HTTPS port 443 only'; return 1; }; shift 2 ;;
+      --ssh-port) [[ $# -ge 2 ]] || return 1; ssh_port="$2"; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  [[ "$ssh_port" =~ ^[0-9]+$ && "$ssh_port" -ge 1 && "$ssh_port" -le 65535 && "$ssh_port" != 443 ]] || return 1
+  [[ $# -gt 0 ]] || { err 'Usage: spark gateway access allow [--ssh-port 22] <node-name|IP> ...'; return 1; }
+  local status selector matches count ips='[]' names_json='[]' config
+  status=$(tailscale status --json) || return 1
+  for selector in "$@"; do
+    matches=$(printf '%s\n' "$status" | jq --arg s "$selector" '[([.Self] + [.Peer[]?])[] | select(.HostName==$s or ((.DNSName // "")|rtrimstr("."))==$s or ((.DNSName // "")|split(".")[0])==$s or any(.TailscaleIPs[]?; .==$s))]') || return 1
+    count=$(printf '%s\n' "$matches" | jq length)
+    [[ "$count" == 1 ]] || { err "Node must resolve uniquely: ${selector}"; return 1; }
+    ips=$(jq -nc --argjson a "$ips" --argjson m "$matches" '$a + $m[0].TailscaleIPs | unique') || return 1
+    names_json=$(printf '%s\n' "$names_json" | jq --arg name "$selector" '. + [$name]') || return 1
+  done
+  config=$(gateway_load_config)
+  config=$(printf '%s\n' "$config" | jq --argjson ips "$ips" --argjson names "$names_json" --argjson ssh "$ssh_port" '
+    if .access.port!=null and .access.port!=443 then .access.enabled=false else . end |
+    .access.port=443 | .access.ssh_port=$ssh | .access.sources=$ips | .access.nodes=$names |
+    .access.policy_status="pending" | del(.access.verified_at)') || return 1
+  gateway_save_config "$config" || return 1
+  info 'Selected source nodes; apply the grants fragment in Tailscale before enabling access'
+  gateway_access_policy
+}
+gateway_access_policy() {
+  local status config addresses sources ssh_port blocked output
+  status=$(tailscale status --json) || return 1
+  config=$(gateway_load_config) || return 1
+  addresses=$(printf '%s\n' "$status" | jq -c '.Self.TailscaleIPs') || return 1
+  sources=$(printf '%s\n' "$config" | jq -c '.access.sources // []') || return 1
+  [[ "$(printf '%s\n' "$sources" | jq length)" -gt 0 ]] || { err 'Select nodes with spark gateway access allow first'; return 1; }
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  blocked=$(gateway_access_blocked_ports) || return 1
+  output=$(jq -n --argjson src "$sources" --argjson dst "$addresses" --argjson ssh "$ssh_port" --argjson blocked "$blocked" --argjson status "$status" '
+    def host: if contains(":") then "["+.+"]" else . end;
+    def destinations($ports): [$dst[] | host as $h | $ports[] | $h+":"+(.|tostring)];
+    {grants:[{src:$src,dst:$dst,ip:["tcp:443"]},{src:$src,dst:$dst,ip:["tcp:"+($ssh|tostring)]}],
+     tests:([$src[] | {src:.,proto:"tcp",accept:destinations([443,$ssh]),deny:destinations($blocked)}] +
+            [$src[] | {src:.,proto:"udp",deny:destinations(($blocked+[443,$ssh])|unique)}] +
+            [$status.Peer[]?.TailscaleIPs[] | select(. as $ip | $src | index($ip) | not) | {src:.,proto:"tcp",deny:destinations([443])}])}') || return 1
+  printf '%s\n' "$output"
+  printf 'Merge these grants and tests in the tailnet admin policy. Keep administrative SSH/key authentication. Remove overlapping broad API grants for these clients: only TCP/443 (LiteLLM) and TCP/%s (SSH) should remain reachable on this node. Other administrators keep their SSH rules. Tests cover both IP families and current/common service ports; refresh after adding listeners or replacing a node.\n' "$ssh_port" >&2
+}
+gateway_access_enable() {
+  local config status dns serve key target current port
+  [[ $# == 0 || ( $# == 2 && "$1" == --port && "$2" == 443 ) ]] || { err 'The private API uses HTTPS port 443 only'; return 1; }
+  gateway_auth_ready && gateway_wait_ready || { err 'Start an authenticated gateway first'; return 1; }
+  config=$(gateway_load_config) || return 1
+  tailscale_funnel_status_active && { err 'Funnel active; resolve public exposure before enabling private gateway access'; return 1; }
+  status=$(tailscale status --json) || return 1
+  dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName // "" | rtrimstr(".")')
+  [[ -n "$dns" ]] || return 1
+  key="$dns:443"; target="http://127.0.0.1:$(gateway_configured_port)"
+  serve=$(tailscale serve status --json) || return 1
+  if ! printf '%s\n' "$serve" | jq -e --arg key "$key" '(.TCP["443"]==null and .Web[$key]==null)' >/dev/null; then
+    printf '%s\n' "$serve" | jq -e --arg key "$key" '.TCP["443"].HTTPS==true and ((.Web[$key].Handlers // {})|keys)==["/"]' >/dev/null || { err 'Port 443 has another handler or TCP service; no services changed'; return 1; }
+    current=$(printf '%s\n' "$serve" | jq -r --arg key "$key" '.Web[$key].Handlers["/"].Proxy // ""')
+    gateway_access_owned_target "$current" || { err 'Port 443 belongs to another service; no services changed'; return 1; }
+  fi
+  tailscale serve --bg --https=443 "$target" || return 1
+  tailscale_funnel_status_active && { tailscale serve --https=443 off; err 'Public exposure detected'; return 1; }
+  config=$(printf '%s\n' "$config" | jq --argjson ssh "$(gateway_access_ssh_port)" '.access.enabled=true | .access.port=443 | .access.ssh_port=$ssh | .protected=true | .access.policy_status="pending" | del(.access.verified_at)') || return 1
+  gateway_save_config "$config" || return 1
+  gateway_access_https_ready "$dns" || { err 'HTTPS 443 not ready; authenticated target kept, policy verification pending'; return 1; }
+  # Retire only Spark API/backends on this hostname; never reset Serve or touch SSH.
+  gateway_access_remove_direct "$dns" "$serve" || return 1
+  info 'Node access follows your Tailscale ACL/grants; Spark does not change the tailnet policy'
+  gateway_access_status
+}
+gateway_access_disable() {
+  local config port status dns key
+  config=$(gateway_load_config); port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
+  status=$(tailscale status --json) || return 1
+  dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")'); key="$dns:$port"
+  # Only remove the exact root handler owned by Spark, never reset all Serve.
+  tailscale serve status --json | jq -e --arg key "$key" --arg target "http://127.0.0.1:$(gateway_configured_port)" '(.Web[$key].Handlers // {}) | keys==["/"] and .["/"].Proxy==$target' >/dev/null || { err 'Serve entry absent or owned by another service'; return 1; }
+  tailscale serve --https="$port" off || return 1
+  gateway_save_config "$(printf '%s\n' "$config" | jq '.access.enabled=false')"
+}
+gateway_access_protect() {
+  local config status dns
+  config=$(gateway_load_config)
+  gateway_wait_ready && [[ "$(printf '%s\n' "$config" | jq -r '.access.enabled and (.access.policy_status=="verified")')" == true ]] || { err 'Verify private gateway access before removing legacy direct Serve routes'; return 1; }
+  gateway_save_config "$(printf '%s\n' "$config" | jq '.protected=true')" || return 1
+  status=$(tailscale status --json) || return 1
+  dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName // "" | rtrimstr(".")')
+  gateway_access_remove_direct "$dns" "$(tailscale serve status --json)" || return 1
+  local findings
+  findings=$(gateway_exposure_findings)
+  if [[ -n "$findings" ]]; then
+    err 'Existing inference listeners still accept non-local connections; restart those model aliases to apply localhost binding'
+    printf '%s\n' "$findings" >&2; return 1
+  fi
+  printf 'Inference APIs are local; node clients use HTTPS/443. Administrative SSH is unchanged.\n'
+
+}
+gateway_access_probe() {
+  local url="${1:-}" kind="${2:-allowed}" key code
+  [[ "$url" == https://* && "$url" != *$'\n'* ]] || return 1
+  case "$kind" in
+    denied)
+      # Any HTTP response proves network reachability, including a 401.
+      if curl -sS --connect-timeout 3 --max-time 5 -o /dev/null "$url/models"; then
+        err 'Denied-node test failed: endpoint reachable'; return 1
+      fi
+      printf 'Network probe: unreachable (also check node connectivity; this alone does not prove the policy)\n' ;;
+    allowed)
+      local token_file="${SPARK_GATEWAY_TOKEN_FILE:-$(gateway_secrets_path)}"
+      key=$(gateway_env_get LITELLM_API_KEY "$token_file" 2>/dev/null || gateway_env_get LITELLM_MASTER_KEY "$token_file") || { err 'Set SPARK_GATEWAY_TOKEN_FILE to a private client env file containing LITELLM_API_KEY'; return 1; }
+      [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
+      code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$url/models") || return 1
+      [[ "$code" == 401 || "$code" == 403 ]] || { err 'Anonymous access accepted'; return 1; }
+      code=$(printf 'header = "Authorization: Bearer sk-invalid"\n' | curl --config - -sS --max-time 5 -o /dev/null -w '%{http_code}' "$url/models") || return 1
+      [[ "$code" == 401 || "$code" == 403 ]] || return 1
+      printf 'header = "Authorization: Bearer %s"\n' "$key" | curl --config - -fsS --max-time 5 -o /dev/null "$url/models" || return 1
+      printf 'Allowed-node probe passed: token required and accepted\n' ;;
+    *) return 1 ;;
+  esac
+}
+gateway_access_command() {
+  local sub="${1:-status}"; [[ $# == 0 ]] || shift
+  case "$sub" in
+    nodes) gateway_access_nodes ;; status) gateway_access_status ;;
+    allow) gateway_with_lock gateway_access_allow "$@" ;; policy) gateway_access_policy ;;
+    enable) gateway_with_lock gateway_access_enable "$@" ;; disable) gateway_with_lock gateway_access_disable ;;
+    protect) gateway_with_lock gateway_access_protect ;; probe) gateway_access_probe "$@" ;; verify) gateway_with_lock gateway_access_verify "$@" ;;
+    *) err 'Usage: spark gateway access <nodes|allow NODE...|policy|enable [--port 443]|disable|status|protect|probe URL [allowed|denied]|verify --allowed NODE --denied NODE>'; return 1 ;;
+  esac
+}
+
+gateway_access_json() {
+  gateway_load_config | jq -c '{enabled:(.access.enabled // false),port:(.access.port // 443),ssh_port:(.access.ssh_port // 22),policy_status:(.access.policy_status // "not-configured"),verified_at:(.access.verified_at // null),nodes:(.access.nodes // []),protected:(.protected != false)}'
+}
+# Read-only evidence; configuration alone does not prove backend isolation.
+gateway_exposure_findings() {
+  local name model port rest listeners serve
+  command -v ss >/dev/null 2>&1 || return 0
+  listeners=$(ss -H -lnt 2>/dev/null) || return 0
+  serve=$(tailscale serve status --json 2>/dev/null || printf '{}')
+  while IFS=$'\t' read -r _name model port rest; do
+    [[ -n "$port" ]] || continue
+    if printf '%s\n' "$listeners" | awk -v port="$port" '$4 ~ ("^(0\\.0\\.0\\.0|\\*|\\[::\\]|::):" port "$") {found=1} END{exit !found}'; then
+      printf 'Backend %s listens on all interfaces (%s)\n' "$model" "$port"
+    fi
+    if printf '%s\n' "$serve" | jq -e --arg a "http://127.0.0.1:$port" --arg b "http://localhost:$port" '[.Web[]?.Handlers[]?.Proxy | select(.==$a or .==$b)] | length>0' >/dev/null; then
+      printf 'Tailscale Serve publishes backend %s directly (%s)\n' "$model" "$port"
+    fi
+  done < <(list_managed_containers)
+}
+
+# SSH probes establish evidence from two live nodes without storing the token there.
+gateway_access_verify() (
+  local allowed='' denied='' config status dns port key mode node selector matches ips selected script quoted payload blocked addresses ssh_port
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --allowed) [[ $# -ge 2 ]] || return 1; allowed="$2"; shift 2 ;;
+      --denied) [[ $# -ge 2 ]] || return 1; denied="$2"; shift 2 ;;
+      *) return 1 ;;
+    esac
+  done
+  [[ -n "$allowed" && -n "$denied" && "$allowed" != "$denied" ]] || { err 'Usage: spark gateway access verify --allowed [user@]NODE --denied [user@]NODE (SSH and Python 3 required)'; return 1; }
+  config=$(gateway_load_config) || return 1
+  [[ "$(printf '%s\n' "$config" | jq -r '.access.enabled // false')" == true ]] || return 1
+  config=$(printf '%s\n' "$config" | jq '.access.policy_status="pending" | del(.access.verified_at)') || return 1
+  gateway_save_config "$config" || return 1
+  gateway_wait_ready || return 1
+  [[ "$(printf '%s\n' "$config" | jq -r '.access.port // 443')" == 443 ]] || { err 'Migrate the private API to HTTPS/443 first'; return 1; }
+  status=$(tailscale status --json) || return 1
+  dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")')
+  port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
+  key="sk-$(openssl rand -hex 32)" || return 1
+  gateway_virtual_create spark-managed "$key" 5m || return 1
+  local probe_hash
+  probe_hash=$(gateway_key_hash "$key") || return 1
+  # Capture the validated hash before local function scope unwinds at EXIT.
+  # shellcheck disable=SC2064
+  trap "printf '%s' '{\"keys\":[\"$probe_hash\"]}' | gateway_admin_post /key/delete >/dev/null 2>&1 || true" EXIT
+  blocked=$(gateway_access_blocked_ports) || return 1
+  addresses=$(printf '%s\n' "$status" | jq -c '.Self.TailscaleIPs // []') || return 1
+  [[ "$(printf '%s\n' "$addresses" | jq length)" -gt 0 ]] || return 1
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  script=$(cat <<'PY'
+import json, socket, ssl, sys, urllib.request, urllib.error, urllib.parse
+p=json.load(sys.stdin)
+u=p['url']+'/models'
+# Distinguish unresolved DNS from policy evidence.
+socket.getaddrinfo(urllib.parse.urlparse(u).hostname, None)
+def status(token=None):
+    headers={} if token is None else {'Authorization':'Bearer '+token}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(u,headers=headers),timeout=5) as r:
+            return r.status
+    except urllib.error.HTTPError as e: return e.code
+if p['mode']=='allowed':
+    assert status() in (401,403), 'anonymous access accepted'
+    assert status('sk-invalid') in (401,403), 'invalid token accepted'
+    assert status(p['token'])==200, 'valid token rejected'
+    # A reachable backend or other application would bypass the single API entry.
+    for address in p['addresses']:
+        for port in p['blocked_ports']:
+            try:
+                connection=socket.create_connection((address,port),timeout=1)
+            except OSError:
+                continue
+            connection.close()
+            raise RuntimeError('Direct application port is reachable: '+str(port))
+else:
+    for address in p['addresses']:
+        try:
+            connection=socket.create_connection((address,443),timeout=3)
+        except OSError:
+            continue
+        connection.close()
+        raise RuntimeError('denied node can connect to HTTPS/443')
+print(p['mode']+' node probe passed')
+PY
+  ) || return 1
+  # POSIX single quoting, including any literal single quotes in the Python source.
+  quoted="'${script//\'/\'\\\'\'}'"
+  for mode in allowed denied; do
+    [[ "$mode" == allowed ]] && node="$allowed" || node="$denied"
+    selector="${node##*@}"
+    [[ "$node" != -* && "$node" != *$'\n'* && "$node" != *$'\r'* ]] || return 1
+    matches=$(printf '%s\n' "$status" | jq --arg s "$selector" '[.Peer[]? | select(.HostName==$s or ((.DNSName // "")|rtrimstr("."))==$s or any(.TailscaleIPs[]?; .==$s))]') || return 1
+    [[ "$(printf '%s\n' "$matches" | jq length)" == 1 ]] || { err "Probe node must resolve uniquely: $selector"; return 1; }
+    ips=$(printf '%s\n' "$matches" | jq -c '.[0].TailscaleIPs')
+    selected=$(printf '%s\n' "$config" | jq -r --argjson ips "$ips" 'any(.access.sources[]; . as $s | $ips | index($s)!=null)')
+    [[ "$mode" == allowed && "$selected" == true || "$mode" == denied && "$selected" == false ]] || { err 'Probe nodes do not match the selected policy'; return 1; }
+    payload=$(jq -nc --arg url "https://$dns/v1" --arg mode "$mode" --argjson blocked "$blocked" --argjson addresses "$addresses" '{url:$url,mode:$mode,blocked_ports:$blocked,addresses:$addresses}') || return 1
+    if [[ "$mode" == allowed ]]; then payload="${payload%\}},\"token\":\"${key}\"}"; fi
+    printf '%s\n' "$payload" | ssh -o BatchMode=yes -o ClearAllForwardings=yes -o ForwardAgent=no -o ConnectTimeout=5 "$node" "python3 -c $quoted" || { err "${mode} node verification failed; policy remains pending"; return 1; }
+  done
+  config=$(printf '%s\n' "$config" | jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.access.policy_status="verified" | .access.verified_at=$now') || return 1
+  gateway_save_config "$config" && gateway_access_status
+)
+
+gateway_access_ssh_port() {
+  local port
+  port=$(gateway_load_config | jq -r '.access.ssh_port // ""') || return 1
+  if [[ -z "$port" && -n "${SSH_CONNECTION:-}" ]]; then port="${SSH_CONNECTION##* }"; fi
+  port="${port:-22}"
+  [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 && "$port" != 443 ]] || return 1
+  printf '%s\n' "$port"
+}
+gateway_access_blocked_ports() {
+  local ssh_port
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  {
+    printf '%s\n' 80 4000 8000 8001 8443 11434 3456 5678 8787 18789
+    gateway_configured_port
+    list_managed_containers 2>/dev/null | awk -F '\t' '{print $3}' || true
+    tailscale serve status --json 2>/dev/null | jq -r '.TCP // {} | keys[]' || true
+    if command -v ss >/dev/null 2>&1; then ss -H -lnt 2>/dev/null | awk '{n=$4;sub(/^.*:/,"",n);print n}' || true; fi
+  } | jq -Rn --argjson ssh "$ssh_port" '[inputs|tonumber? | select(.>=1 and .<=65535 and .!=443 and .!=$ssh)]|unique'
+}
+gateway_access_owned_target() {
+  local target="${1%/}" name model port rest
+  [[ "$target" != "http://127.0.0.1:$(gateway_configured_port)" && "$target" != "http://localhost:$(gateway_configured_port)" && "$target" != http://127.0.0.1:11434 && "$target" != http://localhost:11434 ]] || return 0
+  while IFS=$'\t' read -r name model port rest; do
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    [[ "$target" != "http://127.0.0.1:$port" && "$target" != "http://localhost:$port" ]] || return 0
+  done < <(list_managed_containers)
+  return 1
+}
+gateway_access_remove_direct() {
+  local dns="$1" serve="$2" entry port target ssh_port
+  ssh_port=$(gateway_access_ssh_port) || return 1
+  while IFS= read -r entry; do
+    port=$(printf '%s\n' "$entry" | jq -r '.port')
+    target=$(printf '%s\n' "$entry" | jq -r '.target // ""')
+    [[ "$port" =~ ^[0-9]+$ && "$port" != 443 && "$port" != "$ssh_port" ]] || continue
+    if gateway_access_owned_target "$target"; then tailscale serve --https="$port" off || return 1; fi
+  done < <(printf '%s\n' "$serve" | jq -c --arg dns "$dns" '.Web // {} | to_entries[] | select(.key|startswith($dns+":")) | select((.value.Handlers // {}|keys)==["/"]) | {port:(.key|split(":")|last),target:.value.Handlers["/"].Proxy}')
+}
+gateway_access_https_ready() {
+  local dns="$1" attempt
+  for ((attempt=0; attempt<5; attempt++)); do
+    gateway_curl -fsS --connect-timeout 2 --max-time 5 "https://$dns/v1/models" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
+# Native OAuth beside the browser; session transfer uses ordinary authenticated SSH.
+gateway_login() {
+  local p="${1:-}"
+  [[ $# -gt 0 ]] || return 1; shift
+  if [[ $# == 0 ]]; then gateway_login_local "$p"; return $?; fi
+  [[ $# == 2 && "$1" == --remote ]] || { err 'Usage: spark gateway login PROVIDER [--remote USER@HOST]'; return 1; }
+  gateway_login_remote "$p" "$2"
+}
+gateway_login_remote() (
+  local p="$1" target="$2" transfer cleanup file
+  gateway_oauth_env "$p" >/dev/null || return 1
+  # Keep SSH options and remote command syntax out of user-supplied hostnames.
+  [[ "$target" =~ ^[A-Za-z0-9_][A-Za-z0-9_.@:-]*$ ]] || { err 'Use an SSH alias or USER@HOST'; return 1; }
+  [[ -z "${SSH_CONNECTION:-}" || "$p" != xai ]] || { err 'Start this command on the computer with your browser'; return 1; }
+  docker info >/dev/null 2>&1 || { err 'Local OAuth requires Docker on the computer with the browser'; return 1; }
+  docker image inspect "$LITELLM_IMAGE" >/dev/null 2>&1 || docker pull "$LITELLM_IMAGE" >/dev/null || return 1
+  mkdir -p "$SPARK_CONFIG_DIR" && chmod 700 "$SPARK_CONFIG_DIR" || return 1
+  transfer=$(umask 077; mktemp -d "$SPARK_CONFIG_DIR/oauth-transfer.XXXXXX") || return 1
+  printf -v cleanup 'rm -rf -- %q' "$transfer"
+  # shellcheck disable=SC2064 # Capture the quoted private path before function scope ends.
+  trap "$cleanup" EXIT
+  SPARK_CONFIG_DIR="$transfer" gateway_login_local "$p" || return 1
+  file="$transfer/oauth/$p/$(gateway_oauth_file "$p")"
+  # Never place credentials in command arguments, stdout, or a controller backup.
+  ssh -o BatchMode=yes -o ClearAllForwardings=yes -o ForwardAgent=no -o ConnectTimeout=10 "$target" "\"\$HOME/.local/bin/spark\" gateway import-session $p" < "$file" || return 1
+  info "OAuth session installed on ${target}; temporary local credentials removed on exit"
+)
+gateway_import_session() {
+  local p="${1:-}" file dir content old='' running=0 mode
+  [[ $# == 1 ]] || return 1
+  file=$(gateway_oauth_file "$p") || return 1
+  content=$(head -c 65537) || return 1
+  [[ -n "$content" && ${#content} -le 65536 ]] || { err 'Invalid or oversized OAuth session'; return 1; }
+  if [[ "$p" == github_copilot ]]; then
+    [[ "$content" =~ ^[A-Za-z0-9_.~+/=-]+$ ]] || return 1
+  else
+    printf '%s\n' "$content" | jq -e 'type=="object"' >/dev/null || return 1
+    if [[ "$p" == xai ]]; then
+      printf '%s\n' "$content" | jq -e '(.access_token|type=="string" and length>0) and (.refresh_token|type=="string" and length>0) and (.token_endpoint|type=="string" and startswith("https://auth.x.ai/"))' >/dev/null || return 1
+    fi
+  fi
+  gateway_capabilities "$p" >/dev/null || { err 'Remote LiteLLM image does not support this OAuth provider'; return 1; }
+  dir=$(gateway_oauth_dir "$p")
+  mkdir -p "$dir" && chmod 700 "$SPARK_CONFIG_DIR" "$SPARK_CONFIG_DIR/oauth" "$dir" || return 1
+  mode=$(gateway_load_config | jq -r --arg p "$p" 'if .providers[$p].enabled and .providers[$p].auth=="oauth" then "oauth" else "inactive" end') || return 1
+  if [[ "$mode" == oauth ]] && gateway_running_state; then
+    running=1
+    # Stop refresh workers before reading/replacing credentials from another account.
+    docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || { err 'Could not stop OAuth refresh; session left unchanged'; return 1; }
+  fi
+  [[ ! -f "$dir/$file" ]] || old=$(cat "$dir/$file")
+  if ! gateway_session_write "$dir/$file" "$content"; then
+    [[ "$running" == 0 ]] || gateway_sync_locked || err 'Could not restart the previous OAuth session'
+    return 1
+  fi
+  [[ "$p" != github_copilot ]] || rm -f "$dir/api-key.json"
+  if [[ "$running" == 1 ]] && ! gateway_sync_locked; then
+    docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || { err 'Could not stop the replacement session; inspect gateway status'; return 1; }
+    if [[ -n "$old" ]]; then gateway_session_write "$dir/$file" "$old" || return 1; else rm -f "$dir/$file"; fi
+    gateway_sync_locked || err 'Previous OAuth session could not be restored'
+    return 1
+  fi
+  [[ "$running" == 1 ]] || info "${p} OAuth session installed; enable its models with spark gateway add ${p}"
+}
+gateway_session_write() {
+  local file="$1" content="$2" tmp
+  tmp=$(umask 077; mktemp "${file}.tmp.XXXXXX") || return 1
+  if printf '%s\n' "$content" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file"; then return 0; fi
+  rm -f "$tmp"; return 1
+}
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
+# Native LiteLLM virtual keys: persistent hashes, runtime-only administrative key.
+gateway_key_hash() { printf '%s' "$1" | shasum -a 256 | awk '{print $1}'; }
+gateway_auth_key() {
+  # Internal administration only. Never export this to an inference client.
+  docker exec "$GATEWAY_CONTAINER" cat /run/spark/master-key 2>/dev/null
+}
+gateway_auth_ready() {
+  gateway_load_config | jq -e '.auth.storage=="virtual-keys" and (.auth.client_hash | type=="string" and test("^[a-f0-9]{64}$")) and (.auth.recovery_required!=true)' >/dev/null
+}
+gateway_database_name() { printf '%s-db\n' "$GATEWAY_CONTAINER"; }
+gateway_database_owner() { printf '%s' "$SPARK_CONFIG_DIR" | shasum -a 256 | awk '{print $1}'; }
+gateway_database_remove() {
+  local purge="${1:-0}" dry_run="${2:-0}" name owner existing volume
+  name=$(gateway_database_name); owner=$(gateway_database_owner)
+  if existing=$(docker inspect "$name" --format '{{json .Config.Labels}}' 2>/dev/null); then
+    printf '%s' "$existing" | jq -e --arg owner "$owner" '.["io.spark.gateway-owner"]==$owner' >/dev/null || {
+      warn 'Leaving a database container owned by another configuration'; return 1;
+    }
+    if [[ "$dry_run" == 1 ]]; then
+      printf '  would remove container %s (database volumes retained unless --purge)\n' "$name"
+    else
+      docker rm -f "$name" >/dev/null 2>&1 || return 1
+    fi
+  fi
+  [[ "$purge" == 1 ]] || return 0
+  for volume in "$name-data" "$name-socket"; do
+    existing=$(docker volume inspect "$volume" --format '{{json .Labels}}' 2>/dev/null) || continue
+    printf '%s' "$existing" | jq -e --arg owner "$owner" '.["io.spark.gateway-owner"]==$owner' >/dev/null || return 1
+    if [[ "$dry_run" == 1 ]]; then printf '  would remove volume %s\n' "$volume"; else docker volume rm "$volume" >/dev/null || return 1; fi
+  done
+}
+gateway_database_prepare() {
+  local name owner existing attempt volume
+  name=$(gateway_database_name); owner=$(gateway_database_owner)
+  if existing=$(docker inspect "$name" --format '{{json .}}' 2>/dev/null); then
+    printf '%s\n' "$existing" | jq -e --arg owner "$owner" --arg name "$name" '
+      .Config.Labels["io.spark.gateway-owner"]==$owner and .HostConfig.NetworkMode=="none" and
+      (.HostConfig.PortBindings // {} | length)==0 and
+      any(.Mounts[]; .Name==($name+"-data") and .Destination=="/var/lib/postgresql/data") and
+      any(.Mounts[]; .Name==($name+"-socket") and .Destination=="/var/run/postgresql")' >/dev/null || {
+      err 'Gateway database container is not privately owned by this configuration'; return 1;
+    }
+    docker start "$name" >/dev/null 2>&1 || return 1
+  else
+    for volume in "$name-data" "$name-socket"; do
+      if existing=$(docker volume inspect "$volume" --format '{{json .Labels}}' 2>/dev/null); then
+        printf '%s\n' "$existing" | jq -e --arg owner "$owner" '.["io.spark.gateway-owner"]==$owner' >/dev/null || { err 'Database volume belongs to another configuration'; return 1; }
+      else
+        docker volume create --label "io.spark.gateway-owner=$owner" "$volume" >/dev/null || return 1
+      fi
+    done
+    # No TCP listener/network/password file: only the explicitly mounted Unix socket.
+    docker run -d --name "$name" --label "io.spark.gateway-owner=$owner" --restart unless-stopped --network none \
+      -e POSTGRES_DB=litellm -e POSTGRES_USER=spark -e POSTGRES_HOST_AUTH_METHOD=trust \
+      -e 'POSTGRES_INITDB_ARGS=--auth-local=trust --auth-host=reject' \
+      -v "$name-data:/var/lib/postgresql/data" -v "$name-socket:/var/run/postgresql" \
+      "${SPARK_GATEWAY_POSTGRES_IMAGE:-postgres:17-alpine}" postgres -c 'listen_addresses=' >/dev/null 2>&1 || { err 'Could not start private LiteLLM PostgreSQL'; return 1; }
+  fi
+  for ((attempt=0; attempt<30; attempt++)); do
+    docker exec "$name" pg_isready -q -h /var/run/postgresql -U spark -d litellm >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  err 'Private LiteLLM PostgreSQL did not become ready'; return 1
+}
+gateway_database_client_hashes() {
+  local hashes
+  hashes=$(docker exec "$(gateway_database_name)" psql -X -A -t -v ON_ERROR_STOP=1 -U spark -d litellm -c \
+    'SELECT token FROM "LiteLLM_VerificationToken" WHERE user_id = '\''spark-clients'\'' ORDER BY token') || return 1
+  printf '%s\n' "$hashes" | jq -Rn '[inputs | select(length>0)] | if all(.[]; test("^[a-f0-9]{64}$")) then . else error("Invalid virtual-key hash") end'
+}
+gateway_database_migrate() {
+  local script
+  # Use Prisma's own migrator and socket URL. Some LiteLLM migration coordinators
+  # strip libpq's host query parameter and would incorrectly attempt TCP.
+  script='import pathlib, subprocess
+import litellm_proxy_extras
+schema = pathlib.Path(litellm_proxy_extras.__file__).parent / "schema.prisma"
+subprocess.run(["prisma", "migrate", "deploy", "--schema", str(schema)], check=True)'
+  docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp \
+    -e 'DATABASE_URL=postgresql://spark@localhost/litellm?host=/var/run/postgresql' \
+    -v "$(gateway_database_name)-socket:/var/run/postgresql" --entrypoint python \
+    "${GATEWAY_RESTORE_IMAGE:-$LITELLM_IMAGE}" -c "$script" >/dev/null 2>&1 || {
+    err 'LiteLLM schema migration over the private PostgreSQL socket failed'; return 1;
+  }
+}
+gateway_admin_post() {
+  local path="$1" key payload
+  payload=$(cat) || return 1
+  key=$(gateway_auth_key) || return 1
+  [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
+  # Curl reads both authorization and secret JSON from stdin, never argv/files.
+  { printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$key"
+    printf 'data = %s\n' "$(printf '%s' "$payload" | jq -Rs .)"
+  } | curl --config - -fsS --max-time 60 "http://127.0.0.1:$(gateway_configured_port)$path" 2>/dev/null
+}
+gateway_virtual_owner_ensure() {
+  local user="$1" body info
+  case "$user" in spark-clients|spark-managed) ;; *) return 1 ;; esac
+  info=$(gateway_curl -fsS --max-time 10 "http://127.0.0.1:$(gateway_configured_port)/user/info?user_id=$user" 2>/dev/null) || info='{}'
+  if ! printf '%s\n' "$info" | jq -e --arg user "$user" '.user_info.user_id==$user' >/dev/null; then
+    body=$(printf '{"user_id":"%s","user_role":"internal_user","auto_create_key":false}' "$user")
+    printf '%s' "$body" | gateway_admin_post /user/new >/dev/null || return 1
+    info=$(gateway_curl -fsS --max-time 10 "http://127.0.0.1:$(gateway_configured_port)/user/info?user_id=$user" 2>/dev/null) || return 1
+  fi
+  printf '%s\n' "$info" | jq -e '.user_info.user_role=="internal_user"' >/dev/null || { err 'Inference key owner must not be a proxy administrator'; return 1; }
+}
+gateway_virtual_create() {
+  local user="$1" key="$2" duration="${3:-}" response body alias_hash
+  [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
+  gateway_virtual_owner_ensure "$user" || return 1
+  alias_hash=$(gateway_key_hash "$key") || return 1
+  body=$(printf '{"key":"%s","user_id":"%s","key_alias":"%s-%s","allowed_routes":["llm_api_routes"],"models":[]}' "$key" "$user" "$user" "${alias_hash:0:12}")
+  if [[ -n "$duration" ]]; then
+    [[ "$duration" == 5m ]] || return 1
+    body="${body%\}},\"duration\":\"5m\"}"
+  fi
+  response=$(printf '%s' "$body" | gateway_admin_post /key/generate) || return 1
+  [[ "$(printf '%s' "$response" | jq -r '.key // empty')" == "$key" ]]
+}
+gateway_virtual_validate() {
+  local key="$1" code
+  [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
+  printf 'header = "Authorization: Bearer %s"\n' "$key" | curl --config - -fsS --max-time 5 \
+    "http://127.0.0.1:$(gateway_configured_port)/v1/models" >/dev/null 2>&1 || return 1
+  # Even a valid inference key must not enumerate or administer other keys.
+  code=$(printf 'header = "Authorization: Bearer %s"\n' "$key" | curl --config - -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:$(gateway_configured_port)/key/list" 2>/dev/null) || return 1
+  [[ "$code" == 401 || "$code" == 403 ]]
+}
+gateway_virtual_record() {
+  local config
+  [[ "$1" =~ ^[a-f0-9]{64}$ ]] || return 1
+  config=$(gateway_load_config | jq --arg hash "$1" '.auth={storage:"virtual-keys",client_hash:$hash}') || return 1
+  gateway_save_config "$config"
+}
+gateway_legacy_token_cleanup() {
+  local path tmp
+  path=$(gateway_secrets_path)
+  [[ -f "$path" ]] || return 0
+  tmp=$(umask 077; mktemp "$path.tmp.XXXXXX") || return 1
+  awk 'index($0,"LITELLM_MASTER_KEY=")!=1' "$path" > "$tmp"
+  chmod 600 "$tmp" && mv "$tmp" "$path"
+}
+gateway_virtual_ensure() {
+  [[ "${SPARK_GATEWAY_DEFER_CLIENT:-0}" != 1 ]] || return 0
+  local config hash hashes key fresh=0
+  config=$(gateway_load_config) || return 1
+  [[ "$(printf '%s' "$config" | jq -r '.auth.recovery_required // false')" != true ]] || { err 'Token recovery required: spark gateway auth rotate'; return 1; }
+  hashes=$(gateway_database_client_hashes) || return 1
+  hash=$(printf '%s' "$config" | jq -r '.auth.client_hash // empty')
+  if [[ -n "$hash" ]]; then
+    printf '%s' "$hashes" | jq -e --arg hash "$hash" '.==[$hash]' >/dev/null || { err 'Client key state differs from PostgreSQL; run spark gateway auth rotate'; return 1; }
+  elif [[ "$(printf '%s' "$hashes" | jq length)" == 1 ]]; then
+    hash=$(printf '%s' "$hashes" | jq -r '.[0]')
+    gateway_virtual_record "$hash" || return 1
+  elif [[ "$hashes" == '[]' || "$(printf '%s' "$hashes" | jq length)" == 0 ]]; then
+    # Adopt a known legacy key as an inference-only key; never redisplay it.
+    key=$(gateway_env_get LITELLM_MASTER_KEY 2>/dev/null || true)
+    if [[ -z "$key" ]]; then key="sk-$(openssl rand -hex 32)" || return 1; fresh=1; fi
+    gateway_virtual_create spark-clients "$key" && gateway_virtual_validate "$key" || return 1
+    hash=$(gateway_key_hash "$key")
+    gateway_virtual_record "$hash" || return 1
+    [[ "$fresh" == 0 ]] || gateway_auth_present_new "$key"
+  else
+    err 'Multiple client keys found; run spark gateway auth rotate'; return 1
+  fi
+  gateway_legacy_token_cleanup
+}
+gateway_managed_client_key() {
+  local key
+  key=$(workspace_read_env COMPATIBLE_API_KEY 2>/dev/null || true)
+  if [[ -n "$key" ]] && gateway_virtual_validate "$key"; then printf '%s\n' "$key"; return 0; fi
+  key="sk-$(openssl rand -hex 32)" || return 1
+  gateway_virtual_create spark-managed "$key" && gateway_virtual_validate "$key" || return 1
+  # This is the client's own restricted credential, never the user/admin token.
+  workspace_set_env_key COMPATIBLE_API_KEY "$key" || return 1
+  printf '%s\n' "$key"
+}
+gateway_auth_replace_locked() {
+  local hashes count key hash config
+  gateway_auth_terminal || { err 'Token rotation requires an interactive terminal (ssh -t for a remote command)'; return 1; }
+  docker info >/dev/null 2>&1 || { err 'Cannot inspect LiteLLM; no revocation confirmed'; return 1; }
+  if ! gateway_running_state || [[ "$(docker inspect "$GATEWAY_CONTAINER" --format '{{index .Config.Labels "io.spark.auth-mode"}}' 2>/dev/null)" != virtual-keys ]]; then
+    SPARK_GATEWAY_DEFER_CLIENT=1 gateway_sync_locked || { gateway_auth_recovery_stop; return 1; }
+  fi
+  gateway_wait_ready || { gateway_auth_recovery_stop; return 1; }
+  hashes=$(gateway_database_client_hashes) || { gateway_auth_recovery_stop; return 1; }
+  count=$(printf '%s' "$hashes" | jq length)
+  key="sk-$(openssl rand -hex 32)" || return 1
+  hash=$(gateway_key_hash "$key")
+  # Mark uncertain transactions before calling the server. Never silently revert
+  # a revoked key or automatically generate a replacement after an I/O failure.
+  config=$(gateway_load_config | jq '.auth.recovery_required=true') || return 1
+  gateway_save_config "$config" || return 1
+  # Native regenerate is license-gated in some releases. Generate + delete uses
+  # standard virtual-key APIs and never allows a grace period for the old key.
+  gateway_virtual_create spark-clients "$key" && gateway_virtual_validate "$key" || { gateway_auth_recovery_stop; return 1; }
+  if [[ "$count" != 0 ]]; then
+    printf '{"keys":%s}' "$hashes" | gateway_admin_post /key/delete >/dev/null || { gateway_auth_recovery_stop; return 1; }
+  fi
+  hashes=$(gateway_database_client_hashes) || { gateway_auth_recovery_stop; return 1; }
+  if ! printf '%s' "$hashes" | jq -e --arg hash "$hash" '.==[$hash]' >/dev/null || ! gateway_virtual_validate "$key" || ! gateway_virtual_record "$hash"; then
+    gateway_auth_recovery_stop; return 1
+  fi
+  gateway_legacy_token_cleanup || return 1
+  gateway_auth_present_new "$key"
+  info 'Inference token replaced; the previous token is revoked. Update your clients'
+}
+gateway_auth_recovery_stop() {
+  local config
+  if ! config=$(gateway_load_config | jq '.auth.recovery_required=true') || ! gateway_save_config "$config"; then
+    warn 'Could not record recovery state; keep the gateway stopped until auth rotate succeeds'
+  fi
+  if ! docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1; then
+    err 'Could not stop LiteLLM after an unverified token change; revocation is NOT confirmed. Repair Docker access and run spark gateway auth rotate'; return 1
+  fi
+  err 'Token change could not be verified; gateway stopped. Run spark gateway auth rotate to recover; no old token will be restored'
+}
+gateway_auth_rotate() { gateway_with_lock gateway_auth_replace_locked; }
 # --- Main ---
 main() {
+  GATEWAY_PORT=$(gateway_configured_port)
   case "${1:-}:${2:-}" in
-    status:--json|status:--quiet|ws:status|doctor:*|ws:doctor) ;;
+    status:--json|status:--quiet|ws:status|doctor:*|ws:doctor|gateway:auth|gateway:login|gateway:import-session|gateway:logout|gateway:capabilities|gateway:access) ;;
     *) check_for_updates ;;
   esac
 

@@ -391,91 +391,33 @@ step_tailscale_funnel() {
   done
 }
 
-# The LiteLLM gateway runs in Docker on both backends. In --check we only verify Docker;
-# otherwise we enable this backend's provider (plus optional cloud providers) and start it.
+# Configure on the target itself: credentials and model inventory never come from the controller.
 step_gateway() {
-  local auto_yes="$1" check_only="$2"
-  if ctx_run 'docker info >/dev/null 2>&1'; then
-    info "Docker: available for the gateway"
-  elif [[ "$check_only" == "1" ]]; then
-    setup_fail "Docker not available — the LiteLLM gateway needs it"; return 0
-  elif [[ "$TGT_OS" == "Darwin" ]]; then
-    setup_manual_step "Install Docker Desktop (the gateway runs in a container): https://docs.docker.com/desktop/"; return 0
-  else
-    setup_fail "Docker not running — needed for the gateway"; return 0
+  local auto_yes="$1" check_only="$2" args=''
+  if ! ctx_run 'docker info >/dev/null 2>&1'; then
+    setup_fail 'Docker unavailable; required by LiteLLM'; return 0
   fi
-  [[ "$check_only" == "1" ]] && return 0
-
-  if [[ "$auto_yes" != "1" ]] && ! confirm "Set up the LiteLLM gateway (unified API for local + cloud models)?"; then
-    setup_skip "LiteLLM gateway"; return 0
-  fi
-
-  if ctx_run "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q 'ghcr.io/berriai/litellm'"; then
-    info "LiteLLM image present"
-  elif ctx_run "docker pull ${LITELLM_IMAGE}"; then
-    info "Pulled ${LITELLM_IMAGE}"
-  else
-    setup_fail "LiteLLM image pull failed"; return 0
-  fi
-
-  local prov="vllm"; [[ "$TGT_BACKEND" == "ollama" ]] && prov="ollama"
-  local gw_or=0 gw_zen=0 gw_tg=0 or_key="" zen_key="" tg_key=""
-  if [[ "$auto_yes" != "1" ]]; then
-    if confirm "Enable OpenRouter? (cloud, needs API key)"; then
-      printf "  OpenRouter API key (blank to skip): "; read -rs or_key; printf "\n"; [[ -n "$or_key" ]] && gw_or=1
-    fi
-    if confirm "Enable Zen / OpenCode? (cloud, needs API key)"; then
-      printf "  Zen API key (blank to skip): "; read -rs zen_key; printf "\n"; [[ -n "$zen_key" ]] && gw_zen=1
-    fi
-    if confirm "Enable Together AI? (cloud, needs API key)"; then
-      printf "  Together AI API key (blank to skip): "; read -rs tg_key; printf "\n"; [[ -n "$tg_key" ]] && gw_tg=1
-    fi
-  fi
-
-  local gw_json
-  gw_json=$(jq -n \
-    --argjson port "$GATEWAY_PORT" \
-    --argjson vllm_en "$( [[ "$prov" == "vllm" ]] && echo true || echo false )" \
-    --argjson ollama_en "$( [[ "$prov" == "ollama" ]] && echo true || echo false )" \
-    --argjson or_en "$( [[ "$gw_or" == "1" ]] && echo true || echo false )" --arg or_key "$or_key" \
-    --argjson zen_en "$( [[ "$gw_zen" == "1" ]] && echo true || echo false )" --arg zen_key "$zen_key" \
-    --argjson tg_en "$( [[ "$gw_tg" == "1" ]] && echo true || echo false )" --arg tg_key "$tg_key" \
-    '{enabled:true, port:$port, providers:{
-        vllm:{enabled:$vllm_en, port:8000},
-        ollama:{enabled:$ollama_en},
-        openrouter:{enabled:$or_en, api_key:$or_key},
-        zen:{enabled:$zen_en, api_key:$zen_key},
-        together:{enabled:$tg_en, api_key:$tg_key}
-      }}')
-
-  # gateway_save_config writes the controller copy used by gateway_generate_litellm_yaml.
-  gateway_save_config "$gw_json"
-
-  if [[ "$SETUP_TARGET" == "remote" ]]; then
-    ctx_run 'mkdir -p $HOME/.config/spark && chmod 700 $HOME/.config/spark'
-    printf '%s\n' "$gw_json" | ctx_write_file '$HOME/.config/spark/gateway.json'
-    ctx_run 'chmod 600 $HOME/.config/spark/gateway.json'
-    local yaml; yaml="$(gateway_generate_litellm_yaml)"
-    if [[ -n "$yaml" ]]; then
-      printf '%s\n' "$yaml" | ctx_write_file '$HOME/.config/spark/litellm_config.yaml'
-      ctx_run 'chmod 600 $HOME/.config/spark/litellm_config.yaml'
-    fi
-    local env_flags=""
-    [[ -n "$or_key" ]] && env_flags+=" -e OPENROUTER_API_KEY='${or_key}'"
-    [[ -n "$zen_key" ]] && env_flags+=" -e ZEN_API_KEY='${zen_key}'"
-    [[ -n "$tg_key" ]] && env_flags+=" -e TOGETHER_API_KEY='${tg_key}'"
-    ctx_run "docker rm -f ${GATEWAY_CONTAINER} 2>/dev/null || true"
-    if ctx_run "docker run -d --network host -v ~/.config/spark/litellm_config.yaml:/app/config.yaml ${env_flags} --name ${GATEWAY_CONTAINER} --restart unless-stopped ${LITELLM_IMAGE} --config /app/config.yaml --host 127.0.0.1 --port ${GATEWAY_PORT}"; then
-      info "LiteLLM gateway started on :${GATEWAY_PORT}"
+  if [[ "$check_only" == 1 ]]; then
+    if [[ "$SETUP_TARGET" == remote ]]; then
+      ctx_run '"$HOME/.local/bin/spark" gateway auth status' || setup_fail 'Gateway authentication requires migration'
     else
-      setup_fail "Gateway failed to start"
+      gateway_auth_ready || setup_fail 'Gateway authentication requires migration'
     fi
+    return 0
+  fi
+  [[ "$auto_yes" == 1 ]] || confirm 'Set up the authenticated LiteLLM gateway?' || { setup_skip 'LiteLLM gateway'; return 0; }
+  ctx_run "docker image inspect '${LITELLM_IMAGE}' >/dev/null 2>&1" || ctx_run "docker pull '${LITELLM_IMAGE}'" || { setup_fail 'LiteLLM image unavailable'; return 0; }
+  [[ "$auto_yes" != 1 ]] || args='--yes'
+  if [[ "$SETUP_TARGET" == remote ]]; then
+    # Native OAuth runs beside the browser. SSH transfers its session, never forwards a port.
+    if [[ "$auto_yes" != 1 ]] && confirm 'Configure xAI subscription OAuth in this computer browser for the remote server?'; then
+      gateway_login_remote xai "${REMOTE_USER}@${REMOTE_HOST}" || { setup_fail 'Local xAI OAuth failed'; return 0; }
+    fi
+    local rc=0
+    remote_in "\"\$HOME/.local/bin/spark\" gateway setup ${args}" || rc=$?
+    [[ "$rc" == 0 ]] || setup_fail 'Gateway setup failed on target'
   else
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-      ( gateway_restart ) >/dev/null 2>&1 && info "Gateway restarted" || warn "Could not restart the gateway"
-    else
-      ( gateway_start ) && info "LiteLLM gateway started on :${GATEWAY_PORT}" || warn "Start it later: spark gateway start"
-    fi
+    if [[ "$auto_yes" == 1 ]]; then gateway_setup_local --yes || setup_fail 'Gateway setup failed'; else gateway_setup_local || setup_fail 'Gateway setup failed'; fi
   fi
 }
 
@@ -857,7 +799,7 @@ ensure_local_tailscale() {
 # Copy this CLI to the remote so `spark` is available there too.
 deploy_spark_binary() {
   local self helper rv
-  self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
+  self="${BASH_SOURCE[0]}"
   helper="$(hf_model_inspect_path 2>/dev/null || true)"
   # Always overwrite the remote binary with this controller's copy, so the server runs the exact
   # same spark version every setup run (no stale CLI lingering on the server).
@@ -1167,9 +1109,9 @@ model_server_ensure_gateway_config() {
     '{enabled:true, port:$port, providers:{
       vllm:{enabled:$vllm_en, port:8000},
       ollama:{enabled:$ollama_en},
-      openrouter:{enabled:false, api_key:""},
-      zen:{enabled:false, api_key:""},
-      together:{enabled:false, api_key:""}
+      openrouter:{enabled:false},
+      zen:{enabled:false},
+      together:{enabled:false}
     }}') || return 1
   gateway_save_config "$gw_json"
   info "Configured LiteLLM gateway"

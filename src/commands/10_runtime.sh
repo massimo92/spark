@@ -304,12 +304,10 @@ run_publish_main() {
   gateway_set_main_model "$BACKEND" "$model" || \
     die "Could not update LiteLLM main to ${model}"
 
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    if ! (gateway_restart); then
-      gateway_save_config "$old_config"
-      (gateway_restart) >/dev/null 2>&1 || true
-      die "Could not restart LiteLLM after publishing ${model} as main"
-    fi
+  if ! gateway_sync || ! gateway_model_routed "$BACKEND" "$model" || ! gateway_route_smoke "$BACKEND" "$model"; then
+    gateway_save_config "$old_config"
+    gateway_sync >/dev/null 2>&1 || true
+    die "Could not publish ${model} as LiteLLM main; previous selection restored"
   fi
   info "LiteLLM main now targets ${BACKEND}/${model}"
 }
@@ -1596,6 +1594,8 @@ build_launch() {
     && add_vllm_flag_once --limit-mm-per-prompt '{"image":0}'
   [[ ${#vllm_passthrough_args[@]} -eq 0 ]] || vllm_args+=("${vllm_passthrough_args[@]}")
 
+  if gateway_protected; then set_vllm_flag_value --host 127.0.0.1; fi
+
   # Per-container hard ceiling = NEED + warmup headroom (the startup peak's room). --memory-swap is
   # set higher (by the provisioned swap) so the LOAD-time peak — the loader transiently needs ~2x the
   # weights — can spill into host swap and complete, instead of the container cgroup-OOMing mid-load.
@@ -1732,6 +1732,8 @@ run_backend_vllm() {
     fi
   fi
 
+  # Establish private gateway credentials before changing a real backend.
+  [[ "$dry_run" == 1 ]] || gateway_prepare_runtime vllm || return 1
   # Dry-runs never remove containers; cleanup happens only for a real launch.
 
 
@@ -2023,17 +2025,15 @@ run_backend_vllm() {
   printf "\n  Container '${BOLD}%s${NC}' started." "$cname"
   case "$serve_state" in
     ready)
-      printf " ${GREEN}✓ serving${NC}\n  Test: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$port" ;;
+      printf " ${GREEN}✓ backend ready${NC}\n" ;;
     timeout)
       printf "\n  ${YELLOW}⊘${NC} Still warming up after ${STARTUP_TIMEOUT}s — it may still come up. Follow: ${BOLD}spark logs %s${NC}\n\n" "$model" ;;
     *)
-      printf "\n  Logs: ${BOLD}spark logs %s${NC}  ·  Test: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$model" "$port" ;;
+      printf "\n  Logs: ${BOLD}spark logs %s${NC}  ·  Diagnose backend: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$model" "$port" ;;
   esac
 
-  # Auto-restart gateway if running so it picks up the new model
-  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != "1" ]] && \
-      docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    gateway_restart
+  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != 1 ]]; then
+    gateway_publish_model vllm "$model" "$([[ "$serve_state" == ready ]] && printf 1 || printf 0)" || return 1
   fi
 
   if [[ "$tail_logs" == "1" ]]; then
@@ -2269,18 +2269,6 @@ ollama_arch_kv() {
   awk -v L="$layers" -v H="$kvh" -v D="$kdim" -v T="$ctx" 'BEGIN{ printf "%.1f", (2*L*H*D*2*T)/1073741824 }'
 }
 
-# Enable the Ollama provider in the gateway config and refresh it if running.
-gateway_enable_ollama() {
-  local config
-  config=$(gateway_load_config)
-  config=$(printf '%s' "$config" | jq '.providers.ollama.enabled = true' 2>/dev/null) || return 0
-  gateway_save_config "$config"
-  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != "1" ]] && \
-      docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
-    gateway_restart
-  fi
-}
-
 # Ollama (native) — used on Apple Silicon and CPU hosts. Reads cmd_run's flag locals.
 # Ollama multiplexes models on one port (11434) and loads them on demand, so there is
 # no per-model container, port, or GPU-memory fraction; it manages memory itself.
@@ -2305,6 +2293,7 @@ run_backend_ollama() {
     return 0
   fi
 
+  gateway_prepare_runtime ollama || return 1
   command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark setup"
   ollama_reachable || warn "Ollama service not reachable on :11434 — is it running? (try: ollama serve)"
 
@@ -2340,12 +2329,10 @@ run_backend_ollama() {
     fi
   fi
 
-  # Route it through the gateway (enable provider + refresh if running).
-  gateway_enable_ollama
-
-  printf "\n"
-  printf "  Model ${BOLD}%s${NC} ready via Ollama.\n" "$model"
-  printf "  Gateway: ${DIM}call it as ${NC}${BOLD}ollama_chat/%s${NC}${DIM} on http://localhost:%s/v1${NC}\n\n" "$model" "$GATEWAY_PORT"
+  gateway_register_ollama "$model" || return 1
+  if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != 1 ]]; then
+    gateway_publish_model ollama "$model" "$([[ "$no_wait" == 1 ]] && printf 0 || printf 1)" || return 1
+  fi
 
   [[ "$tail_logs" == "1" ]] && warn "--tail has no effect on the Ollama backend (Ollama runs as a shared service)"
   return 0
@@ -2426,7 +2413,11 @@ cmd_stop() {
   [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" == "1" ]] && refresh_gateway=0
 
   if [[ "$BACKEND" == "ollama" ]]; then
-    cmd_stop_ollama "$target"
+    local loaded_before
+    loaded_before=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}')
+    cmd_stop_ollama "$target" || return 1
+    gateway_forget_ollama "$target" "$loaded_before" || return 1
+    if [[ "$refresh_gateway" == 1 ]] && gateway_running_state; then gateway_sync; fi
     return
   fi
 
@@ -2702,7 +2693,7 @@ model_api_ready() {
 
 gateway_api_ready() {
   gateway_running_state || return 1
-  curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" >/dev/null 2>&1
+  gateway_curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" >/dev/null 2>&1
 }
 
 gateway_model_routed() {
@@ -2712,7 +2703,7 @@ gateway_model_routed() {
     ollama) id="ollama_chat/${model}" ;;
     *) return 1 ;;
   esac
-  out=$(curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" 2>/dev/null) || return 1
+  out=$(gateway_curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" 2>/dev/null) || return 1
   if command -v jq >/dev/null 2>&1; then
     printf '%s\n' "$out" | jq -e --arg id "$id" 'any(.data[]?; .id == $id)' >/dev/null 2>&1
   else
@@ -2747,18 +2738,20 @@ status_operational() {
 }
 
 status_models_json() {
-  local first=1 name model port need wt kv state now pk routed
+  local first=1 name model port need wt kv state now pk routed loaded_ollama
   printf '['
   if [[ "$BACKEND" == "ollama" ]]; then
+    loaded_ollama=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
     while IFS= read -r model; do
       [[ -n "$model" ]] || continue
       [[ "$first" == "1" ]] || printf ','
       first=0
-      if ollama_reachable; then state=ready; else state=unhealthy; fi
+      state=pending
+      if printf '%s\n' "$loaded_ollama" | grep -Fxq "$model"; then if ollama_reachable; then state=ready; else state=unhealthy; fi; fi
       if gateway_model_routed ollama "$model"; then routed=true; else routed=false; fi
       printf '{"name":"%s","engine":"ollama","state":"%s","endpoint":"http://localhost:11434/api","gateway_model":"ollama_chat/%s","gateway_routed":%s}' \
         "$(status_json_escape "$model")" "$state" "$(status_json_escape "$model")" "$routed"
-    done < <(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
+    done < <({ printf '%s\n' "$loaded_ollama"; gateway_load_config | jq -r '.providers.ollama.models[]?'; } | sed '/^$/d' | sort -u)
   else
     while IFS=$'\t' read -r name model port need wt kv; do
       [[ -n "$name" ]] || continue
@@ -2781,9 +2774,10 @@ cmd_status_json() {
   status_operational && ok=true
   if gateway_api_ready; then gateway_state=ready; elif gateway_running_state; then gateway_state=not-ready; fi
   models=$(status_models_json)
-  printf '{"ok":%s,"backend":"%s","docker":"%s","gateway":{"state":"%s","port":%s,"endpoint":"http://localhost:%s/v1"},"models":%s}\n' \
+  printf '{"ok":%s,"backend":"%s","docker":"%s","gateway":{"state":"%s","port":%s,"endpoint":"http://localhost:%s/v1","authentication":"%s","providers":%s,"access":%s},"models":%s}\n' \
     "$ok" "$(status_json_escape "$BACKEND")" "$(docker_running && printf running || printf stopped)" \
-    "$gateway_state" "$(status_json_number "$(gateway_configured_port)")" "$(gateway_configured_port)" "$models"
+    "$gateway_state" "$(status_json_number "$(gateway_configured_port)")" "$(gateway_configured_port)" \
+    "$(gateway_auth_ready && printf configured || printf migration-required)" "$(gateway_provider_status_json)" "$(gateway_access_json)" "$models"
   [[ "$ok" == "true" ]]
 }
 
