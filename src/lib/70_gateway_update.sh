@@ -206,6 +206,8 @@ gateway_generate_litellm_yaml() {
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: false
 
 litellm_settings:
   drop_params: true

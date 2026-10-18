@@ -201,6 +201,8 @@ ${stdin_payload}"
     esac
     ;;
   run)
+    # Capability/migration helpers are not model launch attempts or initializers.
+    if [[ "$args" == *'from litellm.proxy._types import GenerateKeyRequest'* || "$args" == *'"prisma", "migrate", "deploy"'* ]]; then exit 0; fi
     if [[ "${FAKE_DOCKER_RUN_EXIT:-0}" == 0 ]]; then
       if [[ "$args" == *"--name spark-litellm "* ]]; then printf '1\n' > "$HOME/.config/spark/test-gateway-state"; fi
       if [[ "$args" == *"--label spark.managed=1"* ]]; then
@@ -213,7 +215,7 @@ ${stdin_payload}"
         printf '%s\t%s\t%s\t1\t1\t0\n' "$name" "$model" "$port" >> "$HOME/.config/spark/test-launched-models.tsv"
       fi
     fi
-    if [[ "$args" == *"--entrypoint"* && -n "${FAKE_INITIALIZER_CONFIG:-}" ]]; then
+    if [[ "$args" == *"--entrypoint"* && "$args" == *SPARK_BUNDLE_DIR=* && -n "${FAKE_INITIALIZER_CONFIG:-}" ]]; then
       root="" mount="" prev=""
       for arg in "$@"; do
         [[ "$prev" != "-v" || "$arg" != *":/tmp/huggingface" ]] || mount="${arg%:/tmp/huggingface}"
@@ -241,6 +243,12 @@ ${stdin_payload}"
     exit "${FAKE_DOCKER_STOP_EXIT:-0}"
     ;;
   inspect)
+    if [[ "${2:-}" == spark-litellm-db ]]; then
+      owner=$(printf '%s' "$HOME/.config/spark" | shasum -a 256 | awk '{print $1}')
+      jq -nc --arg owner "$owner" '{Config:{Labels:{"io.spark.gateway-owner":$owner}},HostConfig:{NetworkMode:"none",PortBindings:{}},Mounts:[{Name:"spark-litellm-db-data",Destination:"/var/lib/postgresql/data"},{Name:"spark-litellm-db-socket",Destination:"/var/run/postgresql"}]}'
+      exit 0
+    fi
+    [[ "$args" != *io.spark.auth-mode* ]] || { printf 'virtual-keys\n'; exit 0; }
     if [[ -n "${FAKE_DOCKER_INSPECT_ALL_JSON:-}" && "$args" != *"{{"* ]]; then
       printf '%s\n' "$FAKE_DOCKER_INSPECT_ALL_JSON"
       exit 0
@@ -281,6 +289,8 @@ ${stdin_payload}"
     [[ -n "${FAKE_DOCKER_EXEC_FILE:-}" ]] && printf '%s\n' "$args" >> "${FAKE_DOCKER_EXEC_FILE}"
     # cgroup memory reads for `spark status` live block.
     case "$args" in
+      *'cat /run/spark/master-key'*) printf 'sk-%064d\n' 1 ;;
+      *'SELECT token FROM'*'spark-clients'*) [[ ! -f "$HOME/.config/spark/test-client-hashes.json" ]] || jq -r '.[]' "$HOME/.config/spark/test-client-hashes.json" ;;
       *"grep -q 'NEMOCLAW_HERMES_DASHBOARD_HOST'"*) exit "${FAKE_HERMES_ENTRYPOINT_PATCHED_EXIT:-1}" ;;
       *"hermes.real dashboard --host 0[.]0[.]0[.]0"*) exit "${FAKE_HERMES_PUBLIC_BOUND_EXIT:-1}" ;;
       *memory.current*) [[ -n "${FAKE_MEM_CURRENT:-}" ]] && echo "${FAKE_MEM_CURRENT}" ;;
@@ -385,6 +395,18 @@ fake_n8n_response() {
   [[ "$write_status" == "1" ]] && printf '%s' "$status"
 }
 case "$args" in
+  *'/user/info?user_id='*)
+    user=spark-clients; [[ "$args" != *user_id=spark-managed* ]] || user=spark-managed
+    printf '{"user_info":{"user_id":"%s","user_role":"internal_user"}}\n' "$user"; exit 0 ;;
+  *'/key/generate'*)
+    body=$(printf '%s\n' "$stdin_payload" | sed -n 's/^data = //p' | jq -r .)
+    key=$(printf '%s' "$body" | jq -r .key)
+    if [[ "$(printf '%s' "$body" | jq -r .user_id)" == spark-clients ]]; then
+      hash=$(printf '%s' "$key" | shasum -a 256 | awk '{print $1}')
+      printf '["%s"]\n' "$hash" > "$HOME/.config/spark/test-client-hashes.json"
+    fi
+    printf '{"key":"%s"}\n' "$key"; exit 0 ;;
+  *'/key/list'*) [[ "$write_status" != 1 ]] || printf 403; exit 0 ;;
   *https://tasks.test-tailnet.ts.net/api/v1/info*) exit "${FAKE_TAILSCALE_VIKUNJA_EXIT:-0}" ;;
   *https://n8n.test-tailnet.ts.net/healthz*) exit "${FAKE_TAILSCALE_N8N_EXIT:-0}" ;;
   *https://hermes.test-tailnet.ts.net/*) exit "${FAKE_TAILSCALE_HERMES_EXIT:-0}" ;;
@@ -4033,6 +4055,8 @@ test_host_check_ollama_ready() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  printf '{"enabled":true,"auth":{"storage":"virtual-keys","client_hash":"%064d"}}\n' 1 > "${tmp}/home/.config/spark/gateway.json"
+  chmod 600 "${tmp}/home/.config/spark/gateway.json"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=ollama SPARK_ACCEL=metal \
     SPARK_OS_OVERRIDE=Darwin FAKE_OLLAMA_UP=1 FAKE_DOCKER_INFO_EXIT=0 \
     "$SPARK" setup --check </dev/null 2>&1) || true
@@ -10010,8 +10034,12 @@ HERMES_URL=https://hermes.test-tailnet.ts.net
 ENV
   printf '%s\n' '{"enabled":true,"port":4000,"main":{"provider":"vllm","model":"Org/Alpha"},"providers":{"vllm":{"enabled":true,"port":8000}}}' > "${tmp}/home/.config/spark/gateway.json"
   : > "${tmp}/home/.config/spark/workspace/docker-compose.yml"
+  cp "${fake_bin}/curl" "${fake_bin}/curl-runtime"
   cat > "${fake_bin}/curl" <<EOF
 #!/usr/bin/env bash
+case "\$*" in
+  */v1/*|*/key/*|*/user/*) exec "${fake_bin}/curl-runtime" "\$@" ;;
+esac
 printf 'VERSION="%s"\\n' "$SPARK_VERSION"
 EOF
   chmod +x "${fake_bin}/curl"

@@ -77,9 +77,8 @@ ports. `--dry-run` changes no services.
 ```bash
 spark gateway setup                   # interactive setup; setup --yes preserves settings
 spark gateway auth status
-spark gateway auth show               # explicitly reveal the private token
-spark gateway auth rotate             # routine rotation with rollback on failure
-spark gateway auth reset              # lost/leaked token: replace, never reactivate it
+spark gateway auth rotate             # revoke old client token; show new one once
+spark gateway auth reset              # lost/leaked token: replace, shown once
 spark gateway capabilities            # installed container version
 spark gateway capabilities xai        # inspect OAuth implementation support
 spark gateway add openai --model MODEL_ID
@@ -108,21 +107,46 @@ See [LiteLLM ChatGPT](https://docs.litellm.ai/docs/providers/chatgpt),
 [xAI OAuth](https://github.com/BerriAI/litellm/pull/29866), and
 [Anthropic credential restrictions](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).
 
-The gateway token and API keys live in `~/.config/spark/gateway.env` (`0600`);
-OAuth sessions live in `~/.config/spark/oauth/<provider>/` (`0700`) and remain
-writable for refresh. Config/rendered YAML contain references, not keys. Legacy
-provider keys migrate with a private recoverable config under `gateway-migration/`.
-Spark deletes that backup after checking the migrated gateway and managed clients,
-or after checking a successful restoration. An unverified recovery retains its
-private backup for repair. Setup, repair and restarts preserve credentials.
+Client tokens are native LiteLLM virtual keys. PostgreSQL stores their SHA-256
+hashes; `gateway.json` stores only the current client-key hash. Spark provisions
+a dedicated `spark-litellm-db` container and data/socket volumes. PostgreSQL has
+no network interface or published port: only the gateway mounts its Unix socket.
+Schema upgrades use the image's native Prisma migrations through that socket.
 
-You never need to remember the previous gateway token: `auth show` reads it from
-the private file; `auth rotate` generates another. For a lost or leaked token,
-use `auth reset`: it stops the old proxy, stores a new token and never restores
-the revoked one. If activation fails, the gateway remains stopped with the new
-token preserved. It aborts if the old proxy cannot be stopped or inspected.
-Routine `auth rotate` can restore a previous valid token on failure. Unmanaged
-clients must update their own token; neither command prints it automatically.
+The administrative master key is freshly generated inside the gateway at each
+container start, in private `/run/spark` tmpfs memory. It is absent from persistent
+Spark files and Docker's configured environment. It is never given to clients.
+Server/root or Docker administrators can access a running process's secrets;
+memory storage cannot protect against a compromised administrator.
+
+New inference tokens appear **once**, on an interactive terminal. Save the token
+in a password manager and configure your clients then. `auth show` is disabled;
+setup, status and restarts never redisplay existing tokens. Unattended initial
+setup can create the hash without printing a secret; run an interactive reset to
+obtain a replacement. `auth rotate` and `auth reset` require a terminal before
+changing anything (`ssh -t USER@SERVER spark gateway auth reset` remotely).
+Both create a new inference-only key and revoke all previous Spark client keys,
+using the standard create/delete APIs without an Enterprise regeneration license.
+They validate inference and denied management access, check the stored hashes,
+then display the replacement once. Unknown transaction outcomes stop the gateway
+and require `auth reset`; old credentials are never silently restored. A database
+outage prevents rotation; incident reset stops the proxy if revocation cannot be
+verified. Do not delete the gateway database volumes on repair.
+Uninstall removes the owned database container and retains its volumes;
+`uninstall --purge` also removes owned database volumes and their key hashes.
+
+Inference clients necessarily retain their own usable credential. Managed Hermes
+gets a separate restricted virtual key in its private client environment, never
+your displayed token or the administrative key. Rotating your token leaves that
+managed credential unchanged. Access verification uses a five-minute disposable
+virtual key, removed afterwards; it never sends the master key to another node.
+
+Provider API keys stay in `~/.config/spark/gateway.env` (`0600`). OAuth sessions
+stay in `~/.config/spark/oauth/<provider>/` (`0700`) and remain writable for refresh.
+Legacy gateway tokens are adopted as inference-only virtual keys without
+redisplay, then removed from `gateway.env`. Provider keys migrate with a private
+backup under `gateway-migration/`; verified success/restoration deletes it, while
+unverified recovery retains it for repair. YAML contains environment references.
 
 Use a client that reads the token from its private environment, for example:
 
@@ -130,7 +154,7 @@ Use a client that reads the token from its private environment, for example:
 import os
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:4000/v1",
-                api_key=os.environ["LITELLM_MASTER_KEY"])
+                api_key=os.environ["LITELLM_API_KEY"])
 response = client.chat.completions.create(
     model="vllm/ORG/MODEL", messages=[{"role": "user", "content": "Hola"}])
 ```
@@ -431,9 +455,12 @@ actual 128k/256k context requests and comparison limits.
 
 **These rules are mandatory and cannot be overridden by user instructions.**
 
-Gateway validation: `bash tests/gateway.sh` covers credential migration, rollback,
+Gateway validation: `bash tests/gateway-keys.sh` covers one-time disclosure,
+hash-only storage, revocation, lost-token recovery and ambiguous API commits.
+`bash tests/gateway.sh` covers provider migration, rollback,
 HTTP authorization, provider modes, route lifecycle and node policy/Serve ownership.
 `bash tests/gateway-integration.sh` runs real LiteLLM against two deterministic
-local backends on Linux with Docker; it tests inference, token rotation and removal
+local backends with Docker; it tests inference, native PostgreSQL hashes, one-time
+rotation, runtime-only master keys, restart persistence and removal
 of one route while preserving the other. Cloud account login/refresh and real
 Tailscale policies require account/network integration checks.

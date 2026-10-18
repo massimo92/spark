@@ -4696,7 +4696,7 @@ workspace_setup_hermes() {
       NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
-      COMPATIBLE_API_KEY="$(gateway_auth_key)" \
+      COMPATIBLE_API_KEY="$(gateway_managed_client_key)" \
       CHAT_UI_URL="$hermes_url" \
       nemohermes onboard --non-interactive --yes-i-accept-third-party-software \
         --yes \
@@ -4730,7 +4730,7 @@ workspace_setup_hermes() {
       NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
-      COMPATIBLE_API_KEY="$(gateway_auth_key)" \
+      COMPATIBLE_API_KEY="$(gateway_managed_client_key)" \
       CHAT_UI_URL="$hermes_url" \
       bash -c 'curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash' || true
     if command -v nemohermes >/dev/null 2>&1 && workspace_start_hermes_gateway_proxy; then

@@ -14,34 +14,82 @@ check() {
   sandbox=$(mktemp -d "$TEST_ROOT/case.XXXXXX")
   local result=0
   set +e
-  (set -e; SPARK_CONFIG_DIR="$sandbox"; GATEWAY_CONFIG="$sandbox/gateway.json"; WORKSPACE_ENV_FILE="$sandbox/absent.env"; "$@")
+  (set -e
+    SPARK_CONFIG_DIR="$sandbox"; GATEWAY_CONFIG="$sandbox/gateway.json"; WORKSPACE_ENV_FILE="$sandbox/absent.env"
+    # Routing/provider/access unit doubles. Native key HTTP/storage semantics are
+    # covered independently by gateway-keys.sh and real gateway-integration.sh.
+    gateway_auth_key() { printf 'sk-%064d\n' 1; }
+    gateway_auth_ready() { return 0; }
+    gateway_capabilities() { return 0; }
+    gateway_database_prepare() { return 0; }
+    gateway_database_migrate() { return 0; }
+    gateway_virtual_ensure() { return 0; }
+    gateway_virtual_create() { return 0; }
+    gateway_virtual_validate() { [[ "$1" =~ ^sk-[a-f0-9]{64}$ ]]; }
+    gateway_admin_post() { cat >/dev/null; printf '{}\n'; }
+    "$@"
+  )
   result=$?
   set -e
   if [[ "$result" == 0 ]]; then printf 'ok - %s\n' "$label"; passed=$((passed+1)); else printf 'not ok - %s\n' "$label"; exit 1; fi
 
 }
 private_mode() { [[ "$(bundle_path_mode "$1")" == "$2" ]]; }
+database_ownership() {
+  source "$ROOT/src/lib/78_gateway_keys.sh"
+  local owner
+  owner=$(gateway_database_owner)
+  docker() {
+    printf '%s\n' "$*" >> "$SPARK_CONFIG_DIR/database.calls"
+    case "$1" in
+      inspect) printf '%s\n' "$DATABASE_FIXTURE" ;;
+      start|exec) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  mkdir -p "$SPARK_CONFIG_DIR"
+  DATABASE_FIXTURE=$(jq -nc --arg owner "$owner" '{Config:{Labels:{"io.spark.gateway-owner":$owner}},HostConfig:{NetworkMode:"bridge",PortBindings:{}},Mounts:[{Name:"spark-litellm-db-data",Destination:"/var/lib/postgresql/data"},{Name:"spark-litellm-db-socket",Destination:"/var/run/postgresql"}]}')
+  ! gateway_database_prepare
+  ! grep -q '^start ' "$SPARK_CONFIG_DIR/database.calls"
+  DATABASE_FIXTURE=$(printf '%s' "$DATABASE_FIXTURE" | jq '.HostConfig.NetworkMode="none" | .Config.Labels["io.spark.gateway-owner"]="foreign"')
+  ! gateway_database_prepare
+  ! grep -q '^start ' "$SPARK_CONFIG_DIR/database.calls"
+  DATABASE_FIXTURE=$(printf '%s' "$DATABASE_FIXTURE" | jq --arg owner "$owner" '.Config.Labels["io.spark.gateway-owner"]=$owner')
+  gateway_database_prepare
+  grep -q '^start spark-litellm-db' "$SPARK_CONFIG_DIR/database.calls"
+}
+database_uninstall_scope() {
+  source "$ROOT/src/lib/78_gateway_keys.sh"
+  mkdir -p "$SPARK_CONFIG_DIR"
+  local owner
+  owner=$(gateway_database_owner)
+  docker() {
+    printf '%s\n' "$*" >> "$SPARK_CONFIG_DIR/database.calls"
+    case "$1" in
+      inspect) [[ "${DATABASE_MISSING:-0}" != 1 ]] || return 1; printf '{"io.spark.gateway-owner":"%s"}\n' "$DATABASE_OWNER" ;;
+      volume) [[ "$2" != inspect ]] || printf '{"io.spark.gateway-owner":"%s"}\n' "$DATABASE_OWNER" ;;
+      rm) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+  DATABASE_OWNER=foreign
+  ! gateway_database_remove 1
+  ! grep -q '^rm ' "$SPARK_CONFIG_DIR/database.calls"
+  DATABASE_OWNER="$owner"
+  gateway_database_remove 0
+  grep -q '^rm -f spark-litellm-db' "$SPARK_CONFIG_DIR/database.calls"
+  ! grep -q '^volume rm ' "$SPARK_CONFIG_DIR/database.calls"
+  DATABASE_MISSING=1
+  gateway_database_remove 1
+  grep -q '^volume rm spark-litellm-db-data' "$SPARK_CONFIG_DIR/database.calls"
+  grep -q '^volume rm spark-litellm-db-socket' "$SPARK_CONFIG_DIR/database.calls"
+}
 token_persistence() {
   gateway_prepare_runtime vllm
-  local first
-  first=$(gateway_auth_key)
   gateway_prepare_runtime vllm
-  [[ "$first" == "$(gateway_auth_key)" && "$first" =~ ^sk-[a-f0-9]{64}$ ]]
   private_mode "$SPARK_CONFIG_DIR" 700 && private_mode "$(gateway_secrets_path)" 600
-  ! grep -q "$first" "$GATEWAY_CONFIG"
+  ! grep -q LITELLM_MASTER_KEY "$(gateway_secrets_path)"
   ! gateway_env_set BAD $'injected\nTOKEN=value'
-}
-token_rotation_rollback() {
-  gateway_prepare_runtime vllm
-  local old
-  old=$(gateway_auth_key)
-  gateway_running_state() { return 1; }
-  gateway_sync_clients() { return 1; }
-  ! gateway_auth_rotate
-  [[ "$old" == "$(gateway_auth_key)" ]]
-  gateway_sync_clients() { return 0; }
-  gateway_auth_rotate
-  [[ "$old" != "$(gateway_auth_key)" ]]
 }
 migrate() {
   gateway_save_config '{"enabled":true,"port":4321,"main":{"provider":"vllm","model":"Org/B"},"providers":{"openai":{"enabled":true,"api_key":"legacy-test-key","models":["test-model"]}}}'
@@ -179,40 +227,7 @@ client_scope() {
   [[ "$(workspace_read_env COMPATIBLE_API_KEY)" == external-key ]]
   gateway_env_set HERMES_LITELLM_BASE_URL http://127.0.0.1:4000/v1 "$WORKSPACE_ENV_FILE"
   gateway_sync_clients
-  [[ "$(workspace_read_env COMPATIBLE_API_KEY)" == "$(gateway_auth_key)" ]]
-}
-http_auth() {
-  trap 'printf "HTTP authorization test failed near line %s (status %s)\n" "$LINENO" "$?" >&2' ERR
-  gateway_prepare_runtime vllm
-  local pid old code port attempt
-  python3 "$ROOT/tests/fixtures/gateway_http.py" "$(gateway_secrets_path)" "$SPARK_CONFIG_DIR/http.port" > "$SPARK_CONFIG_DIR/http.log" 2>&1 & pid=$!
-  trap "kill $pid 2>/dev/null || true" EXIT
-  for ((attempt=0; attempt<30; attempt++)); do [[ ! -s "$SPARK_CONFIG_DIR/http.port" ]] || break; sleep 0.1; done
-  [[ -s "$SPARK_CONFIG_DIR/http.port" ]] || { cat "$SPARK_CONFIG_DIR/http.log" >&2; return 1; }
-  port=$(cat "$SPARK_CONFIG_DIR/http.port")
-  gateway_save_config "$(gateway_load_config | jq --argjson port "$port" '.port=$port')"
-  gateway_running_state() { return 0; }
-  gateway_wait_ready
-  gateway_model_routed vllm Test/Alpha
-  gateway_route_smoke vllm Test/Alpha
-  ! gateway_route_smoke vllm Wrong/Model
-  old=$(gateway_auth_key)
-  gateway_running_state() { return 1; }
-  gateway_auth_rotate
-  code=$(printf 'header = "Authorization: Bearer %s"\n' "$old" | curl --config - -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/v1/models")
-  [[ "$code" == 401 ]]
-  gateway_route_smoke vllm Test/Alpha
-  old=$(gateway_auth_key)
-  docker() { return 0; }
-  gateway_auth_command reset
-  code=$(printf 'header = "Authorization: Bearer %s"\n' "$old" | curl --config - -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/v1/models")
-  [[ "$code" == 401 ]]
-  gateway_route_smoke vllm Test/Alpha
-  gateway_running_state() { return 0; }
-  tailscale() { return 1; }
-  local output key
-  output=$(gateway_status); key=$(gateway_auth_key)
-  [[ "$output" != *"$key"* && "$output" == *'Authentication: configured'* ]]
+  [[ "$(workspace_read_env COMPATIBLE_API_KEY)" != "$(gateway_auth_key)" ]]
 }
 verified_access() {
   gateway_prepare_runtime vllm
@@ -295,13 +310,6 @@ concurrent_registry() {
   jq -e '.providers.ollama.models==["alpha","beta"]' "$GATEWAY_CONFIG" >/dev/null
   [[ ! -d "$SPARK_CONFIG_DIR/gateway.lock" ]]
 }
-invalid_token_repair() {
-  gateway_prepare_runtime vllm
-  gateway_env_set LITELLM_MASTER_KEY invalid-test-key
-  gateway_running_state() { return 1; }
-  gateway_auth_rotate
-  gateway_auth_ready
-}
 migration_cleanup_verified() {
   gateway_prepare_runtime vllm
   local original=$'previous routes\ngeneral_settings:\n  master_key: os.environ/LITELLM_MASTER_KEY'
@@ -341,22 +349,6 @@ migration_retains_failed_recovery() {
   ! gateway_sync
   [[ -f "$SPARK_CONFIG_DIR/gateway-migration/gateway.json" ]]
 }
-compromised_token_reset() {
-  gateway_prepare_runtime vllm
-  local old
-  old=$(gateway_auth_key)
-  gateway_running_state() { return 0; }
-  docker() { printf '%s\n' "$1" >> "$SPARK_CONFIG_DIR/container.calls"; }
-  gateway_sync_locked() { return 1; }
-  ! gateway_auth_command reset
-  gateway_auth_ready
-  [[ "$(gateway_auth_key)" != "$old" ]]
-  [[ "$(grep -c stop "$SPARK_CONFIG_DIR/container.calls")" -ge 2 ]]
-  old=$(gateway_auth_key)
-  docker() { return 1; }
-  ! gateway_auth_command reset
-  [[ "$(gateway_auth_key)" == "$old" ]]
-}
 remote_oauth_no_tunnel() {
   local controller="$SPARK_CONFIG_DIR" remote_root="$SPARK_CONFIG_DIR/remote" out
   gateway_capabilities() { return 0; }
@@ -395,8 +387,9 @@ oauth_refresh_stopped_before_replace() {
   private_mode "$session_path" 600
   [[ -z "$(find "$(dirname "$session_path")" -name '*.tmp.*')" ]]
 }
-check 'private token persists across setup; rejects dotenv injection' token_persistence
-check 'failed client rotation restores token; successful rotation changes it' token_rotation_rollback
+check 'provider secret file stays private; no persisted master and no dotenv injection' token_persistence
+check 'database startup refuses foreign resources and network exposure' database_ownership
+check 'uninstall refuses foreign resources and retains hashes without purge' database_uninstall_scope
 check 'legacy API keys migrate privately with recoverable config' migrate
 check 'multiple model ports, stopped routes and main preservation' route_lifecycle
 check 'API/OAuth selection, model preservation and capability rejection' provider_modes
@@ -407,17 +400,14 @@ check 'node resolution includes IPv6 and generates allow/deny policy tests' node
 check 'Serve ownership prevents overwrites and preserves unrelated ports' serve_ownership
 check 'missing supervised route fails; no-wait remains pending' publication_failure
 check 'managed client tokens update; external endpoints retain credentials' client_scope
-check 'HTTP token transport, rejection, inference and old-token invalidation' http_auth
 check 'SSH node verification keeps token out of argv; failure clears old evidence' verified_access
 check 'setup preserves provider credentials, port, main and protection preference' setup_persistence
 check 'remote setup configures the target; controller keeps no credentials' remote_setup_target
 check 'xAI rejects fallback callback ports; login/logout preserve private permissions' callback_and_permissions
 check 'failed migration never restores an anonymous gateway' anonymous_rollback_forbidden
 check 'concurrent registry updates keep both routes and release their locks' concurrent_registry
-check 'explicit rotation repairs an invalid stored token' invalid_token_repair
 check 'verified migration and verified rollback remove private backups' migration_cleanup_verified
 check 'unverified recovery retains its private backup' migration_retains_failed_recovery
-check 'incident reset never reactivates a leaked token; stop failure reports no revocation' compromised_token_reset
 check 'remote OAuth transfers credentials via stdin and removes local temporary sessions' remote_oauth_no_tunnel
 check 'headless OAuth requests local browser login without creating a tunnel' headless_oauth_guidance
 check 'OAuth refresh stops before another account session is installed' oauth_refresh_stopped_before_replace

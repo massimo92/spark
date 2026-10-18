@@ -20,7 +20,7 @@ for p in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
   [[ -d "$p" && ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
 
-VERSION="0.1.128"
+VERSION="0.1.129"
 
 # --- Color Output ---
 if [[ -t 1 ]]; then
@@ -12826,7 +12826,7 @@ workspace_setup_hermes() {
       NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
-      COMPATIBLE_API_KEY="$(gateway_auth_key)" \
+      COMPATIBLE_API_KEY="$(gateway_managed_client_key)" \
       CHAT_UI_URL="$hermes_url" \
       nemohermes onboard --non-interactive --yes-i-accept-third-party-software \
         --yes \
@@ -12860,7 +12860,7 @@ workspace_setup_hermes() {
       NEMOCLAW_HERMES_DASHBOARD_HOST=127.0.0.1 \
       NEMOCLAW_POLICY_TIER=restricted \
       NEMOCLAW_POLICY_MODE=suggested \
-      COMPATIBLE_API_KEY="$(gateway_auth_key)" \
+      COMPATIBLE_API_KEY="$(gateway_managed_client_key)" \
       CHAT_UI_URL="$hermes_url" \
       bash -c 'curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash' || true
     if command -v nemohermes >/dev/null 2>&1 && workspace_start_hermes_gateway_proxy; then
@@ -16454,7 +16454,7 @@ nemohermes_rebuild_with_workspace_env() {
   esac
   case "$base_url" in
     "http://host.openshell.internal:$(gateway_configured_port)/v1"*)
-      compatible_api_key=$(gateway_auth_key) || return 1 ;;
+      compatible_api_key=$(gateway_managed_client_key) || return 1 ;;
   esac
   [[ -n "$compatible_api_key" ]] || { err 'Compatible API key missing'; return 1; }
   if [[ "$SPARK_OS" == "Linux" ]]; then
@@ -16898,6 +16898,7 @@ EOF
     else
       docker rm -f "$CONTAINER_NAME" "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
     fi
+    gateway_database_remove "$purge" "$dry_run" || true
     if workspace_configured; then
       if [[ "$dry_run" == "1" ]]; then
         printf "  would run docker compose down -v for workspace\n"
@@ -17369,6 +17370,8 @@ gateway_generate_litellm_yaml() {
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: false
 
 litellm_settings:
   drop_params: true
@@ -17656,21 +17659,20 @@ gateway_env_set() {
   printf '%s=%s\n' "$key" "$value" >> "$tmp"
   chmod 600 "$tmp" && mv "$tmp" "$file"
 }
-gateway_auth_key() { gateway_env_get LITELLM_MASTER_KEY; }
-gateway_auth_ready() {
-  local key
-  key=$(gateway_auth_key) || return 1
-  [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]]
+gateway_auth_terminal() { [[ -t 2 ]]; }
+gateway_auth_present_new() {
+  # Only receive freshly generated keys. Never reveal an existing stored key.
+  if gateway_auth_terminal; then
+    printf '\nNew LiteLLM token (shown once):\n%s\nSave it now in your password manager. Lost token? Run spark gateway auth reset.\n\n' "$1" >&2
+  else
+    printf 'New LiteLLM client key created; only its hash is saved, no token displayed without an interactive terminal. Run spark gateway auth reset in a terminal (ssh -t for a remote command) to generate a replacement.\n' >&2
+  fi
 }
 gateway_auth_ensure() {
   local key p env_key config migrated=0 ollama_models
-  if ! gateway_auth_ready; then
-    if [[ -n "$(gateway_auth_key 2>/dev/null || true)" ]]; then
-      err 'Invalid stored gateway token; use spark gateway auth rotate'; return 1
-    fi
-    key="sk-$(openssl rand -hex 32)" || return 1
-    gateway_env_set LITELLM_MASTER_KEY "$key" || return 1
-  fi
+  # Provider secrets remain private; inference credentials live only as DB hashes.
+  mkdir -p "$SPARK_CONFIG_DIR" && chmod 700 "$SPARK_CONFIG_DIR" || return 1
+  if [[ ! -f "$(gateway_secrets_path)" ]]; then (umask 077; touch "$(gateway_secrets_path)") || return 1; fi
   config=$(gateway_load_config) || return 1
   [[ ! -L "$SPARK_CONFIG_DIR/gateway-migration" ]] || { err 'Recovery folder must not be a symlink'; return 1; }
   # Keep credentials recoverable until the new gateway or a rollback is verified.
@@ -17703,7 +17705,7 @@ gateway_auth_ensure() {
   chmod 600 "$(gateway_secrets_path)"
 }
 gateway_with_lock() (
-  local lock="${SPARK_CONFIG_DIR}/gateway.lock" attempt
+  local lock="${SPARK_CONFIG_DIR}/gateway.lock" attempt cleanup_command
   mkdir -p "$SPARK_CONFIG_DIR" && chmod 700 "$SPARK_CONFIG_DIR" || exit 1
   for ((attempt=0; attempt<30; attempt++)); do
     if mkdir "$lock" 2>/dev/null; then break; fi
@@ -17716,7 +17718,11 @@ gateway_with_lock() (
   done
   [[ "$attempt" -lt 30 ]] || { err 'Gateway busy; retry when the other command finishes'; exit 1; }
   printf '%s\n' "${BASHPID:-$$}" > "$lock/pid"
-  trap 'rm -f "$lock/pid"; rmdir "$lock" 2>/dev/null || true' EXIT
+  # Capture the escaped path now: local variables can unwind before EXIT fires.
+  # shellcheck disable=SC2064
+  printf -v cleanup_command 'rm -f -- %q/pid; rmdir -- %q 2>/dev/null || true' "$lock" "$lock"
+  # shellcheck disable=SC2064
+  trap "$cleanup_command" EXIT
   "$@"
 )
 gateway_provider_env() {
@@ -17744,10 +17750,16 @@ gateway_wait_ready() {
     if gateway_api_ready; then
       # A working token is insufficient: anonymous model enumeration must fail.
       local status
-      status=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(gateway_configured_port)/v1/models") || return 1
-      [[ "$status" == 401 || "$status" == 403 ]] || { err 'Gateway accepts anonymous requests'; return 1; }
-      status=$(printf 'header = "Authorization: Bearer sk-invalid"\n' | curl --config - -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(gateway_configured_port)/v1/models") || return 1
-      [[ "$status" == 401 || "$status" == 403 ]] || { err 'Gateway accepts invalid tokens'; return 1; }
+      status=$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(gateway_configured_port)/v1/models") || status=000
+      case "$status" in
+        401|403) ;; 2??|3??) err 'Gateway accepts anonymous requests'; return 1 ;;
+        *) sleep 1; continue ;; # Database/proxy may still be restarting.
+      esac
+      status=$(printf 'header = "Authorization: Bearer sk-invalid"\n' | curl --config - -sS --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(gateway_configured_port)/v1/models") || status=000
+      case "$status" in
+        401|403) ;; 2??|3??) err 'Gateway accepts invalid tokens'; return 1 ;;
+        *) sleep 1; continue ;;
+      esac
       return 0
     fi
     sleep 1
@@ -17770,7 +17782,7 @@ gateway_publish_model() {
   fi
   printf '  Gateway: http://localhost:%s/v1\n  Model: %s/%s\n' "$(gateway_configured_port)" "$([[ "$provider" == ollama ]] && printf ollama_chat || printf vllm)" "$model"
   [[ "$supervised" == 1 ]] || printf '  State: pending backend readiness (spark status --json)\n'
-  printf '  Authentication: Bearer token (spark gateway auth show)\n'
+  printf '  Authentication: Bearer token saved at creation; if lost, spark gateway auth reset\n'
 }
 gateway_protected() { gateway_load_config | jq -e '.protected != false' >/dev/null; }
 
@@ -17789,6 +17801,7 @@ gateway_oauth_status() {
 gateway_capabilities() {
   local p="${1:-base}" image="${2:-$LITELLM_IMAGE}" script
   case "$p" in
+    keys) script='import prisma, litellm_proxy_extras; from litellm.proxy._types import GenerateKeyRequest; assert "allowed_routes" in GenerateKeyRequest.model_fields; assert "key" in GenerateKeyRequest.model_fields' ;;
     base) script='import importlib.metadata; print(importlib.metadata.version("litellm"))' ;;
     chatgpt) script='from litellm.llms.chatgpt.authenticator import Authenticator; assert callable(Authenticator().get_access_token)' ;;
     github_copilot) script='from litellm.llms.github_copilot.authenticator import Authenticator; assert callable(Authenticator().get_access_token)' ;;
@@ -17845,13 +17858,16 @@ gateway_logout() {
 gateway_sync() { gateway_with_lock gateway_sync_locked; }
 gateway_sync_locked() {
   local path="${SPARK_CONFIG_DIR}/litellm_config.yaml" previous="" yaml tmp running=0 previous_image=""
+  if [[ "${SPARK_GATEWAY_DEFER_CLIENT:-0}" != 1 ]] && gateway_load_config | jq -e '.auth.recovery_required==true' >/dev/null; then
+    err 'Recover the interrupted token change first: spark gateway auth reset'; return 1
+  fi
   gateway_auth_ensure && gateway_preflight || return 1
   [[ -f "$path" ]] && previous=$(cat "$path")
   yaml=$(gateway_generate_litellm_yaml) || return 1
   previous_image=$(docker inspect "$GATEWAY_CONTAINER" --format '{{.Image}}' 2>/dev/null || true)
   if gateway_running_state; then
     running=1
-    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then gateway_wait_ready && gateway_sync_clients && gateway_migration_cleanup; return $?; fi
+    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure && gateway_migration_cleanup; return $?; fi
   fi
   tmp=$(umask 077; mktemp "${path}.tmp.XXXXXX") || return 1
   printf '%s\n' "$yaml" > "$tmp"
@@ -17859,7 +17875,7 @@ gateway_sync_locked() {
   if [[ "$running" == 1 ]]; then
     docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || return 1
   fi
-  if gateway_start_container && gateway_wait_ready && gateway_sync_clients; then gateway_migration_cleanup; return $?; fi
+  if gateway_start_container && gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure; then gateway_migration_cleanup; return $?; fi
   err 'Gateway update failed; restoring the previous rendered routes'
   docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
   # Never restore anonymous access during the first migration.
@@ -17872,7 +17888,7 @@ gateway_sync_locked() {
     printf '%s\n' "$previous" > "$tmp"
     chmod 600 "$tmp" && mv "$tmp" "$path" || return 1
     docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
-    if gateway_migration_restore_config && GATEWAY_RESTORE_IMAGE="$previous_image" gateway_start_container && gateway_wait_ready && gateway_sync_clients; then
+    if gateway_migration_restore_config && GATEWAY_RESTORE_IMAGE="$previous_image" gateway_start_container && gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure; then
       gateway_migration_cleanup || return 1
     else
       err 'Previous gateway routes could not be verified; private recovery backup retained'
@@ -17886,12 +17902,13 @@ gateway_start() {
   gateway_sync
 }
 gateway_start_container() {
-  local port net_args=() run_args=() p dir env_key mode config
+  local port net_args=() run_args=() p dir env_key mode config runtime_script env_file rc=0
   config=$(gateway_load_config)
   port=$(gateway_configured_port)
   [[ "$port" =~ ^[0-9]+$ && "$port" -gt 0 && "$port" -le 65535 ]] || return 1
   while IFS= read -r p; do net_args+=("$p"); done < <(gateway_net_args "$port")
-  run_args=(docker run -d "${net_args[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp --env-file "$(gateway_secrets_path)" -v "${SPARK_CONFIG_DIR}/litellm_config.yaml:/app/config.yaml:ro")
+  gateway_database_prepare && gateway_database_migrate || return 1
+  run_args=()
   for p in chatgpt github_copilot xai; do
     mode=$(printf '%s\n' "$config" | jq -r --arg p "$p" '.providers[$p].auth // "api"')
     if gateway_provider_enabled "$p" | grep -qx true && { [[ "$p" != xai ]] || [[ "$mode" == oauth ]]; }; then
@@ -17902,18 +17919,36 @@ gateway_start_container() {
       [[ "$p" != xai ]] || run_args+=(-e XAI_API_KEY=)
     fi
   done
+  # Strip the legacy administrative key before passing provider env to Docker.
+  env_file=$(umask 077; mktemp "$SPARK_CONFIG_DIR/gateway-runtime.env.XXXXXX") || return 1
+  awk 'index($0,"LITELLM_MASTER_KEY=")!=1 && index($0,"DATABASE_URL=")!=1' "$(gateway_secrets_path)" > "$env_file"
+  runtime_script='import os, secrets, sys
+os.umask(0o077)
+key = "sk-" + secrets.token_hex(32)
+with open("/run/spark/master-key", "w") as f:
+    f.write(key)
+os.environ["LITELLM_MASTER_KEY"] = key
+os.environ.pop("LITELLM_SALT_KEY", None)
+os.execvp("litellm", ["litellm"] + sys.argv[1:])'
+  run_args=(docker run -d "${net_args[@]}" --user "$(id -u):$(id -g)" -e HOME=/tmp --env-file "$env_file"
+    --ulimit core=0:0 --tmpfs "/run/spark:rw,noexec,nosuid,size=1m,mode=0700,uid=$(id -u),gid=$(id -g)"
+    -e 'DATABASE_URL=postgresql://spark@localhost/litellm?host=/var/run/postgresql'
+    -e DISABLE_SCHEMA_UPDATE=true
+    -v "$(gateway_database_name)-socket:/var/run/postgresql"
+    -v "${SPARK_CONFIG_DIR}/litellm_config.yaml:/app/config.yaml:ro" "${run_args[@]}")
   docker rm "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
-  run_args+=(--name "$GATEWAY_CONTAINER" --restart unless-stopped "${GATEWAY_RESTORE_IMAGE:-$LITELLM_IMAGE}" --config /app/config.yaml)
+  run_args+=(--name "$GATEWAY_CONTAINER" --label io.spark.auth-mode=virtual-keys --restart unless-stopped --entrypoint python "${GATEWAY_RESTORE_IMAGE:-$LITELLM_IMAGE}" -c "$runtime_script" --config /app/config.yaml)
   [[ "$SPARK_OS" != Linux ]] || run_args+=(--host 127.0.0.1)
   run_args+=(--port "$port")
-  "${run_args[@]}" >/dev/null 2>&1 || { err 'LiteLLM container failed to start; inspect spark gateway logs'; return 1; }
+  "${run_args[@]}" >/dev/null 2>&1 || rc=$?
+  rm -f "$env_file"
+  [[ "$rc" == 0 ]] || { err 'LiteLLM container failed to start; inspect spark gateway logs'; return 1; }
 }
 gateway_sync_clients() {
   local key
   [[ -f "${WORKSPACE_ENV_FILE:-/nonexistent}" ]] || return 0
   gateway_managed_client_endpoint "${NEMOCLAW_ENDPOINT_URL:-$(workspace_read_env HERMES_LITELLM_BASE_URL 2>/dev/null || true)}" || return 0
-  key=$(gateway_auth_key) || return 1
-  workspace_set_env_key COMPATIBLE_API_KEY "$key" || return 1
+  key=$(gateway_managed_client_key) || return 1
   # Rebuild only a running managed sandbox whose token is stale. Rebuild reads
   # the private workspace env; arbitrary external endpoints are not changed.
   if command -v nemohermes >/dev/null 2>&1 && workspace_hermes_running; then
@@ -17925,44 +17960,13 @@ gateway_sync_clients() {
     fi
   fi
 }
-gateway_auth_rotate() { gateway_with_lock gateway_auth_rotate_locked; }
-gateway_auth_rotate_locked() {
-  local file old key running=0 tmp
-  file=$(gateway_secrets_path)
-  if ! gateway_auth_ready && [[ -n "$(gateway_auth_key 2>/dev/null || true)" ]]; then
-    # The invalid token cannot be used for a Spark rollback. Establish a private
-    # recovery token, then apply the normal verified rotation transaction.
-    key="sk-$(openssl rand -hex 32)" || return 1
-    [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
-    gateway_env_set LITELLM_MASTER_KEY "$key" || return 1
-    warn 'Invalid stored token replaced with a secure recovery token'
-  fi
-  gateway_auth_ensure || return 1
-  old=$(cat "$file")
-  gateway_running_state && running=1
-  key="sk-$(openssl rand -hex 32)" || return 1
-  gateway_env_set LITELLM_MASTER_KEY "$key" || return 1
-  if { [[ "$running" == 0 ]] || docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1; } &&
-     { if [[ "$running" == 1 ]]; then gateway_sync_locked; else gateway_sync_clients; fi; }; then
-    info 'Gateway token rotated; unmanaged clients must update their token'; return 0
-  fi
-  tmp=$(umask 077; mktemp "${file}.tmp.XXXXXX") || return 1
-  printf '%s\n' "$old" > "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$file"
-  if [[ "$running" == 1 ]]; then
-    docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
-    gateway_sync_locked || err 'Token rollback requires spark gateway start'
-  else
-    gateway_sync_clients || err 'Managed clients could not be restored'
-  fi
-  err 'Rotation failed; previous token restored'; return 1
-}
 gateway_auth_command() {
   case "${1:-status}" in
     status) gateway_auth_ready && printf 'authentication: configured\n' || { printf 'authentication: migration-required\n'; return 1; } ;;
-    show) gateway_auth_ready || return 1; gateway_auth_key ;;
+    show) err 'Stored tokens cannot be displayed. Lost token? Run spark gateway auth reset'; return 1 ;;
     rotate) [[ $# == 1 ]] || return 1; gateway_auth_rotate ;;
     reset) [[ $# == 1 ]] || return 1; gateway_with_lock gateway_auth_reset_locked ;;
-    *) err 'Usage: spark gateway auth <status|show|rotate|reset>'; return 1 ;;
+    *) err 'Usage: spark gateway auth <status|rotate|reset>'; return 1 ;;
   esac
 }
 gateway_add() { gateway_with_lock gateway_add_locked "$@"; }
@@ -18047,8 +18051,8 @@ cmd_gateway() {
       cat <<'HELP'
 Usage: spark gateway <setup|start|stop|status|logs|add|remove|auth|login|logout|capabilities|access>
   setup [--yes]             Configure local providers, authentication and access
-  auth status|show|rotate     Manage the private gateway token
-  auth reset                 Revoke a lost/leaked token; never restore it on failure
+  auth status|rotate         Check authentication or rotate the private token
+  auth reset                 Replace a lost/leaked inference token (shown once)
   login PROVIDER [--remote USER@HOST]
                              OAuth login on this computer, optionally install remotely
   logout PROVIDER            Disable the provider and remove its session
@@ -18059,6 +18063,8 @@ Usage: spark gateway <setup|start|stop|status|logs|add|remove|auth|login|logout|
   access nodes|allow|policy|enable|disable|status|protect|probe|verify
                              HTTPS access and Tailscale policy workflow
 Provider API keys are read with hidden input; subscriptions use a separate login.
+New gateway tokens appear once in an interactive terminal; save them immediately.
+Stored tokens cannot be displayed by the CLI. Lost token? Use auth reset.
 Claude Pro/Max is not offered as a general gateway API.
 HELP
       ;;
@@ -18070,6 +18076,7 @@ HELP
 gateway_preflight() {
   local config p mode env_key key
   config=$(gateway_load_config) || return 1
+  gateway_capabilities keys >/dev/null || { err 'LiteLLM image lacks PostgreSQL virtual-key support'; return 1; }
   printf '%s\n' "$config" | jq -e '.port // 4000 | type=="number" and .>0 and .<=65535' >/dev/null || return 1
   for p in openrouter zen together openai anthropic xai chatgpt github_copilot; do
     [[ "$(gateway_provider_enabled "$p")" == true ]] || continue
@@ -18186,26 +18193,6 @@ gateway_migration_restore_config() {
   done
   restored=$(printf '%s\n' "$restored" | jq 'if .providers then del(.providers[].api_key) else . end') || return 1
   gateway_save_config "$restored"
-}
-# Incident recovery: regenerate without knowing the old token, fail closed.
-gateway_auth_reset_locked() {
-  local running=0 key
-  docker info >/dev/null 2>&1 || { err 'Cannot inspect LiteLLM; the previous token has NOT been revoked'; return 1; }
-  gateway_running_state && running=1
-  key="sk-$(openssl rand -hex 32)" || return 1
-  if [[ "$running" == 1 ]] && ! docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1; then
-    err 'Could not stop LiteLLM; the previous token has NOT been revoked'; return 1
-  fi
-  gateway_env_set LITELLM_MASTER_KEY "$key" && gateway_auth_ensure || return 1
-  if [[ "$running" == 1 ]]; then
-    if ! gateway_sync_locked; then
-      docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
-      err 'Previous token revoked; replacement kept private, gateway stopped. Fix the error and run spark gateway start'; return 1
-    fi
-  elif ! gateway_sync_clients; then
-    err 'Previous token replaced; update managed clients before starting LiteLLM'; return 1
-  fi
-  info 'Gateway token regenerated; the previous token is revoked. Update unmanaged clients (auth show reveals the new token)'
 }
 # Based on spark by Massimo Angelini - https://github.com/massimo92/spark
 # Serve exposes a service; only the tailnet policy restricts source nodes.
@@ -18337,7 +18324,7 @@ gateway_access_probe() {
       printf 'Network probe: unreachable (also check node connectivity; this alone does not prove the policy)\n' ;;
     allowed)
       local token_file="${SPARK_GATEWAY_TOKEN_FILE:-$(gateway_secrets_path)}"
-      key=$(gateway_env_get LITELLM_MASTER_KEY "$token_file") || { err 'Set SPARK_GATEWAY_TOKEN_FILE to a private env file containing LITELLM_MASTER_KEY'; return 1; }
+      key=$(gateway_env_get LITELLM_API_KEY "$token_file" 2>/dev/null || gateway_env_get LITELLM_MASTER_KEY "$token_file") || { err 'Set SPARK_GATEWAY_TOKEN_FILE to a private client env file containing LITELLM_API_KEY'; return 1; }
       [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
       code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$url/models") || return 1
       [[ "$code" == 401 || "$code" == 403 ]] || { err 'Anonymous access accepted'; return 1; }
@@ -18380,7 +18367,7 @@ gateway_exposure_findings() {
 }
 
 # SSH probes establish evidence from two live nodes without storing the token there.
-gateway_access_verify() {
+gateway_access_verify() (
   local allowed='' denied='' config status dns port key mode node selector matches ips selected script quoted payload blocked addresses ssh_port
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -18399,7 +18386,13 @@ gateway_access_verify() {
   status=$(tailscale status --json) || return 1
   dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")')
   port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
-  key=$(gateway_auth_key) || return 1
+  key="sk-$(openssl rand -hex 32)" || return 1
+  gateway_virtual_create spark-managed "$key" 5m || return 1
+  local probe_hash
+  probe_hash=$(gateway_key_hash "$key") || return 1
+  # Capture the validated hash before local function scope unwinds at EXIT.
+  # shellcheck disable=SC2064
+  trap "printf '%s' '{\"keys\":[\"$probe_hash\"]}' | gateway_admin_post /key/delete >/dev/null 2>&1 || true" EXIT
   blocked=$(gateway_access_blocked_ports) || return 1
   addresses=$(printf '%s\n' "$status" | jq -c '.Self.TailscaleIPs // []') || return 1
   [[ "$(printf '%s\n' "$addresses" | jq length)" -gt 0 ]] || return 1
@@ -18457,7 +18450,7 @@ PY
   done
   config=$(printf '%s\n' "$config" | jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.access.policy_status="verified" | .access.verified_at=$now') || return 1
   gateway_save_config "$config" && gateway_access_status
-}
+)
 
 gateway_access_ssh_port() {
   local port
@@ -18576,6 +18569,227 @@ gateway_session_write() {
   if printf '%s\n' "$content" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$file"; then return 0; fi
   rm -f "$tmp"; return 1
 }
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
+# Native LiteLLM virtual keys: persistent hashes, runtime-only administrative key.
+gateway_key_hash() { printf '%s' "$1" | shasum -a 256 | awk '{print $1}'; }
+gateway_auth_key() {
+  # Internal administration only. Never export this to an inference client.
+  docker exec "$GATEWAY_CONTAINER" cat /run/spark/master-key 2>/dev/null
+}
+gateway_auth_ready() {
+  gateway_load_config | jq -e '.auth.storage=="virtual-keys" and (.auth.client_hash | type=="string" and test("^[a-f0-9]{64}$")) and (.auth.recovery_required!=true)' >/dev/null
+}
+gateway_database_name() { printf '%s-db\n' "$GATEWAY_CONTAINER"; }
+gateway_database_owner() { printf '%s' "$SPARK_CONFIG_DIR" | shasum -a 256 | awk '{print $1}'; }
+gateway_database_remove() {
+  local purge="${1:-0}" dry_run="${2:-0}" name owner existing volume
+  name=$(gateway_database_name); owner=$(gateway_database_owner)
+  if existing=$(docker inspect "$name" --format '{{json .Config.Labels}}' 2>/dev/null); then
+    printf '%s' "$existing" | jq -e --arg owner "$owner" '.["io.spark.gateway-owner"]==$owner' >/dev/null || {
+      warn 'Leaving a database container owned by another configuration'; return 1;
+    }
+    if [[ "$dry_run" == 1 ]]; then
+      printf '  would remove container %s (database volumes retained unless --purge)\n' "$name"
+    else
+      docker rm -f "$name" >/dev/null 2>&1 || return 1
+    fi
+  fi
+  [[ "$purge" == 1 ]] || return 0
+  for volume in "$name-data" "$name-socket"; do
+    existing=$(docker volume inspect "$volume" --format '{{json .Labels}}' 2>/dev/null) || continue
+    printf '%s' "$existing" | jq -e --arg owner "$owner" '.["io.spark.gateway-owner"]==$owner' >/dev/null || return 1
+    if [[ "$dry_run" == 1 ]]; then printf '  would remove volume %s\n' "$volume"; else docker volume rm "$volume" >/dev/null || return 1; fi
+  done
+}
+gateway_database_prepare() {
+  local name owner existing attempt volume
+  name=$(gateway_database_name); owner=$(gateway_database_owner)
+  if existing=$(docker inspect "$name" --format '{{json .}}' 2>/dev/null); then
+    printf '%s\n' "$existing" | jq -e --arg owner "$owner" --arg name "$name" '
+      .Config.Labels["io.spark.gateway-owner"]==$owner and .HostConfig.NetworkMode=="none" and
+      (.HostConfig.PortBindings // {} | length)==0 and
+      any(.Mounts[]; .Name==($name+"-data") and .Destination=="/var/lib/postgresql/data") and
+      any(.Mounts[]; .Name==($name+"-socket") and .Destination=="/var/run/postgresql")' >/dev/null || {
+      err 'Gateway database container is not privately owned by this configuration'; return 1;
+    }
+    docker start "$name" >/dev/null 2>&1 || return 1
+  else
+    for volume in "$name-data" "$name-socket"; do
+      if existing=$(docker volume inspect "$volume" --format '{{json .Labels}}' 2>/dev/null); then
+        printf '%s\n' "$existing" | jq -e --arg owner "$owner" '.["io.spark.gateway-owner"]==$owner' >/dev/null || { err 'Database volume belongs to another configuration'; return 1; }
+      else
+        docker volume create --label "io.spark.gateway-owner=$owner" "$volume" >/dev/null || return 1
+      fi
+    done
+    # No TCP listener/network/password file: only the explicitly mounted Unix socket.
+    docker run -d --name "$name" --label "io.spark.gateway-owner=$owner" --restart unless-stopped --network none \
+      -e POSTGRES_DB=litellm -e POSTGRES_USER=spark -e POSTGRES_HOST_AUTH_METHOD=trust \
+      -e 'POSTGRES_INITDB_ARGS=--auth-local=trust --auth-host=reject' \
+      -v "$name-data:/var/lib/postgresql/data" -v "$name-socket:/var/run/postgresql" \
+      "${SPARK_GATEWAY_POSTGRES_IMAGE:-postgres:17-alpine}" postgres -c 'listen_addresses=' >/dev/null 2>&1 || { err 'Could not start private LiteLLM PostgreSQL'; return 1; }
+  fi
+  for ((attempt=0; attempt<30; attempt++)); do
+    docker exec "$name" pg_isready -q -h /var/run/postgresql -U spark -d litellm >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  err 'Private LiteLLM PostgreSQL did not become ready'; return 1
+}
+gateway_database_client_hashes() {
+  local hashes
+  hashes=$(docker exec "$(gateway_database_name)" psql -X -A -t -v ON_ERROR_STOP=1 -U spark -d litellm -c \
+    'SELECT token FROM "LiteLLM_VerificationToken" WHERE user_id = '\''spark-clients'\'' ORDER BY token') || return 1
+  printf '%s\n' "$hashes" | jq -Rn '[inputs | select(length>0)] | if all(.[]; test("^[a-f0-9]{64}$")) then . else error("Invalid virtual-key hash") end'
+}
+gateway_database_migrate() {
+  local script
+  # Use Prisma's own migrator and socket URL. Some LiteLLM migration coordinators
+  # strip libpq's host query parameter and would incorrectly attempt TCP.
+  script='import pathlib, subprocess
+import litellm_proxy_extras
+schema = pathlib.Path(litellm_proxy_extras.__file__).parent / "schema.prisma"
+subprocess.run(["prisma", "migrate", "deploy", "--schema", str(schema)], check=True)'
+  docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp \
+    -e 'DATABASE_URL=postgresql://spark@localhost/litellm?host=/var/run/postgresql' \
+    -v "$(gateway_database_name)-socket:/var/run/postgresql" --entrypoint python \
+    "${GATEWAY_RESTORE_IMAGE:-$LITELLM_IMAGE}" -c "$script" >/dev/null 2>&1 || {
+    err 'LiteLLM schema migration over the private PostgreSQL socket failed'; return 1;
+  }
+}
+gateway_admin_post() {
+  local path="$1" key payload
+  payload=$(cat) || return 1
+  key=$(gateway_auth_key) || return 1
+  [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
+  # Curl reads both authorization and secret JSON from stdin, never argv/files.
+  { printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$key"
+    printf 'data = %s\n' "$(printf '%s' "$payload" | jq -Rs .)"
+  } | curl --config - -fsS --max-time 60 "http://127.0.0.1:$(gateway_configured_port)$path" 2>/dev/null
+}
+gateway_virtual_owner_ensure() {
+  local user="$1" body info
+  case "$user" in spark-clients|spark-managed) ;; *) return 1 ;; esac
+  info=$(gateway_curl -fsS --max-time 10 "http://127.0.0.1:$(gateway_configured_port)/user/info?user_id=$user" 2>/dev/null) || info='{}'
+  if ! printf '%s\n' "$info" | jq -e --arg user "$user" '.user_info.user_id==$user' >/dev/null; then
+    body=$(printf '{"user_id":"%s","user_role":"internal_user","auto_create_key":false}' "$user")
+    printf '%s' "$body" | gateway_admin_post /user/new >/dev/null || return 1
+    info=$(gateway_curl -fsS --max-time 10 "http://127.0.0.1:$(gateway_configured_port)/user/info?user_id=$user" 2>/dev/null) || return 1
+  fi
+  printf '%s\n' "$info" | jq -e '.user_info.user_role=="internal_user"' >/dev/null || { err 'Inference key owner must not be a proxy administrator'; return 1; }
+}
+gateway_virtual_create() {
+  local user="$1" key="$2" duration="${3:-}" response body alias_hash
+  [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
+  gateway_virtual_owner_ensure "$user" || return 1
+  alias_hash=$(gateway_key_hash "$key") || return 1
+  body=$(printf '{"key":"%s","user_id":"%s","key_alias":"%s-%s","allowed_routes":["llm_api_routes"],"models":[]}' "$key" "$user" "$user" "${alias_hash:0:12}")
+  if [[ -n "$duration" ]]; then
+    [[ "$duration" == 5m ]] || return 1
+    body="${body%\}},\"duration\":\"5m\"}"
+  fi
+  response=$(printf '%s' "$body" | gateway_admin_post /key/generate) || return 1
+  [[ "$(printf '%s' "$response" | jq -r '.key // empty')" == "$key" ]]
+}
+gateway_virtual_validate() {
+  local key="$1" code
+  [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
+  printf 'header = "Authorization: Bearer %s"\n' "$key" | curl --config - -fsS --max-time 5 \
+    "http://127.0.0.1:$(gateway_configured_port)/v1/models" >/dev/null 2>&1 || return 1
+  # Even a valid inference key must not enumerate or administer other keys.
+  code=$(printf 'header = "Authorization: Bearer %s"\n' "$key" | curl --config - -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:$(gateway_configured_port)/key/list" 2>/dev/null) || return 1
+  [[ "$code" == 401 || "$code" == 403 ]]
+}
+gateway_virtual_record() {
+  local config
+  [[ "$1" =~ ^[a-f0-9]{64}$ ]] || return 1
+  config=$(gateway_load_config | jq --arg hash "$1" '.auth={storage:"virtual-keys",client_hash:$hash}') || return 1
+  gateway_save_config "$config"
+}
+gateway_legacy_token_cleanup() {
+  local path tmp
+  path=$(gateway_secrets_path)
+  [[ -f "$path" ]] || return 0
+  tmp=$(umask 077; mktemp "$path.tmp.XXXXXX") || return 1
+  awk 'index($0,"LITELLM_MASTER_KEY=")!=1' "$path" > "$tmp"
+  chmod 600 "$tmp" && mv "$tmp" "$path"
+}
+gateway_virtual_ensure() {
+  [[ "${SPARK_GATEWAY_DEFER_CLIENT:-0}" != 1 ]] || return 0
+  local config hash hashes key fresh=0
+  config=$(gateway_load_config) || return 1
+  [[ "$(printf '%s' "$config" | jq -r '.auth.recovery_required // false')" != true ]] || { err 'Token recovery required: spark gateway auth reset'; return 1; }
+  hashes=$(gateway_database_client_hashes) || return 1
+  hash=$(printf '%s' "$config" | jq -r '.auth.client_hash // empty')
+  if [[ -n "$hash" ]]; then
+    printf '%s' "$hashes" | jq -e --arg hash "$hash" '.==[$hash]' >/dev/null || { err 'Client key state differs from PostgreSQL; run spark gateway auth reset'; return 1; }
+  elif [[ "$(printf '%s' "$hashes" | jq length)" == 1 ]]; then
+    hash=$(printf '%s' "$hashes" | jq -r '.[0]')
+    gateway_virtual_record "$hash" || return 1
+  elif [[ "$hashes" == '[]' || "$(printf '%s' "$hashes" | jq length)" == 0 ]]; then
+    # Adopt a known legacy key as an inference-only key; never redisplay it.
+    key=$(gateway_env_get LITELLM_MASTER_KEY 2>/dev/null || true)
+    if [[ -z "$key" ]]; then key="sk-$(openssl rand -hex 32)" || return 1; fresh=1; fi
+    gateway_virtual_create spark-clients "$key" && gateway_virtual_validate "$key" || return 1
+    hash=$(gateway_key_hash "$key")
+    gateway_virtual_record "$hash" || return 1
+    [[ "$fresh" == 0 ]] || gateway_auth_present_new "$key"
+  else
+    err 'Multiple client keys found; run spark gateway auth reset'; return 1
+  fi
+  gateway_legacy_token_cleanup
+}
+gateway_managed_client_key() {
+  local key
+  key=$(workspace_read_env COMPATIBLE_API_KEY 2>/dev/null || true)
+  if [[ -n "$key" ]] && gateway_virtual_validate "$key"; then printf '%s\n' "$key"; return 0; fi
+  key="sk-$(openssl rand -hex 32)" || return 1
+  gateway_virtual_create spark-managed "$key" && gateway_virtual_validate "$key" || return 1
+  # This is the client's own restricted credential, never the user/admin token.
+  workspace_set_env_key COMPATIBLE_API_KEY "$key" || return 1
+  printf '%s\n' "$key"
+}
+gateway_auth_replace_locked() {
+  local mode="${1:-rotate}" hashes count key hash config
+  gateway_auth_terminal || { err 'Token rotation requires an interactive terminal (ssh -t for a remote command)'; return 1; }
+  docker info >/dev/null 2>&1 || { err 'Cannot inspect LiteLLM; no revocation confirmed'; return 1; }
+  if ! gateway_running_state || [[ "$(docker inspect "$GATEWAY_CONTAINER" --format '{{index .Config.Labels "io.spark.auth-mode"}}' 2>/dev/null)" != virtual-keys ]]; then
+    SPARK_GATEWAY_DEFER_CLIENT=1 gateway_sync_locked || { [[ "$mode" != reset ]] || gateway_auth_recovery_stop; return 1; }
+  fi
+  gateway_wait_ready || { [[ "$mode" != reset ]] || gateway_auth_recovery_stop; return 1; }
+  hashes=$(gateway_database_client_hashes) || { [[ "$mode" != reset ]] || gateway_auth_recovery_stop; return 1; }
+  count=$(printf '%s' "$hashes" | jq length)
+  key="sk-$(openssl rand -hex 32)" || return 1
+  hash=$(gateway_key_hash "$key")
+  # Mark uncertain transactions before calling the server. Never silently revert
+  # a revoked key or automatically generate a replacement after an I/O failure.
+  config=$(gateway_load_config | jq '.auth.recovery_required=true') || return 1
+  gateway_save_config "$config" || return 1
+  # Native regenerate is license-gated in some releases. Generate + delete uses
+  # standard virtual-key APIs and never allows a grace period for the old key.
+  gateway_virtual_create spark-clients "$key" && gateway_virtual_validate "$key" || { gateway_auth_recovery_stop; return 1; }
+  if [[ "$count" != 0 ]]; then
+    printf '{"keys":%s}' "$hashes" | gateway_admin_post /key/delete >/dev/null || { gateway_auth_recovery_stop; return 1; }
+  fi
+  hashes=$(gateway_database_client_hashes) || { gateway_auth_recovery_stop; return 1; }
+  if ! printf '%s' "$hashes" | jq -e --arg hash "$hash" '.==[$hash]' >/dev/null || ! gateway_virtual_validate "$key" || ! gateway_virtual_record "$hash"; then
+    gateway_auth_recovery_stop; return 1
+  fi
+  gateway_legacy_token_cleanup || return 1
+  gateway_auth_present_new "$key"
+  info 'Inference token replaced; the previous token is revoked. Update your clients'
+}
+gateway_auth_recovery_stop() {
+  local config
+  if ! config=$(gateway_load_config | jq '.auth.recovery_required=true') || ! gateway_save_config "$config"; then
+    warn 'Could not record recovery state; keep the gateway stopped until auth reset succeeds'
+  fi
+  if ! docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1; then
+    err 'Could not stop LiteLLM after an unverified token change; revocation is NOT confirmed. Repair Docker access and run spark gateway auth reset'; return 1
+  fi
+  err 'Token change could not be verified; gateway stopped. Run spark gateway auth reset to recover; no old token will be restored'
+}
+gateway_auth_rotate() { gateway_with_lock gateway_auth_replace_locked rotate; }
+gateway_auth_reset_locked() { gateway_auth_replace_locked reset; }
 # --- Main ---
 main() {
   GATEWAY_PORT=$(gateway_configured_port)

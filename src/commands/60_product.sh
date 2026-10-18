@@ -94,7 +94,7 @@ nemohermes_rebuild_with_workspace_env() {
   esac
   case "$base_url" in
     "http://host.openshell.internal:$(gateway_configured_port)/v1"*)
-      compatible_api_key=$(gateway_auth_key) || return 1 ;;
+      compatible_api_key=$(gateway_managed_client_key) || return 1 ;;
   esac
   [[ -n "$compatible_api_key" ]] || { err 'Compatible API key missing'; return 1; }
   if [[ "$SPARK_OS" == "Linux" ]]; then
@@ -538,6 +538,7 @@ EOF
     else
       docker rm -f "$CONTAINER_NAME" "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
     fi
+    gateway_database_remove "$purge" "$dry_run" || true
     if workspace_configured; then
       if [[ "$dry_run" == "1" ]]; then
         printf "  would run docker compose down -v for workspace\n"

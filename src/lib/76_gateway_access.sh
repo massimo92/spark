@@ -128,7 +128,7 @@ gateway_access_probe() {
       printf 'Network probe: unreachable (also check node connectivity; this alone does not prove the policy)\n' ;;
     allowed)
       local token_file="${SPARK_GATEWAY_TOKEN_FILE:-$(gateway_secrets_path)}"
-      key=$(gateway_env_get LITELLM_MASTER_KEY "$token_file") || { err 'Set SPARK_GATEWAY_TOKEN_FILE to a private env file containing LITELLM_MASTER_KEY'; return 1; }
+      key=$(gateway_env_get LITELLM_API_KEY "$token_file" 2>/dev/null || gateway_env_get LITELLM_MASTER_KEY "$token_file") || { err 'Set SPARK_GATEWAY_TOKEN_FILE to a private client env file containing LITELLM_API_KEY'; return 1; }
       [[ "$key" =~ ^sk-[a-f0-9]{64}$ ]] || return 1
       code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$url/models") || return 1
       [[ "$code" == 401 || "$code" == 403 ]] || { err 'Anonymous access accepted'; return 1; }
@@ -171,7 +171,7 @@ gateway_exposure_findings() {
 }
 
 # SSH probes establish evidence from two live nodes without storing the token there.
-gateway_access_verify() {
+gateway_access_verify() (
   local allowed='' denied='' config status dns port key mode node selector matches ips selected script quoted payload blocked addresses ssh_port
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -190,7 +190,13 @@ gateway_access_verify() {
   status=$(tailscale status --json) || return 1
   dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")')
   port=$(printf '%s\n' "$config" | jq -r '.access.port // 443')
-  key=$(gateway_auth_key) || return 1
+  key="sk-$(openssl rand -hex 32)" || return 1
+  gateway_virtual_create spark-managed "$key" 5m || return 1
+  local probe_hash
+  probe_hash=$(gateway_key_hash "$key") || return 1
+  # Capture the validated hash before local function scope unwinds at EXIT.
+  # shellcheck disable=SC2064
+  trap "printf '%s' '{\"keys\":[\"$probe_hash\"]}' | gateway_admin_post /key/delete >/dev/null 2>&1 || true" EXIT
   blocked=$(gateway_access_blocked_ports) || return 1
   addresses=$(printf '%s\n' "$status" | jq -c '.Self.TailscaleIPs // []') || return 1
   [[ "$(printf '%s\n' "$addresses" | jq length)" -gt 0 ]] || return 1
@@ -248,7 +254,7 @@ PY
   done
   config=$(printf '%s\n' "$config" | jq --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.access.policy_status="verified" | .access.verified_at=$now') || return 1
   gateway_save_config "$config" && gateway_access_status
-}
+)
 
 gateway_access_ssh_port() {
   local port
