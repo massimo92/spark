@@ -44,10 +44,10 @@ printf 'ok - initial inference token appears once; files and DB contain no raw t
 out=$(gateway_virtual_ensure 2>&1)
 [[ "$out" != *"$token"* ]]
 if out=$(gateway_auth_command show 2>&1); then exit 1; fi
-[[ "$out" != *"$token"* ]]
+[[ "$out" != *"$token"* && "$out" == *'Usage: spark gateway auth <status|rotate|reset>'* ]]
 out=$(gateway_auth_command status)
 [[ "$out" == 'authentication: configured' ]]
-printf 'ok - setup, status and show cannot recover the token\n'
+printf 'ok - setup/status cannot recover tokens; removed show uses unknown-command handling\n'
 gateway_virtual_validate "$token"
 printf 'ok - inference token cannot access key-management endpoints\n'
 old="$token"

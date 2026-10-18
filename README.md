@@ -120,7 +120,7 @@ Server/root or Docker administrators can access a running process's secrets;
 memory storage cannot protect against a compromised administrator.
 
 New inference tokens appear **once**, on an interactive terminal. Save the token
-in a password manager and configure your clients then. `auth show` is disabled;
+in a password manager and configure your clients then. Tokens cannot be retrieved;
 setup, status and restarts never redisplay existing tokens. Unattended initial
 setup can create the hash without printing a secret; run an interactive reset to
 obtain a replacement. `auth rotate` and `auth reset` require a terminal before

@@ -17963,7 +17963,6 @@ gateway_sync_clients() {
 gateway_auth_command() {
   case "${1:-status}" in
     status) gateway_auth_ready && printf 'authentication: configured\n' || { printf 'authentication: migration-required\n'; return 1; } ;;
-    show) err 'Stored tokens cannot be displayed. Lost token? Run spark gateway auth reset'; return 1 ;;
     rotate) [[ $# == 1 ]] || return 1; gateway_auth_rotate ;;
     reset) [[ $# == 1 ]] || return 1; gateway_with_lock gateway_auth_reset_locked ;;
     *) err 'Usage: spark gateway auth <status|rotate|reset>'; return 1 ;;
