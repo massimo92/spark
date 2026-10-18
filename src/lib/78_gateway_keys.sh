@@ -146,11 +146,11 @@ gateway_virtual_ensure() {
   [[ "${SPARK_GATEWAY_DEFER_CLIENT:-0}" != 1 ]] || return 0
   local config hash hashes key fresh=0
   config=$(gateway_load_config) || return 1
-  [[ "$(printf '%s' "$config" | jq -r '.auth.recovery_required // false')" != true ]] || { err 'Token recovery required: spark gateway auth reset'; return 1; }
+  [[ "$(printf '%s' "$config" | jq -r '.auth.recovery_required // false')" != true ]] || { err 'Token recovery required: spark gateway auth rotate'; return 1; }
   hashes=$(gateway_database_client_hashes) || return 1
   hash=$(printf '%s' "$config" | jq -r '.auth.client_hash // empty')
   if [[ -n "$hash" ]]; then
-    printf '%s' "$hashes" | jq -e --arg hash "$hash" '.==[$hash]' >/dev/null || { err 'Client key state differs from PostgreSQL; run spark gateway auth reset'; return 1; }
+    printf '%s' "$hashes" | jq -e --arg hash "$hash" '.==[$hash]' >/dev/null || { err 'Client key state differs from PostgreSQL; run spark gateway auth rotate'; return 1; }
   elif [[ "$(printf '%s' "$hashes" | jq length)" == 1 ]]; then
     hash=$(printf '%s' "$hashes" | jq -r '.[0]')
     gateway_virtual_record "$hash" || return 1
@@ -163,7 +163,7 @@ gateway_virtual_ensure() {
     gateway_virtual_record "$hash" || return 1
     [[ "$fresh" == 0 ]] || gateway_auth_present_new "$key"
   else
-    err 'Multiple client keys found; run spark gateway auth reset'; return 1
+    err 'Multiple client keys found; run spark gateway auth rotate'; return 1
   fi
   gateway_legacy_token_cleanup
 }
@@ -178,14 +178,14 @@ gateway_managed_client_key() {
   printf '%s\n' "$key"
 }
 gateway_auth_replace_locked() {
-  local mode="${1:-rotate}" hashes count key hash config
+  local hashes count key hash config
   gateway_auth_terminal || { err 'Token rotation requires an interactive terminal (ssh -t for a remote command)'; return 1; }
   docker info >/dev/null 2>&1 || { err 'Cannot inspect LiteLLM; no revocation confirmed'; return 1; }
   if ! gateway_running_state || [[ "$(docker inspect "$GATEWAY_CONTAINER" --format '{{index .Config.Labels "io.spark.auth-mode"}}' 2>/dev/null)" != virtual-keys ]]; then
-    SPARK_GATEWAY_DEFER_CLIENT=1 gateway_sync_locked || { [[ "$mode" != reset ]] || gateway_auth_recovery_stop; return 1; }
+    SPARK_GATEWAY_DEFER_CLIENT=1 gateway_sync_locked || { gateway_auth_recovery_stop; return 1; }
   fi
-  gateway_wait_ready || { [[ "$mode" != reset ]] || gateway_auth_recovery_stop; return 1; }
-  hashes=$(gateway_database_client_hashes) || { [[ "$mode" != reset ]] || gateway_auth_recovery_stop; return 1; }
+  gateway_wait_ready || { gateway_auth_recovery_stop; return 1; }
+  hashes=$(gateway_database_client_hashes) || { gateway_auth_recovery_stop; return 1; }
   count=$(printf '%s' "$hashes" | jq length)
   key="sk-$(openssl rand -hex 32)" || return 1
   hash=$(gateway_key_hash "$key")
@@ -210,12 +210,11 @@ gateway_auth_replace_locked() {
 gateway_auth_recovery_stop() {
   local config
   if ! config=$(gateway_load_config | jq '.auth.recovery_required=true') || ! gateway_save_config "$config"; then
-    warn 'Could not record recovery state; keep the gateway stopped until auth reset succeeds'
+    warn 'Could not record recovery state; keep the gateway stopped until auth rotate succeeds'
   fi
   if ! docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1; then
-    err 'Could not stop LiteLLM after an unverified token change; revocation is NOT confirmed. Repair Docker access and run spark gateway auth reset'; return 1
+    err 'Could not stop LiteLLM after an unverified token change; revocation is NOT confirmed. Repair Docker access and run spark gateway auth rotate'; return 1
   fi
-  err 'Token change could not be verified; gateway stopped. Run spark gateway auth reset to recover; no old token will be restored'
+  err 'Token change could not be verified; gateway stopped. Run spark gateway auth rotate to recover; no old token will be restored'
 }
-gateway_auth_rotate() { gateway_with_lock gateway_auth_replace_locked rotate; }
-gateway_auth_reset_locked() { gateway_auth_replace_locked reset; }
+gateway_auth_rotate() { gateway_with_lock gateway_auth_replace_locked; }

@@ -78,7 +78,6 @@ ports. `--dry-run` changes no services.
 spark gateway setup                   # interactive setup; setup --yes preserves settings
 spark gateway auth status
 spark gateway auth rotate             # revoke old client token; show new one once
-spark gateway auth reset              # lost/leaked token: replace, shown once
 spark gateway capabilities            # installed container version
 spark gateway capabilities xai        # inspect OAuth implementation support
 spark gateway add openai --model MODEL_ID
@@ -122,16 +121,17 @@ memory storage cannot protect against a compromised administrator.
 New inference tokens appear **once**, on an interactive terminal. Save the token
 in a password manager and configure your clients then. Tokens cannot be retrieved;
 setup, status and restarts never redisplay existing tokens. Unattended initial
-setup can create the hash without printing a secret; run an interactive reset to
-obtain a replacement. `auth rotate` and `auth reset` require a terminal before
-changing anything (`ssh -t USER@SERVER spark gateway auth reset` remotely).
-Both create a new inference-only key and revoke all previous Spark client keys,
+setup can create the hash without printing a secret; use an interactive
+`auth rotate` to obtain a replacement. This command requires a terminal before
+changing anything (`ssh -t USER@SERVER spark gateway auth rotate` remotely).
+It creates a new inference-only key and revokes all previous Spark client keys,
 using the standard create/delete APIs without an Enterprise regeneration license.
-They validate inference and denied management access, check the stored hashes,
-then display the replacement once. Unknown transaction outcomes stop the gateway
-and require `auth reset`; old credentials are never silently restored. A database
-outage prevents rotation; incident reset stops the proxy if revocation cannot be
-verified. Do not delete the gateway database volumes on repair.
+It validates inference and denied management access, checks the stored hashes,
+then displays the replacement once. If preparation or revocation cannot be
+verified, it attempts to stop the gateway and requires another `auth rotate`;
+old credentials are never silently restored. The command also handles lost or
+leaked tokens without knowing the previous token. Do not delete the gateway
+database volumes on repair.
 Uninstall removes the owned database container and retains its volumes;
 `uninstall --purge` also removes owned database volumes and their key hashes.
 

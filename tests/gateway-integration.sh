@@ -90,7 +90,7 @@ code=$(printf 'header = "Authorization: Bearer %s"\n' "$old" | curl --config - -
 [[ "$code" == 401 || "$code" == 403 ]]
 gateway_route_smoke vllm Test/Alpha
 old="$client_token"
-gateway_auth_command reset 3> "$TEST_ROOT/client.once"
+gateway_auth_command rotate 3> "$TEST_ROOT/client.once"
 client_token=$(cat "$TEST_ROOT/client.once")
 gateway_virtual_validate "$client_token"
 [[ "$(gateway_managed_client_key)" == "$managed_token" ]]
@@ -120,10 +120,10 @@ gateway_sync 3> "$TEST_ROOT/client.once"
 [[ ! -s "$TEST_ROOT/client.once" ]]
 ! grep -rF "$client_token" "$SPARK_CONFIG_DIR"
 gateway_virtual_validate "$client_token"
-# Reset also recovers a stopped/deleted proxy using only the persisted hashes.
+# Rotation also recovers a stopped/deleted proxy using only the persisted hashes.
 gateway_stop
 old="$client_token"
-gateway_auth_command reset 3> "$TEST_ROOT/client.once"
+gateway_auth_command rotate 3> "$TEST_ROOT/client.once"
 client_token=$(cat "$TEST_ROOT/client.once")
 gateway_virtual_validate "$client_token"
 ! gateway_virtual_validate "$old"

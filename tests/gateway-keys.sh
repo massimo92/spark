@@ -44,10 +44,12 @@ printf 'ok - initial inference token appears once; files and DB contain no raw t
 out=$(gateway_virtual_ensure 2>&1)
 [[ "$out" != *"$token"* ]]
 if out=$(gateway_auth_command show 2>&1); then exit 1; fi
-[[ "$out" != *"$token"* && "$out" == *'Usage: spark gateway auth <status|rotate|reset>'* ]]
+[[ "$out" != *"$token"* && "$out" == *'Usage: spark gateway auth <status|rotate>'* ]]
+if out=$(gateway_auth_command reset 2>&1); then exit 1; fi
+[[ "$out" != *"$token"* && "$out" == *'Usage: spark gateway auth <status|rotate>'* ]]
 out=$(gateway_auth_command status)
 [[ "$out" == 'authentication: configured' ]]
-printf 'ok - setup/status cannot recover tokens; removed show uses unknown-command handling\n'
+printf 'ok - setup/status cannot recover tokens; removed show/reset use unknown-command handling\n'
 gateway_virtual_validate "$token"
 printf 'ok - inference token cannot access key-management endpoints\n'
 old="$token"
@@ -67,7 +69,7 @@ gateway_auth_terminal() { return 0; }
 printf 'ok - redirected/noninteractive rotation fails before changing credentials\n'
 old="$token"
 gateway_save_config "$(gateway_load_config | jq 'del(.auth)')"
-out=$(gateway_auth_command reset 2>&1)
+out=$(gateway_auth_command rotate 2>&1)
 token=$(printf '%s\n' "$out" | sed -n '/^sk-/p')
 gateway_virtual_validate "$token"
 ! gateway_virtual_validate "$old"
@@ -78,12 +80,12 @@ if out=$(gateway_auth_command rotate 2>&1); then exit 1; fi
 [[ "$out" != *sk-* && ! -e "$TEST_ROOT/runtime/running" ]]
 ! gateway_auth_ready
 old="$token"
-out=$(gateway_auth_command reset 2>&1)
+out=$(gateway_auth_command rotate 2>&1)
 token=$(printf '%s\n' "$out" | sed -n '/^sk-/p')
 gateway_virtual_validate "$token"
 ! gateway_virtual_validate "$old"
 assert_private "$token"
-printf 'ok - ambiguous API commit stops gateway; reset recovers without restoring old keys\n'
+printf 'ok - ambiguous API commit stops gateway; rotation recovers without restoring old keys\n'
 # Migrate a legacy master key into a restricted inference key, without redisplay.
 printf '{"keys":{},"users":{}}' > "$TEST_ROOT/runtime/database.json"
 gateway_save_config "$(gateway_load_config | jq 'del(.auth)')"
@@ -107,35 +109,35 @@ out=$(gateway_virtual_ensure 2>&1)
 gateway_auth_ready
 [[ "$out" != *sk-* && "$out" == *'only its hash'* ]]
 gateway_auth_terminal() { return 0; }
-out=$(gateway_auth_command reset 2>&1)
+out=$(gateway_auth_command rotate 2>&1)
 token=$(printf '%s\n' "$out" | sed -n '/^sk-/p')
 gateway_virtual_validate "$token"
 assert_private "$token"
-printf 'ok - unattended setup retains only an unrecoverable hash; interactive reset shows a new token\n'
+printf 'ok - unattended setup retains only an unrecoverable hash; interactive rotation shows a new token\n'
 hashes_implementation=$(declare -f gateway_database_client_hashes)
 gateway_database_client_hashes() { return 1; }
-if out=$(gateway_auth_command reset 2>&1); then exit 1; fi
+if out=$(gateway_auth_command rotate 2>&1); then exit 1; fi
 [[ ! -e "$TEST_ROOT/runtime/running" && "$out" != *sk-* ]]
 ! gateway_auth_ready
 eval "$hashes_implementation"
 old="$token"
-out=$(gateway_auth_command reset 2>&1)
+out=$(gateway_auth_command rotate 2>&1)
 token=$(printf '%s\n' "$out" | sed -n '/^sk-/p')
 gateway_virtual_validate "$token"
 ! gateway_virtual_validate "$old"
 assert_private "$token"
-printf 'ok - incident reset stops the gateway if DB revocation cannot be verified\n'
+printf 'ok - rotation stops the gateway if DB revocation cannot be verified\n'
 gateway_database_client_hashes() { return 1; }
 touch "$TEST_ROOT/runtime/fail-stop"
-if out=$(gateway_auth_command reset 2>&1); then exit 1; fi
+if out=$(gateway_auth_command rotate 2>&1); then exit 1; fi
 [[ -e "$TEST_ROOT/runtime/running" && "$out" == *'NOT confirmed'* && "$out" != *sk-* ]]
 rm "$TEST_ROOT/runtime/fail-stop"
 eval "$hashes_implementation"
 old="$token"
-out=$(gateway_auth_command reset 2>&1)
+out=$(gateway_auth_command rotate 2>&1)
 token=$(printf '%s\n' "$out" | sed -n '/^sk-/p')
 gateway_virtual_validate "$token"
 ! gateway_virtual_validate "$old"
 assert_private "$token"
-printf 'ok - stop failure reports unconfirmed revocation; a later reset recovers safely\n'
+printf 'ok - stop failure reports unconfirmed revocation; a later rotation recovers safely\n'
 printf '12 virtual-key checks passed\n'

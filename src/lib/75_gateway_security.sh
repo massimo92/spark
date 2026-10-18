@@ -19,9 +19,9 @@ gateway_auth_terminal() { [[ -t 2 ]]; }
 gateway_auth_present_new() {
   # Only receive freshly generated keys. Never reveal an existing stored key.
   if gateway_auth_terminal; then
-    printf '\nNew LiteLLM token (shown once):\n%s\nSave it now in your password manager. Lost token? Run spark gateway auth reset.\n\n' "$1" >&2
+    printf '\nNew LiteLLM token (shown once):\n%s\nSave it now in your password manager. Lost token? Run spark gateway auth rotate.\n\n' "$1" >&2
   else
-    printf 'New LiteLLM client key created; only its hash is saved, no token displayed without an interactive terminal. Run spark gateway auth reset in a terminal (ssh -t for a remote command) to generate a replacement.\n' >&2
+    printf 'New LiteLLM client key created; only its hash is saved, no token displayed without an interactive terminal. Run spark gateway auth rotate in a terminal (ssh -t for a remote command) to generate a replacement.\n' >&2
   fi
 }
 gateway_auth_ensure() {
@@ -138,7 +138,7 @@ gateway_publish_model() {
   fi
   printf '  Gateway: http://localhost:%s/v1\n  Model: %s/%s\n' "$(gateway_configured_port)" "$([[ "$provider" == ollama ]] && printf ollama_chat || printf vllm)" "$model"
   [[ "$supervised" == 1 ]] || printf '  State: pending backend readiness (spark status --json)\n'
-  printf '  Authentication: Bearer token saved at creation; if lost, spark gateway auth reset\n'
+  printf '  Authentication: Bearer token saved at creation; if lost, spark gateway auth rotate\n'
 }
 gateway_protected() { gateway_load_config | jq -e '.protected != false' >/dev/null; }
 
@@ -215,7 +215,7 @@ gateway_sync() { gateway_with_lock gateway_sync_locked; }
 gateway_sync_locked() {
   local path="${SPARK_CONFIG_DIR}/litellm_config.yaml" previous="" yaml tmp running=0 previous_image=""
   if [[ "${SPARK_GATEWAY_DEFER_CLIENT:-0}" != 1 ]] && gateway_load_config | jq -e '.auth.recovery_required==true' >/dev/null; then
-    err 'Recover the interrupted token change first: spark gateway auth reset'; return 1
+    err 'Recover the interrupted token change first: spark gateway auth rotate'; return 1
   fi
   gateway_auth_ensure && gateway_preflight || return 1
   [[ -f "$path" ]] && previous=$(cat "$path")
@@ -320,8 +320,7 @@ gateway_auth_command() {
   case "${1:-status}" in
     status) gateway_auth_ready && printf 'authentication: configured\n' || { printf 'authentication: migration-required\n'; return 1; } ;;
     rotate) [[ $# == 1 ]] || return 1; gateway_auth_rotate ;;
-    reset) [[ $# == 1 ]] || return 1; gateway_with_lock gateway_auth_reset_locked ;;
-    *) err 'Usage: spark gateway auth <status|rotate|reset>'; return 1 ;;
+    *) err 'Usage: spark gateway auth <status|rotate>'; return 1 ;;
   esac
 }
 gateway_add() { gateway_with_lock gateway_add_locked "$@"; }
@@ -406,8 +405,8 @@ cmd_gateway() {
       cat <<'HELP'
 Usage: spark gateway <setup|start|stop|status|logs|add|remove|auth|login|logout|capabilities|access>
   setup [--yes]             Configure local providers, authentication and access
-  auth status|rotate         Check authentication or rotate the private token
-  auth reset                 Replace a lost/leaked inference token (shown once)
+  auth status                Check authentication configuration
+  auth rotate                Replace the inference token (shown once)
   login PROVIDER [--remote USER@HOST]
                              OAuth login on this computer, optionally install remotely
   logout PROVIDER            Disable the provider and remove its session
@@ -419,7 +418,7 @@ Usage: spark gateway <setup|start|stop|status|logs|add|remove|auth|login|logout|
                              HTTPS access and Tailscale policy workflow
 Provider API keys are read with hidden input; subscriptions use a separate login.
 New gateway tokens appear once in an interactive terminal; save them immediately.
-Stored tokens cannot be displayed by the CLI. Lost token? Use auth reset.
+Stored tokens cannot be displayed by the CLI. Lost token? Use auth rotate.
 Claude Pro/Max is not offered as a general gateway API.
 HELP
       ;;
