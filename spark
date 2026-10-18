@@ -18262,7 +18262,6 @@ gateway_access_enable() {
   [[ $# == 0 || ( $# == 2 && "$1" == --port && "$2" == 443 ) ]] || { err 'The private API uses HTTPS port 443 only'; return 1; }
   gateway_auth_ready && gateway_wait_ready || { err 'Start an authenticated gateway first'; return 1; }
   config=$(gateway_load_config) || return 1
-  [[ "$(printf '%s\n' "$config" | jq '.access.sources // [] | length')" -gt 0 ]] || { err 'Select nodes and apply their Tailscale policy first'; return 1; }
   tailscale_funnel_status_active && { err 'Funnel active; resolve public exposure before enabling private gateway access'; return 1; }
   status=$(tailscale status --json) || return 1
   dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName // "" | rtrimstr(".")')
@@ -18281,6 +18280,7 @@ gateway_access_enable() {
   gateway_access_https_ready "$dns" || { err 'HTTPS 443 not ready; authenticated target kept, policy verification pending'; return 1; }
   # Retire only Spark API/backends on this hostname; never reset Serve or touch SSH.
   gateway_access_remove_direct "$dns" "$serve" || return 1
+  info 'Node access follows your Tailscale ACL/grants; Spark does not change the tailnet policy'
   gateway_access_status
 }
 gateway_access_disable() {

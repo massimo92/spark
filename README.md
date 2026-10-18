@@ -174,6 +174,15 @@ not establish provider permission for every use; follow your account's terms.
 ## Private access by Tailscale node
 
 ```bash
+spark gateway access enable                 # HTTPS 443; access controlled in Tailscale
+spark gateway access status
+```
+
+Manage permitted nodes directly in your Tailscale ACL/grants. Spark does not
+require a second node allowlist. To generate an optional policy fragment and
+verify specific allowed/denied nodes:
+
+```bash
 spark gateway access nodes
 spark gateway access allow laptop desktop   # outputs grants + accept/deny tests
 # Merge that fragment into the tailnet admin policy and run its policy tests.

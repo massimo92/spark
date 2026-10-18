@@ -181,7 +181,8 @@ node_policy() {
 }
 serve_ownership() {
   gateway_prepare_runtime vllm
-  gateway_save_config '{"enabled":true,"port":4000,"access":{"sources":["100.64.0.2"]},"providers":{"vllm":{"enabled":true}}}'
+  # Tailnet ACLs can be administered externally, without a duplicate Spark allowlist.
+  gateway_save_config '{"enabled":true,"port":4000,"providers":{"vllm":{"enabled":true}}}'
   gateway_wait_ready() { return 0; }
   gateway_access_https_ready() { return 0; }
   tailscale_funnel_status_active() { return 1; }
@@ -203,7 +204,7 @@ JSON
   local calls
   calls=$(cat "$SPARK_CONFIG_DIR/serve.calls")
   [[ "$calls" == *'--https=443 http://127.0.0.1:4000'* && "$calls" == *'--https=8443 off'* && "$calls" == *'--https=9443 off'* && "$calls" != *reset* && "$calls" != *'--https=22'* && "$calls" != *'--https=5678'* ]]
-  jq -e '.access.port==443 and .access.ssh_port==22 and .access.policy_status=="pending"' "$GATEWAY_CONFIG" >/dev/null
+  jq -e '.access.port==443 and .access.ssh_port==22 and .access.enabled and .access.policy_status=="pending" and (.access.sources==null)' "$GATEWAY_CONFIG" >/dev/null
   ! gateway_access_enable --port 8443
   ! gateway_access_disable
 }
