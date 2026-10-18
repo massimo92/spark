@@ -291,7 +291,7 @@ os.execvp("litellm", ["litellm"] + sys.argv[1:])'
     -e 'DATABASE_URL=postgresql://spark@localhost/litellm?host=/var/run/postgresql'
     -e DISABLE_SCHEMA_UPDATE=true
     -v "$(gateway_database_name)-socket:/var/run/postgresql"
-    -v "${SPARK_CONFIG_DIR}/litellm_config.yaml:/app/config.yaml:ro" "${run_args[@]}")
+    -v "${SPARK_CONFIG_DIR}/litellm_config.yaml:/app/config.yaml:ro" ${run_args[@]+"${run_args[@]}"})
   docker rm "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
   run_args+=(--name "$GATEWAY_CONTAINER" --label io.spark.auth-mode=virtual-keys --restart unless-stopped --entrypoint python "${GATEWAY_RESTORE_IMAGE:-$LITELLM_IMAGE}" -c "$runtime_script" --config /app/config.yaml)
   [[ "$SPARK_OS" != Linux ]] || run_args+=(--host 127.0.0.1)
