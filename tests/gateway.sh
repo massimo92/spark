@@ -224,11 +224,24 @@ client_scope() {
   workspace_read_env() { gateway_env_get "$1" "$WORKSPACE_ENV_FILE"; }
   workspace_set_env_key() { gateway_env_set "$1" "$2" "$WORKSPACE_ENV_FILE"; }
   workspace_hermes_running() { return 1; }
+  workspace_hermes_running_container_name() { return 1; }
   gateway_sync_clients
   [[ "$(workspace_read_env COMPATIBLE_API_KEY)" == external-key ]]
   gateway_env_set HERMES_LITELLM_BASE_URL http://127.0.0.1:4000/v1 "$WORKSPACE_ENV_FILE"
   gateway_sync_clients
   [[ "$(workspace_read_env COMPATIBLE_API_KEY)" != "$(gateway_auth_key)" ]]
+  # A successful status command does not prove the sandbox is running.
+  nemohermes() { return 0; }
+  workspace_hermes_running() { return 0; }
+  nemohermes_rebuild_with_workspace_env() { touch "$SPARK_CONFIG_DIR/rebuilt"; }
+  gateway_sync_clients
+  [[ ! -f "$SPARK_CONFIG_DIR/rebuilt" ]]
+  workspace_hermes_running_container_name() { printf 'hermes-running\n'; }
+  gateway_sync_clients
+  [[ -f "$SPARK_CONFIG_DIR/rebuilt" ]]
+  rm "$SPARK_CONFIG_DIR/rebuilt"
+  gateway_sync_clients
+  [[ ! -f "$SPARK_CONFIG_DIR/rebuilt" ]]
 }
 verified_access() {
   gateway_prepare_runtime vllm
