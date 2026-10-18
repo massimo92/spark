@@ -307,7 +307,8 @@ gateway_sync_clients() {
   key=$(gateway_managed_client_key) || return 1
   # Rebuild only a running managed sandbox whose token is stale. Rebuild reads
   # the private workspace env; arbitrary external endpoints are not changed.
-  if command -v nemohermes >/dev/null 2>&1 && workspace_hermes_running; then
+  # NemoHermes status can return success for a stopped/error sandbox.
+  if command -v nemohermes >/dev/null 2>&1 && [[ -n "$(workspace_hermes_running_container_name 2>/dev/null || true)" ]]; then
     local digest marker="${SPARK_CONFIG_DIR}/hermes-gateway-token.sha256"
     digest=$(printf '%s' "$key" | shasum -a 256 | awk '{print $1}')
     if [[ ! -f "$marker" || "$(cat "$marker")" != "$digest" ]]; then
