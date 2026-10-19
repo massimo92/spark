@@ -46,6 +46,7 @@ benchmark_select_model() {
     [[ -n "$name" && -n "$model" ]] || continue
     is_safe_model_ref "$model" || continue
     is_port "$port" || continue
+    [[ "$(model_api_kind "$name")" != systemone ]] || continue
     names+=("$name"); models+=("$model"); ports+=("$port")
   done < <(list_managed_containers)
 

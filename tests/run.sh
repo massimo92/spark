@@ -1080,8 +1080,16 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 [[ "${1:-}" == "download" ]] || exit 0
-repo="$2"; file="${3:-}"
-dir="${HOME}/.cache/huggingface/hub/models--${repo//\//--}/snapshots/1"
+[[ -z "${FAKE_HF_ARGS_FILE:-}" ]] || printf '%s\n' "$*" >> "$FAKE_HF_ARGS_FILE"
+repo="$2"; shift 2
+file=""; revision=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --revision) revision="$2"; shift 2 ;;
+    *) file="$1"; shift ;;
+  esac
+done
+dir="${HOME}/.cache/huggingface/hub/models--${repo//\//--}/snapshots/${revision}"
 mkdir -p "$dir"
 case "$file" in
   config.json)
@@ -2848,6 +2856,71 @@ EOF
   printf 'Fixture\n' > "$directory/README.md"
 }
 
+test_systemone_bundle_launch_uses_custom_runtime() {
+  local tmp fake_bin out status=0
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  make_model "$tmp/home" alpha-x-ai/clef-flash-NVFP4 "$KV_CONFIG" e676d8e6e14f5ee74830d33fa1fad643d8f53acf
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run clef-flash-nvfp4 --dry-run --port 8007 --max-len 4096 2>&1) || status=1
+  [[ "$out" == *'spark.api=systemone'* && "$out" == *'--entrypoint python3'* &&
+    "$out" == *'/opt/spark/serve_systemone.py alpha-x-ai/clef-flash-NVFP4'* &&
+    "$out" == *'--max-model-len 4096'* && "$out" == *'--port 8007'* &&
+    "$out" == *'--host 127.0.0.1'* && "$out" == *'--kv-cache-memory-bytes 1610612736'* ]] || status=1
+  [[ "$out" != *'vllm serve alpha-x-ai/clef-flash-NVFP4'* ]] || status=1
+  [[ "$status" == 0 ]] || printf '%s\n' "$out" >&2
+  rm -rf "$tmp"; [[ "$status" == 0 ]]
+}
+
+test_systemone_bundle_cannot_replace_chat_main() {
+  local tmp fake_bin out status=0
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  printf '{"enabled":true,"main":{"provider":"vllm","model":"Org/Chat"}}' > "$tmp/home/.config/spark/gateway.json"
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_DOCKER_BUILD_FILE="$tmp/build.calls" \
+    "$SPARK" run clef-flash-nvfp4 --main 2>&1) || status=$?
+  [[ "$status" != 0 && "$out" == *'System One models cannot be the chat main model'* && ! -s "$tmp/build.calls" ]] || status=0
+  jq -e '.main.model=="Org/Chat"' "$tmp/home/.config/spark/gateway.json" >/dev/null || status=0
+  rm -rf "$tmp"; [[ "$status" != 0 ]]
+}
+
+test_systemone_bundle_validates_api_and_runtime() {
+  local tmp out status=0
+  tmp=$(mktemp -d); make_prepared_bundle "$tmp/bundle"
+  jq 'del(.model_source,.initializer,.defaults.draft_model,.defaults.speculative_tokens) |
+    .defaults.vllm_args=["vllm","serve","Org/Prepared","--revision","abcdef1"] |
+    .api={type:"systemone"} | .runtime.command=["python3","/serve.py"]' \
+    "$tmp/bundle/bundle.json" > "$tmp/new.json"
+  mv "$tmp/new.json" "$tmp/bundle/bundle.json"
+  HOME="$tmp/home" "$SPARK" bundle validate "$tmp/bundle" >/dev/null 2>&1 || status=1
+  jq 'del(.runtime.command)' "$tmp/bundle/bundle.json" > "$tmp/new.json"
+  mv "$tmp/new.json" "$tmp/bundle/bundle.json"
+  out=$(HOME="$tmp/home" "$SPARK" bundle validate "$tmp/bundle" 2>&1) && status=1
+  [[ "$out" == *'Invalid bundle runtime'* ]] || status=1
+  rm -rf "$tmp"; [[ "$status" == 0 ]]
+}
+
+test_systemone_alias_capture_replays_custom_runtime() {
+  local tmp fake_bin inspect definition out status=0
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"; make_prepared_bundle "$tmp/bundle"
+  jq 'del(.model_source,.initializer) | .api={type:"systemone"} | .runtime.command=["python3","/serve.py"]' \
+    "$tmp/bundle/bundle.json" > "$tmp/new.json"
+  mv "$tmp/new.json" "$tmp/bundle/bundle.json"
+  make_model "$tmp/home" Org/Prepared "$KV_CONFIG" abcdef1
+  HOME="$tmp/home" PATH="$fake_bin:$PATH" "$SPARK" bundle import "$tmp/bundle" >/dev/null 2>&1
+  inspect='[{"State":{"Running":true},"Path":"python3","Config":{"Entrypoint":["python3"],
+    "Cmd":["/serve.py","Org/Prepared","--revision","abcdef1","--gpu-memory-utilization","0.1","--max-model-len","2048","--max-num-seqs","1","--port","8007","--enforce-eager"],
+    "Labels":{"spark.api":"systemone","spark.model":"Org/Prepared","spark.bundle.name":"prepared-test"}}}]'
+  definition=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_CONTAINER_INSPECT_JSON="$inspect" \
+    bash -c 'source "$1"; alias_capture_definition decision Org/Prepared' _ "$SPARK") || status=1
+  jq -e '.kind=="bundle" and .bundle=="prepared-test"' <<<"$definition" >/dev/null || status=1
+  jq -n --argjson d "$definition" '{decision:$d}' > "$tmp/home/.config/spark/aliases.json"
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    "$SPARK" run decision --dry-run 2>&1) || status=1
+  [[ "$out" == *'--entrypoint python3'* && "$out" == *'/serve.py Org/Prepared'* &&
+    "$out" == *'spark.api=systemone'* && "$out" == *'--port 8007'* ]] || status=1
+  [[ "$status" == 0 ]] || printf '%s\n%s\n' "$definition" "$out" >&2
+  rm -rf "$tmp"; [[ "$status" == 0 ]]
+}
+
 test_bundle_revision_hash_tracks_permissions() {
   local tmp before executable directory
   tmp=$(mktemp -d); mkdir "$tmp/recipe"
@@ -3174,8 +3247,8 @@ test_bundle_sync_checks_git_catalog() {
   check_output=$(cd "$ROOT_DIR" && HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     "$SPARK" bundle sync --check 2>&1)
   local ok=0
-  [[ "$output" == *"Synchronized 3 built-in bundle(s) into spark"* ]] || ok=1
-  [[ "$check_output" == *"Built-in bundles are synchronized (3)"* ]] || ok=1
+  [[ "$output" == *"Synchronized 4 built-in bundle(s) into spark"* ]] || ok=1
+  [[ "$check_output" == *"Built-in bundles are synchronized (4)"* ]] || ok=1
 
   standalone="${tmp}/standalone-spark"
   outside="${tmp}/outside"
@@ -3371,7 +3444,7 @@ test_alias_create_from_bundle_stores_bundle_and_adjustments() {
   local tmp fake_bin aliases output create_output
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
-  if ! create_output=$(printf 'b2\n\nn\n\n\n\n\n\nn\nfalse\n\n\n\n' | \
+  if ! create_output=$(printf 'b3\n\nn\n\n\n\n\n\nn\nfalse\n\n\n\n' | \
     HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
     "$SPARK" alias create qwen-bundle-alias 2>&1); then
     printf '%s\n' "$create_output" >&2
@@ -9745,6 +9818,30 @@ test_pull_vllm_ready() {
   [[ "$out" == *"Ready. Run: spark run Org/Model"* ]]
 }
 
+test_pull_bundle_uses_pinned_revision() {
+  local tmp fake_bin out status=0 revision=e676d8e6e14f5ee74830d33fa1fad643d8f53acf
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_HF_ARGS_FILE="$tmp/hf.calls" \
+    "$SPARK" pull clef-flash-nvfp4 2>&1) || status=1
+  [[ "$(cat "$tmp/hf.calls")" == "download alpha-x-ai/clef-flash-NVFP4 --revision $revision" &&
+    -f "$tmp/home/.cache/huggingface/hub/models--alpha-x-ai--clef-flash-NVFP4/snapshots/$revision/model-00001-of-00001.safetensors" &&
+    "$out" == *'Ready. Run: spark run clef-flash-nvfp4'* ]] || status=1
+  [[ "$status" == 0 ]] || printf '%s\n' "$out" >&2
+  rm -rf "$tmp"; [[ "$status" == 0 ]]
+}
+
+test_pull_rejects_mutable_or_conflicting_revision() {
+  local tmp fake_bin out status=0
+  tmp=$(mktemp -d); fake_bin="$tmp/bin"; make_fake_bin "$fake_bin"
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_HF_ARGS_FILE="$tmp/hf.calls" \
+    "$SPARK" pull Org/Model --revision main 2>&1) && status=1
+  [[ "$out" == *'immutable commit hash'* && ! -e "$tmp/hf.calls" ]] || status=1
+  out=$(HOME="$tmp/home" PATH="$fake_bin:$PATH" FAKE_HF_ARGS_FILE="$tmp/hf.calls" \
+    "$SPARK" pull clef-flash-nvfp4 --revision abcdef1 2>&1) && status=1
+  [[ "$out" == *"differs from the bundle's pinned revision"* && ! -e "$tmp/hf.calls" ]] || status=1
+  rm -rf "$tmp"; [[ "$status" == 0 ]]
+}
+
 test_pull_ollama_routes() {
   local tmp fake_bin out
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
@@ -10428,6 +10525,10 @@ run_test "alias capture rejects secret-bearing vLLM flags" test_alias_capture_re
 run_test "guided alias backend mismatch fails closed" test_alias_backend_mismatch_fails_closed
 run_test "v2 bundles support integrated speculation and no speculation" test_bundle_v2_accepts_integrated_and_no_speculation
 run_test "bundle revision identity includes file and directory permissions" test_bundle_revision_hash_tracks_permissions
+run_test "System One bundle launches its custom runtime with bounded memory" test_systemone_bundle_launch_uses_custom_runtime
+run_test "System One bundle preserves the chat main selection" test_systemone_bundle_cannot_replace_chat_main
+run_test "System One bundle validates its API and launcher" test_systemone_bundle_validates_api_and_runtime
+run_test "System One aliases capture and replay the custom runtime" test_systemone_alias_capture_replays_custom_runtime
 run_test "bundle archives preserve permissions and symlinks under a restrictive umask" test_bundle_archive_preserves_metadata
 run_test "bundle aliases reuse an available immutable image without rebuilding" test_bundle_pin_reuses_image_without_build
 run_test "bundle retries execute the adjusted concurrency and graph mode" test_bundle_startup_retries_use_effective_arguments
@@ -10490,6 +10591,8 @@ run_test "spark run --main checks capacity after stopping current main" test_run
 run_test "spark run --main offers rollback after failure" test_run_main_failure_offers_and_accepts_rollback
 run_test "spark run --main can decline rollback" test_run_main_failure_can_decline_rollback
 run_test "pull (vllm) reports ready" test_pull_vllm_ready
+run_test "pull bundle downloads its immutable model revision" test_pull_bundle_uses_pinned_revision
+run_test "pull rejects mutable and conflicting revisions before download" test_pull_rejects_mutable_or_conflicting_revision
 run_test "pull routes to Ollama on the ollama backend" test_pull_ollama_routes
 run_test "list shows downloaded models" test_list_shows_models
 run_test "list marks partial models" test_list_marks_partial_models

@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "name": "clef-flash-nvfp4",
+  "description": "Clef Flash NVFP4 decision API with a bounded KV cache, alongside a chat model on GB10.",
+  "api": {"type": "systemone"},
+  "defaults": {
+    "target_model": {
+      "id": "alpha-x-ai/clef-flash-NVFP4",
+      "revision": "e676d8e6e14f5ee74830d33fa1fad643d8f53acf"
+    },
+    "vllm_args": [
+      "vllm", "serve", "alpha-x-ai/clef-flash-NVFP4",
+      "--revision", "e676d8e6e14f5ee74830d33fa1fad643d8f53acf",
+      "--gpu-memory-utilization", "0.12",
+      "--max-model-len", "8192",
+      "--max-num-seqs", "1",
+      "--kv-cache-memory-bytes", "1610612736",
+      "--max-num-batched-tokens", "8192",
+      "--enforce-eager"
+    ]
+  },
+  "runtime": {"command": ["python3", "/opt/spark/serve_systemone.py"]},
+  "resources": {"weights_gb": 9.6, "runtime_overhead_gb": 4, "kv_estimator": "engine"},
+  "options": {},
+  "patches": []
+}

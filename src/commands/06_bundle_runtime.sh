@@ -20,6 +20,13 @@ bundle_validate_runtime() {
     and ((.runtime.env // {}) | type == "object" and all(to_entries[];
       (.key | test("^[A-Z][A-Z0-9_]*$") and (test("(^|_)(TOKEN|PASSWORD|SECRET|KEY)($|_)") | not))
       and (.value | clean)))
+    and ((.api // {}) | type == "object")
+    and ((.api.type // "chat") | . == "chat" or . == "systemone")
+    and (if .runtime.command != null then
+      .schema_version == 2
+      and (.runtime.command | type == "array" and length > 0 and all(.[]; clean and length > 0))
+      else true end)
+    and (if .api.type == "systemone" then .schema_version == 2 and .runtime.command != null else true end)
     and ((.resources.weights_gb // 0) | number)
     and ((.resources.runtime_overhead_gb // 0) | number)
     and ((.resources.kv_estimator // "config") | . == "config" or . == "engine")
@@ -151,7 +158,7 @@ bundle_initialize() {
   BUNDLE_TARGET_REVISION=$(jq -r '.defaults.target_model.revision' "$manifest")
   BUNDLE_KV_ESTIMATOR=$(jq -r '.resources.kv_estimator // "config"' "$manifest")
   BUNDLE_WEIGHTS_GB=$(jq -r '.resources.weights_gb // empty' "$manifest")
-  BUNDLE_RUNTIME_OVERHEAD_GB=$(jq -r '.resources.runtime_overhead_gb // 0' "$manifest")
+  BUNDLE_RUNTIME_OVERHEAD_GB=$(jq -r '.resources.runtime_overhead_gb // empty' "$manifest")
   kind=$(jq -r '.model_source.type // "huggingface"' "$manifest")
   [[ "$kind" == "prepared" ]] || return 0
   path=$(jq -r '.model_source.path' "$manifest")

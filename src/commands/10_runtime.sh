@@ -43,6 +43,8 @@ cmd_run_help() {
 
   Bundles declare their target, drafter, Docker build, defaults, and extra
   flags. Example: spark run qwen38-dflash2-lookup --lookup false
+  Decision bundles expose /v1/systemone instead of chat completions.
+  Example: spark run clef-flash-nvfp4 (cannot be used with --main).
 
 EOF
 }
@@ -60,6 +62,7 @@ cmd_run() {
   local BUNDLE_ACTIVE_HASH="" BUNDLE_TARGET_REVISION="" BUNDLE_MODEL_PATH="" BUNDLE_MODEL_LOAD_PATH=""
   local BUNDLE_INITIALIZATION_PENDING=0
   local BUNDLE_ARTIFACT_KEY="" BUNDLE_KV_ESTIMATOR="" BUNDLE_WEIGHTS_GB="" BUNDLE_RUNTIME_OVERHEAD_GB=""
+  local BUNDLE_API_KIND=chat BUNDLE_LAUNCHER_JSON='[]'
   local -a alias_override_args=() alias_setting_args=() vllm_passthrough_args=()
   local -a bundle_explicit_run_args=()
 
@@ -294,7 +297,10 @@ run_publish_main() {
   if [[ "$BACKEND" == "vllm" ]]; then
     port=""
     while IFS=$'\t' read -r name running port rest; do
-      [[ "$running" == "$model" ]] && break
+      if [[ "$running" == "$model" ]]; then
+        [[ "$(model_api_kind "$name")" != systemone ]] || die "System One models cannot be the chat main model"
+        break
+      fi
       port=""
     done < <(list_managed_containers)
     [[ "$port" =~ ^[0-9]+$ ]] && model_api_ready "$port" || \
@@ -833,7 +839,8 @@ alias_capture_definition() {
       elif $entry[0] == "vllm" and $entry[1] == "serve" then $entry + $cmd
       else error("not a direct vllm serve command")
       end
-  ' <<<"$inspect" 2>/dev/null) || die "Container '${cname}' does not run a direct vllm serve command"
+  ' <<<"$inspect" 2>/dev/null) || args=$(bundle_container_args "$inspect") \
+    || die "Container '${cname}' does not run vllm serve or a supported bundle launcher"
   model=$(jq -er '.[2] | select(type == "string" and length > 0)' <<<"$args" 2>/dev/null) \
     || die "Cannot identify the vLLM model in ${cname}"
   local bundle_hash="" load_path="$model"
@@ -933,6 +940,7 @@ run_captured_vllm_definition() {
   local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_HASH="" BUNDLE_TARGET_REVISION=""
   local BUNDLE_MODEL_PATH="" BUNDLE_MODEL_LOAD_PATH="" BUNDLE_ARTIFACT_KEY=""
   local BUNDLE_KV_ESTIMATOR="" BUNDLE_WEIGHTS_GB="" BUNDLE_RUNTIME_OVERHEAD_GB=""
+  local BUNDLE_API_KIND=chat BUNDLE_LAUNCHER_JSON='[]'
 
   alias_validate_definition "$definition" || die "${label} has an invalid or unsafe vLLM definition"
   [[ "$(jq -r '.kind' <<<"$definition")" == "captured-vllm" ]] \
@@ -1623,6 +1631,7 @@ build_launch() {
     --name "$cname"
     --label spark.managed=1
     --label "spark.model=${model}"
+    --label "spark.api=${BUNDLE_API_KIND:-chat}"
     --label "spark.port=${port}"
     --label "spark.need_gb=${NEED_GB}"
     --label "spark.weights_gb=${WEIGHTS_GB}"
@@ -1650,6 +1659,15 @@ build_launch() {
       --label "spark.bundle.run_args=${BUNDLE_ACTIVE_RUN_ARGS_JSON}")
   fi
   [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_swap_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
+  if [[ "${BUNDLE_LAUNCHER_JSON:-[]}" != '[]' ]]; then
+    local launcher=()
+    while IFS= read -r arg; do launcher+=("$arg"); done < <(jq -r '.[]' <<<"$BUNDLE_LAUNCHER_JSON")
+    docker_cmd+=(--entrypoint "${launcher[0]}" "${ALIAS_VLLM_IMAGE_ID:-$ngc_image}")
+    container_vllm_args=()
+    [[ ${#launcher[@]} -le 1 ]] || container_vllm_args+=("${launcher[@]:1}")
+    container_vllm_args+=("${vllm_args[@]:2}")
+    return 0
+  fi
   docker_cmd+=("${ALIAS_VLLM_IMAGE_ID:-$ngc_image}")
   container_vllm_args=("${vllm_args[@]}")
   if [[ "${ALIAS_VLLM_ENTRYPOINT:-}" == "true" || \
@@ -1681,7 +1699,7 @@ await_startup() {
       [[ -n "$n" ]] && { printf 'exit:mamba:%s\n' "$n"; return 0; }
       printf 'exit:other\n'; return 0
     fi
-    if curl -fsS "http://localhost:${port}/v1/models" >/dev/null 2>&1; then
+    if model_api_ready "$port" "${BUNDLE_API_KIND:-chat}"; then
       printf 'ready\n'; return 0
     fi
     ticks=$((ticks + 1))
@@ -1733,7 +1751,10 @@ run_backend_vllm() {
   fi
 
   # Establish private gateway credentials before changing a real backend.
-  [[ "$dry_run" == 1 ]] || gateway_prepare_runtime vllm || return 1
+  if [[ "$dry_run" != 1 ]]; then
+    [[ "${BUNDLE_API_KIND:-chat}" != systemone ]] || systemone_gateway_preflight || return 1
+    gateway_prepare_runtime vllm || return 1
+  fi
   # Dry-runs never remove containers; cleanup happens only for a real launch.
 
 
@@ -1751,7 +1772,7 @@ run_backend_vllm() {
     fi
     warn "Model '${model}' is not downloaded — fetching metadata to check if it fits..."
     fetch_model_metadata "$model" || die "Could not fetch model metadata" "Check the model name and your connection"
-    model_path=$(resolve_model_path "$model") || die "Metadata download did not produce a usable snapshot"
+    model_path=$(resolve_model_path "$model" "${BUNDLE_TARGET_REVISION:-}") || die "Metadata download did not produce a usable snapshot"
     needs_download=1
     REGEN_PROFILE=1   # no cached profile yet; size from the fetched metadata
   fi
@@ -1825,7 +1846,7 @@ run_backend_vllm() {
 
     # Download the full weights and re-profile at the effective context.
     download_model_full "$model"
-    model_path=$(resolve_model_path "$model") || die "Download did not produce a usable snapshot"
+    model_path=$(resolve_model_path "$model" "${BUNDLE_TARGET_REVISION:-}") || die "Download did not produce a usable snapshot"
     REGEN_PROFILE=1
     profile_model "$model" "$model_path"
     auto_enable_mtp_if_supported
@@ -2481,11 +2502,31 @@ cmd_down() {
 }
 
 cmd_pull() {
-  local model="${1:-}"
-  [[ -z "$model" ]] && die "No model specified" "Usage: spark pull <model>"
+  local model="" revision="" launch_ref="" bundle_revision=""
+  local BUNDLE_TARGET_REVISION=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --revision) [[ $# -ge 2 ]] || die "Missing value for --revision"; revision="$2"; shift 2 ;;
+      -h|--help) printf 'Usage: spark pull <model|bundle> [--revision <commit>]\n'; return 0 ;;
+      -*) die "Unknown pull flag: $1" ;;
+      *) [[ -z "$model" ]] || die "Only one pull target can be specified"; model="$1"; shift ;;
+    esac
+  done
+  [[ -n "$model" ]] || die "No model specified" "Usage: spark pull <model|bundle> [--revision <commit>]"
+  [[ -z "$revision" || "$revision" =~ ^[A-Fa-f0-9]{7,64}$ ]] || die "--revision must be an immutable commit hash"
+  launch_ref="$model"
+  if bundle_resolve "$model"; then
+    [[ "$BACKEND" == vllm ]] || die "Model bundles require the vLLM backend"
+    bundle_validate_dir "$BUNDLE_PATH" || die "Invalid bundle: $model"
+    bundle_revision=$(jq -r '.defaults.target_model.revision' "${BUNDLE_PATH}/bundle.json")
+    [[ -z "$revision" || "$revision" == "$bundle_revision" ]] || die "--revision differs from the bundle's pinned revision"
+    revision="$bundle_revision"
+    model=$(jq -r '.defaults.target_model.id' "${BUNDLE_PATH}/bundle.json")
+  fi
   validate_model_ref_for_backend "$model"
 
   if [[ "$BACKEND" == "ollama" ]]; then
+    [[ -z "$revision" ]] || die "--revision is only supported for HuggingFace models"
     is_ollama_ref "$model" || die "Invalid model reference: $model" "Use an Ollama model like 'qwen3:30b'"
     command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark setup"
     printf "\n  Pulling %s with Ollama...\n\n" "$model"
@@ -2497,10 +2538,13 @@ cmd_pull() {
   fi
 
   is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
+  BUNDLE_TARGET_REVISION="$revision"
   printf "\n  Downloading %s...\n\n" "$model"
-  hf download "$model"
+  local -a download=(hf download "$model")
+  [[ -z "$revision" ]] || download+=(--revision "$revision")
+  "${download[@]}"
   local model_path
-  if model_path=$(resolve_model_path "$model" 2>/dev/null); then
+  if model_path=$(resolve_model_path "$model" "$revision" 2>/dev/null); then
     REGEN_PROFILE=1
     KV_CACHE_DTYPE="auto"
     profile_model "$model" "$model_path" || warn "Downloaded, but profile refresh failed; run with --regen-profile if needed"
@@ -2508,7 +2552,7 @@ cmd_pull() {
     warn "Downloaded, but no complete local snapshot was found for profiling"
   fi
   printf "\n"
-  info "Ready. Run: spark run ${model}"
+  info "Ready. Run: spark run ${launch_ref}"
   printf "\n"
 }
 
@@ -2687,7 +2731,10 @@ container_age_seconds() {
 }
 
 model_api_ready() {
-  local port="$1"
+  local port="$1" kind="${2:-chat}"
+  if [[ "$kind" == systemone ]]; then
+    curl -fsS --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1 || return 1
+  fi
   curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1
 }
 
@@ -2698,11 +2745,7 @@ gateway_api_ready() {
 
 gateway_model_routed() {
   local engine="$1" model="$2" id out
-  case "$engine" in
-    vllm) id="vllm/${model}" ;;
-    ollama) id="ollama_chat/${model}" ;;
-    *) return 1 ;;
-  esac
+  id="$(gateway_model_prefix "$engine" "$model")/${model}" || return 1
   out=$(gateway_curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" 2>/dev/null) || return 1
   if command -v jq >/dev/null 2>&1; then
     printf '%s\n' "$out" | jq -e --arg id "$id" 'any(.data[]?; .id == $id)' >/dev/null 2>&1
@@ -2713,7 +2756,7 @@ gateway_model_routed() {
 
 status_model_runtime_state() {
   local name="$1" port="$2" age
-  model_api_ready "$port" && { printf 'ready\n'; return 0; }
+  model_api_ready "$port" "$(model_api_kind "$name")" && { printf 'ready\n'; return 0; }
   age=$(container_age_seconds "$name" 2>/dev/null || true)
   if [[ "$age" =~ ^[0-9]+$ && "$age" -lt 600 ]]; then printf 'starting\n'; else printf 'unhealthy\n'; fi
   return 1
@@ -2732,13 +2775,13 @@ status_operational() {
     return $?
   fi
   while IFS=$'\t' read -r name model port rest; do
-    [[ -n "$name" ]] && model_api_ready "$port" && gateway_model_routed vllm "$model" && ready=1
+    [[ -n "$name" ]] && model_api_ready "$port" "$(model_api_kind "$name")" && gateway_model_routed vllm "$model" && ready=1
   done < <(list_managed_containers)
   [[ "$ready" == "1" ]]
 }
 
 status_models_json() {
-  local first=1 name model port need wt kv state now pk routed loaded_ollama
+  local first=1 name model port need wt kv state now pk routed loaded_ollama api prefix
   printf '['
   if [[ "$BACKEND" == "ollama" ]]; then
     loaded_ollama=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
@@ -2760,8 +2803,10 @@ status_models_json() {
       state=$(status_model_runtime_state "$name" "$port" || true)
       if gateway_model_routed vllm "$model"; then routed=true; else routed=false; fi
       now=$(container_current_gb "$name"); pk=$(container_peak_gb "$name")
-      printf '{"name":"%s","engine":"vllm","state":"%s","endpoint":"http://localhost:%s/v1","gateway_model":"vllm/%s","gateway_routed":%s,"reserved_gb":%s,"live_gb":%s,"peak_gb":%s,"live_memory_scope":"cgroup","engine_memory":%s}' \
-        "$(status_json_escape "${model:-unknown}")" "$state" "$(status_json_escape "$port")" \
+      api=$(model_api_kind "$name"); prefix=vllm
+      [[ "$api" != systemone ]] || prefix=systemone
+      printf '{"name":"%s","engine":"vllm","api":"%s","state":"%s","endpoint":"http://localhost:%s%s","gateway_model":"%s/%s","gateway_routed":%s,"reserved_gb":%s,"live_gb":%s,"peak_gb":%s,"live_memory_scope":"cgroup","engine_memory":%s}' \
+        "$(status_json_escape "${model:-unknown}")" "$api" "$state" "$(status_json_escape "$port")" "$(model_api_path "$api")" "$prefix" \
         "$(status_json_escape "${model:-unknown}")" "$routed" "$(status_json_number "$need")" \
         "$(status_json_number "$now")" "$(status_json_number "$pk")" "$(engine_memory_json "$name")"
     done < <(list_managed_containers)
@@ -2858,13 +2903,16 @@ print_vllm_model_table() {
 
   local i now pk state state_color route_state
   for i in "${!models[@]}"; do
+    local api prefix
+    api=$(model_api_kind "${cnames[$i]}"); prefix=vllm
+    [[ "$api" != systemone ]] || prefix=systemone
     state=$(status_model_runtime_state "${cnames[$i]}" "${ports[$i]}" || true)
     case "$state" in ready) state_color="$GREEN" ;; starting) state_color="$YELLOW" ;; *) state_color="$RED" ;; esac
     printf "  ${state_color}●${NC} ${BOLD}%s${NC}  %s%s%s\n" "${models[$i]}" "$state_color" "$state" "$NC"
-    printf "    Direct:  http://localhost:%s/v1 · up %s\n" "${ports[$i]}" "${ups[$i]}"
+    printf "    Direct:  http://localhost:%s%s · up %s\n" "${ports[$i]}" "$(model_api_path "$api")" "${ups[$i]}"
     if gateway_model_routed vllm "${models[$i]}"; then route_state="routed"; else route_state="not routed"; fi
-    printf "    Gateway: http://localhost:%s/v1 · model vllm/%s · %s\n" \
-      "$(gateway_configured_port)" "${models[$i]}" "$route_state"
+    printf "    Gateway: http://localhost:%s%s · model %s/%s · %s\n" \
+      "$(gateway_configured_port)" "$(model_api_path "$api")" "$prefix" "${models[$i]}" "$route_state"
     printf "    Memory:  %s GB weights · %s GB KV cache · %s GB reserved\n" \
       "${wts[$i]}" "${kvs[$i]}" "${needs[$i]}"
     now=$(container_current_gb "${cnames[$i]}"); pk=$(container_peak_gb "${cnames[$i]}")

@@ -92,6 +92,15 @@ gateway_generate_litellm_yaml() {
     local primary_port="" primary_model="" main_match=0 name model port rest
     while IFS=$'\t' read -r name model port rest; do
       [[ -z "$model" ]] && continue
+      if [[ "$(model_api_kind "$name")" == systemone ]]; then
+        # TypeSafe's transport implements the public System One wire contract;
+        # api_base and the local placeholder key keep the call on this host.
+        yaml+="
+  - $(jq -nc --arg model "$model" --arg base "http://localhost:${port}" \
+          '{model_name:("systemone/"+$model),litellm_params:{model:("typesafe/"+$model),api_base:$base,api_key:"dummy",drop_params:false},model_info:{mode:"decisions"}}')"
+        has_models=1
+        continue
+      fi
       yaml+="
   - model_name: \"vllm/${model}\"
     litellm_params:

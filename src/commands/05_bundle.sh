@@ -369,6 +369,10 @@ bundle_prepare_run() {
   local requested_mem="$mem" requested_len="$max_len" requested_seqs="$max_num_seqs" requested_port="$port" requested_kv="$kv_dtype"
   manifest="${path}/bundle.json"
   bundle_validate_dir "$path" || die "Bundle '${name}' is invalid"
+  BUNDLE_API_KIND=$(jq -r '.api.type // "chat"' "$manifest")
+  BUNDLE_LAUNCHER_JSON=$(jq -c '.runtime.command // []' "$manifest")
+  [[ "$BUNDLE_API_KIND" != systemone || "$publish_main" != 1 ]] \
+    || die "System One models cannot be the chat main model" "Launch without --main; use the /v1/systemone route."
   model=$(jq -r '.defaults.target_model.id' "$manifest")
   vllm_json=$(jq -c '.defaults.vllm_args' "$manifest")
 

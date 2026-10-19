@@ -398,6 +398,43 @@ Edit `src/` modules, then run `scripts/build-single-file.sh` to regenerate the r
 
 MIT
 
+## System One decision models
+
+Decision services use the same `spark run`, `stop`, `logs`, aliases, memory
+admission and gateway lifecycle as chat models. Start with the built-in
+`clef-flash-nvfp4` bundle:
+
+```sh
+spark pull clef-flash-nvfp4
+spark run clef-flash-nvfp4 --dry-run
+spark run clef-flash-nvfp4
+spark status --json
+```
+
+Spark publishes it as `systemone/alpha-x-ai/clef-flash-NVFP4` on the existing
+authenticated LiteLLM gateway. Call `POST /v1/systemone` with `state` and typed
+`questions`, or `/v1/decisions` with LiteLLM's decision request format. Existing
+chat routes and the `main` selection are preserved. Decision models cannot be
+selected as the chat `main` or benchmarked with generative GuideLLM workloads.
+The gateway image must implement LiteLLM's native System One routes and the
+TypeSafe-compatible transport; Spark checks that capability before launch.
+Older installations need `spark update --litellm`.
+
+A schema-2 bundle declares `"api": {"type": "systemone"}` and a
+`runtime.command` argv array, for example `["python3", "/opt/spark/server.py"]`.
+Spark invokes that command with the model and its effective vLLM-shaped flags
+(revision, port, host, memory fraction, context and concurrency). The adapter
+owns translation into its engine, and must expose `/health`, `/v1/models` and
+`POST /v1/systemone`. Its actual command is verified when capturing an alias.
+Bundles without `api` retain their existing chat contract.
+
+`spark status --json` adds `api: "systemone"`, the direct decision endpoint and
+the gateway model id. Memory accounting includes both chat and decision
+containers. Size the decision service for short state snapshots and bound its
+cache; the first Clef bundle uses a 1.5 GiB KV pool and one inference at a time.
+Its model-specific requirements, image limits and unmeasured co-residency are
+documented in [the bundle](bundles/vllm/clef-flash-nvfp4/README.md).
+
 ## Image-owned model preparation
 
 Bundle schema 2 supports a normal Hugging Face model or a prepared local model,
