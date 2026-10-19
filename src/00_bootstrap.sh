@@ -619,10 +619,10 @@ inspect_hf_model() {
   err_file="$(mktemp)"
   set +e
   local -a inspect_args=(--model-id "$model" --local-path "$model_path")
-  if [[ "${BUNDLE_ACTIVE:-0}" == "1" ]]; then
+  if [[ -n "${BUNDLE_TARGET_REVISION:-}" ]]; then
     inspect_args+=(--revision "$BUNDLE_TARGET_REVISION")
-    [[ -z "${BUNDLE_MODEL_PATH:-}" ]] || inspect_args+=(--local-files-only)
   fi
+  [[ -z "${BUNDLE_MODEL_PATH:-}" ]] || inspect_args+=(--local-files-only)
   HF_MODEL_INFO_JSON=$("$py" "$helper" "${inspect_args[@]}" 2>"$err_file")
   status=$?
   set -e
@@ -778,8 +778,11 @@ compute_kv_gb() {
 
 # Known non-KV runtime overhead, shared by sizing and capacity advice.
 profile_runtime_overhead_gb() {
-  local extra="${BUNDLE_RUNTIME_OVERHEAD_GB:-0}"
-  [[ "${IS_MULTIMODAL:-false}" == "true" ]] && extra="${SPARK_MM_ENCODER_OVERHEAD_GB:-8}"
+  local extra="${BUNDLE_RUNTIME_OVERHEAD_GB:-}"
+  if [[ -z "$extra" ]]; then
+    extra=0
+    [[ "${IS_MULTIMODAL:-false}" == "true" ]] && extra="${SPARK_MM_ENCODER_OVERHEAD_GB:-8}"
+  fi
   awk -v x="$extra" 'BEGIN{exit !(x+0>=0)}' || extra=8
   printf '%s\n' "$extra"
 }
@@ -1466,17 +1469,21 @@ verify_capacity() {
 # model and check it fits BEFORE pulling tens of GB of weights. Returns 0 on success.
 fetch_model_metadata() {
   local model="$1"
+  local -a revision_args=()
+  [[ -z "${BUNDLE_TARGET_REVISION:-}" ]] || revision_args=(--revision "$BUNDLE_TARGET_REVISION")
   command -v hf >/dev/null 2>&1 || { err "hf CLI not found" ; printf "    Install it with: spark setup\n"; return 1; }
-  hf download "$model" config.json >/dev/null 2>&1 || return 1
+  hf download "$model" config.json ${revision_args[@]+"${revision_args[@]}"} >/dev/null 2>&1 || return 1
   # Index is best-effort: single-file models won't have it (weights then fall back to params).
-  hf download "$model" model.safetensors.index.json >/dev/null 2>&1 || true
+  hf download "$model" model.safetensors.index.json ${revision_args[@]+"${revision_args[@]}"} >/dev/null 2>&1 || true
   return 0
 }
 
 # Download the full model weights.
 download_model_full() {
   local model="$1"
+  local -a revision_args=()
+  [[ -z "${BUNDLE_TARGET_REVISION:-}" ]] || revision_args=(--revision "$BUNDLE_TARGET_REVISION")
   printf "\n  Downloading %s...\n\n" "$model"
-  hf download "$model"
+  hf download "$model" ${revision_args[@]+"${revision_args[@]}"}
   printf "\n"
 }

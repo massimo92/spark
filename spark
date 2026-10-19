@@ -619,10 +619,10 @@ inspect_hf_model() {
   err_file="$(mktemp)"
   set +e
   local -a inspect_args=(--model-id "$model" --local-path "$model_path")
-  if [[ "${BUNDLE_ACTIVE:-0}" == "1" ]]; then
+  if [[ -n "${BUNDLE_TARGET_REVISION:-}" ]]; then
     inspect_args+=(--revision "$BUNDLE_TARGET_REVISION")
-    [[ -z "${BUNDLE_MODEL_PATH:-}" ]] || inspect_args+=(--local-files-only)
   fi
+  [[ -z "${BUNDLE_MODEL_PATH:-}" ]] || inspect_args+=(--local-files-only)
   HF_MODEL_INFO_JSON=$("$py" "$helper" "${inspect_args[@]}" 2>"$err_file")
   status=$?
   set -e
@@ -778,8 +778,11 @@ compute_kv_gb() {
 
 # Known non-KV runtime overhead, shared by sizing and capacity advice.
 profile_runtime_overhead_gb() {
-  local extra="${BUNDLE_RUNTIME_OVERHEAD_GB:-0}"
-  [[ "${IS_MULTIMODAL:-false}" == "true" ]] && extra="${SPARK_MM_ENCODER_OVERHEAD_GB:-8}"
+  local extra="${BUNDLE_RUNTIME_OVERHEAD_GB:-}"
+  if [[ -z "$extra" ]]; then
+    extra=0
+    [[ "${IS_MULTIMODAL:-false}" == "true" ]] && extra="${SPARK_MM_ENCODER_OVERHEAD_GB:-8}"
+  fi
   awk -v x="$extra" 'BEGIN{exit !(x+0>=0)}' || extra=8
   printf '%s\n' "$extra"
 }
@@ -1466,21 +1469,29 @@ verify_capacity() {
 # model and check it fits BEFORE pulling tens of GB of weights. Returns 0 on success.
 fetch_model_metadata() {
   local model="$1"
+  local -a revision_args=()
+  [[ -z "${BUNDLE_TARGET_REVISION:-}" ]] || revision_args=(--revision "$BUNDLE_TARGET_REVISION")
   command -v hf >/dev/null 2>&1 || { err "hf CLI not found" ; printf "    Install it with: spark setup\n"; return 1; }
-  hf download "$model" config.json >/dev/null 2>&1 || return 1
+  hf download "$model" config.json ${revision_args[@]+"${revision_args[@]}"} >/dev/null 2>&1 || return 1
   # Index is best-effort: single-file models won't have it (weights then fall back to params).
-  hf download "$model" model.safetensors.index.json >/dev/null 2>&1 || true
+  hf download "$model" model.safetensors.index.json ${revision_args[@]+"${revision_args[@]}"} >/dev/null 2>&1 || true
   return 0
 }
 
 # Download the full model weights.
 download_model_full() {
   local model="$1"
+  local -a revision_args=()
+  [[ -z "${BUNDLE_TARGET_REVISION:-}" ]] || revision_args=(--revision "$BUNDLE_TARGET_REVISION")
   printf "\n  Downloading %s...\n\n" "$model"
-  hf download "$model"
+  hf download "$model" ${revision_args[@]+"${revision_args[@]}"}
   printf "\n"
 }
 spark_builtin_bundle_assets() { cat <<'__SPARK_BUNDLE_ASSETS__'
+vllm/clef-flash-nvfp4/Dockerfile	644	RlJPTSB2bGxtL3ZsbG0tb3BlbmFpOnYwLjMwLjBAc2hhMjU2OjhhNjlmZmFkMDE1ZjEzOGQ3MTcwYzRkZGM0MjllMjMwYTNiYzFjMTcxOWY2N2UxNDMyNDc0OWRmMjAwYTRiOTAKCkNPUFkgc2VydmVfc3lzdGVtb25lLnB5IC9vcHQvc3Bhcmsvc2VydmVfc3lzdGVtb25lLnB5CkVOVFJZUE9JTlQgW10K
+vllm/clef-flash-nvfp4/README.md	644	IyBDbGVmIEZsYXNoIE5WRlA0CgpSdW5zIGBhbHBoYS14LWFpL2NsZWYtZmxhc2gtTlZGUDRgIGF0IHRoZSBwaW5uZWQgcmV2aXNpb24gaW4gYGJ1bmRsZS5qc29uYC4KVGhpcyBpcyBhIGNvbW11bml0eSBxdWFudGl6YXRpb24gb2YgQ2xvdWRmbGFyZSdzIENsZWYgRmxhc2gsIG5vdCBhIGNoYXQgbW9kZWwuClRoZSB1cHN0cmVhbSBhdXRob3IgdGVzdGVkIHRoaXMgcnVudGltZSBvbiBER1ggU3BhcmsgLyBHQjEwIHdpdGggdkxMTSAwLjMwLjAuCgpgYGBzaApzcGFyayBwdWxsIGNsZWYtZmxhc2gtbnZmcDQKc3BhcmsgcnVuIGNsZWYtZmxhc2gtbnZmcDQgLS1kcnktcnVuCnNwYXJrIHJ1biBjbGVmLWZsYXNoLW52ZnA0CnNwYXJrIHN0YXR1cyAtLWpzb24Kc3BhcmsgbG9ncyBhbHBoYS14LWFpL2NsZWYtZmxhc2gtTlZGUDQKc3Bhcmsgc3RvcCBhbHBoYS14LWFpL2NsZWYtZmxhc2gtTlZGUDQKYGBgCgpUaGUgZGlyZWN0IHNlcnZpY2UgZXhwb3NlcyBgL2hlYWx0aGAsIGAvdjEvbW9kZWxzYCBhbmQgYFBPU1QgL3YxL3N5c3RlbW9uZWAuClB1bGxpbmcgdGhlIGJ1bmRsZSBkb3dubG9hZHMgaXRzIGltbXV0YWJsZSBtb2RlbCByZXZpc2lvbiwgbm90IHRoZSBtb3ZpbmcgSEYgbWFpbi4KU3BhcmsgYXNzaWducyBhIGZyZWUgcG9ydCwgcHJlc2VydmVzIHRoZSBleGlzdGluZyBjaGF0IGBtYWluYCwgYW5kIHB1Ymxpc2hlcwpgc3lzdGVtb25lL2FscGhhLXgtYWkvY2xlZi1mbGFzaC1OVkZQNGAgdGhyb3VnaCBMaXRlTExNJ3MgYC92MS9zeXN0ZW1vbmVgIGFuZApgL3YxL2RlY2lzaW9uc2AgZW5kcG9pbnRzLiBBbiBvbGQgTGl0ZUxMTSBpbWFnZSBpcyByZWplY3RlZCBiZWZvcmUgbGF1bmNoOwp1cGRhdGUgaXQgd2l0aCBgc3BhcmsgdXBkYXRlIC0tbGl0ZWxsbWAuCgpgYGBqc29uCnsKICAibW9kZWwiOiAic3lzdGVtb25lL2FscGhhLXgtYWkvY2xlZi1mbGFzaC1OVkZQNCIsCiAgInN0YXRlIjogeyJwaGFzZSI6ICJ2YWxpZGF0aW9uIiwgInRlc3RzIjogInBhc3NlZCIsICJwZW5kaW5nIjogW119LAogICJxdWVzdGlvbnMiOiB7CiAgICAiY29tcGxldGUiOiB7InR5cGUiOiAibm91bCIsICJpbnN0cnVjdGlvbnMiOiAiQXJlIGFsbCBsaXN0ZWQgY2hlY2tzIGNvbXBsZXRlPyJ9LAogICAgIm5leHQiOiB7InR5cGUiOiAiY2hvaWNlIiwgImNyaXRlcmlhIjogeyJjb250aW51ZSI6ICJDaGVja3MgcmVtYWluIiwgImZpbmlzaCI6ICJBbGwgY2hlY2tzIGNvbXBsZXRlIn19LAogICAgInByb2dyZXNzIjogeyJ0eXBlIjogInNjb3JlIiwgImNyaXRlcmlhIjogWyJibG9ja2VkIiwgInBhcnRpYWwiLCAiY29tcGxldGUiXX0KICB9Cn0KYGBgCgpTZW5kIHRoYXQgYm9keSB3aXRoIHlvdXIgZXhpc3RpbmcgQmVhcmVyIHRva2VuIHRvIHRoZSBnYXRld2F5J3MKYC92MS9zeXN0ZW1vbmVgLiBGb3IgdGhlIGRpcmVjdCBwb3J0IHVzZSB0aGUgdW5kZXJseWluZyBtb2RlbCBpZCB3aXRob3V0IHRoZQpgc3lzdGVtb25lL2AgcHJlZml4LiBUaGVzZSBleGFtcGxlcyBkZW1vbnN0cmF0ZSByb3V0aW5nLCBub3QgYSByZWxpYWJsZQpjb21wbGV0aW9uIHBvbGljeTogY2FsaWJyYXRlIHRoZSBxdWVzdGlvbnMgb24geW91ciBvd24gYWdlbnQgdHJhY2VzLgoKRGVmYXVsdHM6IDhrIGlucHV0LCBvbmUgaW5mZXJlbmNlIGF0IGEgdGltZSwgZWFnZXIgZXhlY3V0aW9uLCBmaXhlZCAxLjUgR2lCCktWIHBvb2wgYW5kIGEgMTIlIGhvc3QtbWVtb3J5IHJlc2VydmF0aW9uLiBTcGFyayBjaGVja3MgdGhlIGxpdmUgbWVtb3J5CmJ1ZGdldCBiZWZvcmUgbGF1bmNoaW5nLiBUaGUgcmVzZXJ2YXRpb24gaXMgYSBzdGFydGluZyBwb2ludCwgbm90IGEgbWVhc3VyZWQKY28tcmVzaWRlbmN5IGd1YXJhbnRlZS4gVGhlIHByb2Nlc3MgYWxzbyBuZWVkcyB0aGUgam9pbnQgaGVhZCBhbmQgb3B0aW9uCmVtYmVkZGluZ3Mgb3V0c2lkZSB0aGUgYmFja2JvbmUncyB2TExNIGFsbG9jYXRpb24uCgpUaGUgcnVudGltZSBsb2FkcyB0aGUgcGlubmVkIHVwc3RyZWFtIGBjbGVmX3ZsbG0ucHlgIGFuZCBqb2ludCBzY2hlbWEgaGVhZApmcm9tIHRoZSBIRiBjYWNoZSwgb2ZmbGluZS4gSXQgbXVzdCBub3QgZmFsbCBiYWNrIHRvIGdlbmVyYXRpb24gb3IgZGVjb21wcmVzcwp0aGUgY2hlY2twb2ludCB0byBCRjE2LiBUaGUgQVBJIHJlamVjdHMgdW5rbm93biBtb2RlbHMgYW5kIG1hbGZvcm1lZCByZXF1ZXN0cy4KSW5mZXJlbmNlIGlzIHNlcmlhbGl6ZWQgYmVjYXVzZSB0aGUgdXBzdHJlYW0gb2ZmbGluZSB2TExNIGVuZ2luZSBpcyBzaGFyZWQuCkhlYWx0aCByZXF1ZXN0cyByZW1haW4gcmVzcG9uc2l2ZSBkdXJpbmcgaW5mZXJlbmNlLgpSZXF1ZXN0cyBleGNlZWRpbmcgdGhlIGNvbmZpZ3VyZWQgdG9rZW4gd2luZG93IGFyZSByZWplY3RlZDsgdGhlIGFkYXB0ZXIKZGlzYWJsZXMgdGhlIHVwc3RyZWFtIGVuY29kZXIncyBzaWxlbnQgc3RhdGUgdHJ1bmNhdGlvbi4KClRleHQgYW5kIEpTT04gd29yayB0aHJvdWdoIExpdGVMTE0ncyBUeXBlU2FmZS1jb21wYXRpYmxlIHRyYW5zcG9ydC4gVGhlIGRpcmVjdApBUEkgYWRkaXRpb25hbGx5IGFjY2VwdHMgUE5HL0pQRUcvV2ViUCBpbWFnZSBkYXRhIFVSTHM7IHJlbW90ZSBpbWFnZSBVUkxzIGFyZQpyZWplY3RlZC4gSW1hZ2UgZm9yd2FyZGluZyB0aHJvdWdoIHRoZSBnYXRld2F5IGlzIG5vdCBjb25maWd1cmVkIGJ5IHRoaXMgYnVuZGxlCmFuZCBpcyByZWplY3RlZCByYXRoZXIgdGhhbiBzaWxlbnRseSBkcm9wcGVkLiBWaWRlbyBpcyBub3QgZXhwb3NlZC4KClNvdXJjZXM6IFtxdWFudGl6YXRpb24gYW5kIHJ1bnRpbWVdKGh0dHBzOi8vaHVnZ2luZ2ZhY2UuY28vYWxwaGEteC1haS9jbGVmLWZsYXNoLU5WRlA0KSwKW29yaWdpbmFsIG1vZGVsXShodHRwczovL2h1Z2dpbmdmYWNlLmNvL0Nsb3VkZmxhcmUvY2xlZi1mbGFzaCksCltMaXRlTExNIGRlY2lzaW9uIHJvdXRlc10oaHR0cHM6Ly9kb2NzLmxpdGVsbG0uYWkvZG9jcy9kZWNpc2lvbnMpLgpNb2RlbCB3ZWlnaHRzIGFuZCB1cHN0cmVhbSBtb2RlbCBjb2RlOiBBcGFjaGUtMi4wOyBTcGFyaydzIHdyYXBwZXI6IE1JVC4K
+vllm/clef-flash-nvfp4/bundle.json	644	ewogICJzY2hlbWFfdmVyc2lvbiI6IDIsCiAgIm5hbWUiOiAiY2xlZi1mbGFzaC1udmZwNCIsCiAgImRlc2NyaXB0aW9uIjogIkNsZWYgRmxhc2ggTlZGUDQgZGVjaXNpb24gQVBJIHdpdGggYSBib3VuZGVkIEtWIGNhY2hlLCBhbG9uZ3NpZGUgYSBjaGF0IG1vZGVsIG9uIEdCMTAuIiwKICAiYXBpIjogeyJ0eXBlIjogInN5c3RlbW9uZSJ9LAogICJkZWZhdWx0cyI6IHsKICAgICJ0YXJnZXRfbW9kZWwiOiB7CiAgICAgICJpZCI6ICJhbHBoYS14LWFpL2NsZWYtZmxhc2gtTlZGUDQiLAogICAgICAicmV2aXNpb24iOiAiZTY3NmQ4ZTZlMTRmNWVlNzQ4MzBkMzNmYTFmYWQ2NDNkOGY1M2FjZiIKICAgIH0sCiAgICAidmxsbV9hcmdzIjogWwogICAgICAidmxsbSIsICJzZXJ2ZSIsICJhbHBoYS14LWFpL2NsZWYtZmxhc2gtTlZGUDQiLAogICAgICAiLS1yZXZpc2lvbiIsICJlNjc2ZDhlNmUxNGY1ZWU3NDgzMGQzM2ZhMWZhZDY0M2Q4ZjUzYWNmIiwKICAgICAgIi0tZ3B1LW1lbW9yeS11dGlsaXphdGlvbiIsICIwLjEyIiwKICAgICAgIi0tbWF4LW1vZGVsLWxlbiIsICI4MTkyIiwKICAgICAgIi0tbWF4LW51bS1zZXFzIiwgIjEiLAogICAgICAiLS1rdi1jYWNoZS1tZW1vcnktYnl0ZXMiLCAiMTYxMDYxMjczNiIsCiAgICAgICItLW1heC1udW0tYmF0Y2hlZC10b2tlbnMiLCAiODE5MiIsCiAgICAgICItLWVuZm9yY2UtZWFnZXIiCiAgICBdCiAgfSwKICAicnVudGltZSI6IHsiY29tbWFuZCI6IFsicHl0aG9uMyIsICIvb3B0L3NwYXJrL3NlcnZlX3N5c3RlbW9uZS5weSJdfSwKICAicmVzb3VyY2VzIjogeyJ3ZWlnaHRzX2diIjogOS42LCAicnVudGltZV9vdmVyaGVhZF9nYiI6IDQsICJrdl9lc3RpbWF0b3IiOiAiZW5naW5lIn0sCiAgIm9wdGlvbnMiOiB7fSwKICAicGF0Y2hlcyI6IFtdCn0K
+vllm/clef-flash-nvfp4/serve_systemone.py	644	IiIiU21hbGwgSFRUUCBhZGFwdGVyIGZvciB0aGUgcGlubmVkIENsZWYgcG9vbGluZyBydW50aW1lOyBubyBjaGF0IGdlbmVyYXRpb24uIiIiCmZyb20gX19mdXR1cmVfXyBpbXBvcnQgYW5ub3RhdGlvbnMKCmltcG9ydCBhcmdwYXJzZQppbXBvcnQgYmFzZTY0CmltcG9ydCBiaW5hc2NpaQppbXBvcnQgaW8KaW1wb3J0IGpzb24KaW1wb3J0IGxvZ2dpbmcKaW1wb3J0IG9zCmltcG9ydCBzeXMKaW1wb3J0IHRocmVhZGluZwpmcm9tIGh0dHAuc2VydmVyIGltcG9ydCBCYXNlSFRUUFJlcXVlc3RIYW5kbGVyLCBUaHJlYWRpbmdIVFRQU2VydmVyCmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aApmcm9tIHR5cGluZyBpbXBvcnQgQW55CgpNQVhfQk9EWV9CWVRFUyA9IDggKiAxMDI0ICogMTAyNApNQVhfUVVFU1RJT05TID0gMTI4CgoKZGVmIHZhbGlkYXRlX3JlcXVlc3QoYm9keTogQW55LCBtb2RlbDogc3RyKSAtPiBkaWN0W3N0ciwgQW55XToKICAgIGlmIG5vdCBpc2luc3RhbmNlKGJvZHksIGRpY3QpIG9yIGJvZHkuZ2V0KCJtb2RlbCIpICE9IG1vZGVsOgogICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoIm1vZGVsIG11c3QgbWF0Y2ggdGhlIHNlcnZlZCBtb2RlbCBpZCIpCiAgICBpZiBub3QgaXNpbnN0YW5jZShib2R5LmdldCgic3RhdGUiKSwgKHN0ciwgZGljdCwgbGlzdCkpOgogICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoInN0YXRlIG11c3QgYmUgdGV4dCwgYW4gb2JqZWN0LCBvciBhbiBhcnJheSIpCiAgICBpZiBib2R5LmdldCgic3RyZWFtIik6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigiU3lzdGVtIE9uZSBkZWNpc2lvbnMgZG8gbm90IHN1cHBvcnQgc3RyZWFtaW5nIikKICAgIHF1ZXN0aW9ucyA9IGJvZHkuZ2V0KCJxdWVzdGlvbnMiKQogICAgaWYgbm90IGlzaW5zdGFuY2UocXVlc3Rpb25zLCBkaWN0KSBvciBub3QgMSA8PSBsZW4ocXVlc3Rpb25zKSA8PSBNQVhfUVVFU1RJT05TOgogICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoInF1ZXN0aW9ucyBtdXN0IGNvbnRhaW4gMSB0byAxMjggbmFtZWQgcXVlc3Rpb25zIikKICAgIGZvciBuYW1lLCBxdWVzdGlvbiBpbiBxdWVzdGlvbnMuaXRlbXMoKToKICAgICAgICBpZiBub3QgbmFtZSBvciBub3QgaXNpbnN0YW5jZShxdWVzdGlvbiwgZGljdCk6CiAgICAgICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoImV2ZXJ5IHF1ZXN0aW9uIG11c3QgYmUgYSBuYW1lZCBvYmplY3QiKQogICAgICAgIGtpbmQsIGNyaXRlcmlhID0gcXVlc3Rpb24uZ2V0KCJ0eXBlIiksIHF1ZXN0aW9uLmdldCgiY3JpdGVyaWEiKQogICAgICAgIGlmIG5vdCBpc2luc3RhbmNlKGtpbmQsIHN0cikgb3Iga2luZCBub3QgaW4geyJub3VsIiwgImNob2ljZSIsICJzY29yZSJ9OgogICAgICAgICAgICByYWlzZSBWYWx1ZUVycm9yKGYie25hbWV9OiB0eXBlIG11c3QgYmUgbm91bCwgY2hvaWNlLCBvciBzY29yZSIpCiAgICAgICAgaWYgImluc3RydWN0aW9ucyIgaW4gcXVlc3Rpb24gYW5kIG5vdCBpc2luc3RhbmNlKHF1ZXN0aW9uWyJpbnN0cnVjdGlvbnMiXSwgc3RyKToKICAgICAgICAgICAgcmFpc2UgVmFsdWVFcnJvcihmIntuYW1lfTogaW5zdHJ1Y3Rpb25zIG11c3QgYmUgdGV4dCIpCiAgICAgICAgaWYga2luZCA9PSAiY2hvaWNlIiBhbmQgKG5vdCBpc2luc3RhbmNlKGNyaXRlcmlhLCBkaWN0KSBvciBub3QgMSA8PSBsZW4oY3JpdGVyaWEpIDw9IDI1NSk6CiAgICAgICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoZiJ7bmFtZX06IGNob2ljZSByZXF1aXJlcyAxIHRvIDI1NSBjcml0ZXJpYSIpCiAgICAgICAgaWYga2luZCA9PSAic2NvcmUiIGFuZCAobm90IGlzaW5zdGFuY2UoY3JpdGVyaWEsIGxpc3QpIG9yIG5vdCAxIDw9IGxlbihjcml0ZXJpYSkgPD0gMTApOgogICAgICAgICAgICByYWlzZSBWYWx1ZUVycm9yKGYie25hbWV9OiBzY29yZSByZXF1aXJlcyAxIHRvIDEwIGNyaXRlcmlhIikKICAgICAgICBpZiBraW5kID09ICJub3VsIiBhbmQgbm90IChxdWVzdGlvbi5nZXQoImluc3RydWN0aW9ucyIpIG9yIGNyaXRlcmlhKToKICAgICAgICAgICAgcmFpc2UgVmFsdWVFcnJvcihmIntuYW1lfTogbm91bCByZXF1aXJlcyBpbnN0cnVjdGlvbnMgb3IgY3JpdGVyaWEiKQogICAgICAgIGlmIGtpbmQgPT0gIm5vdWwiIGFuZCBjcml0ZXJpYSBpcyBub3QgTm9uZSBhbmQgbm90IGlzaW5zdGFuY2UoY3JpdGVyaWEsIGRpY3QpOgogICAgICAgICAgICByYWlzZSBWYWx1ZUVycm9yKGYie25hbWV9OiBub3VsIGNyaXRlcmlhIG11c3QgYmUgYW4gb2JqZWN0IikKICAgIGlmIGJvZHkuZ2V0KCJ2aWRlb3MiKSBvciBib2R5LmdldCgiYXNzZXRzIik6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigidmlkZW9zIGFuZCBUeXBlU2FmZSBpbWFnZSBhc3NldHMgYXJlIG5vdCBzdXBwb3J0ZWQgYnkgdGhpcyBlbmRwb2ludCIpCiAgICByZXR1cm4gYm9keQoKCmRlZiBkZWNvZGVfaW1hZ2VzKGJvZHk6IGRpY3Rbc3RyLCBBbnldKSAtPiBkaWN0W3N0ciwgQW55XToKICAgIGltYWdlcyA9IGJvZHkuZ2V0KCJpbWFnZXMiLCBbXSkKICAgIGlmIG5vdCBpc2luc3RhbmNlKGltYWdlcywgbGlzdCkgb3IgbGVuKGltYWdlcykgPiAxOgogICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoImltYWdlcyBtdXN0IGJlIGFuIGFycmF5IHdpdGggYXQgbW9zdCBvbmUgaW1hZ2UgZGF0YSBVUkwiKQogICAgaWYgbm90IGltYWdlczoKICAgICAgICByZXR1cm4gYm9keQogICAgZm9yIHZhbHVlIGluIGltYWdlczoKICAgICAgICBpZiBub3QgaXNpbnN0YW5jZSh2YWx1ZSwgc3RyKSBvciAiO2Jhc2U2NCwiIG5vdCBpbiB2YWx1ZToKICAgICAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigiaW1hZ2VzIG11c3QgYmUgYmFzZTY0IFBORy9KUEVHL1dlYlAgZGF0YSBVUkxzIikKICAgICAgICBoZWFkZXIsIGRhdGEgPSB2YWx1ZS5zcGxpdCgiLCIsIDEpCiAgICAgICAgaWYgaGVhZGVyIG5vdCBpbiB7ImRhdGE6aW1hZ2UvcG5nO2Jhc2U2NCIsICJkYXRhOmltYWdlL2pwZWc7YmFzZTY0IiwgImRhdGE6aW1hZ2Uvd2VicDtiYXNlNjQifToKICAgICAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigidW5zdXBwb3J0ZWQgaW1hZ2UgZGF0YSBVUkwiKQogICAgZnJvbSBQSUwgaW1wb3J0IEltYWdlLCBVbmlkZW50aWZpZWRJbWFnZUVycm9yCgogICAgZGVjb2RlZCA9IFtdCiAgICBmb3IgdmFsdWUgaW4gaW1hZ2VzOgogICAgICAgIGRhdGEgPSB2YWx1ZS5zcGxpdCgiLCIsIDEpWzFdCiAgICAgICAgdHJ5OgogICAgICAgICAgICB3aXRoIEltYWdlLm9wZW4oaW8uQnl0ZXNJTyhiYXNlNjQuYjY0ZGVjb2RlKGRhdGEsIHZhbGlkYXRlPVRydWUpKSkgYXMgaW1hZ2U6CiAgICAgICAgICAgICAgICBpZiBpbWFnZS53aWR0aCAqIGltYWdlLmhlaWdodCA+IDE2XzAwMF8wMDA6CiAgICAgICAgICAgICAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigiaW1hZ2UgZXhjZWVkcyAxNiBtaWxsaW9uIHBpeGVscyIpCiAgICAgICAgICAgICAgICBkZWNvZGVkLmFwcGVuZChpbWFnZS5jb252ZXJ0KCJSR0IiKSkKICAgICAgICBleGNlcHQgKGJpbmFzY2lpLkVycm9yLCBVbmlkZW50aWZpZWRJbWFnZUVycm9yLCBPU0Vycm9yLCBJbWFnZS5EZWNvbXByZXNzaW9uQm9tYkVycm9yKSBhcyBleGM6CiAgICAgICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoImludmFsaWQgaW1hZ2UgZGF0YSIpIGZyb20gZXhjCiAgICByZXR1cm4geyoqYm9keSwgImltYWdlcyI6IGRlY29kZWR9CgoKZGVmIG1ha2Vfc2VydmVyKGFkZHJlc3M6IHR1cGxlW3N0ciwgaW50XSwgZW5naW5lOiBBbnksIG1vZGVsOiBzdHIpIC0+IFRocmVhZGluZ0hUVFBTZXJ2ZXI6CiAgICBpbmZlcmVuY2VfbG9jayA9IHRocmVhZGluZy5Mb2NrKCkKCiAgICBjbGFzcyBIYW5kbGVyKEJhc2VIVFRQUmVxdWVzdEhhbmRsZXIpOgogICAgICAgIGRlZiBsb2dfbWVzc2FnZShzZWxmLCBmb3JtYXQ6IHN0ciwgKmFyZ3M6IEFueSkgLT4gTm9uZToKICAgICAgICAgICAgbG9nZ2luZy5pbmZvKGZvcm1hdCwgKmFyZ3MpCgogICAgICAgIGRlZiByZXNwb25kKHNlbGYsIHN0YXR1czogaW50LCBib2R5OiBkaWN0W3N0ciwgQW55XSkgLT4gTm9uZToKICAgICAgICAgICAgZGF0YSA9IGpzb24uZHVtcHMoYm9keSwgYWxsb3dfbmFuPUZhbHNlKS5lbmNvZGUoKQogICAgICAgICAgICBzZWxmLnNlbmRfcmVzcG9uc2Uoc3RhdHVzKQogICAgICAgICAgICBzZWxmLnNlbmRfaGVhZGVyKCJDb250ZW50LVR5cGUiLCAiYXBwbGljYXRpb24vanNvbiIpCiAgICAgICAgICAgIHNlbGYuc2VuZF9oZWFkZXIoIkNvbnRlbnQtTGVuZ3RoIiwgc3RyKGxlbihkYXRhKSkpCiAgICAgICAgICAgIHNlbGYuZW5kX2hlYWRlcnMoKQogICAgICAgICAgICBzZWxmLndmaWxlLndyaXRlKGRhdGEpCgogICAgICAgIGRlZiBkb19HRVQoc2VsZikgLT4gTm9uZToKICAgICAgICAgICAgaWYgc2VsZi5wYXRoID09ICIvaGVhbHRoIjoKICAgICAgICAgICAgICAgIHNlbGYucmVzcG9uZCgyMDAsIHsic3RhdHVzIjogInJlYWR5In0pCiAgICAgICAgICAgIGVsaWYgc2VsZi5wYXRoID09ICIvdjEvbW9kZWxzIjoKICAgICAgICAgICAgICAgIHNlbGYucmVzcG9uZCgyMDAsIHsib2JqZWN0IjogImxpc3QiLCAiZGF0YSI6IFsKICAgICAgICAgICAgICAgICAgICB7ImlkIjogbW9kZWwsICJvYmplY3QiOiAibW9kZWwiLCAib3duZWRfYnkiOiAic3BhcmsiLCAiYXBpIjogInN5c3RlbW9uZSJ9CiAgICAgICAgICAgICAgICBdfSkKICAgICAgICAgICAgZWxzZToKICAgICAgICAgICAgICAgIHNlbGYucmVzcG9uZCg0MDQsIHsiZXJyb3IiOiB7Im1lc3NhZ2UiOiAidW5rbm93biBlbmRwb2ludCJ9fSkKCiAgICAgICAgZGVmIGRvX1BPU1Qoc2VsZikgLT4gTm9uZToKICAgICAgICAgICAgaWYgc2VsZi5wYXRoICE9ICIvdjEvc3lzdGVtb25lIjoKICAgICAgICAgICAgICAgIHNlbGYucmVzcG9uZCg0MDQsIHsiZXJyb3IiOiB7Im1lc3NhZ2UiOiAidXNlIC92MS9zeXN0ZW1vbmUifX0pCiAgICAgICAgICAgICAgICByZXR1cm4KICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgbGVuZ3RoID0gaW50KHNlbGYuaGVhZGVycy5nZXQoIkNvbnRlbnQtTGVuZ3RoIiwgIjAiKSkKICAgICAgICAgICAgICAgIGlmIG5vdCAwIDwgbGVuZ3RoIDw9IE1BWF9CT0RZX0JZVEVTOgogICAgICAgICAgICAgICAgICAgIHNlbGYucmVzcG9uZCg0MTMsIHsiZXJyb3IiOiB7Im1lc3NhZ2UiOiAicmVxdWVzdCBtdXN0IGJlIGJldHdlZW4gMSBieXRlIGFuZCA4IE1pQiJ9fSkKICAgICAgICAgICAgICAgICAgICByZXR1cm4KICAgICAgICAgICAgICAgIHNlbGYuY29ubmVjdGlvbi5zZXR0aW1lb3V0KDMwKQogICAgICAgICAgICAgICAgcmVxdWVzdCA9IHZhbGlkYXRlX3JlcXVlc3QoanNvbi5sb2FkcyhzZWxmLnJmaWxlLnJlYWQobGVuZ3RoKSksIG1vZGVsKQogICAgICAgICAgICAgICAgcmVxdWVzdCA9IGRlY29kZV9pbWFnZXMocmVxdWVzdCkKICAgICAgICAgICAgZXhjZXB0IChWYWx1ZUVycm9yLCBVbmljb2RlRXJyb3IpIGFzIGV4YzoKICAgICAgICAgICAgICAgIHNlbGYucmVzcG9uZCg0MDAsIHsiZXJyb3IiOiB7Im1lc3NhZ2UiOiBzdHIoZXhjKX19KQogICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgIGlmIG5vdCBpbmZlcmVuY2VfbG9jay5hY3F1aXJlKGJsb2NraW5nPUZhbHNlKToKICAgICAgICAgICAgICAgIHNlbGYucmVzcG9uZCg0MjksIHsiZXJyb3IiOiB7Im1lc3NhZ2UiOiAiZGVjaXNpb24gZW5naW5lIGJ1c3k7IHJldHJ5IGxhdGVyIn19KQogICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIHNlbGYucmVzcG9uZCgyMDAsIGVuZ2luZS5zeXN0ZW1vbmUocmVxdWVzdCkpCiAgICAgICAgICAgIGV4Y2VwdCBWYWx1ZUVycm9yIGFzIGV4YzoKICAgICAgICAgICAgICAgIHNlbGYucmVzcG9uZCg0MDAsIHsiZXJyb3IiOiB7Im1lc3NhZ2UiOiBzdHIoZXhjKX19KQogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgbG9nZ2luZy5leGNlcHRpb24oIkNsZWYgZGVjaXNpb24gZmFpbGVkIikKICAgICAgICAgICAgICAgIHNlbGYucmVzcG9uZCg1MDAsIHsiZXJyb3IiOiB7Im1lc3NhZ2UiOiAiZGVjaXNpb24gaW5mZXJlbmNlIGZhaWxlZCJ9fSkKICAgICAgICAgICAgZmluYWxseToKICAgICAgICAgICAgICAgIGluZmVyZW5jZV9sb2NrLnJlbGVhc2UoKQoKICAgIHJldHVybiBUaHJlYWRpbmdIVFRQU2VydmVyKGFkZHJlc3MsIEhhbmRsZXIpCgoKZGVmIGVuY29kZV9jb21wbGV0ZV9yZWNvcmQoZW5naW5lOiBBbnksIHJlY29yZDogZGljdFtzdHIsIEFueV0sIGVuY29kZXI6IEFueSkgLT4gQW55OgogICAgIyBVcHN0cmVhbSBlbmNvZGVfcmVjb3JkIHNpbGVudGx5IHRydW5jYXRlcyB0aGUgc3RhdGUgdG8gbWF4X2xlbmd0aC4gQQogICAgIyBkZWNpc2lvbiBhYm91dCBpbmNvbXBsZXRlIGV2aWRlbmNlIGlzIHVuc2FmZSBldmVuIHdoZW4gaXRzIHNjaGVtYSBmaXRzLgogICAgZW5jb2RlZCA9IGVuY29kZXIoZW5naW5lLnRva2VuaXplciwgcmVjb3JkLCBtYXhfbGVuZ3RoPXN5cy5tYXhzaXplLCBwcm9jZXNzb3I9ZW5naW5lLnByb2Nlc3NvcikKICAgIGlmIGxlbihlbmNvZGVkLmlucHV0X2lkcykgPiBlbmdpbmUubWF4X21vZGVsX2xlbjoKICAgICAgICByYWlzZSBWYWx1ZUVycm9yKGYicmVxdWVzdCBuZWVkcyB7bGVuKGVuY29kZWQuaW5wdXRfaWRzKX0gdG9rZW5zOyBtYXhpbXVtIGlzIHtlbmdpbmUubWF4X21vZGVsX2xlbn0iKQogICAgcmV0dXJuIGVuY29kZWQKCgpkZWYgcGFyc2VyKCkgLT4gYXJncGFyc2UuQXJndW1lbnRQYXJzZXI6CiAgICByZXN1bHQgPSBhcmdwYXJzZS5Bcmd1bWVudFBhcnNlcihkZXNjcmlwdGlvbj1fX2RvY19fKQogICAgcmVzdWx0LmFkZF9hcmd1bWVudCgibW9kZWwiKQogICAgcmVzdWx0LmFkZF9hcmd1bWVudCgiLS1yZXZpc2lvbiIsIHJlcXVpcmVkPVRydWUpCiAgICByZXN1bHQuYWRkX2FyZ3VtZW50KCItLWhvc3QiLCBkZWZhdWx0PSIxMjcuMC4wLjEiKQogICAgcmVzdWx0LmFkZF9hcmd1bWVudCgiLS1wb3J0IiwgdHlwZT1pbnQsIGRlZmF1bHQ9ODAwMCkKICAgIHJlc3VsdC5hZGRfYXJndW1lbnQoIi0tbWF4LW1vZGVsLWxlbiIsIHR5cGU9aW50LCBkZWZhdWx0PTgxOTIpCiAgICByZXN1bHQuYWRkX2FyZ3VtZW50KCItLW1heC1udW0tc2VxcyIsIHR5cGU9aW50LCBkZWZhdWx0PTEpCiAgICByZXN1bHQuYWRkX2FyZ3VtZW50KCItLW1heC1udW0tYmF0Y2hlZC10b2tlbnMiLCB0eXBlPWludCwgZGVmYXVsdD04MTkyKQogICAgcmVzdWx0LmFkZF9hcmd1bWVudCgiLS1ncHUtbWVtb3J5LXV0aWxpemF0aW9uIiwgdHlwZT1mbG9hdCwgZGVmYXVsdD0wLjEyKQogICAgcmVzdWx0LmFkZF9hcmd1bWVudCgiLS1rdi1jYWNoZS1tZW1vcnktYnl0ZXMiLCB0eXBlPWludCwgZGVmYXVsdD0xNjEwNjEyNzM2KQogICAgcmVzdWx0LmFkZF9hcmd1bWVudCgiLS1rdi1jYWNoZS1kdHlwZSIsIGNob2ljZXM9WyJhdXRvIiwgImJmbG9hdDE2IiwgImZwOCJdLCBkZWZhdWx0PSJhdXRvIikKICAgIHJlc3VsdC5hZGRfYXJndW1lbnQoIi0tZW5mb3JjZS1lYWdlciIsIGFjdGlvbj0ic3RvcmVfdHJ1ZSIpCiAgICByZXN1bHQuYWRkX2FyZ3VtZW50KCItLXRydXN0LXJlbW90ZS1jb2RlIiwgYWN0aW9uPSJzdG9yZV90cnVlIikKICAgIHJlc3VsdC5hZGRfYXJndW1lbnQoIi0tbGltaXQtbW0tcGVyLXByb21wdCIsIHR5cGU9anNvbi5sb2FkcywgZGVmYXVsdD17ImltYWdlIjogMSwgInZpZGVvIjogMH0pCiAgICByZXR1cm4gcmVzdWx0CgoKZGVmIGxvYWRfZW5naW5lKGFyZ3M6IGFyZ3BhcnNlLk5hbWVzcGFjZSkgLT4gQW55OgogICAgZnJvbSBodWdnaW5nZmFjZV9odWIgaW1wb3J0IHNuYXBzaG90X2Rvd25sb2FkCgogICAgcGF0aCA9IHN0cihQYXRoKGFyZ3MubW9kZWwpLnJlc29sdmUoKSkgaWYgUGF0aChhcmdzLm1vZGVsKS5pc19kaXIoKSBlbHNlIHNuYXBzaG90X2Rvd25sb2FkKAogICAgICAgIGFyZ3MubW9kZWwsIHJldmlzaW9uPWFyZ3MucmV2aXNpb24sIGxvY2FsX2ZpbGVzX29ubHk9VHJ1ZQogICAgKQogICAgIyBCb3RoIFB5dGhvbiBtb2R1bGVzIGFyZSBwYXJ0IG9mIHRoZSBpbW11dGFibGUgSEYgc25hcHNob3QgZG93bmxvYWRlZCBieSBTcGFyay4KICAgIG9zLmVudmlyb25bIkNMRUZfTU9ERUxfUEFUSCJdID0gcGF0aAogICAgc3lzLnBhdGguaW5zZXJ0KDAsIHBhdGgpCiAgICBmcm9tIGNsZWZfdmxsbSBpbXBvcnQgQ2xlZlZMTE0KICAgIGZyb20gam9pbnRfc2NoZW1hX21vZGVsIGltcG9ydCBlbmNvZGVfcmVjb3JkCgogICAgY2xhc3MgQm91bmRlZENsZWYoQ2xlZlZMTE0pOgogICAgICAgIGRlZiBlbmNvZGUoc2VsZiwgcmVjb3JkOiBkaWN0W3N0ciwgQW55XSkgLT4gQW55OgogICAgICAgICAgICByZXR1cm4gZW5jb2RlX2NvbXBsZXRlX3JlY29yZChzZWxmLCByZWNvcmQsIGVuY29kZV9yZWNvcmQpCgogICAgcmV0dXJuIEJvdW5kZWRDbGVmKAogICAgICAgIHBhdGgsIG1heF9tb2RlbF9sZW49YXJncy5tYXhfbW9kZWxfbGVuLAogICAgICAgIGdwdV9tZW1vcnlfdXRpbGl6YXRpb249YXJncy5ncHVfbWVtb3J5X3V0aWxpemF0aW9uLAogICAgICAgIGt2X2NhY2hlX2dpYj1hcmdzLmt2X2NhY2hlX21lbW9yeV9ieXRlcyAvIDIqKjMwLAogICAgICAgIG1heF9pbWFnZXM9YXJncy5saW1pdF9tbV9wZXJfcHJvbXB0LmdldCgiaW1hZ2UiLCAxKSwgbWF4X3ZpZGVvcz0wLAogICAgICAgIG1heF9udW1fc2Vxcz1hcmdzLm1heF9udW1fc2VxcywgbWF4X251bV9iYXRjaGVkX3Rva2Vucz1hcmdzLm1heF9udW1fYmF0Y2hlZF90b2tlbnMsCiAgICAgICAga3ZfY2FjaGVfZHR5cGU9YXJncy5rdl9jYWNoZV9kdHlwZSwgZW5mb3JjZV9lYWdlcj1hcmdzLmVuZm9yY2VfZWFnZXIsCiAgICApCgoKZGVmIG1haW4oKSAtPiBOb25lOgogICAgYXJncyA9IHBhcnNlcigpLnBhcnNlX2FyZ3MoKQogICAgaWYgKGFyZ3MubWF4X21vZGVsX2xlbiA8IDEgb3IgYXJncy5tYXhfbnVtX3NlcXMgPCAxIG9yIGFyZ3Mua3ZfY2FjaGVfbWVtb3J5X2J5dGVzIDwgMQogICAgICAgICAgICBvciBub3QgMCA8IGFyZ3MuZ3B1X21lbW9yeV91dGlsaXphdGlvbiA8PSAxKToKICAgICAgICByYWlzZSBTeXN0ZW1FeGl0KCJjb250ZXh0LCBjb25jdXJyZW5jeSwgS1YgYnl0ZXMgYW5kIG1lbW9yeSBmcmFjdGlvbiBtdXN0IGJlIHBvc2l0aXZlIikKICAgIGxvZ2dpbmcuYmFzaWNDb25maWcobGV2ZWw9bG9nZ2luZy5JTkZPKQogICAgZW5naW5lID0gbG9hZF9lbmdpbmUoYXJncykKICAgICMgQmluZCBvbmx5IGFmdGVyIHdlaWdodHMgYW5kIHRoZSBqb2ludCBoZWFkIGFyZSByZWFkeS4KICAgIHNlcnZlciA9IG1ha2Vfc2VydmVyKChhcmdzLmhvc3QsIGFyZ3MucG9ydCksIGVuZ2luZSwgYXJncy5tb2RlbCkKICAgIGxvZ2dpbmcuaW5mbygiU3lzdGVtIE9uZSByZWFkeTogJXMgb24gJXM6JXMiLCBhcmdzLm1vZGVsLCBhcmdzLmhvc3QsIGFyZ3MucG9ydCkKICAgIHNlcnZlci5zZXJ2ZV9mb3JldmVyKCkKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgbWFpbigpCg==
 vllm/gemma4-dspark6-lookup/Dockerfile	644	RlJPTSB2bGxtL3ZsbG0tb3BlbmFpOm5pZ2h0bHlAc2hhMjU2OjJjNzQ1N2ExZTI2ODgyODMxOGZmMGEzYjYwYTFjZmQ5MTE5Yjk5M2E2MDEzNTk5NjM1ZGQ5NDZkNGUyMzM3ODQKCkNPUFkgcGF0Y2hlcy9kc3BhcmtfbG9va3VwLnB5IC91c3IvbG9jYWwvbGliL3B5dGhvbjMuMTIvZGlzdC1wYWNrYWdlcy92bGxtL3YxL3dvcmtlci9ncHUvc3BlY19kZWNvZGUvZHNwYXJrL2xvb2t1cC5weQoKQ09QWSBwYXRjaGVzL21vZGVsLXJ1bm5lci1yZXEtc3RhdGVzLnBhdGNoIC90bXAvbW9kZWwtcnVubmVyLXJlcS1zdGF0ZXMucGF0Y2gKUlVOIHBhdGNoIC1kIC91c3IvbG9jYWwvbGliL3B5dGhvbjMuMTIvZGlzdC1wYWNrYWdlcyAtcDEgPCAvdG1wL21vZGVsLXJ1bm5lci1yZXEtc3RhdGVzLnBhdGNoCgpDT1BZIHBhdGNoZXMvZHNwYXJrLWxvb2t1cC5wYXRjaCAvdG1wL2RzcGFyay1sb29rdXAucGF0Y2gKUlVOIHBhdGNoIC1kIC91c3IvbG9jYWwvbGliL3B5dGhvbjMuMTIvZGlzdC1wYWNrYWdlcyAtcDEgPCAvdG1wL2RzcGFyay1sb29rdXAucGF0Y2gKCkVOViBWTExNX01BUkxJTl9VU0VfQVRPTUlDX0FERD0xIFwKICAgIFZMTE1fVVNFX0ZMQVNISU5GRVJfU0FNUExFUj0wCg==
 vllm/gemma4-dspark6-lookup/README.md	644	IyBHZW1tYSA0IERTcGFyayArIGxvb2t1cAoKRXhwZXJpbWVudGFsIE5WSURJQSBHQjEwIGJ1bmRsZS4gSXQga2VlcHMgdGhlIG1lYXN1cmVkIEdlbW1hIDQgRFNwYXJrIGs9NiwKMTI4SyBjb250ZXh0LCBhbmQgQkYxNiBLViBjb25maWd1cmF0aW9uLCB0aGVuIGNvbXBsZW1lbnRzIGl0cyBwcm9wb3NhbCB3aXRoIGEKc2FtZS1yZXF1ZXN0IHN1ZmZpeCBsb29rdXAuCgpMb29rdXAgaXMgZGVsaWJlcmF0ZWx5IGFjdGl2ZSBvbmx5IGZvciBncmVlZHkgZGVjb2RpbmcuIFNhbXBsZWQgZGVjb2Rpbmcga2VlcHMKdGhlIG9yaWdpbmFsIERTcGFyayBwcm9wb3NhbCBzbyByZWplY3Rpb24gc2FtcGxpbmcgcmVtYWlucyBkaXN0cmlidXRpb24tY29ycmVjdC4KClRoZSBjb250cm9sIHJ1biB1c2VzIHRoZSBzYW1lIGltYWdlIGFuZCBwYXRjaGVzIHdpdGggbG9va3VwIGRpc2FibGVkOgoKYGBgYmFzaApzcGFyayBydW4gZ2VtbWE0LWRzcGFyazYtbG9va3VwIC0tbG9va3VwIGZhbHNlCmBgYAo=
 vllm/gemma4-dspark6-lookup/bundle.json	644	ewogICJzY2hlbWFfdmVyc2lvbiI6IDEsCiAgIm5hbWUiOiAiZ2VtbWE0LWRzcGFyazYtbG9va3VwIiwKICAiZGVzY3JpcHRpb24iOiAiR2VtbWEgNCAyNkIgTlZGUDQgd2l0aCBEU3BhcmsgazYgYW5kIGNvbXBsZW1lbnRhcnkgZ3JlZWR5IHN1ZmZpeCBsb29rdXAgb24gTlZJRElBIEdCMTAuIiwKICAiZGVmYXVsdHMiOiB7CiAgICAidGFyZ2V0X21vZGVsIjogewogICAgICAiaWQiOiAibnZpZGlhL0dlbW1hLTQtMjZCLUE0Qi1OVkZQNCIsCiAgICAgICJyZXZpc2lvbiI6ICJhMTljZmUwMGJlODQ1NjhhNjg2NzExMWM5YTY4YzljNDRmZGNmZmU2IgogICAgfSwKICAgICJkcmFmdF9tb2RlbCI6IHsKICAgICAgImlkIjogIm1ha29yYS1haS9nZW1tYTQtMjZiLWE0Yi1kc3BhcmsiLAogICAgICAicmV2aXNpb24iOiAiZTZmNzM5MjMxZTg5MmZlNDUxMmM0NzAxMzY0OTBkNTQ0MWZmZTYyZiIKICAgIH0sCiAgICAic3BlY3VsYXRpdmVfdG9rZW5zIjogNiwKICAgICJ2bGxtX2FyZ3MiOiBbCiAgICAgICJ2bGxtIiwKICAgICAgInNlcnZlIiwKICAgICAgIm52aWRpYS9HZW1tYS00LTI2Qi1BNEItTlZGUDQiLAogICAgICAiLS1yZXZpc2lvbiIsCiAgICAgICJhMTljZmUwMGJlODQ1NjhhNjg2NzExMWM5YTY4YzljNDRmZGNmZmU2IiwKICAgICAgIi0tdHJ1c3QtcmVtb3RlLWNvZGUiLAogICAgICAiLS1ncHUtbWVtb3J5LXV0aWxpemF0aW9uIiwKICAgICAgIjAuNzgiLAogICAgICAiLS1rdi1jYWNoZS1kdHlwZSIsCiAgICAgICJiZmxvYXQxNiIsCiAgICAgICItLW1heC1tb2RlbC1sZW4iLAogICAgICAiMTMxMDcyIiwKICAgICAgIi0tbWF4LW51bS1zZXFzIiwKICAgICAgIjQiLAogICAgICAiLS1wb3J0IiwKICAgICAgIjgwMDAiLAogICAgICAiLS1lbmFibGUtY2h1bmtlZC1wcmVmaWxsIiwKICAgICAgIi0tZW5hYmxlLXByZWZpeC1jYWNoaW5nIiwKICAgICAgIi0tbW9lLWJhY2tlbmQiLAogICAgICAibWFybGluIiwKICAgICAgIi0tcmVhc29uaW5nLXBhcnNlciIsCiAgICAgICJnZW1tYTQiLAogICAgICAiLS1lbmFibGUtYXV0by10b29sLWNob2ljZSIsCiAgICAgICItLXRvb2wtY2FsbC1wYXJzZXIiLAogICAgICAiZ2VtbWE0IiwKICAgICAgIi0tbWF4LW51bS1iYXRjaGVkLXRva2VucyIsCiAgICAgICIzMjc2OCIsCiAgICAgICItLXNwZWN1bGF0aXZlLWNvbmZpZyIsCiAgICAgICJ7XCJtZXRob2RcIjpcImRzcGFya1wiLFwibW9kZWxcIjpcIm1ha29yYS1haS9nZW1tYTQtMjZiLWE0Yi1kc3BhcmtcIixcInJldmlzaW9uXCI6XCJlNmY3MzkyMzFlODkyZmU0NTEyYzQ3MDEzNjQ5MGQ1NDQxZmZlNjJmXCIsXCJudW1fc3BlY3VsYXRpdmVfdG9rZW5zXCI6Nn0iCiAgICBdCiAgfSwKICAib3B0aW9ucyI6IHsKICAgICJsb29rdXAiOiB7CiAgICAgICJkZXNjcmlwdGlvbiI6ICJGdXNlIHN0cm9uZyBzYW1lLXJlcXVlc3Qgc3VmZml4IG1hdGNoZXMgaW50byB0aGUgZ3JlZWR5IERTcGFyayBwcm9wb3NhbC4iLAogICAgICAidHlwZSI6ICJib29sZWFuIiwKICAgICAgImRlZmF1bHQiOiB0cnVlLAogICAgICAiZW52IjogIlZMTE1fRFNQQVJLX0xPT0tVUCIKICAgIH0sCiAgICAibG9va3VwLW5taW4iOiB7CiAgICAgICJkZXNjcmlwdGlvbiI6ICJNaW5pbXVtIHN1ZmZpeCBtYXRjaCBsZW5ndGggY29uc2lkZXJlZCBieSBsb29rdXAuIiwKICAgICAgInR5cGUiOiAiaW50ZWdlciIsCiAgICAgICJkZWZhdWx0IjogNiwKICAgICAgImVudiI6ICJWTExNX0RTUEFSS19MT09LVVBfTk1JTiIKICAgIH0sCiAgICAibG9va3VwLW5zdHJvbmciOiB7CiAgICAgICJkZXNjcmlwdGlvbiI6ICJTdWZmaXggbGVuZ3RoIHRoYXQgY2FuIG92ZXJyaWRlIERTcGFyayB3aXRob3V0IGFncmVlbWVudC4iLAogICAgICAidHlwZSI6ICJpbnRlZ2VyIiwKICAgICAgImRlZmF1bHQiOiA4LAogICAgICAiZW52IjogIlZMTE1fRFNQQVJLX0xPT0tVUF9OU1RST05HIgogICAgfSwKICAgICJsb29rdXAtYWdyZWUiOiB7CiAgICAgICJkZXNjcmlwdGlvbiI6ICJMZWFkaW5nIERTcGFyayB0b2tlbnMgdGhhdCBtdXN0IGFncmVlIGZvciBhIHNob3J0ZXIgbWF0Y2guIiwKICAgICAgInR5cGUiOiAiaW50ZWdlciIsCiAgICAgICJkZWZhdWx0IjogMiwKICAgICAgImVudiI6ICJWTExNX0RTUEFSS19MT09LVVBfQUdSRUUiCiAgICB9CiAgfSwKICAicGF0Y2hlcyI6IFsKICAgIHsKICAgICAgImZpbGUiOiAicGF0Y2hlcy9tb2RlbC1ydW5uZXItcmVxLXN0YXRlcy5wYXRjaCIsCiAgICAgICJkZXNjcmlwdGlvbiI6ICJFeHBvc2VzIGxpdmUgcmVxdWVzdCB0b2tlbiBoaXN0b3J5IHRvIHNwZWN1bGF0b3JzIHRoYXQgb3B0IGludG8gbG9va3VwLiIKICAgIH0sCiAgICB7CiAgICAgICJmaWxlIjogInBhdGNoZXMvZHNwYXJrLWxvb2t1cC5wYXRjaCIsCiAgICAgICJkZXNjcmlwdGlvbiI6ICJGdXNlcyBzYWZlIGdyZWVkeSBsb29rdXAgcHJvcG9zYWxzIGludG8gRFNwYXJrIGFmdGVyIHNlcXVlbnRpYWwgTWFya292IHNhbXBsaW5nLiIKICAgIH0KICBdCn0K
@@ -1911,6 +1922,10 @@ bundle_prepare_run() {
   local requested_mem="$mem" requested_len="$max_len" requested_seqs="$max_num_seqs" requested_port="$port" requested_kv="$kv_dtype"
   manifest="${path}/bundle.json"
   bundle_validate_dir "$path" || die "Bundle '${name}' is invalid"
+  BUNDLE_API_KIND=$(jq -r '.api.type // "chat"' "$manifest")
+  BUNDLE_LAUNCHER_JSON=$(jq -c '.runtime.command // []' "$manifest")
+  [[ "$BUNDLE_API_KIND" != systemone || "$publish_main" != 1 ]] \
+    || die "System One models cannot be the chat main model" "Launch without --main; use the /v1/systemone route."
   model=$(jq -r '.defaults.target_model.id' "$manifest")
   vllm_json=$(jq -c '.defaults.vllm_args' "$manifest")
 
@@ -2477,6 +2492,13 @@ bundle_validate_runtime() {
     and ((.runtime.env // {}) | type == "object" and all(to_entries[];
       (.key | test("^[A-Z][A-Z0-9_]*$") and (test("(^|_)(TOKEN|PASSWORD|SECRET|KEY)($|_)") | not))
       and (.value | clean)))
+    and ((.api // {}) | type == "object")
+    and ((.api.type // "chat") | . == "chat" or . == "systemone")
+    and (if .runtime.command != null then
+      .schema_version == 2
+      and (.runtime.command | type == "array" and length > 0 and all(.[]; clean and length > 0))
+      else true end)
+    and (if .api.type == "systemone" then .schema_version == 2 and .runtime.command != null else true end)
     and ((.resources.weights_gb // 0) | number)
     and ((.resources.runtime_overhead_gb // 0) | number)
     and ((.resources.kv_estimator // "config") | . == "config" or . == "engine")
@@ -2608,7 +2630,7 @@ bundle_initialize() {
   BUNDLE_TARGET_REVISION=$(jq -r '.defaults.target_model.revision' "$manifest")
   BUNDLE_KV_ESTIMATOR=$(jq -r '.resources.kv_estimator // "config"' "$manifest")
   BUNDLE_WEIGHTS_GB=$(jq -r '.resources.weights_gb // empty' "$manifest")
-  BUNDLE_RUNTIME_OVERHEAD_GB=$(jq -r '.resources.runtime_overhead_gb // 0' "$manifest")
+  BUNDLE_RUNTIME_OVERHEAD_GB=$(jq -r '.resources.runtime_overhead_gb // empty' "$manifest")
   kind=$(jq -r '.model_source.type // "huggingface"' "$manifest")
   [[ "$kind" == "prepared" ]] || return 0
   path=$(jq -r '.model_source.path' "$manifest")
@@ -2664,6 +2686,61 @@ engine_memory_json() {
     jq -c . "$file"
   else printf 'null\n'; fi
 }
+# Model API contracts are independent of the inference engine. Old containers
+# have no API label and keep the OpenAI chat-completions contract.
+model_api_kind() {
+  local kind
+  kind=$(docker inspect --format '{{index .Config.Labels "spark.api"}}' "$1" 2>/dev/null || true)
+  case "$kind" in systemone) printf 'systemone\n' ;; *) printf 'chat\n' ;; esac
+}
+
+model_api_path() {
+  case "${1:-chat}" in systemone) printf '/v1/systemone' ;; *) printf '/v1' ;; esac
+}
+
+gateway_model_prefix() {
+  local provider="$1" model="$2" name
+  case "$provider" in
+    ollama) printf 'ollama_chat' ;;
+    systemone) printf 'systemone' ;;
+    vllm)
+      name=$(container_for_ref "$model" 2>/dev/null || true)
+      if [[ -n "$name" && "$(model_api_kind "$name")" == systemone ]]; then
+        printf 'systemone'
+      else
+        printf 'vllm'
+      fi ;;
+    *) return 1 ;;
+  esac
+}
+
+systemone_gateway_preflight() {
+  gateway_capabilities decisions >/dev/null || {
+    err 'LiteLLM image lacks System One decision routing'
+    printf '    Update it first: spark update --litellm\n' >&2
+    return 1
+  }
+}
+
+# Normalize a bundle's custom command back to its canonical vllm-shaped argv.
+# Inspect the actual executable and arguments, rather than trusting a saved argv
+# label, so alias capture cannot silently preserve a different launch command.
+bundle_container_args() {
+  local inspect="$1" name hash launcher
+  name=$(jq -r '.[0].Config.Labels["spark.bundle.name"] // empty' <<<"$inspect")
+  hash=$(jq -r '.[0].Config.Labels["spark.bundle.hash"] // empty' <<<"$inspect")
+  is_safe_bundle_name "$name" || return 1
+  local SPARK_BUNDLE_PIN="$hash"
+  bundle_resolve "$name" || return 1
+  launcher=$(jq -c '.runtime.command // []' "${BUNDLE_PATH}/bundle.json")
+  [[ "$launcher" != '[]' ]] || return 1
+  jq -ce --argjson launcher "$launcher" '
+    ((.[0].Config.Entrypoint // []) + (.[0].Config.Cmd // [])) as $cmd
+    | if $cmd[:($launcher|length)] == $launcher
+      then ["vllm", "serve"] + $cmd[($launcher|length):]
+      else error("container command differs from bundle launcher") end
+  ' <<<"$inspect"
+}
 # Based on spark by Massimo Angelini - https://github.com/massimo92/spark
 # --- Commands ---
 
@@ -2709,6 +2786,8 @@ cmd_run_help() {
 
   Bundles declare their target, drafter, Docker build, defaults, and extra
   flags. Example: spark run qwen38-dflash2-lookup --lookup false
+  Decision bundles expose /v1/systemone instead of chat completions.
+  Example: spark run clef-flash-nvfp4 (cannot be used with --main).
 
 EOF
 }
@@ -2726,6 +2805,7 @@ cmd_run() {
   local BUNDLE_ACTIVE_HASH="" BUNDLE_TARGET_REVISION="" BUNDLE_MODEL_PATH="" BUNDLE_MODEL_LOAD_PATH=""
   local BUNDLE_INITIALIZATION_PENDING=0
   local BUNDLE_ARTIFACT_KEY="" BUNDLE_KV_ESTIMATOR="" BUNDLE_WEIGHTS_GB="" BUNDLE_RUNTIME_OVERHEAD_GB=""
+  local BUNDLE_API_KIND=chat BUNDLE_LAUNCHER_JSON='[]'
   local -a alias_override_args=() alias_setting_args=() vllm_passthrough_args=()
   local -a bundle_explicit_run_args=()
 
@@ -2960,7 +3040,10 @@ run_publish_main() {
   if [[ "$BACKEND" == "vllm" ]]; then
     port=""
     while IFS=$'\t' read -r name running port rest; do
-      [[ "$running" == "$model" ]] && break
+      if [[ "$running" == "$model" ]]; then
+        [[ "$(model_api_kind "$name")" != systemone ]] || die "System One models cannot be the chat main model"
+        break
+      fi
       port=""
     done < <(list_managed_containers)
     [[ "$port" =~ ^[0-9]+$ ]] && model_api_ready "$port" || \
@@ -3499,7 +3582,8 @@ alias_capture_definition() {
       elif $entry[0] == "vllm" and $entry[1] == "serve" then $entry + $cmd
       else error("not a direct vllm serve command")
       end
-  ' <<<"$inspect" 2>/dev/null) || die "Container '${cname}' does not run a direct vllm serve command"
+  ' <<<"$inspect" 2>/dev/null) || args=$(bundle_container_args "$inspect") \
+    || die "Container '${cname}' does not run vllm serve or a supported bundle launcher"
   model=$(jq -er '.[2] | select(type == "string" and length > 0)' <<<"$args" 2>/dev/null) \
     || die "Cannot identify the vLLM model in ${cname}"
   local bundle_hash="" load_path="$model"
@@ -3599,6 +3683,7 @@ run_captured_vllm_definition() {
   local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_HASH="" BUNDLE_TARGET_REVISION=""
   local BUNDLE_MODEL_PATH="" BUNDLE_MODEL_LOAD_PATH="" BUNDLE_ARTIFACT_KEY=""
   local BUNDLE_KV_ESTIMATOR="" BUNDLE_WEIGHTS_GB="" BUNDLE_RUNTIME_OVERHEAD_GB=""
+  local BUNDLE_API_KIND=chat BUNDLE_LAUNCHER_JSON='[]'
 
   alias_validate_definition "$definition" || die "${label} has an invalid or unsafe vLLM definition"
   [[ "$(jq -r '.kind' <<<"$definition")" == "captured-vllm" ]] \
@@ -4289,6 +4374,7 @@ build_launch() {
     --name "$cname"
     --label spark.managed=1
     --label "spark.model=${model}"
+    --label "spark.api=${BUNDLE_API_KIND:-chat}"
     --label "spark.port=${port}"
     --label "spark.need_gb=${NEED_GB}"
     --label "spark.weights_gb=${WEIGHTS_GB}"
@@ -4316,6 +4402,15 @@ build_launch() {
       --label "spark.bundle.run_args=${BUNDLE_ACTIVE_RUN_ARGS_JSON}")
   fi
   [[ -n "$mem_limit_mib" ]] && docker_cmd+=(--memory "${mem_limit_mib}m" --memory-swap "${mem_swap_mib}m" --label "spark.mem_limit_mib=${mem_limit_mib}")
+  if [[ "${BUNDLE_LAUNCHER_JSON:-[]}" != '[]' ]]; then
+    local launcher=()
+    while IFS= read -r arg; do launcher+=("$arg"); done < <(jq -r '.[]' <<<"$BUNDLE_LAUNCHER_JSON")
+    docker_cmd+=(--entrypoint "${launcher[0]}" "${ALIAS_VLLM_IMAGE_ID:-$ngc_image}")
+    container_vllm_args=()
+    [[ ${#launcher[@]} -le 1 ]] || container_vllm_args+=("${launcher[@]:1}")
+    container_vllm_args+=("${vllm_args[@]:2}")
+    return 0
+  fi
   docker_cmd+=("${ALIAS_VLLM_IMAGE_ID:-$ngc_image}")
   container_vllm_args=("${vllm_args[@]}")
   if [[ "${ALIAS_VLLM_ENTRYPOINT:-}" == "true" || \
@@ -4347,7 +4442,7 @@ await_startup() {
       [[ -n "$n" ]] && { printf 'exit:mamba:%s\n' "$n"; return 0; }
       printf 'exit:other\n'; return 0
     fi
-    if curl -fsS "http://localhost:${port}/v1/models" >/dev/null 2>&1; then
+    if model_api_ready "$port" "${BUNDLE_API_KIND:-chat}"; then
       printf 'ready\n'; return 0
     fi
     ticks=$((ticks + 1))
@@ -4399,7 +4494,10 @@ run_backend_vllm() {
   fi
 
   # Establish private gateway credentials before changing a real backend.
-  [[ "$dry_run" == 1 ]] || gateway_prepare_runtime vllm || return 1
+  if [[ "$dry_run" != 1 ]]; then
+    [[ "${BUNDLE_API_KIND:-chat}" != systemone ]] || systemone_gateway_preflight || return 1
+    gateway_prepare_runtime vllm || return 1
+  fi
   # Dry-runs never remove containers; cleanup happens only for a real launch.
 
 
@@ -4417,7 +4515,7 @@ run_backend_vllm() {
     fi
     warn "Model '${model}' is not downloaded — fetching metadata to check if it fits..."
     fetch_model_metadata "$model" || die "Could not fetch model metadata" "Check the model name and your connection"
-    model_path=$(resolve_model_path "$model") || die "Metadata download did not produce a usable snapshot"
+    model_path=$(resolve_model_path "$model" "${BUNDLE_TARGET_REVISION:-}") || die "Metadata download did not produce a usable snapshot"
     needs_download=1
     REGEN_PROFILE=1   # no cached profile yet; size from the fetched metadata
   fi
@@ -4491,7 +4589,7 @@ run_backend_vllm() {
 
     # Download the full weights and re-profile at the effective context.
     download_model_full "$model"
-    model_path=$(resolve_model_path "$model") || die "Download did not produce a usable snapshot"
+    model_path=$(resolve_model_path "$model" "${BUNDLE_TARGET_REVISION:-}") || die "Download did not produce a usable snapshot"
     REGEN_PROFILE=1
     profile_model "$model" "$model_path"
     auto_enable_mtp_if_supported
@@ -5147,11 +5245,31 @@ cmd_down() {
 }
 
 cmd_pull() {
-  local model="${1:-}"
-  [[ -z "$model" ]] && die "No model specified" "Usage: spark pull <model>"
+  local model="" revision="" launch_ref="" bundle_revision=""
+  local BUNDLE_TARGET_REVISION=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --revision) [[ $# -ge 2 ]] || die "Missing value for --revision"; revision="$2"; shift 2 ;;
+      -h|--help) printf 'Usage: spark pull <model|bundle> [--revision <commit>]\n'; return 0 ;;
+      -*) die "Unknown pull flag: $1" ;;
+      *) [[ -z "$model" ]] || die "Only one pull target can be specified"; model="$1"; shift ;;
+    esac
+  done
+  [[ -n "$model" ]] || die "No model specified" "Usage: spark pull <model|bundle> [--revision <commit>]"
+  [[ -z "$revision" || "$revision" =~ ^[A-Fa-f0-9]{7,64}$ ]] || die "--revision must be an immutable commit hash"
+  launch_ref="$model"
+  if bundle_resolve "$model"; then
+    [[ "$BACKEND" == vllm ]] || die "Model bundles require the vLLM backend"
+    bundle_validate_dir "$BUNDLE_PATH" || die "Invalid bundle: $model"
+    bundle_revision=$(jq -r '.defaults.target_model.revision' "${BUNDLE_PATH}/bundle.json")
+    [[ -z "$revision" || "$revision" == "$bundle_revision" ]] || die "--revision differs from the bundle's pinned revision"
+    revision="$bundle_revision"
+    model=$(jq -r '.defaults.target_model.id' "${BUNDLE_PATH}/bundle.json")
+  fi
   validate_model_ref_for_backend "$model"
 
   if [[ "$BACKEND" == "ollama" ]]; then
+    [[ -z "$revision" ]] || die "--revision is only supported for HuggingFace models"
     is_ollama_ref "$model" || die "Invalid model reference: $model" "Use an Ollama model like 'qwen3:30b'"
     command -v ollama >/dev/null 2>&1 || die "Ollama is not installed" "Set up this machine first: spark setup"
     printf "\n  Pulling %s with Ollama...\n\n" "$model"
@@ -5163,10 +5281,13 @@ cmd_pull() {
   fi
 
   is_safe_model_ref "$model" || die "Invalid model reference: $model" "Use a HuggingFace model like org/name"
+  BUNDLE_TARGET_REVISION="$revision"
   printf "\n  Downloading %s...\n\n" "$model"
-  hf download "$model"
+  local -a download=(hf download "$model")
+  [[ -z "$revision" ]] || download+=(--revision "$revision")
+  "${download[@]}"
   local model_path
-  if model_path=$(resolve_model_path "$model" 2>/dev/null); then
+  if model_path=$(resolve_model_path "$model" "$revision" 2>/dev/null); then
     REGEN_PROFILE=1
     KV_CACHE_DTYPE="auto"
     profile_model "$model" "$model_path" || warn "Downloaded, but profile refresh failed; run with --regen-profile if needed"
@@ -5174,7 +5295,7 @@ cmd_pull() {
     warn "Downloaded, but no complete local snapshot was found for profiling"
   fi
   printf "\n"
-  info "Ready. Run: spark run ${model}"
+  info "Ready. Run: spark run ${launch_ref}"
   printf "\n"
 }
 
@@ -5353,7 +5474,10 @@ container_age_seconds() {
 }
 
 model_api_ready() {
-  local port="$1"
+  local port="$1" kind="${2:-chat}"
+  if [[ "$kind" == systemone ]]; then
+    curl -fsS --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1 || return 1
+  fi
   curl -fsS --max-time 2 "http://127.0.0.1:${port}/v1/models" >/dev/null 2>&1
 }
 
@@ -5364,11 +5488,7 @@ gateway_api_ready() {
 
 gateway_model_routed() {
   local engine="$1" model="$2" id out
-  case "$engine" in
-    vllm) id="vllm/${model}" ;;
-    ollama) id="ollama_chat/${model}" ;;
-    *) return 1 ;;
-  esac
+  id="$(gateway_model_prefix "$engine" "$model")/${model}" || return 1
   out=$(gateway_curl -fsS --max-time 2 "http://127.0.0.1:$(gateway_configured_port)/v1/models" 2>/dev/null) || return 1
   if command -v jq >/dev/null 2>&1; then
     printf '%s\n' "$out" | jq -e --arg id "$id" 'any(.data[]?; .id == $id)' >/dev/null 2>&1
@@ -5379,7 +5499,7 @@ gateway_model_routed() {
 
 status_model_runtime_state() {
   local name="$1" port="$2" age
-  model_api_ready "$port" && { printf 'ready\n'; return 0; }
+  model_api_ready "$port" "$(model_api_kind "$name")" && { printf 'ready\n'; return 0; }
   age=$(container_age_seconds "$name" 2>/dev/null || true)
   if [[ "$age" =~ ^[0-9]+$ && "$age" -lt 600 ]]; then printf 'starting\n'; else printf 'unhealthy\n'; fi
   return 1
@@ -5398,13 +5518,13 @@ status_operational() {
     return $?
   fi
   while IFS=$'\t' read -r name model port rest; do
-    [[ -n "$name" ]] && model_api_ready "$port" && gateway_model_routed vllm "$model" && ready=1
+    [[ -n "$name" ]] && model_api_ready "$port" "$(model_api_kind "$name")" && gateway_model_routed vllm "$model" && ready=1
   done < <(list_managed_containers)
   [[ "$ready" == "1" ]]
 }
 
 status_models_json() {
-  local first=1 name model port need wt kv state now pk routed loaded_ollama
+  local first=1 name model port need wt kv state now pk routed loaded_ollama api prefix
   printf '['
   if [[ "$BACKEND" == "ollama" ]]; then
     loaded_ollama=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
@@ -5426,8 +5546,10 @@ status_models_json() {
       state=$(status_model_runtime_state "$name" "$port" || true)
       if gateway_model_routed vllm "$model"; then routed=true; else routed=false; fi
       now=$(container_current_gb "$name"); pk=$(container_peak_gb "$name")
-      printf '{"name":"%s","engine":"vllm","state":"%s","endpoint":"http://localhost:%s/v1","gateway_model":"vllm/%s","gateway_routed":%s,"reserved_gb":%s,"live_gb":%s,"peak_gb":%s,"live_memory_scope":"cgroup","engine_memory":%s}' \
-        "$(status_json_escape "${model:-unknown}")" "$state" "$(status_json_escape "$port")" \
+      api=$(model_api_kind "$name"); prefix=vllm
+      [[ "$api" != systemone ]] || prefix=systemone
+      printf '{"name":"%s","engine":"vllm","api":"%s","state":"%s","endpoint":"http://localhost:%s%s","gateway_model":"%s/%s","gateway_routed":%s,"reserved_gb":%s,"live_gb":%s,"peak_gb":%s,"live_memory_scope":"cgroup","engine_memory":%s}' \
+        "$(status_json_escape "${model:-unknown}")" "$api" "$state" "$(status_json_escape "$port")" "$(model_api_path "$api")" "$prefix" \
         "$(status_json_escape "${model:-unknown}")" "$routed" "$(status_json_number "$need")" \
         "$(status_json_number "$now")" "$(status_json_number "$pk")" "$(engine_memory_json "$name")"
     done < <(list_managed_containers)
@@ -5524,13 +5646,16 @@ print_vllm_model_table() {
 
   local i now pk state state_color route_state
   for i in "${!models[@]}"; do
+    local api prefix
+    api=$(model_api_kind "${cnames[$i]}"); prefix=vllm
+    [[ "$api" != systemone ]] || prefix=systemone
     state=$(status_model_runtime_state "${cnames[$i]}" "${ports[$i]}" || true)
     case "$state" in ready) state_color="$GREEN" ;; starting) state_color="$YELLOW" ;; *) state_color="$RED" ;; esac
     printf "  ${state_color}●${NC} ${BOLD}%s${NC}  %s%s%s\n" "${models[$i]}" "$state_color" "$state" "$NC"
-    printf "    Direct:  http://localhost:%s/v1 · up %s\n" "${ports[$i]}" "${ups[$i]}"
+    printf "    Direct:  http://localhost:%s%s · up %s\n" "${ports[$i]}" "$(model_api_path "$api")" "${ups[$i]}"
     if gateway_model_routed vllm "${models[$i]}"; then route_state="routed"; else route_state="not routed"; fi
-    printf "    Gateway: http://localhost:%s/v1 · model vllm/%s · %s\n" \
-      "$(gateway_configured_port)" "${models[$i]}" "$route_state"
+    printf "    Gateway: http://localhost:%s%s · model %s/%s · %s\n" \
+      "$(gateway_configured_port)" "$(model_api_path "$api")" "$prefix" "${models[$i]}" "$route_state"
     printf "    Memory:  %s GB weights · %s GB KV cache · %s GB reserved\n" \
       "${wts[$i]}" "${kvs[$i]}" "${needs[$i]}"
     now=$(container_current_gb "${cnames[$i]}"); pk=$(container_peak_gb "${cnames[$i]}")
@@ -5655,6 +5780,7 @@ benchmark_select_model() {
     [[ -n "$name" && -n "$model" ]] || continue
     is_safe_model_ref "$model" || continue
     is_port "$port" || continue
+    [[ "$(model_api_kind "$name")" != systemone ]] || continue
     names+=("$name"); models+=("$model"); ports+=("$port")
   done < <(list_managed_containers)
 
@@ -17072,7 +17198,7 @@ cmd_help() {
     calibrate <model> Measure launch configs and save the fastest one
     benchmark         Benchmark a running vLLM model with GuideLLM
     stop [<model>]   Stop a model (no arg: the only one; --all: every one)
-    pull <model>     Download a model from HuggingFace
+    pull <model|bundle> Download a model or the pinned target of a bundle
     list             List downloaded models
     rm <model> [...] Remove downloaded model(s)
     logs [<model>]   Show container logs (-f to follow)
@@ -17256,6 +17382,15 @@ gateway_generate_litellm_yaml() {
     local primary_port="" primary_model="" main_match=0 name model port rest
     while IFS=$'\t' read -r name model port rest; do
       [[ -z "$model" ]] && continue
+      if [[ "$(model_api_kind "$name")" == systemone ]]; then
+        # TypeSafe's transport implements the public System One wire contract;
+        # api_base and the local placeholder key keep the call on this host.
+        yaml+="
+  - $(jq -nc --arg model "$model" --arg base "http://localhost:${port}" \
+          '{model_name:("systemone/"+$model),litellm_params:{model:("typesafe/"+$model),api_base:$base,api_key:"dummy",drop_params:false},model_info:{mode:"decisions"}}')"
+        has_models=1
+        continue
+      fi
       yaml+="
   - model_name: \"vllm/${model}\"
     litellm_params:
@@ -17780,7 +17915,10 @@ gateway_publish_model() {
   if [[ "$supervised" == 1 ]]; then
     gateway_model_routed "$provider" "$model" && gateway_route_smoke "$provider" "$model" || { err "Backend active; LiteLLM route missing for ${model}"; return 1; }
   fi
-  printf '  Gateway: http://localhost:%s/v1\n  Model: %s/%s\n' "$(gateway_configured_port)" "$([[ "$provider" == ollama ]] && printf ollama_chat || printf vllm)" "$model"
+  local prefix path=/v1
+  prefix=$(gateway_model_prefix "$provider" "$model") || return 1
+  [[ "$prefix" != systemone ]] || path=/v1/systemone
+  printf '  Gateway: http://localhost:%s%s\n  Model: %s/%s\n' "$(gateway_configured_port)" "$path" "$prefix" "$model"
   [[ "$supervised" == 1 ]] || printf '  State: pending backend readiness (spark status --json)\n'
   printf '  Authentication: Bearer token saved at creation; if lost, spark gateway auth rotate\n'
 }
@@ -17803,6 +17941,7 @@ gateway_capabilities() {
   case "$p" in
     keys) script='import prisma, litellm_proxy_extras; from litellm.proxy._types import GenerateKeyRequest; assert "allowed_routes" in GenerateKeyRequest.model_fields; assert "key" in GenerateKeyRequest.model_fields' ;;
     base) script='import importlib.metadata; print(importlib.metadata.version("litellm"))' ;;
+    decisions) script='import litellm; from litellm.llms.typesafe.decisions.transformation import TypeSafeDecisionsConfig; from litellm.proxy.decisions_endpoints.endpoints import router; assert callable(litellm.asystemone); assert any(route.path == "/v1/systemone" for route in router.routes)' ;;
     chatgpt) script='from litellm.llms.chatgpt.authenticator import Authenticator; assert callable(Authenticator().get_access_token)' ;;
     github_copilot) script='from litellm.llms.github_copilot.authenticator import Authenticator; assert callable(Authenticator().get_access_token)' ;;
     xai) script='import inspect; from litellm.llms.xai.oauth import XAIOAuthAuthenticator; from litellm.llms.xai.chat import transformation; assert callable(XAIOAuthAuthenticator().login); assert callable(XAIOAuthAuthenticator._start_callback_server); assert "use_xai_oauth" in inspect.getsource(transformation)' ;;
@@ -18073,10 +18212,19 @@ HELP
 
 # Validate the proposed configuration before interrupting a working proxy.
 gateway_preflight() {
-  local config p mode env_key key
+  local config p mode env_key key name rest
   config=$(gateway_load_config) || return 1
   gateway_capabilities keys >/dev/null || { err 'LiteLLM image lacks PostgreSQL virtual-key support'; return 1; }
   printf '%s\n' "$config" | jq -e '.port // 4000 | type=="number" and .>0 and .<=65535' >/dev/null || return 1
+  if [[ "$(gateway_provider_enabled vllm)" == true ]]; then
+    while IFS=$'\t' read -r name rest; do
+      [[ -n "$name" ]] || continue
+      if [[ "$(model_api_kind "$name")" == systemone ]]; then
+        systemone_gateway_preflight || return 1
+        break
+      fi
+    done < <(list_managed_containers)
+  fi
   for p in openrouter zen together openai anthropic xai chatgpt github_copilot; do
     [[ "$(gateway_provider_enabled "$p")" == true ]] || continue
     mode=$(printf '%s\n' "$config" | jq -r --arg p "$p" '.providers[$p].auth // (if $p=="chatgpt" or $p=="github_copilot" then "oauth" else "api" end)')
@@ -18109,8 +18257,15 @@ gateway_forget_ollama_locked() {
   gateway_save_config "$config"
 }
 gateway_route_smoke() {
-  local provider="$1" model="$2" id payload out
-  [[ "$provider" == ollama ]] && id="ollama_chat/$model" || id="vllm/$model"
+  local provider="$1" model="$2" id payload out prefix
+  prefix=$(gateway_model_prefix "$provider" "$model") || return 1
+  id="$prefix/$model"
+  if [[ "$prefix" == systemone ]]; then
+    payload=$(jq -nc --arg id "$id" '{model:$id,state:"Spark gateway routing check",questions:{ready:{type:"noul",instructions:"Is this a gateway routing check?"}}}') || return 1
+    out=$(gateway_curl -fsS --max-time "${SPARK_GATEWAY_SMOKE_TIMEOUT:-60}" -H 'Content-Type: application/json' --data "$payload" "http://127.0.0.1:$(gateway_configured_port)/v1/systemone" 2>/dev/null) || return 1
+    printf '%s\n' "$out" | jq -e '.answers.ready.noul | type=="number" and .>=0 and .<=1' >/dev/null
+    return $?
+  fi
   payload=$(jq -nc --arg id "$id" '{model:$id,messages:[{role:"user",content:"Reply OK"}],max_tokens:1,stream:false}') || return 1
   out=$(gateway_curl -fsS --max-time "${SPARK_GATEWAY_SMOKE_TIMEOUT:-60}" -H 'Content-Type: application/json' --data "$payload" "http://127.0.0.1:$(gateway_configured_port)/v1/chat/completions" 2>/dev/null) || return 1
   printf '%s\n' "$out" | jq -e '(.choices | type)=="array" and (.choices|length)>0' >/dev/null

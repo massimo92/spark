@@ -401,6 +401,65 @@ oauth_refresh_stopped_before_replace() {
   private_mode "$session_path" 600
   [[ -z "$(find "$(dirname "$session_path")" -name '*.tmp.*')" ]]
 }
+decision_route_lifecycle() {
+  gateway_save_config '{"enabled":true,"main":{"provider":"vllm","model":"Org/Chat"},"providers":{"vllm":{"enabled":true}}}'
+  list_managed_containers() { printf 'chat\tOrg/Chat\t8000\t20\t15\t5\ndecision\tOrg/Decision\t8001\t14\t10\t2\n'; }
+  model_api_kind() { [[ "$1" != decision ]] && printf chat || printf systemone; }
+  local yaml
+  yaml=$(gateway_generate_litellm_yaml)
+  [[ "$yaml" == *'vllm/Org/Chat'* && "$yaml" == *'"model_name":"systemone/Org/Decision"'* &&
+    "$yaml" == *'"model":"typesafe/Org/Decision"'* && "$yaml" == *'"api_base":"http://localhost:8001"'* &&
+    "$yaml" == *'"mode":"decisions"'* && "$yaml" == *'"drop_params":false'* &&
+    "$yaml" != *'openai/Org/Decision'* && "$yaml" == *'model_name: "main"'* ]]
+  [[ "$(gateway_model_prefix vllm Org/Decision)" == systemone ]]
+  list_managed_containers() { printf 'chat\tOrg/Chat\t8000\n'; }
+  yaml=$(gateway_generate_litellm_yaml)
+  [[ "$yaml" != *'Org/Decision'* && "$yaml" == *'model_name: "main"'* ]]
+  jq -e '.main.model=="Org/Chat"' "$GATEWAY_CONFIG" >/dev/null
+}
+decision_route_smoke() {
+  gateway_save_config '{"enabled":true,"port":4000,"providers":{"vllm":{"enabled":true}}}'
+  list_managed_containers() { printf 'decision\tOrg/Decision\t8001\n'; }
+  model_api_kind() { printf systemone; }
+  gateway_curl() {
+    local arg payload=''
+    while [[ $# -gt 0 ]]; do
+      arg="$1"; shift
+      if [[ "$arg" == --data ]]; then payload="$1"; shift; fi
+    done
+    [[ "$arg" == 'http://127.0.0.1:4000/v1/systemone' ]]
+    jq -e '.model=="systemone/Org/Decision" and .questions.ready.type=="noul" and (.messages==null)' <<<"$payload" >/dev/null
+    printf '{"answers":{"ready":{"noul":0.9}}}'
+  }
+  gateway_route_smoke vllm Org/Decision
+  gateway_curl() { printf '{"answers":{"ready":{"noul":2}}}'; }
+  ! gateway_route_smoke vllm Org/Decision
+}
+decision_capability_required() {
+  gateway_save_config '{"enabled":true,"providers":{"vllm":{"enabled":true}}}'
+  list_managed_containers() { printf 'decision\tOrg/Decision\t8001\n'; }
+  model_api_kind() { printf systemone; }
+  gateway_capabilities() { [[ "$1" == keys ]]; }
+  ! gateway_preflight
+}
+decision_status_contract() {
+  BACKEND=vllm
+  list_managed_containers() { printf 'decision\tOrg/Decision\t8001\t14\t10\t2\n'; }
+  model_api_kind() { printf systemone; }
+  model_api_ready() { [[ "$1" == 8001 && "$2" == systemone ]]; }
+  gateway_curl() { printf '{"data":[{"id":"systemone/Org/Decision"}]}'; }
+  container_current_gb() { printf 12; }
+  container_peak_gb() { printf 14; }
+  engine_memory_json() { printf null; }
+  status_models_json | jq -e '.[0] | .api=="systemone" and .state=="ready" and
+    .endpoint=="http://localhost:8001/v1/systemone" and .gateway_model=="systemone/Org/Decision" and
+    .gateway_routed==true and .reserved_gb==14' >/dev/null
+  [[ "$(reserved_budget_gb)" == 14.0 ]]
+}
+check 'decision routes coexist with chat main and disappear when stopped' decision_route_lifecycle
+check 'decision publication uses typed inference and validates probabilities' decision_route_smoke
+check 'old LiteLLM images cannot publish decision routes' decision_capability_required
+check 'decision status exposes the correct endpoint and memory reservation' decision_status_contract
 check 'provider secret file stays private; no persisted master and no dotenv injection' token_persistence
 check 'database startup refuses foreign resources and network exposure' database_ownership
 check 'uninstall refuses foreign resources and retains hashes without purge' database_uninstall_scope

@@ -712,7 +712,7 @@ cmd_help() {
     calibrate <model> Measure launch configs and save the fastest one
     benchmark         Benchmark a running vLLM model with GuideLLM
     stop [<model>]   Stop a model (no arg: the only one; --all: every one)
-    pull <model>     Download a model from HuggingFace
+    pull <model|bundle> Download a model or the pinned target of a bundle
     list             List downloaded models
     rm <model> [...] Remove downloaded model(s)
     logs [<model>]   Show container logs (-f to follow)

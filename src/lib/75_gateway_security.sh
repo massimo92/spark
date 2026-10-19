@@ -136,7 +136,10 @@ gateway_publish_model() {
   if [[ "$supervised" == 1 ]]; then
     gateway_model_routed "$provider" "$model" && gateway_route_smoke "$provider" "$model" || { err "Backend active; LiteLLM route missing for ${model}"; return 1; }
   fi
-  printf '  Gateway: http://localhost:%s/v1\n  Model: %s/%s\n' "$(gateway_configured_port)" "$([[ "$provider" == ollama ]] && printf ollama_chat || printf vllm)" "$model"
+  local prefix path=/v1
+  prefix=$(gateway_model_prefix "$provider" "$model") || return 1
+  [[ "$prefix" != systemone ]] || path=/v1/systemone
+  printf '  Gateway: http://localhost:%s%s\n  Model: %s/%s\n' "$(gateway_configured_port)" "$path" "$prefix" "$model"
   [[ "$supervised" == 1 ]] || printf '  State: pending backend readiness (spark status --json)\n'
   printf '  Authentication: Bearer token saved at creation; if lost, spark gateway auth rotate\n'
 }
@@ -159,6 +162,7 @@ gateway_capabilities() {
   case "$p" in
     keys) script='import prisma, litellm_proxy_extras; from litellm.proxy._types import GenerateKeyRequest; assert "allowed_routes" in GenerateKeyRequest.model_fields; assert "key" in GenerateKeyRequest.model_fields' ;;
     base) script='import importlib.metadata; print(importlib.metadata.version("litellm"))' ;;
+    decisions) script='import litellm; from litellm.llms.typesafe.decisions.transformation import TypeSafeDecisionsConfig; from litellm.proxy.decisions_endpoints.endpoints import router; assert callable(litellm.asystemone); assert any(route.path == "/v1/systemone" for route in router.routes)' ;;
     chatgpt) script='from litellm.llms.chatgpt.authenticator import Authenticator; assert callable(Authenticator().get_access_token)' ;;
     github_copilot) script='from litellm.llms.github_copilot.authenticator import Authenticator; assert callable(Authenticator().get_access_token)' ;;
     xai) script='import inspect; from litellm.llms.xai.oauth import XAIOAuthAuthenticator; from litellm.llms.xai.chat import transformation; assert callable(XAIOAuthAuthenticator().login); assert callable(XAIOAuthAuthenticator._start_callback_server); assert "use_xai_oauth" in inspect.getsource(transformation)' ;;
@@ -429,10 +433,19 @@ HELP
 
 # Validate the proposed configuration before interrupting a working proxy.
 gateway_preflight() {
-  local config p mode env_key key
+  local config p mode env_key key name rest
   config=$(gateway_load_config) || return 1
   gateway_capabilities keys >/dev/null || { err 'LiteLLM image lacks PostgreSQL virtual-key support'; return 1; }
   printf '%s\n' "$config" | jq -e '.port // 4000 | type=="number" and .>0 and .<=65535' >/dev/null || return 1
+  if [[ "$(gateway_provider_enabled vllm)" == true ]]; then
+    while IFS=$'\t' read -r name rest; do
+      [[ -n "$name" ]] || continue
+      if [[ "$(model_api_kind "$name")" == systemone ]]; then
+        systemone_gateway_preflight || return 1
+        break
+      fi
+    done < <(list_managed_containers)
+  fi
   for p in openrouter zen together openai anthropic xai chatgpt github_copilot; do
     [[ "$(gateway_provider_enabled "$p")" == true ]] || continue
     mode=$(printf '%s\n' "$config" | jq -r --arg p "$p" '.providers[$p].auth // (if $p=="chatgpt" or $p=="github_copilot" then "oauth" else "api" end)')
@@ -465,8 +478,15 @@ gateway_forget_ollama_locked() {
   gateway_save_config "$config"
 }
 gateway_route_smoke() {
-  local provider="$1" model="$2" id payload out
-  [[ "$provider" == ollama ]] && id="ollama_chat/$model" || id="vllm/$model"
+  local provider="$1" model="$2" id payload out prefix
+  prefix=$(gateway_model_prefix "$provider" "$model") || return 1
+  id="$prefix/$model"
+  if [[ "$prefix" == systemone ]]; then
+    payload=$(jq -nc --arg id "$id" '{model:$id,state:"Spark gateway routing check",questions:{ready:{type:"noul",instructions:"Is this a gateway routing check?"}}}') || return 1
+    out=$(gateway_curl -fsS --max-time "${SPARK_GATEWAY_SMOKE_TIMEOUT:-60}" -H 'Content-Type: application/json' --data "$payload" "http://127.0.0.1:$(gateway_configured_port)/v1/systemone" 2>/dev/null) || return 1
+    printf '%s\n' "$out" | jq -e '.answers.ready.noul | type=="number" and .>=0 and .<=1' >/dev/null
+    return $?
+  fi
   payload=$(jq -nc --arg id "$id" '{model:$id,messages:[{role:"user",content:"Reply OK"}],max_tokens:1,stream:false}') || return 1
   out=$(gateway_curl -fsS --max-time "${SPARK_GATEWAY_SMOKE_TIMEOUT:-60}" -H 'Content-Type: application/json' --data "$payload" "http://127.0.0.1:$(gateway_configured_port)/v1/chat/completions" 2>/dev/null) || return 1
   printf '%s\n' "$out" | jq -e '(.choices | type)=="array" and (.choices|length)>0' >/dev/null
