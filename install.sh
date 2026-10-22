@@ -21,6 +21,15 @@ if ! IFS= read -r first_line < "$tmp_file" || [[ "$first_line" != "#!/usr/bin/en
   exit 1
 fi
 
+bash -n "$tmp_file"
+pin_file="${HOME}/.config/spark/litellm-image"
+if [[ -e "$pin_file" || -L "$pin_file" ]]; then
+  if ! grep -Fxq 'spark_load_litellm_image_pin || { return 1 2>/dev/null || exit 1; }' "$tmp_file"; then
+    printf 'Install refused: downloaded Spark does not support the LiteLLM image pin in %s\n' "$pin_file" >&2
+    exit 1
+  fi
+fi
+
 chmod +x "$tmp_file"
 
 # Install

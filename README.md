@@ -376,6 +376,18 @@ spark uninstall --yes --purge-models
 
 ## Important Paths
 
+To keep a verified LiteLLM image across CLI updates, save its complete
+`repository@sha256:<64 hex digits>` reference as the only line of
+`~/.config/spark/litellm-image` (mode `600`). Spark reads this file on every
+invocation; it takes precedence over the bundled image default. Creating or
+editing the file does not restart a running gateway. Invalid pins stop the CLI
+instead of falling back to a floating tag.
+
+Manual and automatic CLI updates, and this repository's installer, refuse
+releases without pin support while this file exists. The pin stays unchanged
+when updating LiteLLM; change it explicitly to select a different image.
+Uninstalling with configuration removal also removes the pin.
+
 ```text
 ~/.config/spark/                    config, profiles, gateway, workspace secrets
 ~/.local/share/spark/workspace/      workspace data and backups

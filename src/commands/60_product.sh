@@ -402,7 +402,7 @@ cmd_update() {
     self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
     curl -fsSL --max-time 10 \
       "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" -o "${self}.tmp" 2>/dev/null
-    if [[ -s "${self}.tmp" ]] && bash -n "${self}.tmp" 2>/dev/null; then
+    if [[ -s "${self}.tmp" ]] && spark_validate_cli_update "${self}.tmp"; then
       chmod +x "${self}.tmp" && mv "${self}.tmp" "$self" \
         && info "Updated spark CLI to v${spark_remote_version}" \
         || { rm -f "${self}.tmp"; err "Failed to replace spark binary"; }

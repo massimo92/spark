@@ -55,7 +55,38 @@ GATEWAY_CONFIG="${SPARK_CONFIG_DIR}/gateway.json"
 GATEWAY_PORT=4000
 DASHBOARD_DIR="${SPARK_CONFIG_DIR}/dashboard"
 DASHBOARD_PORT=8787
-LITELLM_IMAGE="ghcr.io/berriai/litellm:main-latest"
+LITELLM_IMAGE="ghcr.io/berriai/litellm@sha256:1c70021e83ff1116e5fe3cce336f3cbbc6ca6c85289152d9ecda8f15f68aae62"
+
+# Keep the operator's image pin outside the replaceable CLI. Read data, not shell.
+spark_load_litellm_image_pin() {
+  local file="${SPARK_CONFIG_DIR}/litellm-image" pin
+  [[ -e "$file" || -L "$file" ]] || return 0
+  if [[ ! -f "$file" || ! -r "$file" ]] || ! pin=$(cat "$file"); then
+    printf 'Cannot read LiteLLM image pin: %s\n' "$file" >&2
+    return 1
+  fi
+  if [[ ! "$pin" =~ ^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]]; then
+    printf 'Invalid LiteLLM image pin in %s: expected repository@sha256:<64 hex digits>\n' "$file" >&2
+    return 1
+  fi
+  LITELLM_IMAGE="$pin"
+}
+# shellcheck disable=SC2317 # return when sourced, exit when executed
+spark_load_litellm_image_pin || { return 1 2>/dev/null || exit 1; }
+
+spark_validate_cli_update() {
+  local candidate="$1" file="${SPARK_CONFIG_DIR}/litellm-image"
+  bash -n "$candidate" || return 1
+  spark_load_litellm_image_pin || return 1
+  if [[ -e "$file" || -L "$file" ]]; then
+    # Older releases must not silently discard a configured pin on replacement.
+    if ! grep -Fxq 'spark_load_litellm_image_pin || { return 1 2>/dev/null || exit 1; }' "$candidate"; then
+      printf 'Update refused: downloaded Spark does not support the LiteLLM image pin in %s\n' "$file" >&2
+      return 1
+    fi
+  fi
+}
+
 WORKSPACE_CONFIG_DIR="${SPARK_CONFIG_DIR}/workspace"
 WORKSPACE_DATA_DIR="${HOME}/.local/share/spark/workspace"
 WORKSPACE_COMPOSE_FILE="${WORKSPACE_CONFIG_DIR}/docker-compose.yml"
@@ -16888,7 +16919,7 @@ cmd_update() {
     self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
     curl -fsSL --max-time 10 \
       "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" -o "${self}.tmp" 2>/dev/null
-    if [[ -s "${self}.tmp" ]] && bash -n "${self}.tmp" 2>/dev/null; then
+    if [[ -s "${self}.tmp" ]] && spark_validate_cli_update "${self}.tmp"; then
       chmod +x "${self}.tmp" && mv "${self}.tmp" "$self" \
         && info "Updated spark CLI to v${spark_remote_version}" \
         || { rm -f "${self}.tmp"; err "Failed to replace spark binary"; }
@@ -17572,7 +17603,7 @@ check_for_updates() {
         self=$(command -v spark 2>/dev/null || echo "${BASH_SOURCE[0]}")
         curl -fsSL --max-time 10 \
           "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" -o "${self}.tmp" 2>/dev/null
-        if [[ -s "${self}.tmp" ]] && bash -n "${self}.tmp" 2>/dev/null; then
+        if [[ -s "${self}.tmp" ]] && spark_validate_cli_update "${self}.tmp"; then
           chmod +x "${self}.tmp" && mv "${self}.tmp" "$self" \
             && info "Updated $u" || { rm -f "${self}.tmp"; warn "Failed to update spark CLI"; }
         else
