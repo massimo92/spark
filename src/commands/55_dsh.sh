@@ -221,6 +221,29 @@ dsh_sync_after_gateway() {
   dsh_sync_catalog || warn 'DSH catalogue refresh failed; retained its last valid catalogue. Run spark ws repair to retry.'
 }
 
+# Exit 2 when the gateway configuration and DSH catalogue already match.
+dsh_refresh_catalog_locked() {
+  local config="${SPARK_CONFIG_DIR}/litellm_config.yaml" patch="$DSH_DIR/state/cordis.patch.yml"
+  local desired previous previous_patch current_patch
+  if ! gateway_running_state; then
+    warn 'LiteLLM is stopped; DSH catalogue refresh skipped'
+    return 2
+  fi
+  gateway_api_ready || { err 'LiteLLM is not ready for DSH catalogue refresh'; return 1; }
+  previous=$(cat "$config") || return 1
+  previous_patch=$(cat "$patch" 2>/dev/null || true)
+  desired=$(gateway_generate_litellm_yaml) || return 1
+  if [[ "$previous" != "$desired" ]]; then
+    gateway_sync_locked "$desired" && dsh_sync_catalog || return 1
+    return 0
+  fi
+  dsh_sync_catalog || return 1
+  current_patch=$(cat "$patch") || return 1
+  [[ "$previous_patch" != "$current_patch" ]] || return 2
+}
+
+dsh_refresh_catalog() { gateway_with_lock dsh_refresh_catalog_locked; }
+
 dsh_selected_assets() {
   local plugins="$1" path encoded i
   while IFS=$'\t' read -r path encoded; do

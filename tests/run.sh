@@ -414,6 +414,23 @@ fake_n8n_response() {
   [[ "$write_status" == "1" ]] && printf '%s' "$status"
 }
 case "$args" in
+  *"api.tailscale.com/api/v2/tailnet/-/vip-services/svc:dsh"*)
+    [[ -n "${FAKE_DSH_SERVICE_LOG:-}" && "$stdin_payload" == *"Bearer fixture-services-token"* ]] || exit 1
+    if [[ "$args" == *"-X GET"* ]]; then
+      printf 'get\n' >> "$FAKE_DSH_SERVICE_LOG"
+      if [[ -e "${FAKE_DSH_SERVICE_LOG}.registered" ]]; then
+        printf '{"name":"svc:dsh","ports":["tcp:443"]}\n200'
+      else
+        printf '{}\n404'
+      fi
+    elif [[ "$args" == *"-X PUT"* && "$args" == *'{"name":"svc:dsh","ports":["tcp:443"]}'* ]]; then
+      printf 'create\n' >> "$FAKE_DSH_SERVICE_LOG"
+      : > "${FAKE_DSH_SERVICE_LOG}.registered"
+      printf '\n204'
+    else
+      exit 1
+    fi
+    exit 0 ;;
   *"dsh."*"?token=test-token"*)
     printf 'HTTP/1.1 303 See Other\r\nSet-Cookie: dsh_session=test-cookie; Secure\r\n\r\n'
     exit 0 ;;
@@ -888,6 +905,10 @@ case "${1:-}" in
       exit "${FAKE_TAILSCALE_GET_CONFIG_EXIT:-0}"
     fi
     if [[ "$*" == *"--service=svc:dsh"* && "${FAKE_TAILSCALE_SERVE_EXIT:-0}" == 0 ]]; then
+      if [[ -n "${FAKE_DSH_SERVICE_LOG:-}" && "${*: -1}" != off ]]; then
+        [[ -e "${FAKE_DSH_SERVICE_LOG}.registered" ]] || exit 1
+        printf 'advertise\n' >> "$FAKE_DSH_SERVICE_LOG"
+      fi
       if [[ "${*: -1}" == off ]]; then rm -f "$dsh_serve"; else printf '%s\n' "${*: -1}" >"$dsh_serve"; fi
     fi
     [[ "${2:-}" == "status" ]] && exit 0
@@ -5348,6 +5369,30 @@ test_workspace_setup_writes_compose_names() {
     [[ "$gateway_mode" == "600" ]] &&
     [[ "$litellm_mode" == "600" ]]
 }
+
+test_workspace_setup_registers_dsh_on_first_run() (
+  local tmp fake_bin output
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  fake_bin="$tmp/bin"
+  make_fake_bin "$fake_bin"
+  make_cached_model "$tmp/home" "Org/Alpha"
+  export HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_BACKEND=vllm SPARK_OS_OVERRIDE=Linux
+  export SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com
+  export SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com
+  export SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0
+  export SPARK_TAILSCALE_SERVICES_TOKEN=fixture-services-token SPARK_DSH_TAILSCALE_USERS=m@example.com
+  export FAKE_DSH_SERVICE_LOG="$tmp/dsh.log"
+  export FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n'
+  output=$("$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha --plugins all </dev/null 2>&1) ||
+    { printf '%s\n' "$output"; return 1; }
+  [[ "$output" == *"DSH: https://dsh.test-tailnet.ts.net/"* ]] || return 1
+  [[ "$(cat "$FAKE_DSH_SERVICE_LOG")" == $'get\ncreate\nadvertise' ]] || return 1
+  "$SPARK" ws dsh status | grep -q 'State: ready' || return 1
+  export FAKE_NAMES='spark-litellm\n' FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n'
+  "$SPARK" ws setup --task-manager vikunja --yes </dev/null >/dev/null 2>&1 || return 1
+  [[ "$(cat "$FAKE_DSH_SERVICE_LOG")" == $'get\ncreate\nadvertise' ]]
+)
 
 test_workspace_setup_healthy_fast_path_no_mutation() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
@@ -10818,6 +10863,7 @@ run_test "workspace setup rejects invalid Tailscale mode" test_workspace_setup_r
 run_test "workspace setup rejects invalid Docker image refs" test_workspace_setup_rejects_bad_image_ref
 run_test "workspace setup rejects multiline secrets" test_workspace_setup_rejects_multiline_secret
 run_test "workspace setup writes compose services without spark prefix" test_workspace_setup_writes_compose_names
+run_test "workspace setup registers and approves DSH unattended" test_workspace_setup_registers_dsh_on_first_run
 run_test "workspace setup fast-paths healthy workspace" test_workspace_setup_healthy_fast_path_no_mutation
 run_test "workspace setup repairs compose drift without Hermes onboard" test_workspace_setup_repairs_compose_drift_without_hermes_onboard
 run_test "workspace setup backs up and normalizes invalid env" test_workspace_setup_backs_up_and_normalizes_invalid_env

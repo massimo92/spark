@@ -325,6 +325,9 @@ efforts and an identifiable default without generating a response. DSH uses
 the discovered default when available. Session-log uploads to DeepSeek are
 disabled by default.
 
+`spark update --dsh` also checks the running models for catalogue changes.
+It reloads LiteLLM only when the generated gateway configuration changes.
+
 ```sh
 spark ws setup --plugins chart,workflows
 spark ws setup --yes --plugins all

@@ -157,3 +157,27 @@ service_response=$'{}\n404'
 dsh_register_service
 [[ -e "$fixture/service-created" ]]
 printf 'ok - unattended registration creates missing svc:dsh and preserves existing definitions\n'
+
+workspace_read_env() { printf 'services\n'; }
+dsh_latest_version() { printf '%s\n' "$DSH_INITIAL_VERSION"; }
+dsh_private_mapped() { return 0; }
+gateway_running_state() { return 0; }
+gateway_api_ready() { return 0; }
+gateway_generate_litellm_yaml() { printf '%s\n' "$rendered"; }
+gateway_sync_locked() {
+  printf '%s\n' "$1" >"$SPARK_CONFIG_DIR/litellm_config.yaml"
+  printf 'reload\n' >>"$fixture/gateway-reloads"
+}
+jq -nc --arg version "$DSH_INITIAL_VERSION" --arg image "$(dsh_image_id "$DSH_INITIAL_VERSION" none)" \
+  '{version:$version,image:$image,plugins:"none"}' >"$DSH_DIR/settings.json"
+rendered='current gateway configuration'
+printf '%s\n' "$rendered" >"$SPARK_CONFIG_DIR/litellm_config.yaml"
+FIXTURE_VISIBLE=$(jq -nc --arg id "$qwen_route" '{data:[{id:$id}]}')
+out=$(cmd_update --dsh)
+[[ "$out" == *"model catalogue refreshed"* && ! -e "$fixture/gateway-reloads" ]]
+rendered='new gateway configuration'
+out=$(cmd_update --dsh)
+[[ "$out" == *"model catalogue refreshed"* && "$(cat "$fixture/gateway-reloads")" == reload ]]
+out=$(cmd_update --dsh)
+[[ "$out" == *"No updates applied"* && "$(cat "$fixture/gateway-reloads")" == reload ]]
+printf 'ok - update --dsh refreshes stale catalogues and reloads the gateway only for changed configuration\n'

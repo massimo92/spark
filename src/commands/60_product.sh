@@ -185,7 +185,7 @@ Targets may be combined:
   --task-manager      Workspace task-manager images
   --n8n               Workspace n8n image
   --nemohermes        NemoHermes sandbox
-  --dsh               DeepSeek Harness and its selected plugins
+  --dsh               DeepSeek Harness, selected plugins, and model catalogue
   --all               Every managed component
 EOF
 }
@@ -203,7 +203,7 @@ cmd_update() {
   local task_services=()
   local nemohermes_update=0 nemohermes_status="" nemohermes_update_line=""
   local update_count=0 workspace_images_updated=0
-  local dsh_update=0 dsh_current="" dsh_latest="" dsh_plugins="" dsh_image="" dsh_target="" updated_spark_path=""
+  local dsh_update=0 dsh_refresh=0 dsh_current="" dsh_latest="" dsh_plugins="" dsh_image="" dsh_target="" updated_spark_path=""
 
   if [[ $# -gt 0 ]]; then
     selected_all=0
@@ -376,6 +376,7 @@ cmd_update() {
       dsh_plugins=$(dsh_setting plugins) || return 1
       dsh_image=$(dsh_setting image) || return 1
       dsh_target="$dsh_current"
+      dsh_refresh=1
       if dsh_latest=$(dsh_latest_version); then
         dsh_version_is_newer "$dsh_latest" "$dsh_current" && dsh_target="$dsh_latest"
       else
@@ -391,7 +392,7 @@ cmd_update() {
     fi
   fi
 
-  update_count=$(( spark_update + ngc_update + gateway_update + postgres_update + task_update + n8n_update + nemohermes_update + dsh_update ))
+  update_count=$(( spark_update + ngc_update + gateway_update + postgres_update + task_update + n8n_update + nemohermes_update + dsh_update + dsh_refresh ))
   printf "\n  Available update actions:\n"
   if [[ "$update_count" -eq 0 ]]; then
     printf "    none\n"
@@ -419,6 +420,7 @@ cmd_update() {
   fi
   [[ "$n8n_update" -eq 1 ]] && printf "    - n8n image: %s\n" "$n8n_image"
   [[ "$nemohermes_update" -eq 1 ]] && printf "    - NemoHermes: update available\n"
+  [[ "$dsh_refresh" == 1 ]] && printf '    - DeepSeek Harness: check model catalogue\n'
   if [[ "$dsh_update" == 1 ]]; then
     if [[ "$dsh_target" == "$dsh_current" ]]; then
       printf '    - DeepSeek Harness: selected plugins changed\n'
@@ -503,13 +505,24 @@ cmd_update() {
      grep -q '^dsh_latest_version()' "$updated_spark_path"; then
     # Recheck against the newly installed CLI's plugin library.
     "$updated_spark_path" update --dsh || return 1
-  elif [[ "$dsh_update" == 1 ]] && confirm "Update DeepSeek Harness and selected plugins?"; then
-    if dsh_install "$dsh_target" "$dsh_plugins" "$(dsh_setting url)" && dsh_publish; then
-      info "DeepSeek Harness updated to $dsh_target"
-      did_update=1
-    else
-      err 'Could not update DeepSeek Harness'
-      return 1
+  else
+    if [[ "$dsh_update" == 1 ]] && confirm "Update DeepSeek Harness and selected plugins?"; then
+      if dsh_install "$dsh_target" "$dsh_plugins" "$(dsh_setting url)" && dsh_publish; then
+        info "DeepSeek Harness updated to $dsh_target"
+        did_update=1
+      else
+        err 'Could not update DeepSeek Harness'
+        return 1
+      fi
+    fi
+    if [[ "$dsh_refresh" == 1 ]]; then
+      if dsh_refresh_catalog; then
+        info 'DeepSeek Harness model catalogue refreshed'
+        did_update=1
+      elif [[ $? != 2 ]]; then
+        err 'Could not refresh the DeepSeek Harness model catalogue'
+        return 1
+      fi
     fi
   fi
 

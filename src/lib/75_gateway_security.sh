@@ -217,13 +217,13 @@ gateway_logout() {
 
 gateway_sync() { gateway_with_lock gateway_sync_locked; }
 gateway_sync_locked() {
-  local path="${SPARK_CONFIG_DIR}/litellm_config.yaml" previous="" yaml tmp running=0 previous_image=""
+  local path="${SPARK_CONFIG_DIR}/litellm_config.yaml" previous="" yaml="${1:-}" tmp running=0 previous_image=""
   if [[ "${SPARK_GATEWAY_DEFER_CLIENT:-0}" != 1 ]] && gateway_load_config | jq -e '.auth.recovery_required==true' >/dev/null; then
     err 'Recover the interrupted token change first: spark gateway auth rotate'; return 1
   fi
   gateway_auth_ensure && gateway_preflight || return 1
   [[ -f "$path" ]] && previous=$(cat "$path")
-  yaml=$(gateway_generate_litellm_yaml) || return 1
+  [[ -n "$yaml" ]] || yaml=$(gateway_generate_litellm_yaml) || return 1
   previous_image=$(docker inspect "$GATEWAY_CONTAINER" --format '{{.Image}}' 2>/dev/null || true)
   if gateway_running_state; then
     running=1
