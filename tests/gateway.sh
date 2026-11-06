@@ -320,9 +320,17 @@ concurrent_registry() {
   gateway_prepare_runtime vllm
   gateway_register_ollama alpha & local first=$!
   gateway_register_ollama beta & local second=$!
-  wait "$first"; wait "$second"
-  jq -e '.providers.ollama.models==["alpha","beta"]' "$GATEWAY_CONFIG" >/dev/null
-  [[ ! -d "$SPARK_CONFIG_DIR/gateway.lock" ]]
+  local first_status=0 second_status=0
+  wait "$first" || first_status=$?
+  wait "$second" || second_status=$?
+  if [[ "$first_status" != 0 || "$second_status" != 0 ]]; then
+    printf 'Registry writers exited with %s and %s\n' "$first_status" "$second_status" >&2
+    return 1
+  fi
+  jq -e '.providers.ollama.models==["alpha","beta"]' "$GATEWAY_CONFIG" >/dev/null ||
+    { printf 'Concurrent registry lost a model\n' >&2; return 1; }
+  [[ ! -d "$SPARK_CONFIG_DIR/gateway.lock" ]] ||
+    { printf 'Concurrent registry left its lock behind\n' >&2; return 1; }
 }
 migration_cleanup_verified() {
   gateway_prepare_runtime vllm
