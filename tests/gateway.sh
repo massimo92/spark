@@ -318,8 +318,8 @@ anonymous_rollback_forbidden() {
 }
 concurrent_registry() {
   gateway_prepare_runtime vllm
-  (PS4='+ ${BASHPID} ${EPOCHREALTIME:-0} '; set -x; gateway_register_ollama alpha) >"$SPARK_CONFIG_DIR/alpha.trace" 2>&1 & local first=$!
-  (PS4='+ ${BASHPID} ${EPOCHREALTIME:-0} '; set -x; gateway_register_ollama beta) >"$SPARK_CONFIG_DIR/beta.trace" 2>&1 & local second=$!
+  gateway_register_ollama alpha & local first=$!
+  gateway_register_ollama beta & local second=$!
   local first_status=0 second_status=0
   wait "$first" || first_status=$?
   wait "$second" || second_status=$?
@@ -328,7 +328,7 @@ concurrent_registry() {
     return 1
   fi
   jq -e '.providers.ollama.models==["alpha","beta"]' "$GATEWAY_CONFIG" >/dev/null ||
-    { jq -c '.providers.ollama.models' "$GATEWAY_CONFIG" >&2; cat "$SPARK_CONFIG_DIR/"*.trace >&2; return 1; }
+    { printf 'Concurrent registry lost a model\n' >&2; return 1; }
   [[ ! -d "$SPARK_CONFIG_DIR/gateway.lock" ]] ||
     { printf 'Concurrent registry left its lock behind\n' >&2; return 1; }
 }
