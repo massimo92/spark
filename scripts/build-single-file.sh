@@ -80,7 +80,14 @@ for module in "${MODULES[@]}"; do
   path="${ROOT_DIR}/${module}"
   [[ -f "$path" ]] || { printf 'Missing module: %s\n' "$module" >&2; exit 1; }
   [[ "$module" != "src/commands/05_bundle.sh" ]] || emit_builtin_bundle_assets
-  [[ "$module" != "src/commands/55_dsh.sh" ]] || emit_builtin_dsh_assets >> "$tmp"
+  if [[ "$module" == "src/commands/55_dsh.sh" ]]; then
+    emit_builtin_dsh_assets >> "$tmp"
+    {
+      printf "spark_builtin_dsh_access() { cat <<'__SPARK_DSH_ACCESS__'\n"
+      cat "$ROOT_DIR/src/assets/dsh-access.mjs"
+      printf '\n__SPARK_DSH_ACCESS__\n}\n'
+    } >> "$tmp"
+  fi
   cat "$path" >> "$tmp"
 done
 

@@ -381,7 +381,7 @@ cmd_update() {
       else
         warn "Could not check the latest DeepSeek Harness version"
       fi
-      if [[ "$dsh_image" != "$(dsh_image_id "$dsh_target" "$dsh_plugins")" ]]; then
+      if [[ "$dsh_image" != "$(dsh_image_id "$dsh_target" "$dsh_plugins")" ]] || ! dsh_private_mapped; then
         dsh_update=1
       elif [[ -n "$dsh_latest" ]]; then
         info "DeepSeek Harness and selected plugins are up to date ($dsh_current)"
@@ -504,7 +504,7 @@ cmd_update() {
     # Recheck against the newly installed CLI's plugin library.
     "$updated_spark_path" update --dsh || return 1
   elif [[ "$dsh_update" == 1 ]] && confirm "Update DeepSeek Harness and selected plugins?"; then
-    if dsh_install "$dsh_target" "$dsh_plugins" "$(dsh_setting url)"; then
+    if dsh_install "$dsh_target" "$dsh_plugins" "$(dsh_setting url)" && dsh_publish; then
       info "DeepSeek Harness updated to $dsh_target"
       did_update=1
     else

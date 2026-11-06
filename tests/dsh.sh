@@ -88,8 +88,33 @@ if dsh_plugin_selection unknown; then exit 1; fi
 [[ -z "$(dsh_selected_assets none)" ]]
 dsh_selected_assets session-delete | awk -F '\t' '$1 == "session-delete/package.json" {found=1} END {exit !found}'
 [[ "$(dsh_image_id "$DSH_INITIAL_VERSION" none)" != "$(dsh_image_id "$DSH_INITIAL_VERSION" chart)" ]]
-dsh_mapping_matches '{"services":{"svc:dsh":{"endpoints":{"tcp:443":"https+insecure://127.0.0.1:3080"}}}}'
+dsh_mapping_matches "$(jq -nc --arg target "https://$(dsh_socket_target)" \
+  '{services:{"svc:dsh":{endpoints:{"tcp:443":$target}}}}')" "$(dsh_socket_target)"
 if dsh_mapping_matches '{"services":{"svc:dsh":{"endpoints":{"tcp:443":"https+insecure://127.0.0.1:30801"}}}}'; then
   exit 1
 fi
 printf 'ok - optional plugin selection and assets; private mapping is scoped to DSH\n'
+[[ "$(SPARK_DSH_TAILSCALE_USERS=owner@example.com dsh_access_users)" == owner@example.com ]]
+if SPARK_DSH_TAILSCALE_USERS='*@example.com' dsh_access_users 2>/dev/null; then exit 1; fi
+
+export SPARK_TAILSCALE_SERVICES_TOKEN=test-token
+dsh_service_api() {
+  case "$1:$2" in
+    GET:test-token) printf '%s\n' "$service_response" ;;
+    PUT:test-token)
+      [[ "$3" == '{"name":"svc:dsh","ports":["tcp:443"]}' ]] || return 1
+      touch "$fixture/service-created"
+      printf '\n204\n' ;;
+    *) return 1 ;;
+  esac
+}
+service_response=$'{"name":"svc:dsh","ports":["tcp:443","tcp:80"]}\n200'
+dsh_register_service
+[[ ! -e "$fixture/service-created" ]]
+service_response=$'{"name":"svc:dsh","ports":["tcp:80"]}\n200'
+if dsh_register_service 2>/dev/null; then exit 1; fi
+[[ ! -e "$fixture/service-created" ]]
+service_response=$'{}\n404'
+dsh_register_service
+[[ -e "$fixture/service-created" ]]
+printf 'ok - unattended registration creates missing svc:dsh and preserves existing definitions\n'

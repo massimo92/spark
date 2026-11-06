@@ -427,7 +427,11 @@ case "$args" in
     ' "$HOME/.config/spark/workspace/dsh/state/cordis.patch.yml"
     exit $? ;;
   *"--resolve dsh."*".ts.net:443:"*)
-    printf '401'
+    if [[ "$(cat "$HOME/.config/spark/workspace/dsh/state/test-serve")" == unix:* ]]; then
+      printf 'HTTP/1.1 403 Forbidden\r\nX-Spark-DSH-Access: denied\r\n\r\n'
+    else
+      printf 'HTTP/1.1 401 Unauthorized\r\n\r\n'
+    fi
     exit 0 ;;
   *'/user/info?user_id='*)
     user=spark-clients; [[ "$args" != *user_id=spark-managed* ]] || user=spark-managed
@@ -875,7 +879,8 @@ case "${1:-}" in
     if [[ "${2:-}" == "get-config" && "${3:-}" == "--all" ]]; then
       if [[ -f "$dsh_serve" ]]; then
         config=${FAKE_TAILSCALE_SERVE_CONFIG:-'{"services":{"svc:tasks":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18790"}}}}'}
-        printf '%s\n' "$config" | jq -c '.services["svc:dsh"].endpoints["tcp:443"]="https+insecure://127.0.0.1:3080"' 2>/dev/null ||
+        printf '%s\n' "$config" | jq -c --arg target "$(cat "$dsh_serve")" \
+          '.services["svc:dsh"].endpoints["tcp:443"]=$target' 2>/dev/null ||
           printf '%s\n' "$config"
       else
         echo "${FAKE_TAILSCALE_SERVE_CONFIG:-svc:tasks 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790}"
@@ -883,7 +888,7 @@ case "${1:-}" in
       exit "${FAKE_TAILSCALE_GET_CONFIG_EXIT:-0}"
     fi
     if [[ "$*" == *"--service=svc:dsh"* && "${FAKE_TAILSCALE_SERVE_EXIT:-0}" == 0 ]]; then
-      if [[ "${*: -1}" == off ]]; then rm -f "$dsh_serve"; else : >"$dsh_serve"; fi
+      if [[ "${*: -1}" == off ]]; then rm -f "$dsh_serve"; else printf '%s\n' "${*: -1}" >"$dsh_serve"; fi
     fi
     [[ "${2:-}" == "status" ]] && exit 0
     [[ -n "${FAKE_TAILSCALE_SERVE_STDERR:-}" ]] && printf '%s\n' "${FAKE_TAILSCALE_SERVE_STDERR}" >&2

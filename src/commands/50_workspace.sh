@@ -4938,6 +4938,7 @@ workspace_remote_workspace_cmd() {
       SPARK_WORKSPACE_TASK_MANAGER \
       SPARK_WORKSPACE_VIKUNJA_USERNAME SPARK_WORKSPACE_VIKUNJA_EMAIL \
       SPARK_WORKSPACE_TODOIST_TOKEN \
+      SPARK_TAILSCALE_SERVICES_TOKEN SPARK_DSH_TAILSCALE_USERS \
       SPARK_WORKSPACE_VIKUNJA_PASSWORD SPARK_WORKSPACE_N8N_EMAIL SPARK_WORKSPACE_N8N_PASSWORD; do
       value="${!key:-}"
       if [[ -n "$value" ]]; then
@@ -7806,7 +7807,7 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Tailscale mode is Services or ports" workspace_tailscale_services_mode
   if dsh_configured && [[ "$(workspace_read_env WORKSPACE_TAILSCALE_MODE || true)" == services ]]; then
     workspace_doctor_check "DSH runtime is running" dsh_running
-    workspace_doctor_check "DSH is advertised through Tailscale Serve" dsh_private_mapped
+    workspace_doctor_check "DSH is advertised through its private access proxy" dsh_private_mapped
     workspace_doctor_check "Tailscale approved this host for DSH" dsh_service_approved
     workspace_doctor_check "DSH answers on verified Tailscale HTTPS" dsh_https_ready
     workspace_doctor_check "DSH plugins activated" dsh_plugins_ready

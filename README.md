@@ -301,16 +301,21 @@ spark ws backup
 ```
 
 In Tailscale Services mode, workspace setup also runs DeepSeek Harness (DSH)
-on the Linux host. Register `svc:dsh` with TCP 443 in the Tailscale Services
-console and approve the host. Grant access to the intended users in your
-tailnet policy. The DSH web server listens on loopback and uses its own browser
-authentication. Run `spark ws dsh login` on a private terminal to get the
-sign-in link. When the stable URL shows `dsh web authentication required`,
-open that sign-in link in the browser you intend to use. The browser keeps
-the session cookie and returns to the stable URL. Use
-`ssh -t USER@HOST '~/.local/bin/spark ws dsh login'` for a remote host.
-`spark ws dsh status` distinguishes pending approval, HTTPS reachability
-and model catalogue readiness.
+on the Linux host. Set `SPARK_DSH_TAILSCALE_USERS` at setup to the exact
+Tailscale logins allowed to use the DSH owner session, separated by commas.
+Spark stores that list and checks it on every HTTP and WebSocket connection
+before creating the DSH session internally. The tailnet policy must also allow
+those users to reach `svc:dsh` on TCP 443. They can then open
+`https://dsh.<tailnet>.ts.net/` directly. With an empty list, DSH uses its own
+browser authentication and `spark ws dsh login` prints the private sign-in link.
+
+For unattended first-time publication, set a tailnet policy once with
+`autoApprovers.services["svc:dsh"]` set to the approved host tag. Supply a
+Tailscale API access token with Services write permission through
+`SPARK_TAILSCALE_SERVICES_TOKEN` when the service needs to be created. Spark
+reuses existing definitions and approved hosts. The token is sent over SSH
+stdin during remote setup and is used only for service registration.
+`spark ws dsh status` shows publication, HTTPS and model catalogue readiness.
 
 Spark configures DSH with a restricted LiteLLM key and refreshes its managed
 catalog when gateway routes change. LiteLLM publishes the effective vLLM
