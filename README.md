@@ -305,7 +305,12 @@ on the Linux host. Register `svc:dsh` with TCP 443 in the Tailscale Services
 console and approve the host. Grant access to the intended users in your
 tailnet policy. The DSH web server listens on loopback and uses its own browser
 authentication. Run `spark ws dsh login` on a private terminal to get the
-sign-in link. `spark ws dsh status` shows the stable URL.
+sign-in link. When the stable URL shows `dsh web authentication required`,
+open that sign-in link in the browser you intend to use. The browser keeps
+the session cookie and returns to the stable URL. Use
+`ssh -t USER@HOST '~/.local/bin/spark ws dsh login'` for a remote host.
+`spark ws dsh status` distinguishes pending approval, HTTPS reachability
+and model catalogue readiness.
 
 Spark configures DSH with a restricted LiteLLM key and refreshes its managed
 catalog when gateway routes change. LiteLLM publishes the effective vLLM

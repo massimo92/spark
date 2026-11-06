@@ -42,7 +42,7 @@ function restoreConfig(config, base) {
 
 export class WorkflowEngine {
   /**
-   * @param ctx - contexto cordis con agents, sessionController, skills, compaction y logger.
+   * @param ctx - contexto cordis con agents, sessionController, skills y logger.
    */
   constructor(ctx, { scratchRoot = SCRATCH_ROOT } = {}) {
     this.ctx = ctx
@@ -258,7 +258,9 @@ export class WorkflowEngine {
    */
   compact(run, index) {
     if (index < 1 || !this.live(run)) return undefined
-    const api = this.ctx.compaction
+    // En el perfil web la compactación pertenece al preset del agente.
+    const api = run.agent.ctx?.get?.('compaction') ??
+      (typeof this.ctx.get === 'function' ? this.ctx.get('compaction') : this.ctx.compaction)
     if (typeof api?.compactNow !== 'function') {
       if (!this.warnedCompaction) {
         this.warnedCompaction = true

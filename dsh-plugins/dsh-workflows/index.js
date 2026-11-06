@@ -13,7 +13,7 @@ import { WorkflowEngine } from './src/engine.js'
 import { WorkflowStore } from './src/store.js'
 
 export const name = '@local/dsh-workflows'
-export const inject = ['connection', 'agents', 'sessionController', 'skills', 'compaction']
+export const inject = ['connection', 'agents', 'sessionController', 'skills']
 
 /** Rutas `/api/workflows.<endpoint>` (POST JSON → `{ ok, value }` o `{ ok: false, error }`). */
 const ROUTE_PREFIX = '/api/workflows.'

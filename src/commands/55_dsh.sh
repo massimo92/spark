@@ -91,6 +91,12 @@ dsh_render_patch() {
   printf '%s\n%s\n' "$visible" "$info" | jq -s --arg plugins "$plugins" --arg url "$url" '
     def enabled($name): $plugins | split(",") | index($name) != null;
     def positive: select(type == "number" and . > 0 and . == floor);
+    # Leave input space and, for large windows, the stock compaction headroom
+    # plus the retained fraction of the remaining message budget.
+    def output_fits($context):
+      . as $output |
+      select($context != null and $output < $context and
+        ($context <= 65536 or ($context - $output) * 0.84 > 65536));
     def protocol:
       if . == "responses" then "openai-responses"
       elif . == "chat" or . == null then "openai-completions"
@@ -101,9 +107,12 @@ dsh_render_patch() {
     [$visible.data[] | select((.id | type) == "string" and (.id | contains("*") | not)) |
       .id as $id | $catalog[$id] as $model |
       ($model.mode | protocol) as $api |
+      ([$model.spark_context_window, $model.max_input_tokens] | map(positive) | first) as $context |
+      (if $id == "main" or ($id | startswith("vllm/") or startswith("ollama_chat/"))
+       then $model.spark_max_output_tokens else $model.max_output_tokens end) as $output |
       {id:$id, api:$api, name:$model.display_name,
-       contextWindow:([$model.spark_context_window, $model.max_input_tokens] | map(positive) | first),
-       maxTokens:([$model.max_output_tokens] | map(positive) | first),
+       contextWindow:$context,
+       maxTokens:([$output | positive | output_fits($context)] | first),
        input:(if $model.supports_vision == true then ["text","image"] else ["text"] end),
        reasoningEfforts:$model.spark_reasoning_efforts, compat:$model.spark_dsh_compat}
       | with_entries(select(.value != null))] | unique_by(.id) as $models |
@@ -186,7 +195,7 @@ dsh_selected_assets() {
 
 dsh_image_id() {
   local version="$1" plugins="$2" digest
-  digest=$({ printf '%s\n' "$version" node24-v2; dsh_selected_assets "$plugins"; } | shasum -a 256) || return 1
+  digest=$({ printf '%s\n' "$version" node24-v3; dsh_selected_assets "$plugins"; } | shasum -a 256) || return 1
   printf 'spark/dsh:%s-%s\n' "$version" "${digest:0:16}"
 }
 
@@ -237,13 +246,65 @@ dsh_running() {
     [[ "$(docker inspect -f '{{.State.Running}}' "$DSH_CONTAINER" 2>/dev/null)" == true ]]
 }
 
+dsh_plugins_ready() {
+  local log="$DSH_DIR/state/launch.log"
+  [[ -r "$log" ]] || return 1
+  if grep -Eq '^(llm-pi-ai-protocols|dsh-chart|workflows|session-delete|search-router) \(' "$log"; then
+    return 1
+  else
+    [[ $? == 1 ]]
+  fi
+}
+
+dsh_live_catalog() {
+  local url login host cookie
+  url=$(dsh_setting url) || return 1
+  login=$(dsh_launch_url) || return 1
+  host="${url#https://}"
+  host="${host%/}"
+  # The self-signed backend is reached strictly on loopback. The Tailscale
+  # check below separately verifies the public-facing TLS certificate.
+  local loopback=(--noproxy '*' --connect-to "$host:443:127.0.0.1:$DSH_PORT" --insecure --max-time 4)
+  cookie=$(printf 'url = "%s"\n' "$login" |
+    curl --config - -fsS "${loopback[@]}" -D - -o /dev/null |
+    awk '
+      /^HTTP\// && $2 == 303 { redirect=1 }
+      tolower($1) == "set-cookie:" && tolower($0) ~ /;[[:space:]]*secure/ {
+        split($2, pair, ";")
+        if (pair[1] ~ /^[A-Za-z0-9._~-]+=[A-Za-z0-9._~%=-]+$/) cookie=pair[1]
+      }
+      END { if (!redirect || cookie == "") exit 1; print cookie }
+    ') || return 1
+  printf 'header = "Cookie: %s"\n' "$cookie" |
+    curl --config - -fsS "${loopback[@]}" -H "Origin: ${url%/}" -H 'Content-Type: application/json' \
+      -d '{"type":"client-request","rpcId":"00000000-0000-4000-8000-000000000001","method":"session/modelCatalog","payload":{"args":{}}}' \
+      "${url%/}/api/session/modelCatalog" |
+    jq -ce '.result | select(.ok == true) | .value | select(.groups | type == "array")'
+}
+
+dsh_catalog_matches() {
+  jq -e --slurpfile patch "$DSH_DIR/state/cordis.patch.yml" '
+    [$patch[0][] | (select(.id == "llm-pi-ai" and .disabled != true),
+      (.insert[]? | select(.id == "llm-pi-ai-protocols"))) |
+      .config.providers | to_entries[] | .key as $provider |
+      .value.models[] | [$provider,.id]] as $expected |
+    [.groups[] | .id as $provider | .models[] | [$provider,.id]] as $active |
+    ($expected - $active | length) == 0
+  ' >/dev/null
+}
+
+dsh_catalog_ready() { dsh_live_catalog 2>/dev/null | dsh_catalog_matches 2>/dev/null; }
+
 dsh_wait_ready() {
   local attempt
   for ((attempt=0; attempt<30; attempt++)); do
-    if dsh_running && dsh_launch_url >/dev/null; then return 0; fi
+    if dsh_running && dsh_launch_url >/dev/null; then
+      dsh_plugins_ready || { err 'A DSH plugin did not activate. Inspect the private launch.log.'; return 1; }
+      dsh_catalog_ready && return 0
+    fi
     sleep 1
   done
-  err 'DSH did not start. Inspect its private launch.log under the workspace DSH state directory.'
+  err 'DSH or its managed model catalogue did not become ready. Inspect its private launch.log.'
   return 1
 }
 
@@ -260,11 +321,24 @@ dsh_start_container() {
     -v "$WORKSPACE_DATA_DIR/dsh-files:/workspace" -w /workspace \
     "$image" sh -ec '
       umask 077
+      exec > /state/launch.log 2>&1
+      for package in @local/dsh-chart @local/dsh-workflows dsh-search-router \
+        @local/session-delete @local/dsh-llm-pi-ai-protocols; do
+        source="/opt/spark-dsh/node_modules/$package"
+        [ -r "$source/package.json" ] || continue
+        link="/state/profiles/web/node_modules/$package"
+        if [ -L "$link" ] && [ "$(readlink "$link")" = "$source" ]; then continue; fi
+        if [ -e "$link" ] || [ -L "$link" ]; then
+          echo "DSH profile already owns plugin $package"
+          exit 1
+        fi
+        mkdir -p "${link%/*}"
+        ln -s "$source" "$link"
+      done
       export LITELLM_API_KEY="$(cat /run/spark-dsh/gateway-key)"
       exec node /opt/spark-dsh/node_modules/@deepseek-ai/dsh/lib/bin.js web \
         --no-open --host 127.0.0.1 --port "$1" --public-url "$2" --trusted-host "$3" \
-        --tls-cert /run/spark-dsh/tls.crt --tls-key /run/spark-dsh/tls.key \
-        > /state/launch.log 2>&1
+        --tls-cert /run/spark-dsh/tls.crt --tls-key /run/spark-dsh/tls.key
     ' sh "$DSH_PORT" "$url" "$host" >/dev/null && dsh_wait_ready
 }
 
@@ -294,7 +368,7 @@ dsh_activate_locked() (
   if dsh_running &&
      [[ "$settings" == "$(cat "$DSH_DIR/settings.json" 2>/dev/null || true)" &&
         "$previous_key" == "$(cat "$DSH_DIR/secrets/gateway-key")" ]]; then
-    dsh_sync_catalog
+    dsh_sync_catalog && dsh_wait_ready
     return $?
   fi
   if ! printf '%s\n' "$settings" | dsh_write "$DSH_DIR/settings.json" || ! dsh_sync_catalog "$plugins"; then
@@ -343,6 +417,30 @@ dsh_mapping_matches() {
   ' <<<"$1" >/dev/null 2>&1
 }
 
+dsh_service_ip() {
+  tailscale status --json 2>/dev/null | jq -er '
+    [.Self.CapMap["service-host"][]? | .["svc:dsh"][]? | strings] |
+    (map(select(test("^[0-9]+(\\.[0-9]+){3}$"))) | first) //
+    (map(select(contains(":") and test("^[0-9A-Fa-f:]+$"))) | first // empty)
+  '
+}
+
+dsh_service_approved() { dsh_service_ip >/dev/null; }
+
+dsh_https_ready() {
+  local url host ip status
+  url=$(dsh_setting url) || return 1
+  ip=$(dsh_service_ip) || return 1
+  host="${url#https://}"
+  host="${host%/}"
+  [[ "$ip" != *:* ]] || ip="[$ip]"
+  # Linux need not use MagicDNS for its own service. Probe the approved VIP
+  # with the service hostname as SNI and keep certificate verification on.
+  status=$(curl --noproxy '*' --resolve "$host:443:$ip" -sS --max-time 5 \
+    -o /dev/null -w '%{http_code}' "$url" 2>/dev/null) || return 1
+  [[ "$status" == 401 || "$status" == 200 ]]
+}
+
 dsh_publish() {
   local out
   if tailscale_funnel_status_active; then
@@ -363,7 +461,11 @@ dsh_publish() {
     fi
     dsh_private_mapped || return 1
   fi
-  info "DSH: $(dsh_setting url)  (first sign-in: spark ws dsh login)"
+  if dsh_service_approved; then
+    info "DSH: $(dsh_setting url)  (first sign-in: spark ws dsh login)"
+  else
+    warn 'DSH is advertised. Approve this host for svc:dsh in the Tailscale Services admin console.'
+  fi
 }
 
 dsh_install() {
@@ -447,7 +549,11 @@ dsh_version_is_newer() {
 
 dsh_status_state() {
   if ! dsh_running; then printf 'stopped\n'
-  elif ! dsh_private_mapped; then printf 'running-not-ready\n'
+  elif ! dsh_private_mapped; then printf 'not-advertised\n'
+  elif ! dsh_service_approved; then printf 'pending-approval\n'
+  elif ! dsh_https_ready; then printf 'https-unreachable\n'
+  elif ! dsh_plugins_ready; then printf 'plugins-failed\n'
+  elif ! dsh_catalog_ready; then printf 'catalog-incomplete\n'
   else printf 'ready\n'
   fi
 }
@@ -459,13 +565,14 @@ dsh_command() {
     status)
       local state
       state=$(dsh_status_state)
-      printf 'DeepSeek Harness %s\n  State: %s\n  URL: %s\n  Plugins: %s\n' \
+      printf 'DeepSeek Harness %s\n  State: %s\n  URL: %s\n  Plugins: %s\n  First visit or expired session: spark ws dsh login\n' \
         "$(dsh_setting version)" "$state" "$(dsh_setting url)" "$(dsh_setting plugins)"
       [[ "$state" == ready ]]
       ;;
     login)
       [[ -t 1 ]] || die 'DSH sign-in requires a terminal' 'Use ssh -t when running remotely'
       dsh_running && dsh_private_mapped || die 'DSH private access is not ready'
+      dsh_service_approved || die 'DSH host approval is pending' 'Approve this host for svc:dsh in the Tailscale Services admin console'
       dsh_launch_url || die 'Could not read the DSH sign-in link'
       ;;
     *) die 'Usage: spark ws dsh <status|login>' ;;

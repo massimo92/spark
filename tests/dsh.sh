@@ -27,6 +27,7 @@ length=32K
 yaml=$(gateway_generate_litellm_yaml)
 primary=$(printf '%s\n' "$yaml" | sed -n 's/^    model_info: //p' | jq -cs 'select(length == 2 and .[0] == .[1]) | .[0]')
 jq -e '.spark_context_window == 32768 and .max_input_tokens == 32768 and .max_output_tokens == 1024
+  and .spark_max_output_tokens == 1024
   and .supports_vision == false and .supports_function_calling == true and .spark_reasoning_efforts.xhigh == "xhigh"'   <<<"$primary" >/dev/null
 printf 'ok - gateway publishes the effective runtime limits and capabilities for vLLM and main\n'
 
@@ -47,10 +48,15 @@ dsh_sync_catalog
 jq -e '
   any(.[]; .id == "session-log-deepseek" and .config.enabled == false) and
   (map(select(.id == "llm-pi-ai"))[0].config.providers |
-    .litellm.models[0].contextWindow == 32768 and .litellm.models[0].input == ["text"] and
+    .litellm.models[0].contextWindow == 32768 and .litellm.models[0].maxTokens == 1024 and
+    .litellm.models[0].input == ["text"] and
     .litellm.models[0].reasoningEfforts.xhigh == "xhigh" and
     .["litellm-responses"].models[0].input == ["text","image"] and
     ([.[] | .models[]] | length) == 2)' "$patch" >/dev/null
+if dsh_catalog_matches <<<'{"groups":[]}'; then exit 1; fi
+jq -c '[.[] | select(.id=="llm-pi-ai") | .config.providers | to_entries[] |
+  {id:.key,models:.value.models}] | {groups:.}' "$patch" | dsh_catalog_matches
+printf 'ok - DSH readiness requires the runtime to publish the managed model IDs\n'
 length=16384
 dsh_sync_catalog
 jq -e 'any(.[]; .config.providers.litellm.models[0].contextWindow == 16384)' "$patch" >/dev/null
@@ -63,6 +69,16 @@ fail_metadata=0
 dsh_sync_catalog
 jq -e 'any(.[]; .id == "llm-pi-ai" and .config.providers == {})' "$patch" >/dev/null
 printf 'ok - DSH reconciles protocols, context changes and stopped models, and retains a good catalog on failure\n'
+
+dsh_render_patch '{"data":[{"id":"main"},{"id":"vllm/example"},{"id":"chatgpt/fixture"}]}' \
+  '{"data":[{"model_name":"main","model_info":{"spark_context_window":262144,"max_output_tokens":262144}},
+    {"model_name":"vllm/example","model_info":{"spark_context_window":262144,"spark_max_output_tokens":210000}},
+    {"model_name":"chatgpt/fixture","model_info":{"mode":"responses","max_input_tokens":272000,"max_output_tokens":128000}}]}' \
+  protocols http://127.0.0.1:4000/v1 |
+  jq -e '[.[] | .insert[]? | select(.id=="llm-pi-ai-protocols") |
+    .config.providers.litellm.models[] | {key:.id,value:.maxTokens}] | from_entries |
+    .main == null and .["vllm/example"] == null and .["chatgpt/fixture"] == 128000' >/dev/null
+printf 'ok - DSH ignores synthesized output limits and leaves room for history\n'
 
 [[ "$(dsh_plugin_selection workflows,chart,chart)" == chart,workflows ]]
 if dsh_plugin_selection unknown; then exit 1; fi

@@ -414,6 +414,21 @@ fake_n8n_response() {
   [[ "$write_status" == "1" ]] && printf '%s' "$status"
 }
 case "$args" in
+  *"dsh."*"?token=test-token"*)
+    printf 'HTTP/1.1 303 See Other\r\nSet-Cookie: dsh_session=test-cookie; Secure\r\n\r\n'
+    exit 0 ;;
+  *"dsh."*"/api/session/modelCatalog"*)
+    jq -c '
+      {result:{ok:true,value:{groups:[
+        .[] | (select(.id == "llm-pi-ai" and .disabled != true),
+          (.insert[]? | select(.id == "llm-pi-ai-protocols"))) |
+        .config.providers | to_entries[] | {id:.key,models:.value.models}
+      ]}}}
+    ' "$HOME/.config/spark/workspace/dsh/state/cordis.patch.yml"
+    exit $? ;;
+  *"--resolve dsh."*".ts.net:443:"*)
+    printf '401'
+    exit 0 ;;
   *'/user/info?user_id='*)
     user=spark-clients; [[ "$args" != *user_id=spark-managed* ]] || user=spark-managed
     printf '{"user_info":{"user_id":"%s","user_role":"internal_user"}}\n' "$user"; exit 0 ;;
@@ -837,11 +852,20 @@ case "${1:-}" in
   status)
     if [[ "${2:-}" == "--json" ]]; then
       if [[ -n "${FAKE_TAILSCALE_STATUS_JSON_FILE:-}" && -f "$FAKE_TAILSCALE_STATUS_JSON_FILE" ]]; then
-        cat "$FAKE_TAILSCALE_STATUS_JSON_FILE"
+        status=$(cat "$FAKE_TAILSCALE_STATUS_JSON_FILE")
       elif [[ -n "${FAKE_TAILSCALE_STATUS_JSON:-}" ]]; then
-        printf '%s\n' "$FAKE_TAILSCALE_STATUS_JSON"
+        status="$FAKE_TAILSCALE_STATUS_JSON"
       else
-        printf '%s\n' '{"MagicDNSSuffix":"test-tailnet.ts.net."}'
+        status='{"MagicDNSSuffix":"test-tailnet.ts.net."}'
+      fi
+      if [[ -f "$HOME/.config/spark/workspace/dsh/state/test-serve" ]]; then
+        jq -c '
+          .Self.CapMap //= (["tasks","vikunja","n8n","hermes"] |
+            map({key:("services/"+.),value:[{Name:("svc:"+.),Ports:["tcp:443"]}]}) | from_entries) |
+          .Self.CapMap["service-host"] += [{"svc:dsh":["100.78.237.114"]}]
+        ' <<<"$status"
+      else
+        printf '%s\n' "$status"
       fi
       exit 0
     fi

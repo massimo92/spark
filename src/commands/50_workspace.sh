@@ -7806,7 +7806,11 @@ cmd_workspace_doctor() {
   workspace_doctor_check "Tailscale mode is Services or ports" workspace_tailscale_services_mode
   if dsh_configured && [[ "$(workspace_read_env WORKSPACE_TAILSCALE_MODE || true)" == services ]]; then
     workspace_doctor_check "DSH runtime is running" dsh_running
-    workspace_doctor_check "DSH has a private Tailscale mapping" dsh_private_mapped
+    workspace_doctor_check "DSH is advertised through Tailscale Serve" dsh_private_mapped
+    workspace_doctor_check "Tailscale approved this host for DSH" dsh_service_approved
+    workspace_doctor_check "DSH answers on verified Tailscale HTTPS" dsh_https_ready
+    workspace_doctor_check "DSH plugins activated" dsh_plugins_ready
+    workspace_doctor_check "DSH serves the managed LiteLLM models" dsh_catalog_ready
   fi
   workspace_doctor_check "Tailscale workspace URLs respond" workspace_tailscale_https_urls_ready
 

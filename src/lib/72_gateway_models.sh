@@ -47,10 +47,12 @@ gateway_vllm_model_info() {
     ([$generation.max_new_tokens,
       (if ($args | value("--generation-config")) as $source | $source == null or $source == "auto"
        then $profile.hf.raw.generation_config.max_new_tokens else null end)] | map(positive) | first) as $output |
+    (if $context != null and $output != null then [$context, $output] | min else $output end) as $output_limit |
     {mode:"chat",
      spark_context_window:$context,
      max_input_tokens:$context,
-     max_output_tokens:(if $context != null and $output != null then [$context, $output] | min else $output end),
+     max_output_tokens:$output_limit,
+     spark_max_output_tokens:$output_limit,
      supports_vision:(if $media.image == 0 or (($media.image | objects | .count) // -1) == 0 then false
        elif .Labels["spark.is_multimodal"] == "true" then true
        elif .Labels["spark.is_multimodal"] == "false" then false
