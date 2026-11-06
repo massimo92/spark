@@ -185,13 +185,14 @@ Targets may be combined:
   --task-manager      Workspace task-manager images
   --n8n               Workspace n8n image
   --nemohermes        NemoHermes sandbox
+  --dsh               DeepSeek Harness, selected plugins, and model catalogue
   --all               Every managed component
 EOF
 }
 
 cmd_update() {
   local selected_all=1 selected_spark=0 selected_ngc=0 selected_gateway=0
-  local selected_postgres=0 selected_task=0 selected_n8n=0 selected_nemohermes=0
+  local selected_postgres=0 selected_task=0 selected_n8n=0 selected_nemohermes=0 selected_dsh=0
   local did_update=0 image_check_rc=0
   local spark_update=0 spark_remote_version=""
   local ngc_update=0 current_ngc="" current_tag="" latest_tag=""
@@ -202,6 +203,7 @@ cmd_update() {
   local task_services=()
   local nemohermes_update=0 nemohermes_status="" nemohermes_update_line=""
   local update_count=0 workspace_images_updated=0
+  local dsh_update=0 dsh_refresh=0 dsh_current="" dsh_latest="" dsh_plugins="" dsh_image="" dsh_target="" updated_spark_path=""
 
   if [[ $# -gt 0 ]]; then
     selected_all=0
@@ -215,6 +217,7 @@ cmd_update() {
       --task-manager) selected_task=1 ;;
       --n8n) selected_n8n=1 ;;
       --nemohermes) selected_nemohermes=1 ;;
+      --dsh) selected_dsh=1 ;;
       --all) selected_all=1 ;;
       -h|--help) cmd_update_help; return 0 ;;
       *) die "Unknown update target: $1" "Run: spark update --help" ;;
@@ -367,7 +370,29 @@ cmd_update() {
     fi
   fi
 
-  update_count=$(( spark_update + ngc_update + gateway_update + postgres_update + task_update + n8n_update + nemohermes_update ))
+  if [[ "$selected_all" == 1 || "$selected_dsh" == 1 ]]; then
+    if dsh_configured && [[ "$(workspace_read_env WORKSPACE_TAILSCALE_MODE || true)" == services ]]; then
+      dsh_current=$(dsh_setting version) || return 1
+      dsh_plugins=$(dsh_setting plugins) || return 1
+      dsh_image=$(dsh_setting image) || return 1
+      dsh_target="$dsh_current"
+      dsh_refresh=1
+      if dsh_latest=$(dsh_latest_version); then
+        dsh_version_is_newer "$dsh_latest" "$dsh_current" && dsh_target="$dsh_latest"
+      else
+        warn "Could not check the latest DeepSeek Harness version"
+      fi
+      if [[ "$dsh_image" != "$(dsh_image_id "$dsh_target" "$dsh_plugins")" ]] || ! dsh_private_mapped; then
+        dsh_update=1
+      elif [[ -n "$dsh_latest" ]]; then
+        info "DeepSeek Harness and selected plugins are up to date ($dsh_current)"
+      fi
+    elif [[ "$selected_dsh" == 1 ]]; then
+      warn "DeepSeek Harness is not configured; run spark ws setup"
+    fi
+  fi
+
+  update_count=$(( spark_update + ngc_update + gateway_update + postgres_update + task_update + n8n_update + nemohermes_update + dsh_update + dsh_refresh ))
   printf "\n  Available update actions:\n"
   if [[ "$update_count" -eq 0 ]]; then
     printf "    none\n"
@@ -395,6 +420,14 @@ cmd_update() {
   fi
   [[ "$n8n_update" -eq 1 ]] && printf "    - n8n image: %s\n" "$n8n_image"
   [[ "$nemohermes_update" -eq 1 ]] && printf "    - NemoHermes: update available\n"
+  [[ "$dsh_refresh" == 1 ]] && printf '    - DeepSeek Harness: check model catalogue\n'
+  if [[ "$dsh_update" == 1 ]]; then
+    if [[ "$dsh_target" == "$dsh_current" ]]; then
+      printf '    - DeepSeek Harness: selected plugins changed\n'
+    else
+      printf '    - DeepSeek Harness: %s → %s\n' "$dsh_current" "$dsh_target"
+    fi
+  fi
   printf "\n"
 
   if [[ "$spark_update" -eq 1 ]] && confirm "Update spark CLI to v${spark_remote_version}?"; then
@@ -404,7 +437,7 @@ cmd_update() {
       "https://raw.githubusercontent.com/${GITHUB_REPO}/main/spark" -o "${self}.tmp" 2>/dev/null
     if [[ -s "${self}.tmp" ]] && spark_validate_cli_update "${self}.tmp"; then
       chmod +x "${self}.tmp" && mv "${self}.tmp" "$self" \
-        && info "Updated spark CLI to v${spark_remote_version}" \
+        && { updated_spark_path="$self"; info "Updated spark CLI to v${spark_remote_version}"; } \
         || { rm -f "${self}.tmp"; err "Failed to replace spark binary"; }
     else
       rm -f "${self}.tmp"
@@ -468,6 +501,31 @@ cmd_update() {
     did_update=1
   fi
 
+  if [[ -n "$dsh_current" && -n "$updated_spark_path" ]] &&
+     grep -q '^dsh_latest_version()' "$updated_spark_path"; then
+    # Recheck against the newly installed CLI's plugin library.
+    "$updated_spark_path" update --dsh || return 1
+  else
+    if [[ "$dsh_update" == 1 ]] && confirm "Update DeepSeek Harness and selected plugins?"; then
+      if dsh_install "$dsh_target" "$dsh_plugins" "$(dsh_setting url)" && dsh_publish; then
+        info "DeepSeek Harness updated to $dsh_target"
+        did_update=1
+      else
+        err 'Could not update DeepSeek Harness'
+        return 1
+      fi
+    fi
+    if [[ "$dsh_refresh" == 1 ]]; then
+      if dsh_refresh_catalog; then
+        info 'DeepSeek Harness model catalogue refreshed'
+        did_update=1
+      elif [[ $? != 2 ]]; then
+        err 'Could not refresh the DeepSeek Harness model catalogue'
+        return 1
+      fi
+    fi
+  fi
+
   if [[ "$did_update" -eq 0 ]]; then
     printf "  No updates applied.\n"
   fi
@@ -527,6 +585,7 @@ EOF
   fi
 
   local name model self
+  dsh_workspace_uninstall "$dry_run" || return 1
   if command -v docker >/dev/null 2>&1; then
     while IFS=$'\t' read -r name model _; do
       [[ -z "$name" ]] && continue
@@ -763,6 +822,7 @@ cmd_help() {
     --yes                       Accept safe defaults
     --full                      Set up model server + agent workspace
     --model MODEL               Workspace/Hermes model for --full
+    --plugins SELECTION         Optional DSH plugins for --full
     --tailscale-mode services|ports
                                 Workspace private-access mode for --full
     --funnel-action reset|abort Handle active Tailscale Funnel explicitly

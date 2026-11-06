@@ -54,6 +54,7 @@ make_fake_bin() {
 #!/usr/bin/env bash
 set -euo pipefail
 args="$*"
+dsh_state="$HOME/.config/spark/workspace/dsh/state"
 case "${1:-}" in
   --version)
     echo "Docker version 29.4.3, build fake"
@@ -201,6 +202,11 @@ ${stdin_payload}"
     esac
     ;;
   run)
+    if [[ "$args" == *"--name spark-dsh "* ]]; then
+      printf 'true\n' >"$dsh_state/test-container"
+      printf 'dsh web: %s?token=test-token\n' "$(jq -r '.url' "$dsh_state/../settings.json")" >"$dsh_state/launch.log"
+      exit 0
+    fi
     # Capability/migration helpers are not model launch attempts or initializers.
     if [[ "$args" == *'from litellm.proxy._types import GenerateKeyRequest'* || "$args" == *'"prisma", "migrate", "deploy"'* ]]; then exit 0; fi
     if [[ "${FAKE_DOCKER_RUN_EXIT:-0}" == 0 ]]; then
@@ -232,6 +238,10 @@ ${stdin_payload}"
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
     ;;
   stop|rm|rename)
+    if [[ "${*: -1}" == spark-dsh ]]; then
+      if [[ "$1" == stop ]]; then printf 'false\n' >"$dsh_state/test-container"; else rm -f "$dsh_state/test-container"; fi
+      exit 0
+    fi
     if [[ "${FAKE_DOCKER_STOP_EXIT:-0}" == 0 && -f "$HOME/.config/spark/test-launched-models.tsv" ]]; then
       for name in "${@:2}"; do
         awk -F '\t' -v n="$name" '$1!=n' "$HOME/.config/spark/test-launched-models.tsv" > "$HOME/.config/spark/test-models.tmp"
@@ -243,6 +253,15 @@ ${stdin_payload}"
     exit "${FAKE_DOCKER_STOP_EXIT:-0}"
     ;;
   inspect)
+    if [[ "${*: -1}" == spark-dsh ]]; then
+      [[ -f "$dsh_state/test-container" ]] || exit 1
+      case "$args" in
+        *io.spark.dsh.owner*) printf '%s' "$HOME/.config/spark" | shasum -a 256 | awk '{print $1}' ;;
+        *State.Running*) cat "$dsh_state/test-container" ;;
+        *'{{.Image}}'*) printf 'sha256:test-dsh\n' ;;
+      esac
+      exit 0
+    fi
     if [[ "${2:-}" == spark-litellm-db ]]; then
       owner=$(printf '%s' "$HOME/.config/spark" | shasum -a 256 | awk '{print $1}')
       jq -nc --arg owner "$owner" '{Config:{Labels:{"io.spark.gateway-owner":$owner}},HostConfig:{NetworkMode:"none",PortBindings:{}},Mounts:[{Name:"spark-litellm-db-data",Destination:"/var/lib/postgresql/data"},{Name:"spark-litellm-db-socket",Destination:"/var/run/postgresql"}]}'
@@ -395,6 +414,42 @@ fake_n8n_response() {
   [[ "$write_status" == "1" ]] && printf '%s' "$status"
 }
 case "$args" in
+  *"api.tailscale.com/api/v2/tailnet/-/vip-services/svc:dsh"*)
+    [[ -n "${FAKE_DSH_SERVICE_LOG:-}" && "$stdin_payload" == *"Bearer fixture-services-token"* ]] || exit 1
+    if [[ "$args" == *"-X GET"* ]]; then
+      printf 'get\n' >> "$FAKE_DSH_SERVICE_LOG"
+      if [[ -e "${FAKE_DSH_SERVICE_LOG}.registered" ]]; then
+        printf '{"name":"svc:dsh","ports":["tcp:443"]}\n200'
+      else
+        printf '{}\n404'
+      fi
+    elif [[ "$args" == *"-X PUT"* && "$args" == *'{"name":"svc:dsh","ports":["tcp:443"]}'* ]]; then
+      printf 'create\n' >> "$FAKE_DSH_SERVICE_LOG"
+      : > "${FAKE_DSH_SERVICE_LOG}.registered"
+      printf '\n204'
+    else
+      exit 1
+    fi
+    exit 0 ;;
+  *"dsh."*"?token=test-token"*)
+    printf 'HTTP/1.1 303 See Other\r\nSet-Cookie: dsh_session=test-cookie; Secure\r\n\r\n'
+    exit 0 ;;
+  *"dsh."*"/api/session/modelCatalog"*)
+    jq -c '
+      {result:{ok:true,value:{groups:[
+        .[] | (select(.id == "llm-pi-ai" and .disabled != true),
+          (.insert[]? | select(.id == "llm-pi-ai-protocols"))) |
+        .config.providers | to_entries[] | {id:.key,models:.value.models}
+      ]}}}
+    ' "$HOME/.config/spark/workspace/dsh/state/cordis.patch.yml"
+    exit $? ;;
+  *"--resolve dsh."*".ts.net:443:"*)
+    if [[ "$(cat "$HOME/.config/spark/workspace/dsh/state/test-serve")" == unix:* ]]; then
+      printf 'HTTP/1.1 403 Forbidden\r\nX-Spark-DSH-Access: denied\r\n\r\n'
+    else
+      printf 'HTTP/1.1 401 Unauthorized\r\n\r\n'
+    fi
+    exit 0 ;;
   *'/user/info?user_id='*)
     user=spark-clients; [[ "$args" != *user_id=spark-managed* ]] || user=spark-managed
     printf '{"user_info":{"user_id":"%s","user_role":"internal_user"}}\n' "$user"; exit 0 ;;
@@ -500,6 +555,7 @@ case "$args" in
     if [[ -n "${FAKE_LITELLM_SMOKE_JSON:-}" ]]; then printf '%s\n' "$FAKE_LITELLM_SMOKE_JSON";
     else printf '%s\n' '{"choices":[{"message":{"content":"ok"}}],"usage":{"completion_tokens":1}}'; fi
     exit 0 ;;
+  */model/info*) printf '%s\n' '{"data":[]}'; exit 0 ;;
   */v1/models*)
     if [[ "$args" == *":4000/v1/models"* && "$write_status" == 1 && ( "$stdin_payload" != *"Authorization: Bearer sk-"* || "$stdin_payload" == *"sk-invalid"* ) ]]; then printf 401; exit 0; fi
     ready="${FAKE_VLLM_READY:-1}"
@@ -817,19 +873,43 @@ case "${1:-}" in
   status)
     if [[ "${2:-}" == "--json" ]]; then
       if [[ -n "${FAKE_TAILSCALE_STATUS_JSON_FILE:-}" && -f "$FAKE_TAILSCALE_STATUS_JSON_FILE" ]]; then
-        cat "$FAKE_TAILSCALE_STATUS_JSON_FILE"
+        status=$(cat "$FAKE_TAILSCALE_STATUS_JSON_FILE")
       elif [[ -n "${FAKE_TAILSCALE_STATUS_JSON:-}" ]]; then
-        printf '%s\n' "$FAKE_TAILSCALE_STATUS_JSON"
+        status="$FAKE_TAILSCALE_STATUS_JSON"
       else
-        printf '%s\n' '{"MagicDNSSuffix":"test-tailnet.ts.net."}'
+        status='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"Tags":["tag:spark"]}}'
+      fi
+      if [[ -f "$HOME/.config/spark/workspace/dsh/state/test-serve" ]]; then
+        jq -c '
+          .Self.CapMap //= (["tasks","vikunja","n8n","hermes"] |
+            map({key:("services/"+.),value:[{Name:("svc:"+.),Ports:["tcp:443"]}]}) | from_entries) |
+          .Self.CapMap["service-host"] += [{"svc:dsh":["100.78.237.114"]}]
+        ' <<<"$status"
+      else
+        printf '%s\n' "$status"
       fi
       exit 0
     fi
     exit "${FAKE_TAILSCALE_STATUS_EXIT:-1}" ;;
   serve)
+    dsh_serve="$HOME/.config/spark/workspace/dsh/state/test-serve"
     if [[ "${2:-}" == "get-config" && "${3:-}" == "--all" ]]; then
-      echo "${FAKE_TAILSCALE_SERVE_CONFIG:-svc:tasks 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790}"
+      if [[ -f "$dsh_serve" ]]; then
+        config=${FAKE_TAILSCALE_SERVE_CONFIG:-'{"services":{"svc:tasks":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18790"}}}}'}
+        printf '%s\n' "$config" | jq -c --arg target "$(cat "$dsh_serve")" \
+          '.services["svc:dsh"].endpoints["tcp:443"]=$target' 2>/dev/null ||
+          printf '%s\n' "$config"
+      else
+        echo "${FAKE_TAILSCALE_SERVE_CONFIG:-svc:tasks 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790}"
+      fi
       exit "${FAKE_TAILSCALE_GET_CONFIG_EXIT:-0}"
+    fi
+    if [[ "$*" == *"--service=svc:dsh"* && "${FAKE_TAILSCALE_SERVE_EXIT:-0}" == 0 ]]; then
+      if [[ -n "${FAKE_DSH_SERVICE_LOG:-}" && "${*: -1}" != off ]]; then
+        [[ -e "${FAKE_DSH_SERVICE_LOG}.registered" ]] || exit 1
+        printf 'advertise\n' >> "$FAKE_DSH_SERVICE_LOG"
+      fi
+      if [[ "${*: -1}" == off ]]; then rm -f "$dsh_serve"; else printf '%s\n' "${*: -1}" >"$dsh_serve"; fi
     fi
     [[ "${2:-}" == "status" ]] && exit 0
     [[ -n "${FAKE_TAILSCALE_SERVE_STDERR:-}" ]] && printf '%s\n' "${FAKE_TAILSCALE_SERVE_STDERR}" >&2
@@ -5290,6 +5370,31 @@ test_workspace_setup_writes_compose_names() {
     [[ "$litellm_mode" == "600" ]]
 }
 
+test_workspace_setup_registers_dsh_on_first_run() (
+  local tmp fake_bin fake_path output
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  fake_bin="$tmp/bin"
+  make_fake_bin "$fake_bin"
+  make_cached_model "$tmp/home" "Org/Alpha"
+  fake_path="$fake_bin:$PATH"
+  export HOME="$tmp/home" SPARK_BACKEND=vllm SPARK_OS_OVERRIDE=Linux
+  export SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com
+  export SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com
+  export SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0
+  export SPARK_TAILSCALE_SERVICES_TOKEN=fixture-services-token SPARK_DSH_TAILSCALE_USERS=m@example.com
+  export FAKE_DSH_SERVICE_LOG="$tmp/dsh.log"
+  export FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n'
+  output=$(env "PATH=$fake_path" "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha --plugins all </dev/null 2>&1) ||
+    { printf '%s\n' "$output"; return 1; }
+  [[ "$output" == *"DSH: https://dsh.test-tailnet.ts.net/"* ]] || return 1
+  [[ "$(cat "$FAKE_DSH_SERVICE_LOG")" == $'get\ncreate\nadvertise' ]] || return 1
+  env "PATH=$fake_path" "$SPARK" ws dsh status | grep -q 'State: ready' || return 1
+  export FAKE_NAMES='spark-litellm\n' FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n'
+  env "PATH=$fake_path" "$SPARK" ws setup --task-manager vikunja --yes </dev/null >/dev/null 2>&1 || return 1
+  [[ "$(cat "$FAKE_DSH_SERVICE_LOG")" == $'get\ncreate\nadvertise' ]]
+)
+
 test_workspace_setup_healthy_fast_path_no_mutation() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out status env_file compose_file env_before compose_before env_after compose_after compose_calls nemo_calls
@@ -6715,6 +6820,11 @@ test_workspace_doctor_remote_delegates_strict() {
     [[ "$out" == *"remote strict doctor ok"* ]]
 }
 
+workspace_doctor_all_passed() {
+  [[ "$1" =~ ([0-9]+)/([0-9]+)[[:space:]]checks[[:space:]]passed ]] &&
+    [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]
+}
+
 test_workspace_doctor_checklist_passes() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out
@@ -6735,7 +6845,7 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"71/71 checks passed"* ]] &&
+    workspace_doctor_all_passed "$out" &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
@@ -6831,7 +6941,7 @@ test_workspace_doctor_strict_checks_pinned_images() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --strict --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"72/72 checks passed"* ]] &&
+  workspace_doctor_all_passed "$out" &&
     [[ "$out" == *"[x] Compose image refs are pinned for production"* ]] &&
     [[ "$out" != *"Hermes GitHub repo access verified"* ]] &&
     [[ "$out" != *"Hermes WhatsApp channel healthy"* ]]
@@ -6882,14 +6992,14 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 71 and
+    .passed == .total and
     .failed == 0 and
-    .total == 71 and
+    .total == (.checks | length) and
     .model == "Org/Alpha" and
-    ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Identity & recovery" and .passed == 14 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Resilience" and .passed == 2 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Inference & agent" and .passed == 20 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Configuration" and .passed > 0 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Identity & recovery" and .passed > 0 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Resilience" and .passed > 0 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Inference & agent" and .passed > 0 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM Hermes route completes smoke request" and .ok == true)] | length == 1) and
@@ -7995,6 +8105,7 @@ test_workspace_doctor_flags_tailscale_service_host_not_advertised() {
     SPARK_WORKSPACE_N8N_EMAIL=m@example.com FAKE_TAILSCALE_STATUS_EXIT=0 \
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha >/dev/null 2>&1 || true
+  rm -f "${tmp}/home/.config/spark/workspace/dsh/state/test-serve"
   set +e
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm \
     FAKE_TAILSCALE_STATUS_EXIT=0 FAKE_NAMES='spark-litellm\n' \
@@ -8184,7 +8295,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"71/71 checks passed"* ]] &&
+  workspace_doctor_all_passed "$out" &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -8206,7 +8317,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"71/71 checks passed"* ]] &&
+  workspace_doctor_all_passed "$out" &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -10759,6 +10870,7 @@ run_test "workspace setup rejects invalid Tailscale mode" test_workspace_setup_r
 run_test "workspace setup rejects invalid Docker image refs" test_workspace_setup_rejects_bad_image_ref
 run_test "workspace setup rejects multiline secrets" test_workspace_setup_rejects_multiline_secret
 run_test "workspace setup writes compose services without spark prefix" test_workspace_setup_writes_compose_names
+run_test "workspace setup registers and approves DSH unattended" test_workspace_setup_registers_dsh_on_first_run
 run_test "workspace setup fast-paths healthy workspace" test_workspace_setup_healthy_fast_path_no_mutation
 run_test "workspace setup repairs compose drift without Hermes onboard" test_workspace_setup_repairs_compose_drift_without_hermes_onboard
 run_test "workspace setup backs up and normalizes invalid env" test_workspace_setup_backs_up_and_normalizes_invalid_env

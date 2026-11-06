@@ -1,0 +1,53 @@
+# dsh-search-router — composition patch.
+#
+# What this file does (bundle layers apply in dsh.profile.bundles order; the
+# last write wins per row id, and this plugin is appended after dsh-base /
+# dsh-web-app, so every override below wins over the shipped composition):
+#
+# 1. insert the search-router plugin row (registers the `search-router`
+#    WebSearchProvider into ctx.web);
+# 2. point the web seam at it (web.searchProvider = search-router), so the
+#    native web_search tool resolves to the router instead of deepseek-official;
+# 3. disable the built-in web-search-deepseek provider row — with the seam
+#    configured above it would never be called, but disabling also keeps it
+#    from initializing at all (and from asking for DEEPSEEK_API_KEY);
+# 4. re-enable the tool-web row, which the shipped web profile disables: a
+#    search router without the model-facing web_search tool would be pointless.
+#    fetch stays off — this plugin routes search only.
+#
+# All of it is reversible: `dsh plugin --profile <p> remove dsh-search-router`
+# drops this layer and the next boot composes without these rows. To keep the
+# plugin but use DeepSeek search again for one profile, add to that profile's
+# own cordis.patch.yml (it applies after every bundle layer):
+#
+#   - id: web
+#     config:
+#       searchProvider: deepseek-official
+#   - id: web-search-deepseek
+#     disabled: false
+#
+# Configure the router itself by overriding the plugin row's config in the
+# profile's own cordis.patch.yml (a patch replaces the whole config block):
+#
+#   - id: search-router
+#     config:
+#       order: [exa, tavily, searxng]
+#       providers:
+#         exa: { apiKeyEnv: EXA_API_KEY }
+
+- insert:
+    - id: search-router
+      name: dsh-search-router
+
+- id: web
+  config:
+    searchProvider: search-router
+
+- id: web-search-deepseek
+  disabled: true
+
+- id: tool-web
+  disabled: false
+  config:
+    fetch: false
+    searchTimeoutMs: 60000

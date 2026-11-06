@@ -23,8 +23,10 @@ MODULES=(
   "src/commands/30_status_doctor.sh"
   "src/commands/40_setup.sh"
   "src/commands/50_workspace.sh"
+  "src/commands/55_dsh.sh"
   "src/commands/60_product.sh"
   "src/lib/70_gateway_update.sh"
+  "src/lib/72_gateway_models.sh"
   "src/lib/75_gateway_security.sh"
   "src/lib/76_gateway_access.sh"
   "src/lib/77_gateway_oauth.sh"
@@ -56,10 +58,36 @@ emit_builtin_bundle_assets() {
   rm -f "$index"
 }
 
+emit_builtin_dsh_assets() {
+  local root="${ROOT_DIR}/dsh-plugins" asset rel
+  printf "spark_builtin_dsh_assets() { cat <<'__SPARK_DSH_ASSETS__'\n"
+  if [[ -d "$root" ]]; then
+    while IFS= read -r asset; do
+      rel="${asset#"${root}"/}"
+      case "$rel" in
+        */package.json|*/cordis.patch.yml|*/index.js|*/client.js|*/lib/*|*/locale/*|*/src/*|*/icon.svg|*/LICENSE|*/NOTICE)
+          printf '%s\t' "$rel"
+          base64 < "$asset" | tr -d '\n'
+          printf '\n'
+          ;;
+      esac
+    done < <(find "$root" \( -name node_modules -o -name .git -o -name test -o -name vendor \) -prune -o -type f -print | LC_ALL=C sort)
+  fi
+  printf '__SPARK_DSH_ASSETS__\n}\n'
+}
+
 for module in "${MODULES[@]}"; do
   path="${ROOT_DIR}/${module}"
   [[ -f "$path" ]] || { printf 'Missing module: %s\n' "$module" >&2; exit 1; }
   [[ "$module" != "src/commands/05_bundle.sh" ]] || emit_builtin_bundle_assets
+  if [[ "$module" == "src/commands/55_dsh.sh" ]]; then
+    emit_builtin_dsh_assets >> "$tmp"
+    {
+      printf "spark_builtin_dsh_access() { cat <<'__SPARK_DSH_ACCESS__'\n"
+      cat "$ROOT_DIR/src/assets/dsh-access.mjs"
+      printf '\n__SPARK_DSH_ACCESS__\n}\n'
+    } >> "$tmp"
+  fi
   cat "$path" >> "$tmp"
 done
 

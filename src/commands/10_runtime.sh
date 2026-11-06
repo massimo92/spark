@@ -1636,7 +1636,8 @@ build_launch() {
     --label "spark.need_gb=${NEED_GB}"
     --label "spark.weights_gb=${WEIGHTS_GB}"
     --label "spark.kv_gb=${KV_GB}"
-    --label "spark.max_model_len=${MAX_MODEL_LEN}")
+    --label "spark.max_model_len=${MAX_MODEL_LEN}"
+    --label "spark.is_multimodal=${IS_MULTIMODAL}")
   if [[ "$ngc_image" == vllm/vllm-openai:* ]]; then
     # The official image already has `vllm serve` as its entrypoint. USER and
     # LOGNAME also let its Python runtime resolve Spark's unprivileged host UID.

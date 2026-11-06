@@ -1,0 +1,97 @@
+--- stock/client.js
++++ local/client.js
+@@ -525,6 +525,16 @@
+ 				}), props.expanded ? (0, react_jsx_runtime.jsxs)("div", {
+ 					className: ModelsSection_module_css_default["modelAdvanced"],
+ 					children: [
++						props.modelProtocols?.length ? (0, react_jsx_runtime.jsxs)("label", {
++							className: ModelsSection_module_css_default["modelField"],
++							children: [(0, react_jsx_runtime.jsx)("span", {className: ModelsSection_module_css_default["modelFieldLabel"],children:t("customApi")}), (0, react_jsx_runtime.jsxs)("select", {
++								className: ModelsSection_module_css_default["input"],
++								"aria-label": `${t("customApi")} ${position}`,
++								value: typeof model.api === "string" ? model.api : "", disabled,
++								onChange: event => props.onFieldChange("api", event.target.value || void 0),
++								children: [(0, react_jsx_runtime.jsx)("option", {value:"",children:t("modelApiDefault")}), ...props.modelProtocols.map(api => (0, react_jsx_runtime.jsx)("option", {value:api,children:protocolLabel(t,api)},api))]
++							})]
++						}) : null,
+ 						["contextWindow", "maxTokens"].map((field) => (0, react_jsx_runtime.jsxs)("label", {
+ 							className: ModelsSection_module_css_default["modelField"],
+ 							children: [(0, react_jsx_runtime.jsx)("span", {
+@@ -1059,6 +1069,7 @@
+ 							inputFallback: inputDefaults.get(textOf(model, "id")) ?? props.defaultInput,
+ 							inputLoading: catalogProvider !== void 0 && catalog === void 0,
+ 							reasoningLevels: props.reasoningLevels,
++							modelProtocols: props.modelProtocols,
+ 							expanded: expanded.has(index),
+ 							disabled,
+ 							t,
+@@ -1604,7 +1615,7 @@
+ 						baseURL: normalizedBaseURL,
+ 						models: models.map((model) => ({ ...model }))
+ 					};
+-					const written = await operations.writeSettings(NS$1, [{
++					const written = await operations.writeSettings(props.settingsNs ?? NS$1, [{
+ 						op: "set",
+ 						path: ["providers", route],
+ 						value: profile
+@@ -1743,8 +1754,9 @@
+ 						models,
+ 						onChange: setModels,
+ 						reasoningLevels,
++						modelProtocols: props.settingsNs === "llm-pi-ai-protocols" ? protocols : void 0,
+ 						probe: {
+-							settingsNs: NS$1,
++							settingsNs: props.settingsNs ?? NS$1,
+ 							baseURL: normalizedBaseURL,
+ 							api: protocol,
+ 							...keyValue.length === 0 ? {} : { apiKey: keyValue }
+@@ -1839,7 +1851,7 @@
+ 		/** The editor layout the owning namespace selects. */
+ 		function layoutOf(ns) {
+ 			if (ns === "llm-deepseek") return "deepseek";
+-			if (ns === "llm-pi-ai") return "pi-ai";
++			if (ns === "llm-pi-ai" || ns === "llm-pi-ai-protocols") return "pi-ai";
+ 			return "unknown";
+ 		}
+ 		/** The credential reference this profile resolves keys through. */
+@@ -2154,6 +2166,7 @@
+ 								...catalogProps,
+ 								catalogProvider: props.declared === true ? void 0 : props.provider,
+ 								reasoningLevels,
++								modelProtocols: namespace.ns === "llm-pi-ai-protocols" ? protocols : void 0,
+ 								defaultInput: Array.isArray(defaultInput) ? defaultInput : void 0,
+ 								probe,
+ 								probeBlocked: keyFailure,
+@@ -2464,7 +2477,7 @@
+ 					namespace
+ 				}];
+ 			});
+-			const piAi = state.namespaces.get("llm-pi-ai");
++			const piAi = state.namespaces.get("llm-pi-ai-protocols") ?? state.namespaces.get("llm-pi-ai");
+ 			const protocols = protocolChoices(piAi, schema);
+ 			const reasoningLevels = reasoningLevelChoices(piAi, schema);
+ 			const catalogOffered = configurable.length > 0;
+@@ -2742,6 +2755,7 @@
+ 										protocols,
+ 										reasoningLevels,
+ 										revision: piAi.revision,
++										settingsNs: piAi.ns,
+ 										operations,
+ 										t,
+ 										readOnly: !state.writable,
+@@ -3338,6 +3352,7 @@
+ 			customRouteTaken: "A provider already uses this ID.",
+ 			customDisplayName: "Display name",
+ 			customApi: "API protocol",
++			modelApiDefault: "Use provider protocol",
+ 			customApiUnset: "Not selected",
+ 			protocolOpenAiCompletions: "OpenAI Chat Completions",
+ 			protocolOpenAiResponses: "OpenAI Responses",
+@@ -3475,6 +3490,7 @@
+ 			customRouteTaken: "已有提供商使用了这个 ID。",
+ 			customDisplayName: "显示名称",
+ 			customApi: "API 协议",
++			modelApiDefault: "使用提供方协议",
+ 			customApiUnset: "未选择",
+ 			protocolOpenAiCompletions: "OpenAI Chat Completions",
+ 			protocolOpenAiResponses: "OpenAI Responses",

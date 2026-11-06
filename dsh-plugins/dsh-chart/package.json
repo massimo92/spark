@@ -1,0 +1,22 @@
+{
+  "name": "@local/dsh-chart",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Renderiza bloques ```dsh-chart (JSON de datos puro) como gráficos ECharts en el chat. Sin eval, sin red, sin fs: el JSON del modelo nunca se convierte en código.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.js", "lib/client.js", "cordis.patch.yml", "README.md",
+    "NOTICE"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  }
+}

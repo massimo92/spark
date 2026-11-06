@@ -132,6 +132,8 @@ WORKSPACE_N8N_IMAGE_DEFAULT="docker.n8n.io/n8nio/n8n:latest"
 # The empty default keeps source modules usable without the release build.
 # shellcheck disable=SC2317,SC2329
 spark_builtin_bundle_assets() { :; }
+# shellcheck disable=SC2317,SC2329
+spark_builtin_dsh_assets() { :; }
 
 # Detect total system memory in GiB. On the GB10 (unified memory) nvidia-smi reports
 # N/A, so read the system memory instead: /proc/meminfo (Linux), sysctl (macOS).

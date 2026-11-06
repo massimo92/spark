@@ -1,0 +1,5 @@
+# Registra el plugin en la composición del perfil. La mitad host no hace nada;
+# todo el comportamiento vive en el módulo cliente (navegador).
+- insert:
+    - id: dsh-chart
+      name: '@local/dsh-chart'

@@ -63,6 +63,12 @@ gateway_auth_ensure() {
 gateway_with_lock() (
   local lock="${SPARK_CONFIG_DIR}/gateway.lock" attempt cleanup_command
   mkdir -p "$SPARK_CONFIG_DIR" && chmod 700 "$SPARK_CONFIG_DIR" || exit 1
+  if [[ "$SPARK_OS" == Linux ]] && command -v flock >/dev/null 2>&1; then
+    # Serialize Linux callers at the kernel level. Keep the directory lock for
+    # callers using an older Spark version or a host without flock.
+    exec 9<"$SPARK_CONFIG_DIR" || exit 1
+    flock -x -w 30 9 || { err 'Gateway busy; retry when the other command finishes'; exit 1; }
+  fi
   for ((attempt=0; attempt<30; attempt++)); do
     if mkdir "$lock" 2>/dev/null; then break; fi
     local owner
@@ -79,7 +85,7 @@ gateway_with_lock() (
   printf -v cleanup_command 'rm -f -- %q/pid; rmdir -- %q 2>/dev/null || true' "$lock" "$lock"
   # shellcheck disable=SC2064
   trap "$cleanup_command" EXIT
-  "$@"
+  "$@" 9<&-
 )
 gateway_provider_env() {
   case "$1" in
@@ -217,17 +223,21 @@ gateway_logout() {
 
 gateway_sync() { gateway_with_lock gateway_sync_locked; }
 gateway_sync_locked() {
-  local path="${SPARK_CONFIG_DIR}/litellm_config.yaml" previous="" yaml tmp running=0 previous_image=""
+  local path="${SPARK_CONFIG_DIR}/litellm_config.yaml" previous="" yaml="${1:-}" tmp running=0 previous_image=""
   if [[ "${SPARK_GATEWAY_DEFER_CLIENT:-0}" != 1 ]] && gateway_load_config | jq -e '.auth.recovery_required==true' >/dev/null; then
     err 'Recover the interrupted token change first: spark gateway auth rotate'; return 1
   fi
   gateway_auth_ensure && gateway_preflight || return 1
   [[ -f "$path" ]] && previous=$(cat "$path")
-  yaml=$(gateway_generate_litellm_yaml) || return 1
+  [[ -n "$yaml" ]] || yaml=$(gateway_generate_litellm_yaml) || return 1
   previous_image=$(docker inspect "$GATEWAY_CONTAINER" --format '{{.Image}}' 2>/dev/null || true)
   if gateway_running_state; then
     running=1
-    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure && gateway_migration_cleanup; return $?; fi
+    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then
+      gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure && gateway_migration_cleanup || return 1
+      dsh_sync_after_gateway
+      return 0
+    fi
   fi
   tmp=$(umask 077; mktemp "${path}.tmp.XXXXXX") || return 1
   printf '%s\n' "$yaml" > "$tmp"
@@ -235,7 +245,11 @@ gateway_sync_locked() {
   if [[ "$running" == 1 ]]; then
     docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || return 1
   fi
-  if gateway_start_container && gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure; then gateway_migration_cleanup; return $?; fi
+  if gateway_start_container && gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure; then
+    gateway_migration_cleanup || return 1
+    dsh_sync_after_gateway
+    return 0
+  fi
   err 'Gateway update failed; restoring the previous rendered routes'
   docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
   # Never restore anonymous access during the first migration.

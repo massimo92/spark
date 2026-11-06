@@ -1,0 +1,60 @@
+--- stock/lib/index.js
++++ local/lib/index.js
+@@ -686,7 +686,7 @@
+ 		if (seen.has(entry.id)) invalid(provider, `lists model "${entry.id}" more than once`);
+ 		seen.add(entry.id);
+ 		const base = defaults.get(entry.id);
+-		const api = request.api ?? base?.api ?? routeApi;
++		const api = entry.api ?? request.api ?? base?.api ?? routeApi;
+ 		if (api === void 0) invalid(provider, `model "${entry.id}" needs an api; the installed catalog does not describe it, so set the route's api to the wire protocol its endpoint speaks`);
+ 		const baseUrl = request.baseURL ?? base?.baseUrl ?? providerBaseUrl;
+ 		if (baseUrl === void 0) invalid(provider, `model "${entry.id}" needs a baseURL; the installed catalog does not describe this route`);
+@@ -925,16 +925,28 @@
+ */
+ function buildProvider(spec) {
+ 	const catalog = catalogProvider(spec.provider);
+-	if (catalog !== void 0 && spec.api === void 0) return reuseCatalogProvider(catalog, spec);
+-	const factory = spec.api === void 0 ? void 0 : PROTOCOLS[spec.api];
+-	if (factory === void 0) throw new PiAiCatalogError(`llm-pi-ai: provider "${spec.provider}" names api "${spec.api}", which this build cannot serve; supported protocols are ${supportedProtocols().join(", ")}`);
++	const inherited = catalog !== void 0 && spec.api === void 0 ? reuseCatalogProvider(catalog, spec) : void 0;
++	// Preserve provider-native dispatch unless a model explicitly overrides its protocol.
++	if (inherited !== void 0 && !spec.apiOverrides?.size) return inherited;
++	const implementations = new Map();
++	const implementationFor = (model) => {
++		if (inherited !== void 0 && !spec.apiOverrides?.has(model.id)) return inherited;
++		const factory = PROTOCOLS[model.api];
++		if (factory === void 0) throw new PiAiCatalogError(`llm-pi-ai: model "${model.id}" on provider "${spec.provider}" names unsupported api "${model.api}"`);
++		if (!implementations.has(model.api)) implementations.set(model.api, factory());
++		return implementations.get(model.api);
++	};
++	for (const model of spec.models) implementationFor(model);
+ 	return createProvider({
+ 		id: spec.provider,
+ 		name: spec.displayName,
+ 		...spec.baseURL === void 0 ? {} : { baseUrl: spec.baseURL },
+ 		auth: routeAuth(spec, catalog),
+ 		models: spec.models,
+-		api: factory()
++		api: {
++			stream: (model, context, options) => implementationFor(model).stream(model, context, options),
++			streamSimple: (model, context, options) => implementationFor(model).streamSimple(model, context, options)
++		}
+ 	});
+ }
+ //#endregion
+@@ -1033,6 +1045,7 @@
+ const reasoningEfforts = z.dict(z.union([z.string(), z.const(null)]), z.union(THINKING_LEVELS));
+ /** The fields a `models` entry and a `modelOverrides` value share; only the id's home differs. */
+ const modelFields = {
++	api: z.union(supportedProtocols()),
+ 	name: z.string(),
+ 	contextWindow: z.number().step(1).min(1),
+ 	maxTokens: z.number().step(1).min(1),
+@@ -1157,6 +1170,7 @@
+ 				...source.api === void 0 ? {} : { api: source.api },
+ 				...source.baseURL === void 0 ? {} : { baseURL: source.baseURL },
+ 				models: catalog.models,
++				apiOverrides: new Set([...(source.models ?? []).filter((entry) => entry.api !== void 0).map((entry) => entry.id), ...Object.entries(source.modelOverrides ?? {}).filter(([, entry]) => entry.api !== void 0).map(([id]) => id)]),
+ 				namesCredential: source.apiKeyEnv !== void 0
+ 			});
+ 		} catch (error) {

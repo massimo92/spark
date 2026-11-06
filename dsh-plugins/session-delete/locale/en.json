@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Delete",
+    "description": "Adds a Delete option to the three-dots menu of each session in the left sidebar: stops the session, removes it from its workspace, and deletes its persisted logs."
+  }
+}

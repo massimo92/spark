@@ -1,0 +1,6 @@
+# dsh-workflows: inserta la fila del plugin. La mitad host registra el canal
+# RPC /workflows y el motor de fases; la mitad cliente (lib/client.js) añade la
+# pestaña "Workflows" a la barra lateral derecha y la franja sobre el input.
+- insert:
+    - id: workflows
+      name: '@local/dsh-workflows'

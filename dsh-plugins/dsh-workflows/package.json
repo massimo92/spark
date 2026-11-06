@@ -1,0 +1,29 @@
+{
+  "name": "@local/dsh-workflows",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Workflows por fases para DSH: cada fase controla prompt, contexto inyectado, skills, modelo y esfuerzo. Se editan y ejecutan desde una pestaña de la barra lateral derecha del chat.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.js", "src", "lib/client.js", "cordis.patch.yml", "README.md"],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-input-trigger",
+        "@deepseek-ai/dsh-api-session-controller"
+      ]
+    }
+  }
+}

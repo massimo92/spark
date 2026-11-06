@@ -1,0 +1,28 @@
+{
+  "name": "@local/session-delete",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Adds a Delete option to the three-dots menu of each session in the left sidebar: stops the session's work, removes it from every workspace and deletes its persisted logs.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-workspace"]
+    }
+  }
+}
