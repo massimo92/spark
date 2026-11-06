@@ -133,8 +133,23 @@ docker restart "$(gateway_database_name)" >/dev/null
 gateway_database_prepare
 gateway_wait_ready
 gateway_virtual_validate "$client_token"
+# DSH reads the effective aliases through its own key and refreshes after a
+# successful gateway change. Its process and Tailscale are tested separately.
+(umask 077; mkdir -p "$DSH_DIR/state" "$DSH_DIR/secrets")
+printf '{"plugins":"none"}\n' > "$DSH_DIR/settings.json"
+dsh_ensure_key
+dsh_sync_catalog
+dsh_catalog_has() {
+  jq -e --arg model "$1" 'any(.[] | .config.providers.litellm.models[]?; .id == $model)' \
+    "$DSH_DIR/state/cordis.patch.yml" >/dev/null
+}
+dsh_catalog_has vllm/Test/Alpha
+dsh_catalog_has vllm/Test/Beta
+if dsh_catalog_has systemone/Test/Decision; then exit 1; fi
 list_managed_containers() { printf 'alpha\tTest/Alpha\t%s\n' "$alpha"; }
 gateway_sync
+dsh_catalog_has vllm/Test/Alpha
+if dsh_catalog_has vllm/Test/Beta; then exit 1; fi
 ! gateway_model_routed vllm Test/Beta
 ! gateway_model_routed systemone Test/Decision
 gateway_route_smoke vllm Test/Alpha

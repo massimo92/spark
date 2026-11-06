@@ -89,7 +89,7 @@ gateway_generate_litellm_yaml() {
   # vLLM — one explicit entry per running model (routes to its own port),
   # no wildcard that could resurrect a stopped local model.
   if [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]]; then
-    local primary_port="" primary_model="" main_match=0 name model port rest
+    local primary_port="" primary_model="" primary_info="{}" model_info main_match=0 name model port rest
     while IFS=$'\t' read -r name model port rest; do
       [[ -z "$model" ]] && continue
       if [[ "$(model_api_kind "$name")" == systemone ]]; then
@@ -101,24 +101,29 @@ gateway_generate_litellm_yaml() {
         has_models=1
         continue
       fi
+      model_info=$(gateway_vllm_model_info "$name" "$model") || return 1
       yaml+="
   - model_name: \"vllm/${model}\"
     litellm_params:
       model: \"openai/${model}\"
       api_base: \"http://localhost:${port}/v1\"
-      api_key: \"dummy\""
+      api_key: \"dummy\"
+    model_info: ${model_info}"
       has_models=1
       if [[ -z "$primary_port" ]]; then
         primary_port="$port"
         primary_model="$model"
+        primary_info="$model_info"
       fi
       if [[ "$port" == "$vllm_port" && "$main_match" == "0" ]]; then
         primary_port="$port"
         primary_model="$model"
+        primary_info="$model_info"
       fi
       if [[ "$main_provider" == "vllm" && "$model" == "$main_model" ]]; then
         primary_port="$port"
         primary_model="$model"
+        primary_info="$model_info"
         main_match=1
       fi
     done < <(list_managed_containers)
@@ -130,7 +135,8 @@ gateway_generate_litellm_yaml() {
     litellm_params:
       model: \"openai/${primary_model}\"
       api_base: \"http://localhost:${primary_port}/v1\"
-      api_key: \"dummy\""
+      api_key: \"dummy\"
+    model_info: ${primary_info}"
       main_added=1
     fi
 
@@ -153,15 +159,16 @@ gateway_generate_litellm_yaml() {
   if [[ "$(echo "$config" | jq -r '.providers.ollama.enabled // false')" == "true" ]]; then
     local ollama_host="localhost"
     [[ "$SPARK_OS" == "Darwin" ]] && ollama_host="host.docker.internal"
-    local ollama_model
+    local ollama_model ollama_info
     while IFS= read -r ollama_model; do
       [[ -n "$ollama_model" ]] || continue
+      ollama_info=$(gateway_ollama_model_info "$ollama_model") || return 1
       yaml+="
-  - $(jq -nc --arg name "ollama_chat/$ollama_model" --arg base "http://${ollama_host}:11434" '{model_name:$name,litellm_params:{model:$name,api_base:$base}}')"
+  - $(jq -nc --arg name "ollama_chat/$ollama_model" --arg base "http://${ollama_host}:11434" --argjson info "$ollama_info" '{model_name:$name,litellm_params:{model:$name,api_base:$base},model_info:$info}')"
       has_models=1
       if [[ "$main_added" == 0 && "$main_provider" == ollama && "$main_model" == "$ollama_model" ]]; then
         yaml+="
-  - $(jq -nc --arg model "ollama_chat/$ollama_model" --arg base "http://${ollama_host}:11434" '{model_name:"main",litellm_params:{model:$model,api_base:$base}}')"
+  - $(jq -nc --arg model "ollama_chat/$ollama_model" --arg base "http://${ollama_host}:11434" --argjson info "$ollama_info" '{model_name:"main",litellm_params:{model:$model,api_base:$base},model_info:$info}')"
         main_added=1
       fi
     done < <(printf '%s\n' "$config" | jq -r '.providers.ollama.models[]?')
@@ -189,15 +196,16 @@ gateway_generate_litellm_yaml() {
     has_models=1
   fi
 
-  local provider cloud_model mode params
+  local provider cloud_model mode params client_info
   for provider in openai anthropic xai chatgpt github_copilot; do
     [[ "$(printf '%s\n' "$config" | jq -r --arg p "$provider" '.providers[$p].enabled // false')" == true ]] || continue
     mode=$(printf '%s\n' "$config" | jq -r --arg p "$provider" '.providers[$p].auth // "api"')
     while IFS= read -r cloud_model; do
       [[ -n "$cloud_model" ]] || continue
       # JSON quoted scalars are valid YAML and prevent model names injecting settings.
-      params=$(jq -nc --arg name "$provider/$cloud_model" --arg mode "$mode" --arg p "$provider" \
-        '{model_name:$name,litellm_params:{model:$name}} |
+      client_info=$(gateway_model_client_info "$provider/$cloud_model") || return 1
+      params=$(jq -nc --argjson info "$client_info" --arg name "$provider/$cloud_model" --arg mode "$mode" --arg p "$provider" \
+        '{model_name:$name,litellm_params:{model:$name},model_info:$info} |
         if $mode == "oauth" and $p == "xai" then .litellm_params.use_xai_oauth=true
         elif $mode == "api" then .litellm_params.api_key=("os.environ/" + ($p|ascii_upcase) + "_API_KEY")
         else . end |

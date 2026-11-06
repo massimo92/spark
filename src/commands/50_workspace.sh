@@ -4981,7 +4981,7 @@ workspace_remote_persisted_task_manager() {
 workspace_setup_remote() {
   local spec="$1" check_only="$2" auto_yes="$3" requested_model="$4" requested_tail_mode="${5:-}"
   local task_manager="${6:-}" postgres_image="${7:-}" vikunja_image="${8:-}" n8n_image="${9:-}"
-  local super_productivity_image="${10:-}" supersync_image="${11:-}" funnel_action="${12:-}" args=()
+  local super_productivity_image="${10:-}" supersync_image="${11:-}" funnel_action="${12:-}" plugins="${13:-}" args=()
   args=(setup)
   [[ "$check_only" == "1" ]] && args+=(--check)
   [[ "$auto_yes" == "1" ]] && args+=(--yes)
@@ -4994,6 +4994,7 @@ workspace_setup_remote() {
   [[ -n "$super_productivity_image" ]] && args+=(--super-productivity-image "$super_productivity_image")
   [[ -n "$supersync_image" ]] && args+=(--supersync-image "$supersync_image")
   [[ -n "$funnel_action" ]] && args+=(--funnel-action "$funnel_action")
+  [[ -n "$plugins" ]] && args+=(--plugins "$plugins")
   workspace_remote_workspace_cmd "$spec" "${args[@]}"
 }
 
@@ -5003,11 +5004,17 @@ workspace_setup() {
   local postgres_image="" vikunja_image="" n8n_image="" super_productivity_image="" supersync_image="" model tailnet
   local vikunja_username="" vikunja_email="" vikunja_password="" vikunja_password_file=""
   local token="" n8n_email_arg="" n8n_password_arg="" n8n_password_file="" funnel_action=""
+  local requested_plugins="" dsh_plugins=""
   local existing_model="" existing_tail_mode="" effective_tail_mode="" env_tail_mode="" setup_overrides=0
   env_tail_mode="${SPARK_WORKSPACE_TAILSCALE_MODE:-}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --yes) auto_yes=1; shift ;;
+      --yes|-y) auto_yes=1; shift ;;
+      --plugins)
+        requested_plugins=${2:-}
+        dsh_plugin_selection "$requested_plugins" >/dev/null || die 'Use --plugins all, none, or comma-separated plugin names'
+        shift 2
+        ;;
       --check) check_only=1; shift ;;
       --model) requested_model="${2:-}"; [[ -n "$requested_model" ]] || die "--model requires a value"; shift 2 ;;
       --remote) remote_spec="${2:-}"; [[ -n "$remote_spec" ]] || die "--remote requires user@host"; shift 2 ;;
@@ -5075,6 +5082,9 @@ workspace_setup() {
   if workspace_task_manager_valid "$teardown_task_manager"; then
     teardown_task_manager_images=$(workspace_task_manager_teardown_images "$teardown_task_manager" 2>/dev/null || true)
   fi
+  if [[ -n "$requested_plugins" && "${requested_tail_mode:-$env_tail_mode}" == ports ]]; then
+    die '--plugins requires Tailscale Services mode'
+  fi
   if [[ "$task_manager" == "super-productivity" && ( "$requested_tail_mode" == "ports" || "$env_tail_mode" == "ports" ) ]]; then
     die "SuperSync requires HTTPS; --tailscale-mode ports is not supported" "Use Tailscale Services mode."
   fi
@@ -5091,6 +5101,11 @@ workspace_setup() {
   [[ -n "$supersync_image" ]] && workspace_validate_image_ref "SuperSync image" "$supersync_image"
   [[ -n "$n8n_image" ]] && workspace_validate_image_ref "n8n image" "$n8n_image"
   [[ -z "$remote_spec" ]] || {
+    if [[ "$check_only" != 1 && "${requested_tail_mode:-${env_tail_mode:-services}}" == services ]] &&
+       [[ -z "$requested_plugins" && "$auto_yes" != 1 ]] && is_interactive; then
+      # The remote setup reads its script from stdin. Prompt on the local TTY.
+      requested_plugins=$(dsh_select_plugins "" "$auto_yes" keep) || return 1
+    fi
     if [[ "$check_only" != "1" ]]; then
       [[ -n "$requested_model" ]] || die "--model is required with --remote ws setup"
       SPARK_WORKSPACE_VIKUNJA_USERNAME=$(workspace_prompt_username_choice SPARK_WORKSPACE_VIKUNJA_USERNAME "Workspace username" "$(whoami)")
@@ -5109,7 +5124,7 @@ workspace_setup() {
     fi
     workspace_setup_remote "$remote_spec" "$check_only" "$auto_yes" "$requested_model" \
       "$requested_tail_mode" "$task_manager" "$postgres_image" "$vikunja_image" "$n8n_image" \
-      "$super_productivity_image" "$supersync_image" "$funnel_action"
+      "$super_productivity_image" "$supersync_image" "$funnel_action" "$requested_plugins"
     return $?
   }
   if [[ -z "$requested_tail_mode" && -n "$env_tail_mode" ]]; then
@@ -5144,10 +5159,18 @@ workspace_setup() {
   if [[ -n "${SPARK_WORKSPACE_POSTGRES_IMAGE:-}" || -n "${SPARK_WORKSPACE_VIKUNJA_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPER_PRODUCTIVITY_ELECTRON_IMAGE:-}" || -n "${SPARK_WORKSPACE_SUPERSYNC_IMAGE:-}" || -n "${SPARK_WORKSPACE_N8N_IMAGE:-}" || -n "${SPARK_WORKSPACE_TAILSCALE_MODE:-}" ]]; then
     setup_overrides=1
   fi
+  if [[ "$check_only" != 1 && "$effective_tail_mode" == services ]]; then
+    if [[ "$SPARK_OS" == Linux ]]; then
+      dsh_plugins=$(dsh_select_plugins "$requested_plugins" "$auto_yes" "$(dsh_setting plugins || true)") || return 1
+    else
+      dsh_plugins="$requested_plugins"
+    fi
+  fi
   if [[ "$check_only" != "1" && "$setup_overrides" == "0" && -n "$existing_model" ]] && workspace_configured; then
     if workspace_doctor_passes_quiet "$existing_model"; then
       info "Workspace already configured"
-      return 0
+      dsh_workspace_setup "$effective_tail_mode" "$(workspace_tailnet_suffix || true)" "$dsh_plugins"
+      return $?
     fi
     local failed_ids
     failed_ids=$(workspace_doctor_failed_ids_quiet "$existing_model")
@@ -5188,6 +5211,9 @@ workspace_setup() {
   fi
   [[ "$check_only" == "1" ]] && workspace_configure_tailscale "$tailnet" "$check_only" "$funnel_action" "$auto_yes"
   if [[ "$check_only" == "1" ]]; then
+    if [[ "$SPARK_OS" == Linux && "$effective_tail_mode" == services ]] && ! dsh_configured; then
+      info "DeepSeek Harness will be installed during workspace setup"
+    fi
     if [[ -n "$model" ]]; then
       workspace_setup_hermes "$model" "$tailnet" "$check_only"
       SPARK_WORKSPACE_READ_ONLY=1 cmd_workspace_doctor --model "$model" || setup_fail "Workspace doctor reported issues"
@@ -5313,6 +5339,10 @@ workspace_setup() {
       workspace_tailscale_mark_error url-unreachable
       setup_fail "Tailscale workspace URLs are not reachable yet"
     fi
+  fi
+  if [[ "${#SETUP_FAILED[@]}" -eq 0 ]]; then
+    dsh_workspace_setup "$effective_tail_mode" "$tailnet" "$dsh_plugins" \
+      || setup_fail "Could not reconcile DeepSeek Harness"
   fi
   workspace_finalize_task_manager_teardown "$teardown_task_manager" "$task_manager" \
     || setup_fail "Could not remove the abandoned $(workspace_task_manager_label "$teardown_task_manager") services, images and data"
@@ -5558,6 +5588,9 @@ cmd_workspace_status() {
     return 1
   fi
   workspace_print_status_summary
+  if dsh_configured && [[ "$(workspace_read_env WORKSPACE_TAILSCALE_MODE || true)" == services ]]; then
+    workspace_print_service_row "$(dsh_status_state)" "DeepSeek Harness" "$(dsh_setting url)"
+  fi
   if [[ "$verbose" == "1" ]] && command -v nemohermes >/dev/null 2>&1; then
     printf "\n"
     workspace_print_verbose_hermes_status
@@ -5668,6 +5701,8 @@ workspace_start() {
     rc=1
   fi
 
+  dsh_workspace_start "$tailnet" || rc=1
+
   [[ "$rc" -eq 0 ]] && info "Workspace started" || err "Workspace started with errors; run spark ws doctor"
   printf "\n"
   return "$rc"
@@ -5698,6 +5733,7 @@ workspace_stop() {
   workspace_stop_hermes_dashboard_proxy
   info "Stopped Hermes dashboard proxy"
 
+  dsh_workspace_stop || rc=1
   gateway_stop || rc=1
 
   if [[ -n "$model" ]] && workspace_model_running "$model"; then
@@ -7768,6 +7804,10 @@ cmd_workspace_doctor() {
     workspace_doctor_check "Tailscale local config maps vikunja, n8n, hermes" workspace_tailscale_services_configured
   fi
   workspace_doctor_check "Tailscale mode is Services or ports" workspace_tailscale_services_mode
+  if dsh_configured && [[ "$(workspace_read_env WORKSPACE_TAILSCALE_MODE || true)" == services ]]; then
+    workspace_doctor_check "DSH runtime is running" dsh_running
+    workspace_doctor_check "DSH has a private Tailscale mapping" dsh_private_mapped
+  fi
   workspace_doctor_check "Tailscale workspace URLs respond" workspace_tailscale_https_urls_ready
 
   workspace_doctor_section "Inference & agent" "spark ws repair --yes"
@@ -8132,10 +8172,12 @@ cmd_workspace_setup_help() {
 
   ${BOLD}Flags:${NC}
     --check                     Read-only validation; no files, containers, or Funnel changes.
-    --yes                       Accept other safe defaults; task-manager selection is still required.
+    -y, --yes                   Accept other safe defaults; task-manager selection is still required.
     --remote user@host          Run setup on a configured remote host.
     --model MODEL               Hermes model; selected from spark list data when omitted.
     --task-manager NAME         vikunja, super-productivity, or todoist; required when non-interactive.
+    --plugins SELECTION         DSH plugins: all, none, or comma-separated names.
+                                chart, workflows, search-router, session-delete, protocols
     --tailscale-mode services   Prefer HTTPS names for local services; Todoist exposes n8n/hermes only.
     --tailscale-mode ports      Fallback: MagicDNS host + separate ports bound to Tailscale IP.
     --funnel-action reset       Reset active public Funnel and re-check before setup continues.
@@ -8168,7 +8210,7 @@ cmd_workspace_help() {
   ${BOLD}Usage:${NC} spark ws <command> [options]
 
   ${BOLD}Commands:${NC}
-    setup       Install/check the selected task manager + n8n + Hermes
+    setup       Install/check the task manager, n8n, Hermes, and DeepSeek Harness
     start       Start the configured workspace runtime
     stop        Stop the workspace runtime and preserve all data
     restart     Stop and start the configured workspace runtime
@@ -8178,6 +8220,7 @@ cmd_workspace_help() {
     containers  Show raw workspace container state
     logs        Follow task-manager, SuperSync/Electron, n8n, Postgres, Hermes, or gateway logs
     doctor      Read-only workspace check
+    dsh         Show DSH status or get a private sign-in link
     backup      Back up config, task-manager data, n8n, Hermes, and NemoClaw state
 
   Use ${BOLD}spark ws <command> --help${NC} on commands with options.
@@ -8188,6 +8231,7 @@ cmd_workspace_help() {
     --remote user@host          Run workspace setup on a configured remote host
     --model MODEL               Hermes model; must match spark list data
     --task-manager NAME         vikunja, super-productivity, or todoist
+    --plugins SELECTION         DSH plugins: all, none, or comma-separated names
     --tailscale-mode services|ports
                                 default = services; ports = MagicDNS + ports
     --funnel-action reset|abort Handle active Tailscale Funnel explicitly
@@ -8223,6 +8267,7 @@ cmd_workspace() {
     containers) cmd_workspace_containers "$@" ;;
     logs)   cmd_workspace_logs "$@" ;;
     doctor) cmd_workspace_doctor "$@" ;;
+    dsh) dsh_command "$@" ;;
     backup) cmd_workspace_backup "$@" ;;
     help|--help|-h|"") cmd_workspace_help ;;
     *) die "Unknown ws command: $subcmd" "Run 'spark ws help'" ;;

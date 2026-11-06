@@ -1247,8 +1247,9 @@ cmd_setup_help() {
 
   ${BOLD}Flags:${NC}
     --check                 Read-only validation. Does not install, write config, or reset Funnel.
-    --yes                   Accept safe defaults. Does not reset Funnel by itself.
+    -y, --yes               Accept safe defaults. Does not reset Funnel by itself.
     --full                  Set up model server + agent workspace.
+    --plugins SELECTION     Optional DSH plugins for --full: all, none, or comma-separated names.
     --model MODEL           Workspace/Hermes model. Required for remote --full unless --check.
     --tailscale-mode MODE   Workspace private access mode: default services; use ports to keep port URLs.
     --funnel-action reset   If Funnel is active, run 'tailscale funnel reset' and re-check.
@@ -1262,7 +1263,7 @@ EOF
 }
 
 cmd_setup_full_workspace() {
-  local auto_yes="$1" check_only="$2" funnel_action="$3" model="$4" tail_mode="$5" args=()
+  local auto_yes="$1" check_only="$2" funnel_action="$3" model="$4" tail_mode="$5" plugins="${6:-}" args=()
   printf "\n  ${BOLD}spark setup --full${NC} — agent workspace\n"
   if [[ "$SETUP_TARGET" == "remote" ]]; then
     if [[ "$check_only" != "1" && -z "$model" ]]; then
@@ -1276,16 +1277,22 @@ cmd_setup_full_workspace() {
   [[ -n "$model" ]] && args+=(--model "$model")
   [[ -n "$tail_mode" ]] && args+=(--tailscale-mode "$tail_mode")
   [[ -n "$funnel_action" ]] && args+=(--funnel-action "$funnel_action")
+  [[ -n "$plugins" ]] && args+=(--plugins "$plugins")
   workspace_setup "${args[@]}"
 }
 
 cmd_setup() {
-  local auto_yes=0 check_only=0 full=0 funnel_action="" full_model="" full_tail_mode="" setup_rc=0 workspace_rc=0
+  local auto_yes=0 check_only=0 full=0 funnel_action="" full_model="" full_tail_mode="" full_plugins="" setup_rc=0 workspace_rc=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --yes)     auto_yes=1; shift ;;
+      --yes|-y)  auto_yes=1; shift ;;
       --check)   check_only=1; shift ;;
       --full)    full=1; shift ;;
+      --plugins)
+        full_plugins=${2:-}
+        dsh_plugin_selection "$full_plugins" >/dev/null || die 'Use --plugins all, none, or comma-separated plugin names'
+        shift 2
+        ;;
       --model)   full_model="${2:-}"; [[ -n "$full_model" ]] || die "--model requires a value"; shift 2 ;;
       --tailscale-mode)
         full_tail_mode="${2:-}"
@@ -1306,6 +1313,8 @@ cmd_setup() {
     esac
   done
 
+  [[ -z "$full_plugins" || "$full" == 1 ]] || die '--plugins requires --full'
+
   SETUP_SKIPPED=()
   SETUP_FAILED=()
   SUDO_PW=""; SUDO_READY=0
@@ -1318,7 +1327,7 @@ cmd_setup() {
       printf "  ${YELLOW}Workspace setup skipped because base setup still has unresolved issue(s).${NC}\n\n"
       return "$setup_rc"
     fi
-    cmd_setup_full_workspace "$auto_yes" "$check_only" "$funnel_action" "$full_model" "$full_tail_mode" || workspace_rc=$?
+    cmd_setup_full_workspace "$auto_yes" "$check_only" "$funnel_action" "$full_model" "$full_tail_mode" "$full_plugins" || workspace_rc=$?
   fi
   [[ "$setup_rc" -ne 0 ]] && return "$setup_rc"
   return "$workspace_rc"

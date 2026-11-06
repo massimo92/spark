@@ -227,7 +227,11 @@ gateway_sync_locked() {
   previous_image=$(docker inspect "$GATEWAY_CONTAINER" --format '{{.Image}}' 2>/dev/null || true)
   if gateway_running_state; then
     running=1
-    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure && gateway_migration_cleanup; return $?; fi
+    if [[ "$previous" == "$yaml" ]] && gateway_api_ready; then
+      gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure && gateway_migration_cleanup || return 1
+      dsh_sync_after_gateway
+      return 0
+    fi
   fi
   tmp=$(umask 077; mktemp "${path}.tmp.XXXXXX") || return 1
   printf '%s\n' "$yaml" > "$tmp"
@@ -235,7 +239,11 @@ gateway_sync_locked() {
   if [[ "$running" == 1 ]]; then
     docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || return 1
   fi
-  if gateway_start_container && gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure; then gateway_migration_cleanup; return $?; fi
+  if gateway_start_container && gateway_wait_ready && gateway_sync_clients && gateway_virtual_ensure; then
+    gateway_migration_cleanup || return 1
+    dsh_sync_after_gateway
+    return 0
+  fi
   err 'Gateway update failed; restoring the previous rendered routes'
   docker stop "$GATEWAY_CONTAINER" >/dev/null 2>&1 || true
   # Never restore anonymous access during the first migration.

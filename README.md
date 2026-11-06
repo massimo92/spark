@@ -300,6 +300,34 @@ spark ws doctor
 spark ws backup
 ```
 
+In Tailscale Services mode, workspace setup also runs DeepSeek Harness (DSH)
+on the Linux host. Register `svc:dsh` with TCP 443 in the Tailscale Services
+console and approve the host. Grant access to the intended users in your
+tailnet policy. The DSH web server listens on loopback and uses its own browser
+authentication. Run `spark ws dsh login` on a private terminal to get the
+sign-in link. `spark ws dsh status` shows the stable URL.
+
+Spark configures DSH with a restricted LiteLLM key and refreshes its managed
+catalog when gateway routes change. LiteLLM publishes the effective vLLM
+context and known output limits, vision, tools and reasoning options. DSH
+groups routes by protocol and uses the server default for unverified reasoning
+levels. Session-log uploads to DeepSeek are disabled by default.
+
+```sh
+spark ws setup --plugins chart,workflows
+spark ws setup --yes --plugins all
+spark update --dsh
+```
+
+Optional plugins live under `dsh-plugins/`. Choose them during interactive
+setup or pass `--plugins all`, `--plugins none`, or a comma-separated list of
+`chart`, `workflows`, `search-router`, `session-delete`, and `protocols`.
+Without a terminal or with `--yes`, setup uses the saved selection or installs
+the base DSH profile on a new host. `protocols` combines the native Chat
+Completions and Responses providers under one LiteLLM provider. The workspace
+mounted for DSH is `~/.local/share/spark/workspace/dsh-files`.
+
+
 Choose explicitly for unattended setup:
 
 ```bash

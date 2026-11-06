@@ -1,0 +1,59 @@
+{
+  "name": "dsh-search-router",
+  "version": "0.3.1-dsh02.3",
+  "description": "Route DSH's native web_search tool to user-configurable search providers with sequential fallback. The plugin is a router, not a search engine.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": {
+      "default": "./src/index.js"
+    },
+    "./client": {
+      "default": "./src/client/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "web-search",
+    "search-router",
+    "exa",
+    "tavily",
+    "brave",
+    "perplexity",
+    "deepseek",
+    "searxng",
+    "duckduckgo",
+    "cordis"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-api-remotes"
+      ]
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-web": "~0.2.0-rc.2 || >=0.2.1-rc.1 <0.3.0"
+  }
+}

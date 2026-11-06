@@ -54,6 +54,7 @@ make_fake_bin() {
 #!/usr/bin/env bash
 set -euo pipefail
 args="$*"
+dsh_state="$HOME/.config/spark/workspace/dsh/state"
 case "${1:-}" in
   --version)
     echo "Docker version 29.4.3, build fake"
@@ -201,6 +202,11 @@ ${stdin_payload}"
     esac
     ;;
   run)
+    if [[ "$args" == *"--name spark-dsh "* ]]; then
+      printf 'true\n' >"$dsh_state/test-container"
+      printf 'dsh web: %s?token=test-token\n' "$(jq -r '.url' "$dsh_state/../settings.json")" >"$dsh_state/launch.log"
+      exit 0
+    fi
     # Capability/migration helpers are not model launch attempts or initializers.
     if [[ "$args" == *'from litellm.proxy._types import GenerateKeyRequest'* || "$args" == *'"prisma", "migrate", "deploy"'* ]]; then exit 0; fi
     if [[ "${FAKE_DOCKER_RUN_EXIT:-0}" == 0 ]]; then
@@ -232,6 +238,10 @@ ${stdin_payload}"
     exit "${FAKE_DOCKER_RUN_EXIT:-0}"
     ;;
   stop|rm|rename)
+    if [[ "${*: -1}" == spark-dsh ]]; then
+      if [[ "$1" == stop ]]; then printf 'false\n' >"$dsh_state/test-container"; else rm -f "$dsh_state/test-container"; fi
+      exit 0
+    fi
     if [[ "${FAKE_DOCKER_STOP_EXIT:-0}" == 0 && -f "$HOME/.config/spark/test-launched-models.tsv" ]]; then
       for name in "${@:2}"; do
         awk -F '\t' -v n="$name" '$1!=n' "$HOME/.config/spark/test-launched-models.tsv" > "$HOME/.config/spark/test-models.tmp"
@@ -243,6 +253,15 @@ ${stdin_payload}"
     exit "${FAKE_DOCKER_STOP_EXIT:-0}"
     ;;
   inspect)
+    if [[ "${*: -1}" == spark-dsh ]]; then
+      [[ -f "$dsh_state/test-container" ]] || exit 1
+      case "$args" in
+        *io.spark.dsh.owner*) printf '%s' "$HOME/.config/spark" | shasum -a 256 | awk '{print $1}' ;;
+        *State.Running*) cat "$dsh_state/test-container" ;;
+        *'{{.Image}}'*) printf 'sha256:test-dsh\n' ;;
+      esac
+      exit 0
+    fi
     if [[ "${2:-}" == spark-litellm-db ]]; then
       owner=$(printf '%s' "$HOME/.config/spark" | shasum -a 256 | awk '{print $1}')
       jq -nc --arg owner "$owner" '{Config:{Labels:{"io.spark.gateway-owner":$owner}},HostConfig:{NetworkMode:"none",PortBindings:{}},Mounts:[{Name:"spark-litellm-db-data",Destination:"/var/lib/postgresql/data"},{Name:"spark-litellm-db-socket",Destination:"/var/run/postgresql"}]}'
@@ -500,6 +519,7 @@ case "$args" in
     if [[ -n "${FAKE_LITELLM_SMOKE_JSON:-}" ]]; then printf '%s\n' "$FAKE_LITELLM_SMOKE_JSON";
     else printf '%s\n' '{"choices":[{"message":{"content":"ok"}}],"usage":{"completion_tokens":1}}'; fi
     exit 0 ;;
+  */model/info*) printf '%s\n' '{"data":[]}'; exit 0 ;;
   */v1/models*)
     if [[ "$args" == *":4000/v1/models"* && "$write_status" == 1 && ( "$stdin_payload" != *"Authorization: Bearer sk-"* || "$stdin_payload" == *"sk-invalid"* ) ]]; then printf 401; exit 0; fi
     ready="${FAKE_VLLM_READY:-1}"
@@ -827,9 +847,19 @@ case "${1:-}" in
     fi
     exit "${FAKE_TAILSCALE_STATUS_EXIT:-1}" ;;
   serve)
+    dsh_serve="$HOME/.config/spark/workspace/dsh/state/test-serve"
     if [[ "${2:-}" == "get-config" && "${3:-}" == "--all" ]]; then
-      echo "${FAKE_TAILSCALE_SERVE_CONFIG:-svc:tasks 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790}"
+      if [[ -f "$dsh_serve" ]]; then
+        config=${FAKE_TAILSCALE_SERVE_CONFIG:-'{"services":{"svc:tasks":{"endpoints":{"tcp:443":"http://127.0.0.1:3456"}},"svc:n8n":{"endpoints":{"tcp:443":"http://127.0.0.1:5678"}},"svc:hermes":{"endpoints":{"tcp:443":"http://127.0.0.1:18790"}}}}'}
+        printf '%s\n' "$config" | jq -c '.services["svc:dsh"].endpoints["tcp:443"]="https+insecure://127.0.0.1:3080"' 2>/dev/null ||
+          printf '%s\n' "$config"
+      else
+        echo "${FAKE_TAILSCALE_SERVE_CONFIG:-svc:tasks 127.0.0.1:3456\nsvc:n8n 127.0.0.1:5678\nsvc:hermes 127.0.0.1:18790}"
+      fi
       exit "${FAKE_TAILSCALE_GET_CONFIG_EXIT:-0}"
+    fi
+    if [[ "$*" == *"--service=svc:dsh"* && "${FAKE_TAILSCALE_SERVE_EXIT:-0}" == 0 ]]; then
+      if [[ "${*: -1}" == off ]]; then rm -f "$dsh_serve"; else : >"$dsh_serve"; fi
     fi
     [[ "${2:-}" == "status" ]] && exit 0
     [[ -n "${FAKE_TAILSCALE_SERVE_STDERR:-}" ]] && printf '%s\n' "${FAKE_TAILSCALE_SERVE_STDERR}" >&2
