@@ -139,6 +139,7 @@ dsh_render_patch() {
     def insert($id; $name): {insert:[{id:$id,name:$name}]};
     (enabled("protocols")) as $mixed |
     [
+      {id:"workspace-controller",config:{documentsDirectory:"/workspace"}},
       {id:"session-log-deepseek",config:{enabled:false}},
       {id:"llm-deepseek",disabled:true},
       {id:"llm-deepseek-account",disabled:true},

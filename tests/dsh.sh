@@ -46,6 +46,7 @@ gateway_curl() {
 patch="$DSH_DIR/state/cordis.patch.yml"
 dsh_sync_catalog
 jq -e '
+  any(.[]; .id == "workspace-controller" and .config.documentsDirectory == "/workspace") and
   any(.[]; .id == "session-log-deepseek" and .config.enabled == false) and
   (map(select(.id == "llm-pi-ai"))[0].config.providers |
     .litellm.models[0].contextWindow == 32768 and .litellm.models[0].maxTokens == 1024 and
