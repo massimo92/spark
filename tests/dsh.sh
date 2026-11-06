@@ -81,6 +81,24 @@ dsh_render_patch '{"data":[{"id":"main"},{"id":"vllm/example"},{"id":"chatgpt/fi
     .main == null and .["vllm/example"] == null and .["chatgpt/fixture"] == 128000' >/dev/null
 printf 'ok - DSH ignores synthesized output limits and leaves room for history\n'
 
+qwen_route="vllm/$FIXTURE_MODEL"
+alias_info=$(jq -nc --arg id "$qwen_route" --arg model "openai/$FIXTURE_MODEL" '
+  {data:(["main",$id] | map({model_name:.,litellm_params:{model:$model,api_base:"http://localhost:8012/v1"}}))}')
+alias_visible=$(jq -nc --arg id "$qwen_route" '{data:[{id:"main"},{id:$id}]}')
+dsh_render_patch "$alias_visible" "$alias_info" protocols http://127.0.0.1:4000/v1 |
+  jq -e --arg id "$qwen_route" '
+    [.[] | .insert[]? | select(.id=="llm-pi-ai-protocols") | .config.providers.litellm.models[] |
+      {id,name}] == [{id:$id,name:"Qwen 3.8 Flash Next"}] and
+    any(.[]; .id == "agent-default-model" and .config.model == $id)' >/dev/null
+dsh_render_patch '{"data":[{"id":"main"}]}' "$alias_info" none http://127.0.0.1:4000/v1 |
+  jq -e 'any(.[]; .id == "agent-default-model" and .config.model == "main")' >/dev/null
+other_backend=$(jq -c '.data[0].litellm_params.api_base = "http://localhost:8013/v1"' <<<"$alias_info")
+dsh_render_patch "$alias_visible" "$other_backend" none http://127.0.0.1:4000/v1 |
+  jq -e --arg id "$qwen_route" '
+    [.[] | select(.id=="llm-pi-ai") | .config.providers.litellm.models[].id] == ["main",$id] and
+    any(.[]; .id == "agent-default-model" and .config.model == "main")' >/dev/null
+printf 'ok - DSH names Qwen and hides main only when its equivalent named route is available\n'
+
 [[ "$(dsh_plugin_selection workflows,chart,chart)" == chart,workflows ]]
 if dsh_plugin_selection unknown; then exit 1; fi
 [[ "$(dsh_select_plugins '' 1)" == none ]]

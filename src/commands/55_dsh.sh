@@ -114,7 +114,14 @@ dsh_render_patch() {
       if . == "responses" then "openai-responses"
       elif . == "chat" or . == null then "openai-completions"
       else empty end;
+    def display_name($id; $model):
+      ($model.display_name | strings | select(length > 0)) //
+      (if $id == "vllm/Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid"
+       then "Qwen 3.8 Flash Next" else null end);
     .[0] as $visible | .[1] as $info |
+    def route_params($id):
+      [$info.data[] | select(.model_name == $id) | .litellm_params] |
+      if length == 1 then .[0] else null end;
     ($info.data | map(select(.model_name | type == "string") | {key:.model_name,value:(.model_info // {})}) |
       from_entries) as $catalog |
     [$visible.data[] | select((.id | type) == "string" and (.id | contains("*") | not)) |
@@ -123,12 +130,22 @@ dsh_render_patch() {
       ([$model.spark_context_window, $model.max_input_tokens] | map(positive) | first) as $context |
       (if $id == "main" or ($id | startswith("vllm/") or startswith("ollama_chat/"))
        then $model.spark_max_output_tokens else $model.max_output_tokens end) as $output |
-      {id:$id, api:$api, name:$model.display_name,
+      {id:$id, api:$api, name:display_name($id;$model),
        contextWindow:$context,
        maxTokens:([$output | positive | output_fits($context)] | first),
        input:(if $model.supports_vision == true then ["text","image"] else ["text"] end),
        reasoningEfforts:$model.spark_reasoning_efforts, compat:$model.spark_dsh_compat}
-      | with_entries(select(.value != null))] | unique_by(.id) as $models |
+      | with_entries(select(.value != null))] | unique_by(.id) as $visible_models |
+    # Hide the main alias only when its named local route is also visible
+    # and LiteLLM reports the same backend parameters for both routes.
+    route_params("main") as $main |
+    (if ($main.model | type) == "string" and ($main.api_base | type) == "string" then
+      ($main.model | if startswith("openai/") then sub("^openai/"; "vllm/") else . end) as $named |
+      if ($named | startswith("vllm/") or startswith("ollama_chat/")) and
+         route_params($named) == $main and any($visible_models[]; .id == $named)
+      then $named else "main" end
+    else "main" end) as $default |
+    ($visible_models | map(select(.id != "main" or $default == "main"))) as $models |
     def provider($name; $api; $entries):
       {displayName:$name, api:$api, baseURL:$url, apiKeyEnv:"LITELLM_API_KEY", models:$entries};
     def native($name; $api):
@@ -152,7 +169,7 @@ dsh_render_patch() {
         {id:"llm-pi-ai",config:{providers:(
           native("litellm";"openai-completions") + native("litellm-responses";"openai-responses"))}}
       end,
-      ((($models | map(select(.id == "main")) | first) // ($models | first)) |
+      ((($models | map(select(.id == $default)) | first) // ($models | first)) |
         if has("id") then
           {id:"agent-default-model",config:{model:.id,provider:(
             if $mixed or .api == "openai-completions" then "litellm"
