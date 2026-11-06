@@ -680,6 +680,7 @@ function resolveRouteModels(request, validation = "strict") {
 	assertOfferedCompatFields(provider, "route", request.compat);
 	const seen = /* @__PURE__ */ new Set();
 	const configuredMaxTokens = /* @__PURE__ */ new Map();
+	const configuredReasoning = /* @__PURE__ */ new Map();
 	const resolveEntry = (entry) => {
 		assertOfferedCompatFields(provider, `model "${entry.id}"`, entry.compat);
 		if (entry.id.length === 0) invalid(provider, "has a model with an empty id");
@@ -695,6 +696,7 @@ function resolveRouteModels(request, validation = "strict") {
 		const maxTokens = entry.maxTokens ?? base?.maxTokens ?? request.defaultMaxTokens;
 		if (!Number.isInteger(maxTokens) || maxTokens <= 0) invalid(provider, `model "${entry.id}" maxTokens must be a positive integer`);
 		if (entry.maxTokens !== void 0) configuredMaxTokens.set(entry.id, entry.maxTokens);
+		if (entry.defaultReasoningEffort !== void 0) configuredReasoning.set(entry.id, entry.defaultReasoningEffort);
 		return {
 			...base,
 			id: entry.id,
@@ -731,6 +733,7 @@ function resolveRouteModels(request, validation = "strict") {
 	return {
 		models: serviceableModels,
 		configuredMaxTokens,
+		configuredReasoning,
 		modelErrors
 	};
 }
@@ -1051,6 +1054,7 @@ const modelFields = {
 	maxTokens: z.number().step(1).min(1),
 	input: z.array(z.union(MODALITIES)),
 	reasoningEfforts: z.union([z.const(false), reasoningEfforts]),
+	defaultReasoningEffort: z.union(THINKING_LEVELS),
 	compat: compatProfile
 };
 const modelProfile = z.object({
@@ -1191,6 +1195,7 @@ function resolveProfiles(providers, validation = "strict") {
 			...rest.headers === void 0 ? {} : { headers: { ...rest.headers } },
 			...rest.thinkingBudgets === void 0 ? {} : { thinkingBudgets: { ...rest.thinkingBudgets } },
 			configuredMaxTokens: catalog?.configuredMaxTokens ?? /* @__PURE__ */ new Map(),
+			configuredReasoning: catalog?.configuredReasoning ?? /* @__PURE__ */ new Map(),
 			modelErrors: catalog?.modelErrors ?? /* @__PURE__ */ new Map(),
 			...piProvider === void 0 ? {} : { piProvider },
 			...catalogError === void 0 ? {} : { catalogError }
@@ -1925,7 +1930,7 @@ var PiAiAdapter = class extends LlmAdapter {
 	modelInfo(snapshot, provider, model) {
 		const profile = this.profileOf(snapshot, provider);
 		const resolvedModel = this.modelOf(snapshot, provider, model);
-		const defaultLevel = describableReasoningLevel(resolvedModel, profile.reasoning);
+		const defaultLevel = describableReasoningLevel(resolvedModel, profile.configuredReasoning.get(model) ?? profile.reasoning);
 		const configuredMaxTokens = profile.configuredMaxTokens.get(model);
 		return {
 			provider,
@@ -1964,7 +1969,8 @@ var PiAiAdapter = class extends LlmAdapter {
 				...options,
 				tools: [ANTHROPIC_TOOL_UPDATE_PLACEHOLDER, ...tools]
 			} : options;
-			const reasoning = resolveReasoningLevel(model, options.reasoningEffort ?? profile.reasoning);
+			const reasoning = resolveReasoningLevel(model,
+				options.reasoningEffort ?? profile.configuredReasoning.get(options.model) ?? profile.reasoning);
 			const apiKey = await this.config.resolveApiKey(options.provider, profile);
 			const consumer = new AbortController();
 			const upstream = options.signal === void 0 ? consumer.signal : AbortSignal.any([options.signal, consumer.signal]);

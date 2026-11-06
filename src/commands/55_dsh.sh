@@ -118,6 +118,10 @@ dsh_render_patch() {
       ($model.display_name | strings | select(length > 0)) //
       (if $id == "vllm/Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid"
        then "Qwen 3.8 Flash Next" else null end);
+    def default_effort:
+      .spark_reasoning_efforts as $levels |
+      .spark_default_reasoning_effort |
+      strings | select(. as $level | ($levels | type) == "object" and ($levels | has($level)));
     .[0] as $visible | .[1] as $info |
     def route_params($id):
       [$info.data[] | select(.model_name == $id) | .litellm_params] |
@@ -134,7 +138,8 @@ dsh_render_patch() {
        contextWindow:$context,
        maxTokens:([$output | positive | output_fits($context)] | first),
        input:(if $model.supports_vision == true then ["text","image"] else ["text"] end),
-       reasoningEfforts:$model.spark_reasoning_efforts, compat:$model.spark_dsh_compat}
+       reasoningEfforts:$model.spark_reasoning_efforts, defaultReasoningEffort:([$model | default_effort] | first),
+       compat:$model.spark_dsh_compat}
       | with_entries(select(.value != null))] | unique_by(.id) as $visible_models |
     # Hide the main alias only when its named local route is also visible
     # and LiteLLM reports the same backend parameters for both routes.
@@ -149,9 +154,12 @@ dsh_render_patch() {
     def provider($name; $api; $entries):
       {displayName:$name, api:$api, baseURL:$url, apiKeyEnv:"LITELLM_API_KEY", models:$entries};
     def native($name; $api):
-      [$models[] | select(.api == $api) | del(.api)] as $entries |
+      [$models[] | select(.api == $api)] as $entries |
+      ($entries | map(.defaultReasoningEffort) | unique) as $defaults |
       if ($entries | length) == 0 then {} else
-        {($name):provider(("LiteLLM " + (if $api == "openai-responses" then "Responses" else "Chat" end)); $api; $entries)}
+        {($name):(provider(("LiteLLM " + (if $api == "openai-responses" then "Responses" else "Chat" end));
+          $api; ($entries | map(del(.api,.defaultReasoningEffort)))) +
+          (if ($defaults | length) == 1 and $defaults[0] != null then {reasoning:$defaults[0]} else {} end))}
       end;
     def insert($id; $name): {insert:[{id:$id,name:$name}]};
     (enabled("protocols")) as $mixed |
@@ -171,9 +179,10 @@ dsh_render_patch() {
       end,
       ((($models | map(select(.id == $default)) | first) // ($models | first)) |
         if has("id") then
-          {id:"agent-default-model",config:{model:.id,provider:(
+          {id:"agent-default-model",config:({model:.id,provider:(
             if $mixed or .api == "openai-completions" then "litellm"
-            else "litellm-responses" end)}}
+            else "litellm-responses" end)} +
+            (if has("defaultReasoningEffort") then {reasoningEffort:.defaultReasoningEffort} else {} end))}
         else empty end)
     ] +
     [if enabled("chart") then insert("dsh-chart";"@local/dsh-chart") else empty end,

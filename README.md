@@ -319,9 +319,11 @@ stdin during remote setup and is used only for service registration.
 
 Spark configures DSH with a restricted LiteLLM key and refreshes its managed
 catalog when gateway routes change. LiteLLM publishes the effective vLLM
-context and known output limits, vision, tools and reasoning options. DSH
-groups routes by protocol and uses the server default for unverified reasoning
-levels. Session-log uploads to DeepSeek are disabled by default.
+context and known output limits, vision, tools and reasoning options. Spark
+probes the active vLLM chat template through its tokenizer to detect observable
+efforts and an identifiable default without generating a response. DSH uses
+the discovered default when available. Session-log uploads to DeepSeek are
+disabled by default.
 
 ```sh
 spark ws setup --plugins chart,workflows

@@ -5,7 +5,7 @@
 gateway_model_client_info() {
   case "$1" in
     vllm/Saren/Qwen3.8-Flash-Next-W4A16-AutoRound-hybrid)
-      printf '%s\n' '{"spark_reasoning_efforts":{"off":null,"low":"low","medium":"medium","xhigh":"xhigh"},"spark_dsh_compat":{"supportsDeveloperRole":false,"thinkingFormat":"chat-template","chatTemplateKwargs":{"enable_thinking":{"$var":"thinking.enabled"},"reasoning_effort":{"$var":"thinking.effort","omitWhenOff":true},"preserve_thinking":true}}}'
+      printf '%s\n' '{"spark_dsh_compat":{"supportsDeveloperRole":false,"chatTemplateKwargs":{"preserve_thinking":true}}}'
       ;;
     chatgpt/gpt-6-astra|chatgpt/gpt-6.1-sol|chatgpt/gpt-6-luna)
       local context=272000
@@ -16,15 +16,68 @@ gateway_model_client_info() {
   esac
 }
 
+gateway_vllm_template_tokens() {
+  local model="$1" port="$2" effort="$3" response status
+  response=$(jq -nc --arg model "$model" --arg effort "$effort" '
+    {model:$model,messages:[{role:"user",content:"OK"}],add_generation_prompt:true} +
+    (if $effort == "default" then {}
+     elif $effort == "off" then {chat_template_kwargs:{enable_thinking:false}}
+     else {chat_template_kwargs:({enable_thinking:true} +
+       (if $effort == "enabled" then {} else {reasoning_effort:$effort} end))}
+     end)' |
+    curl --noproxy '*' -sS --connect-timeout 1 --max-time 2 -w '\n%{http_code}' \
+      -H 'Content-Type: application/json' -d @- "http://127.0.0.1:$port/tokenize") || return 1
+  status="${response##*$'\n'}"
+  case "$status" in
+    200) jq -ce '.tokens | select(type == "array" and length > 0)' <<<"${response%$'\n'*}" ;;
+    400|422) printf 'null\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+gateway_vllm_template_reasoning() {
+  local model="$1" port="$2" effort tokens
+  [[ "$port" =~ ^[1-9][0-9]{0,4}$ && "$port" -le 65535 ]] || return 1
+  # An HTTP success is insufficient. Many templates silently ignore unknown
+  # kwargs or fall back to their default when given an unknown effort.
+  {
+    for effort in default enabled spark-unknown-effort off minimal low medium high xhigh max; do
+      tokens=$(gateway_vllm_template_tokens "$model" "$port" "$effort") || return 1
+      [[ "$effort" != default && "$effort" != enabled || "$tokens" != null ]] || return 1
+      jq -nc --arg effort "$effort" --argjson tokens "$tokens" '{key:$effort,value:$tokens}'
+    done
+  } | jq -sce '
+    select(length == 10) | from_entries as $probe |
+    [$probe | to_entries[] | select(.key | IN("minimal","low","medium","high","xhigh","max")) |
+      select(.value != null and .value != $probe["spark-unknown-effort"])] as $positive |
+    ($positive | group_by(.value) | map(select(length == 1) | first)) as $distinct |
+    (if $probe.off != null and $probe.off != $probe.enabled and
+        all($positive[]; .value != $probe.off) then [{key:"off",value:$probe.off}] else [] end
+    ) as $off |
+    ($distinct + $off) as $efforts |
+    select(($distinct | length) > 0 and ($efforts | length) > 1) |
+    [$efforts[] | select(.value == $probe.default) | .key] as $defaults |
+    {spark_reasoning_efforts:($efforts | map({key,value:(if .key == "off" then null else .key end)}) | from_entries),
+     spark_dsh_compat:{supportsDeveloperRole:false,thinkingFormat:"chat-template",
+       chatTemplateKwargs:{enable_thinking:{"$var":"thinking.enabled"},
+         reasoning_effort:{"$var":"thinking.effort",omitWhenOff:true}}}} +
+    (if ($defaults | length) == 1 then {spark_default_reasoning_effort:$defaults[0]} else {} end)
+  ' 2>/dev/null
+}
+
 gateway_vllm_model_info() {
-  local container="$1" model="$2" runtime profile known artifact
+  local container="$1" model="$2" port="${3:-}" runtime profile known artifact detected='{}'
   runtime=$(docker inspect --format '{{json .Config}}' "$container" 2>/dev/null || true)
   known=$(gateway_model_client_info "vllm/$model") || return 1
+  if [[ -n "$port" ]] && jq -e 'any(.Cmd[]?; . == "--reasoning-parser" or startswith("--reasoning-parser="))' \
+    <<<"$runtime" >/dev/null 2>&1; then
+    detected=$(gateway_vllm_template_reasoning "$model" "$port" 2>/dev/null) || detected='{}'
+  fi
   artifact=$(jq -r '.Labels["spark.bundle.artifact"] // empty' <<<"$runtime" 2>/dev/null || true)
   [[ "$artifact" =~ ^[a-zA-Z0-9._-]+$ ]] || artifact=""
   profile=$(BUNDLE_ARTIFACT_KEY="$artifact" profile_file_for "$model")
   profile=$(jq -ce 'select(type == "object")' "$profile" 2>/dev/null || printf '{}')
-  printf '%s\n' "$runtime" | jq -c --argjson profile "$profile" --argjson known "$known" '
+  printf '%s\n' "$runtime" | jq -c --argjson profile "$profile" --argjson known "$known" --argjson detected "$detected" '
     def value($flag):
       . as $args | [range(0; length) as $i |
         if $args[$i] == $flag then $args[$i+1]
@@ -60,12 +113,12 @@ gateway_vllm_model_info() {
          elif . == "false" then false else . end) end),
      supports_function_calling:(($args | index("--enable-auto-tool-choice")) != null and
        ($args | value("--tool-call-parser")) != null)}
-    + ($known | if $parser == null then del(.spark_reasoning_efforts) else . end)
-    + (if ($efforts | type) == "object" and $parser != null and ($known | has("spark_reasoning_efforts") | not)
+    + (if ($efforts | type) == "object" and $parser != null and ($detected | length) == 0
        then ($efforts | keys | map(select(test("^(minimal|low|medium|high|xhigh|max)$"))) |
          map({key:.,value:.}) | from_entries |
          if length > 0 then {spark_reasoning_efforts:.} else {} end)
        else {} end)
+    + (if ($detected | length) > 0 then $known * $detected else {} end)
     | with_entries(select(.value != null))
   ' 2>/dev/null | awk 'NF { print; found=1 } END { if (!found) print "{\"mode\":\"chat\"}" }'
 }

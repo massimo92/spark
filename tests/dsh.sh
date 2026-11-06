@@ -16,6 +16,17 @@ gateway_load_config() {
 }
 list_managed_containers() { printf 'fixture\t%s\t8012\n' "$FIXTURE_MODEL"; }
 model_api_kind() { printf 'chat\n'; }
+gateway_vllm_template_tokens() {
+  [[ "$2" == 8012 ]] || return 1
+  if [[ "${ignore_effort:-0}" == 1 ]]; then printf '[5]\n'; return; fi
+  case "$3" in
+    off) printf '[1]\n' ;;
+    low) printf '[2]\n' ;;
+    medium) printf '[3]\n' ;;
+    default|enabled|xhigh) printf '[4]\n' ;;
+    *) printf 'null\n' ;;
+  esac
+}
 docker() {
   jq -nc --arg length "$length" '
     {Cmd:["--max-model-len="+$length,"--reasoning-parser","qwen3","--enable-auto-tool-choice",
@@ -28,7 +39,13 @@ yaml=$(gateway_generate_litellm_yaml)
 primary=$(printf '%s\n' "$yaml" | sed -n 's/^    model_info: //p' | jq -cs 'select(length == 2 and .[0] == .[1]) | .[0]')
 jq -e '.spark_context_window == 32768 and .max_input_tokens == 32768 and .max_output_tokens == 1024
   and .spark_max_output_tokens == 1024
-  and .supports_vision == false and .supports_function_calling == true and .spark_reasoning_efforts.xhigh == "xhigh"'   <<<"$primary" >/dev/null
+  and .supports_vision == false and .supports_function_calling == true
+  and .spark_reasoning_efforts == {off:null,low:"low",medium:"medium",xhigh:"xhigh"}
+  and .spark_default_reasoning_effort == "xhigh"
+  and .spark_dsh_compat.chatTemplateKwargs.preserve_thinking == true' <<<"$primary" >/dev/null
+ignore_effort=1
+if gateway_vllm_template_reasoning "$FIXTURE_MODEL" 8012; then exit 1; fi
+ignore_effort=0
 printf 'ok - gateway publishes the effective runtime limits and capabilities for vLLM and main\n'
 
 mkdir -p "$DSH_DIR/state" "$DSH_DIR/secrets"
@@ -38,7 +55,7 @@ FIXTURE_VISIBLE=$(jq -nc --arg model "vllm/$FIXTURE_MODEL" '{data:[{id:$model},{
 curl() { cat >/dev/null; printf '%s\n' "$FIXTURE_VISIBLE"; }
 gateway_curl() {
   [[ "${fail_metadata:-0}" == 0 ]] || return 1
-  jq -nc --arg name "vllm/$FIXTURE_MODEL" --argjson info "$(gateway_vllm_model_info fixture "$FIXTURE_MODEL")" '
+  jq -nc --arg name "vllm/$FIXTURE_MODEL" --argjson info "$(gateway_vllm_model_info fixture "$FIXTURE_MODEL" 8012)" '
     {data:[{model_name:$name,model_info:$info},
       {model_name:"chatgpt/fixture",model_info:{mode:"responses",max_input_tokens:200000,supports_vision:true}},
       {model_name:"systemone/fixture",model_info:{mode:"decisions"}}]}'
@@ -49,6 +66,8 @@ jq -e '
   any(.[]; .id == "workspace-controller" and .config.documentsDirectory == "/workspace") and
   any(.[]; .id == "session-log-deepseek" and .config.enabled == false) and
   (map(select(.id == "llm-pi-ai"))[0].config.providers |
+    .litellm.reasoning == "xhigh" and
+    .["litellm-responses"].reasoning == null and
     .litellm.models[0].contextWindow == 32768 and .litellm.models[0].maxTokens == 1024 and
     .litellm.models[0].input == ["text"] and
     .litellm.models[0].reasoningEfforts.xhigh == "xhigh" and
@@ -83,13 +102,14 @@ printf 'ok - DSH ignores synthesized output limits and leaves room for history\n
 
 qwen_route="vllm/$FIXTURE_MODEL"
 alias_info=$(jq -nc --arg id "$qwen_route" --arg model "openai/$FIXTURE_MODEL" '
-  {data:(["main",$id] | map({model_name:.,litellm_params:{model:$model,api_base:"http://localhost:8012/v1"}}))}')
+  {data:(["main",$id] | map({model_name:.,litellm_params:{model:$model,api_base:"http://localhost:8012/v1"},
+    model_info:{spark_reasoning_efforts:{xhigh:"xhigh"},spark_default_reasoning_effort:"xhigh"}}))}')
 alias_visible=$(jq -nc --arg id "$qwen_route" '{data:[{id:"main"},{id:$id}]}')
 dsh_render_patch "$alias_visible" "$alias_info" protocols http://127.0.0.1:4000/v1 |
   jq -e --arg id "$qwen_route" '
     [.[] | .insert[]? | select(.id=="llm-pi-ai-protocols") | .config.providers.litellm.models[] |
-      {id,name}] == [{id:$id,name:"Qwen 3.8 Flash Next"}] and
-    any(.[]; .id == "agent-default-model" and .config.model == $id)' >/dev/null
+      {id,name,defaultReasoningEffort}] == [{id:$id,name:"Qwen 3.8 Flash Next",defaultReasoningEffort:"xhigh"}] and
+    any(.[]; .id == "agent-default-model" and .config.model == $id and .config.reasoningEffort == "xhigh")' >/dev/null
 dsh_render_patch '{"data":[{"id":"main"}]}' "$alias_info" none http://127.0.0.1:4000/v1 |
   jq -e 'any(.[]; .id == "agent-default-model" and .config.model == "main")' >/dev/null
 other_backend=$(jq -c '.data[0].litellm_params.api_base = "http://localhost:8013/v1"' <<<"$alias_info")

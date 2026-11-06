@@ -101,7 +101,7 @@ gateway_generate_litellm_yaml() {
         has_models=1
         continue
       fi
-      model_info=$(gateway_vllm_model_info "$name" "$model") || return 1
+      model_info=$(gateway_vllm_model_info "$name" "$model" "$port") || return 1
       yaml+="
   - model_name: \"vllm/${model}\"
     litellm_params:
