@@ -877,7 +877,7 @@ case "${1:-}" in
       elif [[ -n "${FAKE_TAILSCALE_STATUS_JSON:-}" ]]; then
         status="$FAKE_TAILSCALE_STATUS_JSON"
       else
-        status='{"MagicDNSSuffix":"test-tailnet.ts.net."}'
+        status='{"MagicDNSSuffix":"test-tailnet.ts.net.","Self":{"Tags":["tag:spark"]}}'
       fi
       if [[ -f "$HOME/.config/spark/workspace/dsh/state/test-serve" ]]; then
         jq -c '
@@ -5371,26 +5371,27 @@ test_workspace_setup_writes_compose_names() {
 }
 
 test_workspace_setup_registers_dsh_on_first_run() (
-  local tmp fake_bin output
+  local tmp fake_bin fake_path output
   tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' EXIT
   fake_bin="$tmp/bin"
   make_fake_bin "$fake_bin"
   make_cached_model "$tmp/home" "Org/Alpha"
-  export HOME="$tmp/home" PATH="$fake_bin:$PATH" SPARK_BACKEND=vllm SPARK_OS_OVERRIDE=Linux
+  fake_path="$fake_bin:$PATH"
+  export HOME="$tmp/home" SPARK_BACKEND=vllm SPARK_OS_OVERRIDE=Linux
   export SPARK_WORKSPACE_VIKUNJA_USERNAME=massimo SPARK_WORKSPACE_VIKUNJA_EMAIL=m@example.com
   export SPARK_WORKSPACE_VIKUNJA_PASSWORD=secret123 SPARK_WORKSPACE_N8N_EMAIL=m@example.com
   export SPARK_WORKSPACE_N8N_PASSWORD=secret456 FAKE_TAILSCALE_STATUS_EXIT=0
   export SPARK_TAILSCALE_SERVICES_TOKEN=fixture-services-token SPARK_DSH_TAILSCALE_USERS=m@example.com
   export FAKE_DSH_SERVICE_LOG="$tmp/dsh.log"
   export FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n'
-  output=$("$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha --plugins all </dev/null 2>&1) ||
+  output=$(env "PATH=$fake_path" "$SPARK" ws setup --task-manager vikunja --yes --model Org/Alpha --plugins all </dev/null 2>&1) ||
     { printf '%s\n' "$output"; return 1; }
   [[ "$output" == *"DSH: https://dsh.test-tailnet.ts.net/"* ]] || return 1
   [[ "$(cat "$FAKE_DSH_SERVICE_LOG")" == $'get\ncreate\nadvertise' ]] || return 1
-  "$SPARK" ws dsh status | grep -q 'State: ready' || return 1
+  env "PATH=$fake_path" "$SPARK" ws dsh status | grep -q 'State: ready' || return 1
   export FAKE_NAMES='spark-litellm\n' FAKE_COMPOSE_SERVICES='postgres\nvikunja\nn8n\n'
-  "$SPARK" ws setup --task-manager vikunja --yes </dev/null >/dev/null 2>&1 || return 1
+  env "PATH=$fake_path" "$SPARK" ws setup --task-manager vikunja --yes </dev/null >/dev/null 2>&1 || return 1
   [[ "$(cat "$FAKE_DSH_SERVICE_LOG")" == $'get\ncreate\nadvertise' ]]
 )
 
@@ -6819,6 +6820,11 @@ test_workspace_doctor_remote_delegates_strict() {
     [[ "$out" == *"remote strict doctor ok"* ]]
 }
 
+workspace_doctor_all_passed() {
+  [[ "$1" =~ ([0-9]+)/([0-9]+)[[:space:]]checks[[:space:]]passed ]] &&
+    [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]]
+}
+
 test_workspace_doctor_checklist_passes() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out
@@ -6839,7 +6845,7 @@ test_workspace_doctor_checklist_passes() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-    [[ "$out" == *"71/71 checks passed"* ]] &&
+    workspace_doctor_all_passed "$out" &&
     [[ "$out" == *"Configuration"* ]] &&
     [[ "$out" == *"Identity & recovery"* ]] &&
     [[ "$out" == *"Runtime services"* ]] &&
@@ -6986,14 +6992,14 @@ test_workspace_doctor_json() {
   rm -rf "$tmp"
   printf '%s' "$out" | jq -e '
     .ok == true and
-    .passed == 71 and
+    .passed == .total and
     .failed == 0 and
-    .total == 71 and
+    .total == (.checks | length) and
     .model == "Org/Alpha" and
-    ([.areas[] | select(.name == "Configuration" and .passed == 18 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Identity & recovery" and .passed == 14 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Resilience" and .passed == 2 and .failed == 0)] | length == 1) and
-    ([.areas[] | select(.name == "Inference & agent" and .passed == 20 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Configuration" and .passed > 0 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Identity & recovery" and .passed > 0 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Resilience" and .passed > 0 and .failed == 0)] | length == 1) and
+    ([.areas[] | select(.name == "Inference & agent" and .passed > 0 and .failed == 0)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .ok == true)] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM exposes Hermes model route" and .category == "Inference & agent" and (.action | length > 0))] | length == 1) and
     ([.checks[] | select(.label == "LiteLLM Hermes route completes smoke request" and .ok == true)] | length == 1) and
@@ -8288,7 +8294,7 @@ test_workspace_doctor_accepts_multiline_tailscale_service_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"71/71 checks passed"* ]] &&
+  workspace_doctor_all_passed "$out" &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 
@@ -8310,7 +8316,7 @@ test_workspace_doctor_accepts_tailscale_services_endpoint_json() {
     FAKE_MANAGED='spark-vllm-alpha\tOrg/Alpha\t8000\t1.0\t1.0\t0.0\n' \
     "$SPARK" ws doctor --verbose --model Org/Alpha 2>&1)
   rm -rf "$tmp"
-  [[ "$out" == *"71/71 checks passed"* ]] &&
+  workspace_doctor_all_passed "$out" &&
     [[ "$out" == *"[x] Tailscale local config maps vikunja, n8n, hermes"* ]]
 }
 

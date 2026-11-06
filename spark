@@ -19023,7 +19023,9 @@ gateway_ollama_model_info() {
   details=$(jq -nc --arg model "$model" '{model:$model}' |
     curl -fsS --max-time 2 -H 'Content-Type: application/json' -d @- \
       http://127.0.0.1:11434/api/show 2>/dev/null || printf '{}')
-  jq -nc --arg model "$model" --argjson runtime "$runtime" --argjson details "$details" '
+  jq -nc --arg model "$model" --arg runtime "$runtime" --arg details "$details" '
+    (($runtime | fromjson? | objects) // {}) as $runtime |
+    (($details | fromjson? | objects) // {}) as $details |
     ($runtime.models // [] | map(select(.name == $model or .name == ($model + ":latest"))) |
       first | .context_length | select(type == "number" and . > 0)) as $context |
     {mode:"chat",spark_context_window:$context,max_input_tokens:$context}
