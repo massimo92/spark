@@ -72,6 +72,11 @@ when explicitly selected with `--main`; stopping that model does not silently
 redirect `main`. New vLLM launches bind localhost. Benchmarks use local backend
 ports. `--dry-run` changes no services.
 
+New vLLM model containers use Docker's `unless-stopped` restart policy, including
+aliases and bundles. They restart after a host reboot or process failure; models
+you explicitly stop stay stopped. Existing containers pick up this policy when
+recreated with `spark run`.
+
 ## Gateway credentials and providers
 
 ```bash

@@ -1617,6 +1617,7 @@ build_launch() {
       'BEGIN{ printf "%d", m + (s>0 ? s : 0)*1024 }')
   fi
   docker_cmd=(docker run -d
+    --restart unless-stopped
     --gpus all
     --network host
     --ipc=host
@@ -1689,6 +1690,8 @@ await_startup() {
     if [[ -n "$st" && "$st" != "running" && "$st" != "created" ]]; then
       oom=$(docker inspect -f '{{.State.OOMKilled}}' "$cname" 2>/dev/null || echo "false")
       logs=$(docker logs --tail 80 "$cname" 2>&1 || true)
+      # Let Spark handle startup failures without Docker racing its adaptive retry.
+      [[ "$st" != "restarting" ]] || docker stop "$cname" >/dev/null 2>&1 || true
       [[ "$oom" == "true" ]] && { printf 'exit:oom\n'; return 0; }
       if grep -qiE 'No available memory for (the )?cache blocks|Available KV cache memory:[[:space:]]*-' <<< "$logs"; then
         printf 'exit:kv-memory\n'; return 0

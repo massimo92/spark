@@ -283,7 +283,7 @@ ${stdin_payload}"
       *State.Running*) echo "${FAKE_STATE_RUNNING:-true}" ;;
       *State.StartedAt*) echo "${FAKE_STARTED_AT:-}" ;;
       *State.Status*)
-        if [[ -n "${FAKE_RETRY:-}" && "${_att}" -le 1 ]]; then echo "exited"
+        if [[ -n "${FAKE_RETRY:-}" && "${_att}" -le 1 ]]; then echo "restarting"
         else echo "${FAKE_STATE_STATUS:-running}"; fi ;;
       *State.OOMKilled*)
         if [[ "${FAKE_RETRY:-}" == "oom" && "${_att}" -le 1 ]]; then echo "true"
@@ -2538,6 +2538,7 @@ EOF
 
   [[ "$status" -eq 0 ]] &&
     [[ "$output" == *"docker run"* ]] &&
+    [[ "$output" == *"--restart unless-stopped"* ]] &&
     [[ "$output" == *"--max-model-len 32768"* ]] &&
     [[ "$marker_missing" -eq 1 ]]
 }
@@ -2868,6 +2869,7 @@ test_alias_capture_replays_image_env_and_operational_overrides() {
   [[ "$out" == *"VLLM_MARLIN_USE_ATOMIC_ADD=1"* ]] || ok=1
   [[ "$out" == *"--port 8001"* && "$out" != *"--port 8000"* && "$out" != *"--port=9000"* ]] || ok=1
   [[ "$out" == *"--label spark.managed=1"* ]] || ok=1
+  [[ "$out" == *"--restart unless-stopped"* ]] || ok=1
   [[ "$out" == *"--memory "* && "$out" == *"--memory-swap "* ]] || ok=1
   [[ "$out" == *"--network host"* && "$out" == *"--ipc=host"* ]] || ok=1
   [[ ! -s "$stop_file" && ! -s "$run_file" ]] || ok=1
@@ -3510,6 +3512,7 @@ test_bundle_run_resolves_defaults_and_dynamic_options() {
   [[ "$output" == *"VLLM_DFLASH2_LOOKUP=0"* ]] || ok=1
   [[ "$output" == *"--disable-log-stats"* ]] || ok=1
   [[ "$output" == *"spark.bundle.name=qwen38-dflash2-lookup"* ]] || ok=1
+  [[ "$output" == *"--restart unless-stopped"* ]] || ok=1
   [[ "$output" != *"VLLM_SPEC_DECODE_ATTN"* ]] || ok=1
   unbuilt_output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
     FAKE_DOCKER_IMAGE_EXISTS=0 "$SPARK" run qwen38-dflash2-lookup --dry-run 2>&1) || ok=1
@@ -9170,6 +9173,7 @@ test_startup_retry_mamba() {
   local nruns; nruns=$(grep -c '^run .*--label spark.managed=1' "${tmp}/d.txt" 2>/dev/null || echo 0)
   rm -rf "$tmp"
   [[ "$nruns" -eq 2 ]] && [[ "$last" == *"--max-num-seqs 2"* ]] &&
+    [[ "$last" == *"--restart unless-stopped"* ]] &&
     [[ "$out" == *"retrying with --max-num-seqs 2"* ]] && [[ "$out" == *"backend ready"* ]]
 }
 
@@ -9224,6 +9228,27 @@ test_startup_unrecoverable_aborts() {
   nruns=$(grep -c '^run .*--label spark.managed=1' "${tmp}/d.txt" 2>/dev/null || echo 0)
   rm -rf "$tmp"
   [[ "$nruns" -eq 1 ]] && [[ "$out" == *"failed to start"* ]]
+}
+
+test_startup_unrecoverable_stops_restart_loop() {
+  local tmp out status=0
+  tmp=$(mktemp -d)
+  out=$(STOP_LOG="${tmp}/stopped" bash -c '
+    source "$1"
+    docker() {
+      case "$*" in
+        *State.Status*) printf "restarting\n" ;;
+        *State.OOMKilled*) printf "false\n" ;;
+        logs*) printf "RuntimeError: unrelated fatal error\n" ;;
+        stop*) printf "%s\n" "$2" > "$STOP_LOG" ;;
+        *) return 1 ;;
+      esac
+    }
+    if await_startup spark-vllm-broken 8000 3; then :; else exit 1; fi
+  ' _ "$SPARK") || status=$?
+  [[ "$out" == "exit:other" && "$(cat "${tmp}/stopped" 2>/dev/null)" == "spark-vllm-broken" ]] || status=1
+  rm -rf "$tmp"
+  return "$status"
 }
 
 # --no-wait launches and returns without supervising.
@@ -10586,6 +10611,7 @@ test_stop_ollama_unloads() {
 }
 
 run_test "architecture command maps core boundaries" test_architecture_command_maps_core_boundaries
+run_test "failed startup stops Docker restart loop" test_startup_unrecoverable_stops_restart_loop
 run_test "benchmark auto-selects one running model" test_benchmark_auto_selects_single_model
 run_test "memory utilization accepts legacy leading decimal" test_mem_util_accepts_leading_decimal_point
 run_test "benchmark requires --model without a TTY" test_benchmark_requires_model_when_noninteractive
