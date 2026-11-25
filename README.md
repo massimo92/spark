@@ -258,7 +258,8 @@ also run `access probe URL allowed|denied`;
 an allowed probe reads `SPARK_GATEWAY_TOKEN_FILE` (a private env file), while an
 unreachable denied probe alone does not establish that the policy caused denial.
 
-On the node hostname, HTTPS/443 points only to LiteLLM. Spark can replace a root
+On the node hostname, HTTPS/443 points only to LiteLLM, plus the optional
+read-only metrics path `/spark` (see below). Spark can replace a root
 Serve handler targeting a known Spark backend, then retire legacy gateway/backend
 Serve ports on that hostname. It refuses unrelated services or extra handlers;
 service virtual hosts such as Hermes/n8n remain untouched. Funnel must be disabled.
@@ -269,6 +270,64 @@ restart existing models through their aliases to replace public listeners.
 `spark doctor` reports detected direct model listeners/Serve routes, authentication
 failures and pending policy verification. Existing clients using backend URLs must
 change URLs themselves.
+
+## Metrics endpoint
+
+Tailnet clients (for example a benchmark plugin on a laptop) can read every
+running instance and its vLLM metrics from one URL, without reaching the
+loopback-only vLLM ports:
+
+```bash
+spark metrics start          # install systemd unit (sudo) + publish Serve path /spark
+spark metrics status         # service health and tailnet URL (--json available)
+spark metrics stop           # remove the Serve path and the unit
+curl https://<node>.<tailnet>.ts.net/spark/metrics
+```
+
+`start` writes a python3 stdlib server to `~/.config/spark/metrics/` and runs it
+as `spark-metrics.service` (your user, `Restart=always`, enabled at boot), bound
+to `127.0.0.1:8791`. It then runs `tailscale serve --https=443 --set-path /spark`
+on the node hostname next to LiteLLM, so clients already granted TCP/443 need no
+new Tailscale Service or policy. `--local` skips publishing. Rerun `start` after
+updating Spark when `spark doctor` reports the server script as outdated.
+
+| Route | Returns |
+|---|---|
+| `GET /spark/metrics` | host memory (`/proc/meminfo`) and every instance |
+| `GET /spark/metrics/<instance>` | one instance (404 if unknown) |
+| `GET /spark/metrics/<instance>/raw` | that instance's raw Prometheus text |
+| `GET /spark/health` | `{"ok":true}` |
+
+Each request runs `spark status --json` again, so `spark run`/`stop` show up
+immediately, then reads each vLLM `/metrics` in parallel (2 s timeout). An
+instance that cannot be read gets an `error` field; System One instances are
+listed with `metrics_skipped`. Counters are cumulative since the instance
+started: diff two snapshots to measure one run.
+
+```json
+{"schema":1,"generated_at":"2026-11-25T15:10:02.120Z",
+ "host":{"mem_total_gb":121.63,"mem_used_gb":38.2,"mem_available_gb":83.43,"swap_used_gb":0.0},
+ "instances":[{"instance":"demo-9b-mtp","container":"spark-vllm-demo-9b-mtp","config":"c5 · 16k · mtp2",
+   "api":"chat","state":"ready","endpoint":"http://localhost:8003/v1","gateway_model":"vllm/demo-9b-mtp",
+   "reserved_gb":19.4,"live_gb":6.7,"engine_memory":{"kv_gib":1.36,"kv_tokens":27433},"metrics_port":8003,
+   "vllm":{"kv_cache_usage_perc":0,"num_requests_running":0,"num_requests_waiting":0,
+     "cache_config":{"block_size":16,"num_gpu_blocks":72,"cache_dtype":"auto"},
+     "prompt_tokens_total":48,"generation_tokens_total":385,
+     "prefix_cache_hits_total":0,"prefix_cache_queries_total":48,
+     "spec_decode":{"num_drafts":188,"num_draft_tokens":376,"num_accepted_tokens":195,
+       "accepted_tokens_per_pos":[118,77],"acceptance_rate":0.5186,"mean_acceptance_length":2.0372,
+       "acceptance_rate_per_pos":[0.6277,0.4096]},
+     "histograms":{"time_to_first_token_seconds":{"sum":1.72,"count":4,"buckets":[{"le":0.25,"count":2},"…",{"le":"+Inf","count":4}]},
+       "inter_token_latency_seconds":{"…":"…"},"request_prefill_time_seconds":{"…":"…"},
+       "request_decode_time_seconds":{"…":"…"},"e2e_request_latency_seconds":{"…":"…"}}}},
+  {"instance":"mica-v0.5-4b","api":"systemone","vllm":null,"metrics_skipped":"api systemone does not expose vLLM metrics"}]}
+```
+
+Security: the endpoint is read-only (GET/HEAD), unauthenticated, and reachable
+only through Tailscale Serve on the tailnet (never Funnel; `start` refuses while
+Funnel is active). Your tailnet grants decide which nodes reach HTTPS/443. It
+returns only per-instance status fields and vLLM metrics: no gateway keys,
+provider data, or prompts. `spark gateway access disable` also removes `/spark`.
 
 ## Daily Commands
 

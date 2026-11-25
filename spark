@@ -5979,6 +5979,9 @@ print_services_overview() {
   fi
   dashboard_row "$gw_state" "LiteLLM gateway" "$gw_detail"
   if docker_running; then dashboard_row ok "Docker" "running"; else dashboard_row missing "Docker" "not running"; fi
+  if metrics_installed; then
+    if metrics_active && metrics_healthy; then dashboard_row ok "Metrics endpoint" "healthy · $(metrics_target)${METRICS_SERVE_PATH}/metrics"; else dashboard_row warn "Metrics endpoint" "not healthy · spark metrics start"; fi
+  fi
   [[ "$inference_only" == "1" ]] && return 0
   if workspace_configured; then
     ws_count=$(workspace_service_count)
@@ -6906,7 +6909,7 @@ doctor_print_json() {
     "$(status_json_escape "$SPARK_OS")" "$(status_json_escape "$SPARK_ARCH")" \
     "$(status_json_escape "$ACCEL")" "$(status_json_escape "$BACKEND")" \
     "$passed" "$failed" "$total"
-  for area in "Runtime" "Model assets" "Host safety" "Exposure" "Gateway"; do
+  for area in "Runtime" "Model assets" "Host safety" "Exposure" "Gateway" "Metrics"; do
     read -r area_passed area_failed <<< "$(doctor_area_counts "$area")"
     [[ $((area_passed + area_failed)) -gt 0 ]] || continue
     [[ "$first" == "1" ]] || printf ','
@@ -6945,7 +6948,7 @@ doctor_print_human() {
   printf "  target     %s/%s · %s · backend %s\n\n" "$SPARK_OS" "$SPARK_ARCH" "$ACCEL" "$BACKEND"
 
   printf "  ${BOLD}Areas${NC}\n"
-  for area in "Runtime" "Model assets" "Host safety" "Exposure" "Gateway"; do
+  for area in "Runtime" "Model assets" "Host safety" "Exposure" "Gateway" "Metrics"; do
     read -r area_passed area_failed <<< "$(doctor_area_counts "$area")"
     [[ $((area_passed + area_failed)) -gt 0 ]] || continue
     if [[ "$area_failed" -eq 0 ]]; then state="${GREEN}ok${NC}"; else state="${RED}issue${NC}"; fi
@@ -7237,6 +7240,7 @@ cmd_doctor() {
   fi
 
   doctor_checks_gateway_security
+  doctor_checks_metrics
   failed=$(doctor_count fail)
   if [[ "$json_mode" == "1" ]]; then
     doctor_print_json
@@ -17903,6 +17907,655 @@ dsh_command() {
     *) die 'Usage: spark ws dsh <status|login>' ;;
   esac
 }
+spark_builtin_metrics_server() { cat <<'__SPARK_METRICS_SERVER__'
+#!/usr/bin/env python3
+"""Spark metrics endpoint: a read-only JSON view of Spark-managed vLLM instances.
+
+It binds to loopback only; `spark metrics start` publishes it on the tailnet with
+Tailscale Serve. Every request rediscovers instances with `spark status --json`
+and reads each instance's vLLM Prometheus /metrics with a short timeout.
+"""
+import argparse
+import concurrent.futures
+import datetime
+import http.server
+import json
+import math
+import re
+import subprocess
+import sys
+import threading
+import urllib.parse
+import urllib.request
+
+SCHEMA = 1
+LOOPBACK_HOSTS = ("localhost", "127.0.0.1")
+# Only these `spark status --json` fields are copied; nothing else leaves the host.
+STATUS_FIELDS = (
+    "instance", "name", "model", "container", "config", "engine", "api", "state",
+    "endpoint", "gateway_model", "gateway_routed", "reserved_gb", "live_gb",
+    "peak_gb", "engine_memory",
+)
+COUNTERS = (
+    "prompt_tokens_total", "generation_tokens_total", "prefix_cache_hits_total",
+    "prefix_cache_queries_total", "num_preemptions_total",
+)
+HISTOGRAMS = (
+    "time_to_first_token_seconds", "inter_token_latency_seconds",
+    "request_prefill_time_seconds", "request_decode_time_seconds",
+    "e2e_request_latency_seconds",
+)
+MAX_METRICS_BYTES = 8 * 1024 * 1024
+
+_SAMPLE = re.compile(r'^([A-Za-z_:][A-Za-z0-9_:]*)(?:\{(.*)\})?\s+(\S+)(?:\s+-?\d+)?\s*$')
+_LABEL = re.compile(r'\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:,|$)')
+_UNESCAPE = {"n": "\n", "\\": "\\", '"': '"'}
+
+
+def _number(value):
+    """JSON has no NaN/Inf; emit null and keep integers integral."""
+    if value is None or math.isnan(value) or math.isinf(value):
+        return None
+    return int(value) if float(value).is_integer() else value
+
+
+def parse_labels(text):
+    labels, pos = {}, 0
+    while pos < len(text):
+        match = _LABEL.match(text, pos)
+        if not match:
+            raise ValueError("bad labels: " + text)
+        value = re.sub(r"\\(.)", lambda m: _UNESCAPE.get(m.group(1), m.group(1)), match.group(2))
+        labels[match.group(1)] = value
+        pos = match.end()
+    return labels
+
+
+def parse_prometheus(text):
+    """Return {metric name: [(labels, value), ...]} from Prometheus text format."""
+    samples = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _SAMPLE.match(line)
+        if not match:
+            continue
+        try:
+            labels = parse_labels(match.group(2) or "")
+            value = float(match.group(3))
+        except ValueError:
+            continue
+        samples.setdefault(match.group(1), []).append((labels, value))
+    return samples
+
+
+def _total(samples, name):
+    series = samples.get(name)
+    return None if not series else sum(value for _, value in series)
+
+
+def _maximum(samples, name):
+    series = samples.get(name)
+    return None if not series else max(value for _, value in series)
+
+
+def _histogram(samples, base):
+    count = _total(samples, "vllm:" + base + "_count")
+    if count is None:
+        return None
+    buckets = {}
+    for labels, value in samples.get("vllm:" + base + "_bucket", []):
+        bound = labels.get("le")
+        if bound is not None:
+            buckets[bound] = buckets.get(bound, 0.0) + value
+
+    def order(bound):
+        try:
+            return float(bound)
+        except ValueError:
+            return math.inf
+
+    return {
+        "sum": _number(_total(samples, "vllm:" + base + "_sum")),
+        "count": _number(count),
+        "buckets": [
+            {"le": bound if math.isinf(order(bound)) else _number(order(bound)), "count": _number(buckets[bound])}
+            for bound in sorted(buckets, key=order)
+        ],
+    }
+
+
+def _label_value(value):
+    if value in (None, "None", ""):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def _spec_decode(samples):
+    drafts = _total(samples, "vllm:spec_decode_num_drafts_total")
+    if drafts is None:
+        return None
+    draft_tokens = _total(samples, "vllm:spec_decode_num_draft_tokens_total")
+    accepted = _total(samples, "vllm:spec_decode_num_accepted_tokens_total")
+    per_pos = {}
+    for labels, value in samples.get("vllm:spec_decode_num_accepted_tokens_per_pos_total", []):
+        try:
+            position = int(labels.get("position", ""))
+        except ValueError:
+            continue
+        per_pos[position] = per_pos.get(position, 0.0) + value
+    accepted_per_pos = [_number(per_pos[p]) for p in sorted(per_pos)]
+    return {
+        "num_drafts": _number(drafts),
+        "num_draft_tokens": _number(draft_tokens),
+        "num_accepted_tokens": _number(accepted),
+        "accepted_tokens_per_pos": accepted_per_pos,
+        # Derived: accepted / proposed draft tokens, and tokens emitted per decode step.
+        "acceptance_rate": round(accepted / draft_tokens, 4) if draft_tokens and accepted is not None else None,
+        "mean_acceptance_length": round(1 + accepted / drafts, 4) if drafts and accepted is not None else None,
+        "acceptance_rate_per_pos": [round(per_pos[p] / drafts, 4) for p in sorted(per_pos)] if drafts else [],
+    }
+
+
+def summarize(samples):
+    """Reduce vLLM Prometheus samples to the fields Spark publishes."""
+    kv_usage = _maximum(samples, "vllm:kv_cache_usage_perc")
+    if kv_usage is None:
+        kv_usage = _maximum(samples, "vllm:gpu_cache_usage_perc")
+    cache = None
+    info = samples.get("vllm:cache_config_info")
+    if info:
+        labels = info[0][0]
+        cache = {key: _label_value(labels.get(key)) for key in ("block_size", "num_gpu_blocks", "cache_dtype")}
+    result = {
+        "kv_cache_usage_perc": _number(kv_usage),
+        "num_requests_running": _number(_total(samples, "vllm:num_requests_running")),
+        "num_requests_waiting": _number(_total(samples, "vllm:num_requests_waiting")),
+        "cache_config": cache,
+    }
+    for name in COUNTERS:
+        result[name] = _number(_total(samples, "vllm:" + name))
+    result["spec_decode"] = _spec_decode(samples)
+    result["histograms"] = {name: _histogram(samples, name) for name in HISTOGRAMS}
+    return result
+
+
+def read_meminfo(path):
+    values = {}
+    try:
+        with open(path, encoding="ascii") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                parts = rest.split()
+                if parts and parts[0].isdigit():
+                    values[key] = int(parts[0])
+    except OSError:
+        pass
+
+    def gib(kib):
+        return None if kib is None else round(kib / 1048576, 2)
+
+    total, available = values.get("MemTotal"), values.get("MemAvailable")
+    swap_total, swap_free = values.get("SwapTotal"), values.get("SwapFree")
+    return {
+        "mem_total_gb": gib(total),
+        "mem_used_gb": gib(total - available) if total is not None and available is not None else None,
+        "mem_available_gb": gib(available),
+        "swap_used_gb": gib(swap_total - swap_free) if swap_total is not None and swap_free is not None else None,
+    }
+
+
+def instance_id(model):
+    return model.get("instance") or model.get("container") or model.get("name") or ""
+
+
+def endpoint_port(endpoint):
+    parts = urllib.parse.urlsplit(endpoint or "")
+    if parts.scheme != "http" or parts.hostname not in LOOPBACK_HOSTS or not parts.port:
+        raise ValueError("endpoint is not a local HTTP port: " + str(endpoint))
+    return parts.port
+
+
+def vllm_instances(status):
+    return [m for m in status.get("models") or [] if isinstance(m, dict) and m.get("engine") == "vllm"]
+
+
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def fetch_metrics_text(port, timeout):
+    with _OPENER.open("http://127.0.0.1:%d/metrics" % port, timeout=timeout) as response:
+        body = response.read(MAX_METRICS_BYTES + 1)
+    if len(body) > MAX_METRICS_BYTES:
+        raise ValueError("metrics response too large")
+    return body.decode("utf-8", "replace")
+
+
+def describe(model, fetch, timeout):
+    """One instance: status fields, plus parsed vLLM metrics or an error."""
+    item = {key: model.get(key) for key in STATUS_FIELDS}
+    item["instance"] = instance_id(model)
+    item["vllm"] = None
+    if model.get("api", "chat") != "chat":
+        item["metrics_skipped"] = "api %s does not expose vLLM metrics" % model.get("api")
+        return item
+    try:
+        item["metrics_port"] = endpoint_port(model.get("endpoint"))
+        samples = parse_prometheus(fetch(item["metrics_port"], timeout))
+        if not any(name.startswith("vllm:") for name in samples):
+            raise ValueError("response has no vLLM metrics")
+        item["vllm"] = summarize(samples)
+    except Exception as error:  # one broken instance must not fail the response
+        item["error"] = "%s: %s" % (type(error).__name__, error)
+    return item
+
+
+def build_payload(status, fetch, timeout, meminfo, only=None):
+    models = vllm_instances(status)
+    if only is not None:
+        models = [m for m in models if only in (instance_id(m), m.get("container"))]
+    workers = max(1, min(8, len(models)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        instances = list(pool.map(lambda m: describe(m, fetch, timeout), models))
+    return {
+        "schema": SCHEMA,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "host": read_meminfo(meminfo),
+        "instances": instances,
+    }
+
+
+class StatusError(Exception):
+    pass
+
+
+def run_status(spark, timeout):
+    try:
+        done = subprocess.run(
+            [spark, "status", "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise StatusError("spark status failed: %s" % type(error).__name__)
+    # A non-zero exit only means "not fully operational"; the JSON is still valid.
+    try:
+        status = json.loads(done.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        raise StatusError("spark status returned no JSON (exit %d)" % done.returncode)
+    if not isinstance(status, dict):
+        raise StatusError("spark status returned unexpected JSON")
+    return status
+
+
+class MetricsServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, spark, timeout=2.0, status_timeout=60.0, meminfo="/proc/meminfo",
+                 status_source=None, fetch=fetch_metrics_text):
+        super().__init__(address, Handler)
+        self.timeout_seconds = timeout
+        self.meminfo = meminfo
+        self.fetch = fetch
+        self._status_lock = threading.Lock()
+        self._status_source = status_source or (lambda: run_status(spark, status_timeout))
+
+    def status(self):
+        # Serialize discovery: concurrent polls must not fan out `spark status` runs.
+        with self._status_lock:
+            return self._status_source()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "spark-metrics"
+    sys_version = ""
+
+    def log_message(self, *_args):
+        pass
+
+    def _send(self, code, body, content_type="application/json"):
+        data = body if isinstance(body, bytes) else (json.dumps(body, indent=None) + "\n").encode()
+        self.send_response(code)
+        self.send_header("Content-Type", content_type + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path.rstrip("/")
+        # Tailscale Serve mounts this at /spark; accept the path with or without it.
+        if path == "/spark" or path.startswith("/spark/"):
+            path = path[len("/spark"):]
+        parts = [urllib.parse.unquote(p) for p in path.split("/") if p]
+        if parts == ["health"]:
+            return self._send(200, {"ok": True, "schema": SCHEMA})
+        if not parts or parts[0] != "metrics" or len(parts) > 3 or (len(parts) == 3 and parts[2] != "raw"):
+            return self._send(404, {"error": "not found", "routes": [
+                "/spark/metrics", "/spark/metrics/<instance>", "/spark/metrics/<instance>/raw", "/spark/health"]})
+        try:
+            status = self.server.status()
+        except StatusError as error:
+            return self._send(503, {"error": str(error)})
+        server = self.server
+        if len(parts) == 1:
+            return self._send(200, build_payload(status, server.fetch, server.timeout_seconds, server.meminfo))
+        name = parts[1]
+        if not any(name in (instance_id(m), m.get("container")) for m in vllm_instances(status)):
+            return self._send(404, {"error": "unknown instance", "instance": name})
+        if len(parts) == 2:
+            payload = build_payload(status, server.fetch, server.timeout_seconds, server.meminfo, only=name)
+            instance = payload.pop("instances")[0]
+            payload["instance"] = instance
+            return self._send(200, payload)
+        model = next(m for m in vllm_instances(status) if name in (instance_id(m), m.get("container")))
+        if model.get("api", "chat") != "chat":
+            return self._send(404, {"error": "api %s does not expose vLLM metrics" % model.get("api"), "instance": name})
+        try:
+            text = server.fetch(endpoint_port(model.get("endpoint")), server.timeout_seconds)
+        except Exception as error:
+            return self._send(502, {"error": "%s: %s" % (type(error).__name__, error), "instance": name})
+        return self._send(200, text.encode(), "text/plain; version=0.0.4")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8791)
+    parser.add_argument("--spark", required=True, help="absolute path of the spark CLI")
+    parser.add_argument("--timeout", type=float, default=2.0, help="per-instance /metrics timeout")
+    parser.add_argument("--meminfo", default="/proc/meminfo")
+    args = parser.parse_args(argv)
+    if args.host != "127.0.0.1":
+        parser.error("--host must be 127.0.0.1; Tailscale Serve publishes it on the tailnet")
+    if not 0 < args.timeout <= 2:
+        parser.error("--timeout must be in (0, 2] seconds")
+    server = MetricsServer((args.host, args.port), args.spark, timeout=args.timeout, meminfo=args.meminfo)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+__SPARK_METRICS_SERVER__
+}
+# Based on spark by Massimo Angelini - https://github.com/massimo92/spark
+# --- Metrics endpoint: read-only JSON for instances and their vLLM metrics ---
+# A python3 stdlib server bound to 127.0.0.1, supervised by a systemd unit, and
+# published by Tailscale Serve at /spark on the node hostname next to LiteLLM.
+METRICS_PORT="${SPARK_METRICS_PORT:-8791}"
+METRICS_DIR="${SPARK_CONFIG_DIR}/metrics"
+METRICS_SCRIPT="${METRICS_DIR}/spark-metrics.py"
+METRICS_UNIT_NAME="spark-metrics.service"
+METRICS_UNIT_DIR="${SPARK_METRICS_UNIT_DIR:-/etc/systemd/system}"
+METRICS_SERVE_PATH="/spark"
+
+metrics_target() { printf 'http://127.0.0.1:%s\n' "$METRICS_PORT"; }
+metrics_unit_path() { printf '%s/%s\n' "$METRICS_UNIT_DIR" "$METRICS_UNIT_NAME"; }
+metrics_installed() { [[ -f "$(metrics_unit_path)" ]]; }
+metrics_active() { command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$METRICS_UNIT_NAME" 2>/dev/null; }
+metrics_healthy() {
+  curl --noproxy '*' -fsS --max-time 2 "$(metrics_target)${METRICS_SERVE_PATH}/health" >/dev/null 2>&1
+}
+metrics_script_current() {
+  [[ -f "$METRICS_SCRIPT" ]] && cmp -s "$METRICS_SCRIPT" <(spark_builtin_metrics_server)
+}
+
+metrics_spark_path() {
+  local self
+  self=$(command -v spark 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+  [[ "$self" == /* ]] || self="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+  printf '%s\n' "$self"
+}
+
+metrics_unit_content() {
+  local python="$1" spark_bin="$2" user="$3"
+  cat <<EOF
+# Managed by spark metrics start; remove with spark metrics stop.
+[Unit]
+Description=Spark read-only metrics endpoint (127.0.0.1:${METRICS_PORT})
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=${user}
+Environment=HOME=${HOME}
+Environment=PATH=$(dirname "$spark_bin"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=${python} -I ${METRICS_SCRIPT} --host 127.0.0.1 --port ${METRICS_PORT} --spark ${spark_bin}
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# The tailnet hostname of this node, without the trailing dot.
+metrics_dns() {
+  local dns
+  dns=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // "" | rtrimstr(".")' 2>/dev/null) || return 1
+  [[ -n "$dns" ]] || return 1
+  printf '%s\n' "$dns"
+}
+
+# published | unpublished | conflict | unknown (Tailscale unavailable).
+metrics_serve_state() {
+  local dns serve current
+  command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1 || { printf 'unknown\n'; return 0; }
+  dns=$(metrics_dns) || { printf 'unknown\n'; return 0; }
+  serve=$(tailscale serve status --json 2>/dev/null || true)
+  [[ -n "$serve" ]] || serve='{}'
+  current=$(printf '%s\n' "$serve" | jq -r --arg key "$dns:443" --arg path "$METRICS_SERVE_PATH" \
+    '.Web[$key].Handlers[$path].Proxy // ""' 2>/dev/null) || { printf 'unknown\n'; return 0; }
+  if [[ -z "$current" ]]; then printf 'unpublished\n'
+  elif [[ "${current%/}" == "$(metrics_target)" ]]; then printf 'published\n'
+  else printf 'conflict\n'; fi
+}
+
+metrics_publish() {
+  local dns serve state
+  command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1 || { err 'Tailscale is not connected'; return 1; }
+  tailscale_funnel_status_active && { err 'Funnel active; resolve public exposure before publishing metrics'; return 1; }
+  dns=$(metrics_dns) || { err 'Cannot read the Tailscale hostname'; return 1; }
+  state=$(metrics_serve_state)
+  [[ "$state" != conflict ]] || { err "Serve path ${METRICS_SERVE_PATH} on ${dns} belongs to another service; nothing changed"; return 1; }
+  serve=$(tailscale serve status --json 2>/dev/null || true)
+  [[ -n "$serve" ]] || serve='{}'
+  printf '%s\n' "$serve" | jq -e '(.TCP["443"] // null) == null or .TCP["443"].HTTPS == true' >/dev/null 2>&1 ||
+    { err 'Port 443 is a raw TCP forward on this node; nothing changed'; return 1; }
+  # Tailnet-only Serve on the existing HTTPS/443 hostname; never Funnel.
+  tailscale serve --bg --https=443 --set-path "$METRICS_SERVE_PATH" "$(metrics_target)" >/dev/null || return 1
+  if tailscale_funnel_status_active; then
+    tailscale serve --https=443 --set-path "$METRICS_SERVE_PATH" off >/dev/null 2>&1 || true
+    err 'Public exposure detected; metrics unpublished'
+    return 1
+  fi
+}
+
+# Remove only the Spark-owned /spark handler; other Serve config stays untouched.
+metrics_unpublish() {
+  case "$(metrics_serve_state)" in
+    published) tailscale serve --https=443 --set-path "$METRICS_SERVE_PATH" off >/dev/null ;;
+    conflict) warn "Serve path ${METRICS_SERVE_PATH} belongs to another service; left unchanged" ;;
+    *) return 0 ;;
+  esac
+}
+
+metrics_require_host() {
+  [[ "$SPARK_OS" == Linux ]] || die "spark metrics runs on the Linux model server" "Run it on the GX10/DGX host"
+  command -v systemctl >/dev/null 2>&1 || die "systemd is required for the metrics service"
+  command -v python3 >/dev/null 2>&1 || die "python3 is required for the metrics service" "Run: spark setup"
+  command -v jq >/dev/null 2>&1 || die "jq is required" "Run: spark setup"
+}
+
+metrics_install_service() {
+  local python spark_bin user staged
+  python=$(command -v python3); spark_bin=$(metrics_spark_path); user=$(id -un)
+  [[ "$python" == /* && "$spark_bin" == /* && "$spark_bin$python$HOME" != *[[:space:]]* ]] ||
+    die "python3, spark and HOME paths must be absolute and contain no spaces"
+  mkdir -p "$METRICS_DIR" && chmod 700 "$METRICS_DIR" || die "Cannot create $METRICS_DIR"
+  staged=$(mktemp "${METRICS_DIR}/.spark-metrics.XXXXXX") || die "Cannot stage the metrics server"
+  spark_builtin_metrics_server > "$staged" && chmod 644 "$staged" && mv "$staged" "$METRICS_SCRIPT" ||
+    { rm -f "$staged"; die "Cannot write $METRICS_SCRIPT"; }
+  staged=$(mktemp "${METRICS_DIR}/.unit.XXXXXX") || die "Cannot stage the metrics unit"
+  metrics_unit_content "$python" "$spark_bin" "$user" > "$staged" || { rm -f "$staged"; die "Cannot render the metrics unit"; }
+  printf "  Installing %s (sudo)\n" "$(metrics_unit_path)"
+  if ! sudo install -m 0644 "$staged" "$(metrics_unit_path)"; then rm -f "$staged"; die "Cannot install the metrics unit"; fi
+  rm -f "$staged"
+  sudo systemctl daemon-reload && sudo systemctl enable "$METRICS_UNIT_NAME" >/dev/null 2>&1 &&
+    sudo systemctl restart "$METRICS_UNIT_NAME" || die "Cannot start $METRICS_UNIT_NAME" "journalctl -u $METRICS_UNIT_NAME"
+}
+
+metrics_wait_healthy() {
+  local attempt attempts="${SPARK_METRICS_READY_ATTEMPTS:-10}"
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    metrics_healthy && return 0
+    [[ "$attempt" -lt "$attempts" ]] && sleep 1
+  done
+  return 1
+}
+
+metrics_start() {
+  local publish=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --local) publish=0 ;;
+      *) die "Unknown metrics start flag: $1" "Usage: spark metrics start [--local]" ;;
+    esac
+    shift
+  done
+  metrics_require_host
+  metrics_install_service
+  metrics_wait_healthy || die "Metrics service did not become healthy" "journalctl -u $METRICS_UNIT_NAME"
+  info "Metrics service running on $(metrics_target)${METRICS_SERVE_PATH}/metrics (loopback only)"
+  if [[ "$publish" == 1 ]]; then
+    metrics_publish || die "Metrics service runs locally but is not published on the tailnet" "Fix Tailscale, then rerun: spark metrics start"
+    info "Published on the tailnet (Tailscale Serve, no Funnel)"
+  fi
+  metrics_status
+}
+
+metrics_stop() {
+  [[ $# == 0 ]] || die "Usage: spark metrics stop"
+  metrics_unpublish || warn "Could not remove the Tailscale Serve path ${METRICS_SERVE_PATH}"
+  if metrics_installed; then
+    sudo systemctl disable --now "$METRICS_UNIT_NAME" >/dev/null 2>&1 || true
+    sudo rm -f "$(metrics_unit_path)" || die "Cannot remove $(metrics_unit_path)"
+    sudo systemctl daemon-reload || true
+  fi
+  rm -f "$METRICS_SCRIPT"
+  info "Metrics endpoint stopped and removed from boot"
+}
+
+metrics_status_json() {
+  local installed=false active=false healthy=false current=false state dns url=null
+  metrics_installed && installed=true
+  metrics_active && active=true
+  metrics_healthy && healthy=true
+  metrics_script_current && current=true
+  state=$(metrics_serve_state)
+  if [[ "$state" == published ]] && dns=$(metrics_dns); then url="\"https://${dns}${METRICS_SERVE_PATH}/metrics\""; fi
+  printf '{"installed":%s,"active":%s,"healthy":%s,"script_current":%s,"local_url":"%s%s/metrics","serve":"%s","url":%s}\n' \
+    "$installed" "$active" "$healthy" "$current" "$(metrics_target)" "$METRICS_SERVE_PATH" "$state" "$url"
+}
+
+metrics_status() {
+  local json=0 status
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json=1 ;;
+      *) die "Unknown metrics status flag: $1" "Usage: spark metrics status [--json]" ;;
+    esac
+    shift
+  done
+  status=$(metrics_status_json)
+  if [[ "$json" == 1 ]]; then
+    printf '%s\n' "$status"
+  else
+    printf "\n  ${BOLD}spark metrics${NC}\n"
+    printf '%s\n' "$status" | jq -r '
+      "  Service:  " + (if .installed then (if .active then "active" else "inactive" end) else "not installed" end) + " (spark-metrics.service)",
+      "  Local:    " + .local_url + (if .healthy then " (healthy)" else " (unreachable)" end),
+      "  Tailnet:  " + (.url // .serve),
+      (if .installed and (.script_current | not) then "  Server script is outdated; run: spark metrics start" else empty end)'
+    printf '\n'
+  fi
+  printf '%s\n' "$status" | jq -e '.installed and .active and .healthy' >/dev/null
+}
+
+doctor_checks_metrics() {
+  metrics_installed || return 0
+  if metrics_active && metrics_healthy; then
+    doctor_pass "Metrics" "Metrics endpoint" "healthy on $(metrics_target)"
+  else
+    doctor_fail "Metrics" "Metrics endpoint" "installed but not healthy" "spark metrics start"
+  fi
+  if metrics_script_current; then
+    doctor_pass "Metrics" "Metrics server version" "current"
+  else
+    doctor_fail "Metrics" "Metrics server version" "outdated after a Spark update" "spark metrics start"
+  fi
+  case "$(metrics_serve_state)" in
+    published) doctor_pass "Metrics" "Metrics tailnet path" "Serve ${METRICS_SERVE_PATH} (tailnet only)" ;;
+    unknown) doctor_skip "Metrics" "Metrics tailnet path" "skipped; Tailscale not connected" ;;
+    conflict) doctor_fail "Metrics" "Metrics tailnet path" "${METRICS_SERVE_PATH} owned by another service" "tailscale serve status" ;;
+    *) doctor_fail "Metrics" "Metrics tailnet path" "not published" "spark metrics start" ;;
+  esac
+}
+
+metrics_uninstall() {
+  local dry_run="${1:-0}"
+  metrics_installed || return 0
+  if [[ "$dry_run" == 1 ]]; then printf "  would stop and remove %s\n" "$METRICS_UNIT_NAME"; return 0; fi
+  metrics_stop
+}
+
+cmd_metrics_help() {
+  cat <<EOF
+
+  ${BOLD}Usage:${NC} spark metrics <start [--local]|stop|status [--json]>
+
+  Read-only JSON endpoint with every Spark-managed instance and its vLLM metrics
+  (KV cache, tokens, speculative decoding, TTFT/ITL histograms) for tailnet clients.
+
+    start    Install/refresh the ${METRICS_UNIT_NAME} systemd unit (sudo), bound to
+             127.0.0.1:${METRICS_PORT}, and publish it with Tailscale Serve at
+             https://<node>${METRICS_SERVE_PATH}/metrics. --local skips publishing.
+    stop     Remove the Serve path and the systemd unit.
+    status   Show service health and the tailnet URL.
+
+  Routes: ${METRICS_SERVE_PATH}/metrics, ${METRICS_SERVE_PATH}/metrics/<instance>,
+          ${METRICS_SERVE_PATH}/metrics/<instance>/raw, ${METRICS_SERVE_PATH}/health
+
+EOF
+}
+
+cmd_metrics() {
+  local sub="${1:-status}"
+  [[ $# == 0 ]] || shift
+  case "$sub" in
+    start) metrics_start "$@" ;;
+    stop) metrics_stop "$@" ;;
+    status) metrics_status "$@" ;;
+    -h|--help|help) cmd_metrics_help ;;
+    *) die "Unknown metrics command: $sub" "Usage: spark metrics <start|stop|status>" ;;
+  esac
+}
 cmd_models_recommend() {
   local json=0
   while [[ $# -gt 0 ]]; do
@@ -18491,6 +19144,7 @@ EOF
 
   local name model self
   dsh_workspace_uninstall "$dry_run" || return 1
+  metrics_uninstall "$dry_run" || warn "Could not remove the metrics service"
   if command -v docker >/dev/null 2>&1; then
     while IFS=$'\t' read -r name model _; do
       [[ -z "$name" ]] && continue
@@ -18631,6 +19285,7 @@ cmd_architecture() {
     workspace     Task manager+n8n+Postgres+Hermes lifecycle and doctor
     gateway       LiteLLM provider config, YAML generation, container runtime
     product       dashboard, status, recommendations, uninstall/reinstall
+    metrics       loopback read-only instance/vLLM metrics service at Serve /spark
     cli           command parsing, help, config, update, dispatch
 
   ${BOLD}Boundary rules:${NC}
@@ -18670,6 +19325,7 @@ cmd_help() {
     status           One-shot health and runtime snapshot
     ws               Set up a private agent workspace (task manager + n8n + Hermes)
     doctor           Check all prerequisites (read-only)
+    metrics          Read-only tailnet JSON of instances and vLLM metrics
     models           Recommend models for this hardware
     run <model>      Start serving a model (can run several at once)
     bundle            Browse, import, submit, synchronize, and run vLLM bundles
@@ -20087,9 +20743,9 @@ gateway_access_enable() {
   key="$dns:443"; target="http://127.0.0.1:$(gateway_configured_port)"
   serve=$(tailscale serve status --json) || return 1
   if ! printf '%s\n' "$serve" | jq -e --arg key "$key" '(.TCP["443"]==null and .Web[$key]==null)' >/dev/null; then
-    printf '%s\n' "$serve" | jq -e --arg key "$key" '.TCP["443"].HTTPS==true and ((.Web[$key].Handlers // {})|keys)==["/"]' >/dev/null || { err 'Port 443 has another handler or TCP service; no services changed'; return 1; }
+    printf '%s\n' "$serve" | jq -e '.TCP["443"].HTTPS==true' >/dev/null && printf '%s\n' "$serve" | gateway_access_handlers_owned "$key" >/dev/null || { err 'Port 443 has another handler or TCP service; no services changed'; return 1; }
     current=$(printf '%s\n' "$serve" | jq -r --arg key "$key" '.Web[$key].Handlers["/"].Proxy // ""')
-    gateway_access_owned_target "$current" || { err 'Port 443 belongs to another service; no services changed'; return 1; }
+    [[ -z "$current" ]] || gateway_access_owned_target "$current" || { err 'Port 443 belongs to another service; no services changed'; return 1; }
   fi
   tailscale serve --bg --https=443 "$target" || return 1
   tailscale_funnel_status_active && { tailscale serve --https=443 off; err 'Public exposure detected'; return 1; }
@@ -20107,7 +20763,9 @@ gateway_access_disable() {
   status=$(tailscale status --json) || return 1
   dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")'); key="$dns:$port"
   # Only remove the exact root handler owned by Spark, never reset all Serve.
-  tailscale serve status --json | jq -e --arg key "$key" --arg target "http://127.0.0.1:$(gateway_configured_port)" '(.Web[$key].Handlers // {}) | keys==["/"] and .["/"].Proxy==$target' >/dev/null || { err 'Serve entry absent or owned by another service'; return 1; }
+  tailscale serve status --json | gateway_access_handlers_owned "$key" | jq -e --arg target "http://127.0.0.1:$(gateway_configured_port)" '.["/"].Proxy==$target' >/dev/null || { err 'Serve entry absent or owned by another service'; return 1; }
+  # Private access off also withdraws the Spark metrics path on this hostname.
+  metrics_unpublish || return 1
   tailscale serve --https="$port" off || return 1
   gateway_save_config "$(printf '%s\n' "$config" | jq '.access.enabled=false')"
 }
@@ -20286,6 +20944,14 @@ gateway_access_blocked_ports() {
     tailscale serve status --json 2>/dev/null | jq -r '.TCP // {} | keys[]' || true
     if command -v ss >/dev/null 2>&1; then ss -H -lnt 2>/dev/null | awk '{n=$4;sub(/^.*:/,"",n);print n}' || true; fi
   } | jq -Rn --argjson ssh "$ssh_port" '[inputs|tonumber? | select(.>=1 and .<=65535 and .!=443 and .!=$ssh)]|unique'
+}
+# The node hostname may hold only "/" and the Spark metrics path.
+# Prints the handlers when that holds, fails otherwise.
+gateway_access_handlers_owned() {
+  jq -e --arg key "$1" --arg path "$METRICS_SERVE_PATH" --arg metrics "$(metrics_target)" '
+    (.Web[$key].Handlers // {}) as $h |
+    if ((($h | keys) - [$path]) | . == ["/"] or . == []) and
+       (($h[$path].Proxy // $metrics) | rtrimstr("/")) == $metrics then $h else false end'
 }
 gateway_access_owned_target() {
   local target="${1%/}" name model port rest
@@ -20609,7 +21275,7 @@ gateway_auth_rotate() { gateway_with_lock gateway_auth_replace_locked; }
 main() {
   GATEWAY_PORT=$(gateway_configured_port)
   case "${1:-}:${2:-}" in
-    status:--json|status:--quiet|ws:status|doctor:*|ws:doctor|gateway:auth|gateway:login|gateway:import-session|gateway:logout|gateway:capabilities|gateway:access) ;;
+    status:--json|status:--quiet|metrics:status|ws:status|doctor:*|ws:doctor|gateway:auth|gateway:login|gateway:import-session|gateway:logout|gateway:capabilities|gateway:access) ;;
     *) check_for_updates ;;
   esac
 
@@ -20629,6 +21295,7 @@ main() {
     status)       shift; cmd_status "$@" ;;
     logs)         shift; cmd_logs "$@" ;;
     doctor)       shift; cmd_doctor "$@" ;;
+    metrics)      shift; cmd_metrics "$@" ;;
     setup)        shift; cmd_setup "$@" ;;
     repair)       shift; cmd_repair "$@" ;;
     ws)           shift; cmd_workspace "$@" ;;

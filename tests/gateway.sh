@@ -207,6 +207,16 @@ JSON
   jq -e '.access.port==443 and .access.ssh_port==22 and .access.enabled and .access.policy_status=="pending" and (.access.sources==null)' "$GATEWAY_CONFIG" >/dev/null
   ! gateway_access_enable --port 8443
   ! gateway_access_disable
+  # The Spark metrics path may share the hostname; any other handler still blocks.
+  local owned='{"TCP":{"443":{"HTTPS":true}},"Web":{"gx.example.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:4000"},"/spark":{"Proxy":"http://127.0.0.1:8791"}}}}}'
+  printf '%s\n' "$owned" > "$SPARK_CONFIG_DIR/serve.json"; : > "$SPARK_CONFIG_DIR/serve.calls"
+  gateway_access_enable >/dev/null
+  [[ "$(cat "$SPARK_CONFIG_DIR/serve.calls")" != *'/spark'* ]]
+  printf '%s\n' "${owned/8791/9999}" > "$SPARK_CONFIG_DIR/serve.json"
+  ! gateway_access_enable 2>/dev/null
+  printf '%s\n' "$owned" > "$SPARK_CONFIG_DIR/serve.json"; : > "$SPARK_CONFIG_DIR/serve.calls"
+  gateway_access_disable
+  [[ "$(cat "$SPARK_CONFIG_DIR/serve.calls")" == *'serve --https=443 --set-path /spark off'*'serve --https=443 off'* ]]
 }
 publication_failure() {
   gateway_prepare_runtime vllm

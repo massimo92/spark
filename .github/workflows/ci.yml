@@ -77,6 +77,7 @@ jobs:
           bash tests/gateway.sh
           bash tests/gateway-keys.sh
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_systemone_server.py'
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_spark_metrics.py'
 
       - name: Run tests
         env:

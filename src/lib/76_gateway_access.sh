@@ -75,9 +75,9 @@ gateway_access_enable() {
   key="$dns:443"; target="http://127.0.0.1:$(gateway_configured_port)"
   serve=$(tailscale serve status --json) || return 1
   if ! printf '%s\n' "$serve" | jq -e --arg key "$key" '(.TCP["443"]==null and .Web[$key]==null)' >/dev/null; then
-    printf '%s\n' "$serve" | jq -e --arg key "$key" '.TCP["443"].HTTPS==true and ((.Web[$key].Handlers // {})|keys)==["/"]' >/dev/null || { err 'Port 443 has another handler or TCP service; no services changed'; return 1; }
+    printf '%s\n' "$serve" | jq -e '.TCP["443"].HTTPS==true' >/dev/null && printf '%s\n' "$serve" | gateway_access_handlers_owned "$key" >/dev/null || { err 'Port 443 has another handler or TCP service; no services changed'; return 1; }
     current=$(printf '%s\n' "$serve" | jq -r --arg key "$key" '.Web[$key].Handlers["/"].Proxy // ""')
-    gateway_access_owned_target "$current" || { err 'Port 443 belongs to another service; no services changed'; return 1; }
+    [[ -z "$current" ]] || gateway_access_owned_target "$current" || { err 'Port 443 belongs to another service; no services changed'; return 1; }
   fi
   tailscale serve --bg --https=443 "$target" || return 1
   tailscale_funnel_status_active && { tailscale serve --https=443 off; err 'Public exposure detected'; return 1; }
@@ -95,7 +95,9 @@ gateway_access_disable() {
   status=$(tailscale status --json) || return 1
   dns=$(printf '%s\n' "$status" | jq -r '.Self.DNSName | rtrimstr(".")'); key="$dns:$port"
   # Only remove the exact root handler owned by Spark, never reset all Serve.
-  tailscale serve status --json | jq -e --arg key "$key" --arg target "http://127.0.0.1:$(gateway_configured_port)" '(.Web[$key].Handlers // {}) | keys==["/"] and .["/"].Proxy==$target' >/dev/null || { err 'Serve entry absent or owned by another service'; return 1; }
+  tailscale serve status --json | gateway_access_handlers_owned "$key" | jq -e --arg target "http://127.0.0.1:$(gateway_configured_port)" '.["/"].Proxy==$target' >/dev/null || { err 'Serve entry absent or owned by another service'; return 1; }
+  # Private access off also withdraws the Spark metrics path on this hostname.
+  metrics_unpublish || return 1
   tailscale serve --https="$port" off || return 1
   gateway_save_config "$(printf '%s\n' "$config" | jq '.access.enabled=false')"
 }
@@ -274,6 +276,14 @@ gateway_access_blocked_ports() {
     tailscale serve status --json 2>/dev/null | jq -r '.TCP // {} | keys[]' || true
     if command -v ss >/dev/null 2>&1; then ss -H -lnt 2>/dev/null | awk '{n=$4;sub(/^.*:/,"",n);print n}' || true; fi
   } | jq -Rn --argjson ssh "$ssh_port" '[inputs|tonumber? | select(.>=1 and .<=65535 and .!=443 and .!=$ssh)]|unique'
+}
+# The node hostname may hold only "/" and the Spark metrics path.
+# Prints the handlers when that holds, fails otherwise.
+gateway_access_handlers_owned() {
+  jq -e --arg key "$1" --arg path "$METRICS_SERVE_PATH" --arg metrics "$(metrics_target)" '
+    (.Web[$key].Handlers // {}) as $h |
+    if ((($h | keys) - [$path]) | . == ["/"] or . == []) and
+       (($h[$path].Proxy // $metrics) | rtrimstr("/")) == $metrics then $h else false end'
 }
 gateway_access_owned_target() {
   local target="${1%/}" name model port rest

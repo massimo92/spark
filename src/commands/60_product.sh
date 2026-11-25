@@ -586,6 +586,7 @@ EOF
 
   local name model self
   dsh_workspace_uninstall "$dry_run" || return 1
+  metrics_uninstall "$dry_run" || warn "Could not remove the metrics service"
   if command -v docker >/dev/null 2>&1; then
     while IFS=$'\t' read -r name model _; do
       [[ -z "$name" ]] && continue
@@ -726,6 +727,7 @@ cmd_architecture() {
     workspace     Task manager+n8n+Postgres+Hermes lifecycle and doctor
     gateway       LiteLLM provider config, YAML generation, container runtime
     product       dashboard, status, recommendations, uninstall/reinstall
+    metrics       loopback read-only instance/vLLM metrics service at Serve /spark
     cli           command parsing, help, config, update, dispatch
 
   ${BOLD}Boundary rules:${NC}
@@ -765,6 +767,7 @@ cmd_help() {
     status           One-shot health and runtime snapshot
     ws               Set up a private agent workspace (task manager + n8n + Hermes)
     doctor           Check all prerequisites (read-only)
+    metrics          Read-only tailnet JSON of instances and vLLM metrics
     models           Recommend models for this hardware
     run <model>      Start serving a model (can run several at once)
     bundle            Browse, import, submit, synchronize, and run vLLM bundles

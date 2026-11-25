@@ -2480,6 +2480,136 @@ test_tailscale_funnel_ignores_tailnet_only_services() {
   rm -rf "$tmp"
 }
 
+# Metrics endpoint: fake sudo/systemd/curl/tailscale around the real CLI.
+make_metrics_fake_bin() {
+  local dir="$1"
+  make_fake_bin "$dir"
+  cat > "${dir}/sudo" <<'EOF'
+#!/usr/bin/env bash
+printf 'sudo %s\n' "$*" >> "${FAKE_METRICS_LOG:?}"
+exec "$@"
+EOF
+  cat > "${dir}/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >> "${FAKE_METRICS_LOG:?}"
+case "$*" in
+  *is-active*) exit "${FAKE_METRICS_ACTIVE_EXIT:-0}" ;;
+esac
+exit 0
+EOF
+  cat > "${dir}/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >> "${FAKE_METRICS_LOG:?}"
+exit "${FAKE_METRICS_HEALTH_EXIT:-0}"
+EOF
+  cat > "${dir}/tailscale" <<'EOF'
+#!/usr/bin/env bash
+printf 'tailscale %s\n' "$*" >> "${FAKE_METRICS_LOG:?}"
+serve_json="${FAKE_METRICS_SERVE_JSON:-}"
+[[ -n "$serve_json" ]] || serve_json='{}'
+case "$*" in
+  "status --json") printf '{"Self":{"DNSName":"gx10.test-tailnet.ts.net."}}\n' ;;
+  status) exit 0 ;;
+  "serve status --json") printf '%s\n' "$serve_json" ;;
+  "funnel status") exit 1 ;;
+esac
+exit 0
+EOF
+  chmod +x "${dir}/sudo" "${dir}/systemctl" "${dir}/curl" "${dir}/tailscale"
+}
+
+metrics_run() {
+  local tmp="$1"; shift
+  HOME="${tmp}/home" PATH="${tmp}/bin:$PATH" SPARK_OS_OVERRIDE=Linux \
+    SPARK_METRICS_UNIT_DIR="${tmp}/units" SPARK_METRICS_READY_ATTEMPTS=1 \
+    FAKE_METRICS_LOG="${tmp}/calls.log" "$@"
+}
+
+METRICS_SERVE_OWNED='{"TCP":{"443":{"HTTPS":true}},"Web":{"gx10.test-tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:4000"},"/spark":{"Proxy":"http://127.0.0.1:8791"}}}}}'
+
+test_metrics_start_installs_loopback_unit_and_publishes_serve_path() {
+  local tmp out status unit calls script
+  tmp=$(mktemp -d); mkdir -p "${tmp}/units"; make_metrics_fake_bin "${tmp}/bin"
+  out=$(metrics_run "$tmp" "$SPARK" metrics start 2>&1); status=$?
+  unit=$(cat "${tmp}/units/spark-metrics.service" 2>/dev/null || true)
+  calls=$(cat "${tmp}/calls.log" 2>/dev/null || true)
+  script="${tmp}/home/.config/spark/metrics/spark-metrics.py"
+  cmp -s "$script" "${ROOT_DIR}/src/assets/spark-metrics.py" || status=1
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$unit" == *"-I ${script} --host 127.0.0.1 --port 8791 --spark /"* ]] &&
+    [[ "$unit" == *"User=$(id -un)"* ]] &&
+    [[ "$unit" == *"Restart=always"* ]] &&
+    [[ "$unit" == *"WantedBy=multi-user.target"* ]] &&
+    [[ "$calls" == *"systemctl enable spark-metrics.service"* ]] &&
+    [[ "$calls" == *"systemctl restart spark-metrics.service"* ]] &&
+    [[ "$calls" == *"curl --noproxy * -fsS --max-time 2 http://127.0.0.1:8791/spark/health"* ]] &&
+    [[ "$calls" == *"tailscale serve --bg --https=443 --set-path /spark http://127.0.0.1:8791"* ]] &&
+    ! grep -Eq '^tailscale funnel( [^s].*)?$' <<<"$calls" &&
+    [[ "$out" == *"Published on the tailnet"* ]]
+}
+
+test_metrics_start_refuses_foreign_serve_path() {
+  local tmp out status calls
+  tmp=$(mktemp -d); mkdir -p "${tmp}/units"; make_metrics_fake_bin "${tmp}/bin"
+  out=$(metrics_run "$tmp" env FAKE_METRICS_SERVE_JSON="${METRICS_SERVE_OWNED/8791/9999}" \
+    "$SPARK" metrics start 2>&1); status=$?
+  calls=$(cat "${tmp}/calls.log" 2>/dev/null || true)
+  rm -rf "$tmp"
+  [[ "$status" -ne 0 ]] &&
+    [[ "$out" == *"belongs to another service"* ]] &&
+    [[ "$calls" != *"--set-path /spark http"* ]]
+}
+
+test_metrics_status_and_stop_touch_only_spark_path() {
+  local tmp out status json calls stop_out
+  tmp=$(mktemp -d); mkdir -p "${tmp}/units"; make_metrics_fake_bin "${tmp}/bin"
+  metrics_run "$tmp" "$SPARK" metrics start --local >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+  : > "${tmp}/calls.log"
+  json=$(metrics_run "$tmp" env FAKE_METRICS_SERVE_JSON="$METRICS_SERVE_OWNED" "$SPARK" metrics status --json 2>&1); status=$?
+  if out=$(metrics_run "$tmp" env FAKE_METRICS_HEALTH_EXIT=7 "$SPARK" metrics status 2>&1); then status=1; fi
+  stop_out=$(metrics_run "$tmp" env FAKE_METRICS_SERVE_JSON="$METRICS_SERVE_OWNED" "$SPARK" metrics stop 2>&1) || status=1
+  calls=$(cat "${tmp}/calls.log")
+  [[ ! -e "${tmp}/units/spark-metrics.service" && ! -e "${tmp}/home/.config/spark/metrics/spark-metrics.py" ]] || status=1
+  rm -rf "$tmp"
+  [[ "$status" -eq 0 ]] &&
+    [[ "$(jq -c '[.installed,.active,.healthy,.script_current,.serve,.url]' <<<"$json")" == '[true,true,true,true,"published","https://gx10.test-tailnet.ts.net/spark/metrics"]' ]] &&
+    [[ "$out" == *"(unreachable)"* ]] &&
+    [[ "$calls" == *"tailscale serve --https=443 --set-path /spark off"* ]] &&
+    ! grep -q '^tailscale serve --https=443 off' <<<"$calls" &&
+    [[ "$calls" == *"systemctl disable --now spark-metrics.service"* ]] &&
+    [[ "$stop_out" == *"removed from boot"* ]]
+}
+
+test_metrics_doctor_reports_unhealthy_service() {
+  local tmp out
+  tmp=$(mktemp -d); mkdir -p "${tmp}/units"; make_metrics_fake_bin "${tmp}/bin"
+  metrics_run "$tmp" "$SPARK" metrics start --local >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+  out=$(metrics_run "$tmp" env FAKE_METRICS_ACTIVE_EXIT=3 bash -c '
+    source "$1"; DOCTOR_CATEGORIES=(); DOCTOR_LABELS=(); DOCTOR_RESULTS=(); DOCTOR_DETAILS=(); DOCTOR_ACTIONS=()
+    doctor_checks_metrics
+    for i in "${!DOCTOR_LABELS[@]}"; do printf "%s=%s\n" "${DOCTOR_LABELS[$i]}" "${DOCTOR_RESULTS[$i]}"; done
+  ' _ "$SPARK" 2>&1)
+  rm -rf "$tmp"
+  [[ "$out" == *"Metrics endpoint=fail"* ]] &&
+    [[ "$out" == *"Metrics server version=ok"* ]] &&
+    [[ "$out" == *"Metrics tailnet path=fail"* ]]
+}
+
+test_gateway_access_tolerates_only_spark_metrics_path() {
+  local out root='{"Proxy":"http://127.0.0.1:4000"}' own='{"Proxy":"http://127.0.0.1:8791"}' other='{"Proxy":"http://127.0.0.1:9999"}'
+  out=$(ROOT_H="$root" OWN_H="$own" OTHER_H="$other" bash -c '
+    source "$1"
+    check() { jq -nc --argjson h "$1" "{Web:{\"gx10.ts.net:443\":{Handlers:\$h}}}" | gateway_access_handlers_owned gx10.ts.net:443 >/dev/null && echo ok || echo refused; }
+    check "{\"/\":$ROOT_H}"
+    check "{\"/\":$ROOT_H,\"/spark\":$OWN_H}"
+    check "{\"/spark\":$OWN_H}"
+    check "{\"/\":$ROOT_H,\"/spark\":$OTHER_H}"
+    check "{\"/\":$ROOT_H,\"/other\":$OWN_H}"
+  ' _ "$SPARK" 2>&1)
+  [[ "$out" == $'ok\nok\nok\nrefused\nrefused' ]]
+}
+
 test_doctor_json_quiet_and_exit_codes() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin json quiet_out json_status quiet_status
@@ -10896,6 +11026,11 @@ run_test "doctor reports failed systemd-sysctl" test_doctor_reports_failed_syste
 run_test "doctor rejects swap-gated earlyoom" test_doctor_rejects_swap_gated_earlyoom
 run_test "doctor reports unbounded vLLM containers" test_doctor_reports_unbounded_vllm_container
 run_test "Funnel detection ignores tailnet-only services" test_tailscale_funnel_ignores_tailnet_only_services
+run_test "metrics start installs a loopback unit and publishes Serve /spark" test_metrics_start_installs_loopback_unit_and_publishes_serve_path
+run_test "metrics start refuses a foreign Serve /spark handler" test_metrics_start_refuses_foreign_serve_path
+run_test "metrics status and stop touch only the Spark Serve path" test_metrics_status_and_stop_touch_only_spark_path
+run_test "metrics doctor reports an unhealthy service" test_metrics_doctor_reports_unhealthy_service
+run_test "gateway access tolerates only the Spark metrics Serve path" test_gateway_access_tolerates_only_spark_metrics_path
 run_test "doctor supports JSON, quiet, and failure exit codes" test_doctor_json_quiet_and_exit_codes
 run_test "invalid --port fails during validation" test_invalid_port_fails_before_side_effects
 run_test "dry-run uses JSON profiles without executing model data" test_dry_run_uses_json_profile_safely

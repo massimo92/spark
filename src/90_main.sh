@@ -2,7 +2,7 @@
 main() {
   GATEWAY_PORT=$(gateway_configured_port)
   case "${1:-}:${2:-}" in
-    status:--json|status:--quiet|ws:status|doctor:*|ws:doctor|gateway:auth|gateway:login|gateway:import-session|gateway:logout|gateway:capabilities|gateway:access) ;;
+    status:--json|status:--quiet|metrics:status|ws:status|doctor:*|ws:doctor|gateway:auth|gateway:login|gateway:import-session|gateway:logout|gateway:capabilities|gateway:access) ;;
     *) check_for_updates ;;
   esac
 
@@ -22,6 +22,7 @@ main() {
     status)       shift; cmd_status "$@" ;;
     logs)         shift; cmd_logs "$@" ;;
     doctor)       shift; cmd_doctor "$@" ;;
+    metrics)      shift; cmd_metrics "$@" ;;
     setup)        shift; cmd_setup "$@" ;;
     repair)       shift; cmd_repair "$@" ;;
     ws)           shift; cmd_workspace "$@" ;;

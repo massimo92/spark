@@ -184,7 +184,7 @@ doctor_print_json() {
     "$(status_json_escape "$SPARK_OS")" "$(status_json_escape "$SPARK_ARCH")" \
     "$(status_json_escape "$ACCEL")" "$(status_json_escape "$BACKEND")" \
     "$passed" "$failed" "$total"
-  for area in "Runtime" "Model assets" "Host safety" "Exposure" "Gateway"; do
+  for area in "Runtime" "Model assets" "Host safety" "Exposure" "Gateway" "Metrics"; do
     read -r area_passed area_failed <<< "$(doctor_area_counts "$area")"
     [[ $((area_passed + area_failed)) -gt 0 ]] || continue
     [[ "$first" == "1" ]] || printf ','
@@ -223,7 +223,7 @@ doctor_print_human() {
   printf "  target     %s/%s · %s · backend %s\n\n" "$SPARK_OS" "$SPARK_ARCH" "$ACCEL" "$BACKEND"
 
   printf "  ${BOLD}Areas${NC}\n"
-  for area in "Runtime" "Model assets" "Host safety" "Exposure" "Gateway"; do
+  for area in "Runtime" "Model assets" "Host safety" "Exposure" "Gateway" "Metrics"; do
     read -r area_passed area_failed <<< "$(doctor_area_counts "$area")"
     [[ $((area_passed + area_failed)) -gt 0 ]] || continue
     if [[ "$area_failed" -eq 0 ]]; then state="${GREEN}ok${NC}"; else state="${RED}issue${NC}"; fi
@@ -515,6 +515,7 @@ cmd_doctor() {
   fi
 
   doctor_checks_gateway_security
+  doctor_checks_metrics
   failed=$(doctor_count fail)
   if [[ "$json_mode" == "1" ]]; then
     doctor_print_json

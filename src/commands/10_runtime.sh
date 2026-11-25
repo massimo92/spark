@@ -2984,6 +2984,9 @@ print_services_overview() {
   fi
   dashboard_row "$gw_state" "LiteLLM gateway" "$gw_detail"
   if docker_running; then dashboard_row ok "Docker" "running"; else dashboard_row missing "Docker" "not running"; fi
+  if metrics_installed; then
+    if metrics_active && metrics_healthy; then dashboard_row ok "Metrics endpoint" "healthy · $(metrics_target)${METRICS_SERVE_PATH}/metrics"; else dashboard_row warn "Metrics endpoint" "not healthy · spark metrics start"; fi
+  fi
   [[ "$inference_only" == "1" ]] && return 0
   if workspace_configured; then
     ws_count=$(workspace_service_count)

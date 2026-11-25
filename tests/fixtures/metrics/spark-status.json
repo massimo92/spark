@@ -1,0 +1,144 @@
+{
+  "ok": true,
+  "backend": "vllm",
+  "docker": "running",
+  "gateway": {
+    "state": "ready",
+    "port": 4000,
+    "endpoint": "http://localhost:4000/v1",
+    "authentication": "configured",
+    "providers": {
+      "vllm": {
+        "enabled": true,
+        "auth": "local",
+        "session": "not-applicable"
+      },
+      "chatgpt": {
+        "enabled": true,
+        "auth": "oauth",
+        "session": "credentials-present"
+      }
+    },
+    "access": {
+      "enabled": true,
+      "port": 443,
+      "ssh_port": 22,
+      "policy_status": "pending",
+      "verified_at": null,
+      "nodes": [],
+      "protected": true
+    }
+  },
+  "models": [
+    {
+      "name": "abliterant/Qwen3.5-9B-RANA-abliterated-FP8",
+      "model": "abliterant/Qwen3.5-9B-RANA-abliterated-FP8",
+      "instance": "demo-9b-mtp-kv8",
+      "container": "spark-vllm-demo-9b-mtp-kv8",
+      "config": "kv8 · c5 · 16k · mtp2",
+      "engine": "vllm",
+      "api": "chat",
+      "state": "ready",
+      "endpoint": "http://localhost:8004/v1",
+      "gateway_model": "vllm/demo-9b-mtp-kv8",
+      "gateway_routed": true,
+      "reserved_gb": 19.4,
+      "live_gb": 7.8,
+      "peak_gb": 7.9,
+      "live_memory_scope": "cgroup",
+      "engine_memory": {
+        "started_at": "2026-11-25T15:00:09.63190197Z",
+        "source": "vllm-startup-log",
+        "kv_gib": 1.35,
+        "kv_tokens": 42715
+      }
+    },
+    {
+      "name": "abliterant/Qwen3.5-9B-RANA-abliterated-FP8",
+      "model": "abliterant/Qwen3.5-9B-RANA-abliterated-FP8",
+      "instance": "demo-9b-mtp",
+      "container": "spark-vllm-demo-9b-mtp",
+      "config": "c5 · 16k · mtp2",
+      "engine": "vllm",
+      "api": "chat",
+      "state": "ready",
+      "endpoint": "http://localhost:8003/v1",
+      "gateway_model": "vllm/demo-9b-mtp",
+      "gateway_routed": true,
+      "reserved_gb": 19.4,
+      "live_gb": 6.7,
+      "peak_gb": 7.7,
+      "live_memory_scope": "cgroup",
+      "engine_memory": {
+        "started_at": "2026-11-25T14:54:20.732604758Z",
+        "source": "vllm-startup-log",
+        "kv_gib": 1.36,
+        "kv_tokens": 27433
+      }
+    },
+    {
+      "name": "abliterant/Qwen3.5-9B-RANA-abliterated-FP8",
+      "model": "abliterant/Qwen3.5-9B-RANA-abliterated-FP8",
+      "instance": "demo-9b-kv8",
+      "container": "spark-vllm-demo-9b-kv8",
+      "config": "kv8 · c5 · 16k",
+      "engine": "vllm",
+      "api": "chat",
+      "state": "ready",
+      "endpoint": "http://localhost:8002/v1",
+      "gateway_model": "vllm/demo-9b-kv8",
+      "gateway_routed": true,
+      "reserved_gb": 19.4,
+      "live_gb": 6.7,
+      "peak_gb": 7.6,
+      "live_memory_scope": "cgroup",
+      "engine_memory": {
+        "started_at": "2026-11-25T14:49:35.953141801Z",
+        "source": "vllm-startup-log",
+        "kv_gib": 3.38,
+        "kv_tokens": 155648
+      }
+    },
+    {
+      "name": "abliterant/Qwen3.5-9B-RANA-abliterated-FP8",
+      "model": "abliterant/Qwen3.5-9B-RANA-abliterated-FP8",
+      "instance": "demo-9b",
+      "container": "spark-vllm-demo-9b",
+      "config": "c5 · 16k",
+      "engine": "vllm",
+      "api": "chat",
+      "state": "ready",
+      "endpoint": "http://localhost:8000/v1",
+      "gateway_model": "vllm/demo-9b",
+      "gateway_routed": true,
+      "reserved_gb": 19.4,
+      "live_gb": 8.7,
+      "peak_gb": 9.0,
+      "live_memory_scope": "cgroup",
+      "engine_memory": {
+        "started_at": "2026-11-25T14:44:44.991409413Z",
+        "source": "vllm-startup-log",
+        "kv_gib": 3.24,
+        "kv_tokens": 86662
+      }
+    },
+    {
+      "name": "sky7350/Mica-v0.5-4B",
+      "model": "sky7350/Mica-v0.5-4B",
+      "instance": "mica-v0.5-4b",
+      "container": "spark-vllm-mica-v0.5-4b",
+      "config": "c1 · 32k · eager",
+      "engine": "vllm",
+      "api": "systemone",
+      "state": "ready",
+      "endpoint": "http://localhost:8001/v1/systemone",
+      "gateway_model": "systemone/sky7350/Mica-v0.5-4B",
+      "gateway_routed": true,
+      "reserved_gb": 12.1,
+      "live_gb": 0.8,
+      "peak_gb": 6.4,
+      "live_memory_scope": "cgroup",
+      "engine_memory": null
+    }
+  ]
+}
