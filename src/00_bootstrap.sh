@@ -264,6 +264,7 @@ MAX_NUM_SEQS_DEFAULT="${SPARK_MAX_NUM_SEQS:-5}"
 # (concurrency too high for the cache → lower --max-num-seqs; insufficient KV
 # reservation → raise the memory fraction; warmup OOM → --enforce-eager).
 STARTUP_TIMEOUT="${SPARK_STARTUP_TIMEOUT:-600}"          # seconds to wait for the API to come up
+STARTUP_POLL_INTERVAL="${SPARK_STARTUP_POLL_INTERVAL:-3}" # seconds between readiness checks
 STARTUP_MAX_RETRIES="${SPARK_STARTUP_MAX_RETRIES:-2}"    # auto-retries on a recoverable failure
 # earlyoom's emergency floor: kill the hog when free RAM drops below this %. The last-resort backstop
 # (the cgroup cap + admission keep normal operation far from it). spark setup configures earlyoom here.
