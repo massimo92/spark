@@ -1,0 +1,68 @@
+{
+  "schema_version": 2,
+  "name": "mica-v05-4b-q8",
+  "description": "Mica v0.5 4B Q8 decision API on ARM64 GB10, 32k context and bounded concurrency.",
+  "api": {
+    "type": "systemone"
+  },
+  "defaults": {
+    "target_model": {
+      "id": "sky7350/Mica-v0.5-4B",
+      "revision": "5ea7aafe324defec353494417ba723195c119b59"
+    },
+    "vllm_args": [
+      "vllm",
+      "serve",
+      "sky7350/Mica-v0.5-4B",
+      "--revision",
+      "5ea7aafe324defec353494417ba723195c119b59",
+      "--gpu-memory-utilization",
+      "0.10",
+      "--max-model-len",
+      "32768",
+      "--max-num-seqs",
+      "1",
+      "--enforce-eager",
+      "--port",
+      "8001"
+    ]
+  },
+  "model_source": {
+    "type": "prepared",
+    "path": "model"
+  },
+  "initializer": {
+    "command": [
+      "python3",
+      "/opt/mica/initialize.py"
+    ],
+    "version": "mica-q8-v1",
+    "memory_gb": 8,
+    "minimum_free_disk_gb": 6,
+    "gpu": false
+  },
+  "runtime": {
+    "command": [
+      "python3",
+      "/opt/mica/serve_spark.py"
+    ],
+    "env": {
+      "PYTHONUNBUFFERED": "1",
+      "TOKENIZERS_PARALLELISM": "false",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1"
+    }
+  },
+  "resources": {
+    "weights_gb": 4.5,
+    "runtime_overhead_gb": 6,
+    "kv_estimator": "engine"
+  },
+  "options": {},
+  "patches": [
+    {
+      "file": "patches/long-input-b11700.patch",
+      "description": "Official Mica long-input optimization for the pinned llama.cpp b11700 runtime."
+    }
+  ]
+}
