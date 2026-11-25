@@ -136,7 +136,7 @@ dashboard_models_html() {
   fi
 
   printf '<table><thead><tr><th>Model</th><th>Need</th><th>Weights</th><th>KV</th><th>Port</th><th>Up</th></tr></thead><tbody>\n'
-  while IFS=$'\t' read -r name model port need wt kv; do
+  while IFS=$'\t' read -r name model port need wt kv _; do
     [[ -z "$name" ]] && continue
     rows=$((rows + 1))
     [[ "${need:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] && reserved=$(awk -v a="$reserved" -v b="$need" 'BEGIN{printf "%.1f", a+b}')

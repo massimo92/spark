@@ -66,11 +66,48 @@ A supervised run checks a real completion before reporting the gateway usable;
 `--no-wait` and backend startup timeouts report pending readiness. Publication
 failure returns an error and identifies the backend as still active.
 
-Use `http://localhost:4000/v1` with `vllm/<model>` or `ollama_chat/<model>`.
+Use `http://localhost:4000/v1` with `vllm/<model>` (`vllm/<instance>` for named
+instances, see below) or `ollama_chat/<model>`.
 Stopping a model removes its route, preserving the others. `main` changes only
 when explicitly selected with `--main`; stopping that model does not silently
 redirect `main`. New vLLM launches bind localhost. Benchmarks use local backend
 ports. `--dry-run` changes no services.
+
+### Several instances of one model
+
+One vLLM model can run as several instances at once (memory admission still
+applies to each). Every instance has a name, stored in the `spark.instance`
+container label:
+
+- `--name <name>` sets it explicitly.
+- `spark run <alias>` names it after the alias, so its route stays stable when
+  the alias is edited.
+- Otherwise it is generated from the naming flags given on the command line:
+  `<slug>[-kv8][-c<N>][-<ctx>k][-<method><K>]` from `--kv-cache-dtype fp8`,
+  `--max-num-seqs`, `--max-len` (or `--max-model-len`), and
+  `--speculative-config` (`--mtp` gives `mtp`). Bundles use their target model's
+  slug and the flags given to `spark run <bundle>`.
+
+```bash
+spark run Qwen/Qwen3.5-9B                         # qwen3.5-9b      -> vllm/Qwen/Qwen3.5-9B
+spark run Qwen/Qwen3.5-9B --max-len 16384         # qwen3.5-9b-16k  -> vllm/qwen3.5-9b-16k
+spark run Qwen/Qwen3.5-9B --kv-cache-dtype fp8 --max-len 16384 \
+  -- --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+                                                  # qwen3.5-9b-kv8-16k-mtp2
+spark stop qwen3.5-9b-16k                         # stop or follow one instance by name
+```
+
+Without naming flags a run is the model's default instance: same container name
+(`spark-vllm-<slug>`) and route (`vllm/<model>`) as before, and containers started
+by older versions count as default instances. Other instances get
+`spark-vllm-<instance>` and the route `vllm/<instance>`. Only a running instance
+with the same name blocks a launch; `--force` replaces just that instance. Runs
+that differ only in other flags (`--mem`, image, eager mode) share a name: add
+`--name` to keep both. `stop`, `logs`, `benchmark --model` and `--main` accept an
+instance name, or a model id when it has one running instance. When an alias's
+saved port is used by another instance, Spark picks the next free port; an
+explicit `--port` wins. `spark status` shows each instance with its effective
+configuration, e.g. `kv8 · c5 · 16k · mtp2`.
 
 New vLLM model containers use Docker's `unless-stopped` restart policy, including
 aliases and bundles. They restart after a host reboot or process failure; models
@@ -249,8 +286,8 @@ spark alias set <alias> --mem 0.65  # replace saved arguments (Spark or vLLM), k
 spark run <alias> --kv-cache-memory-bytes 12G  # change arguments for this run only
 spark run <alias> --explain  # inspect its resolved, non-destructive launch plan
 spark benchmark              # public GuideLLM benchmark of a running vLLM model
-spark logs [model]           # model logs
-spark stop [model|--all]     # stop running models
+spark logs [instance|model] # model logs
+spark stop [instance|model|--all]  # stop running models
 spark down                   # stop all model and gateway services
 ```
 

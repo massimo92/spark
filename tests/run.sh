@@ -212,13 +212,17 @@ ${stdin_payload}"
     if [[ "${FAKE_DOCKER_RUN_EXIT:-0}" == 0 ]]; then
       if [[ "$args" == *"--name spark-litellm "* ]]; then printf '1\n' > "$HOME/.config/spark/test-gateway-state"; fi
       if [[ "$args" == *"--label spark.managed=1"* ]]; then
-        model='' port='' name='' previous=''
+        model='' port='' name='' instance='' previous=''
         for arg in "$@"; do
           [[ "$previous" != --name ]] || name="$arg"
-          case "$arg" in spark.model=*) model="${arg#spark.model=}" ;; spark.port=*) port="${arg#spark.port=}" ;; esac
+          case "$arg" in
+            spark.model=*) model="${arg#spark.model=}" ;;
+            spark.port=*) port="${arg#spark.port=}" ;;
+            spark.instance=*) instance="${arg#spark.instance=}" ;;
+          esac
           previous="$arg"
         done
-        printf '%s\t%s\t%s\t1\t1\t0\n' "$name" "$model" "$port" >> "$HOME/.config/spark/test-launched-models.tsv"
+        printf '%s\t%s\t%s\t1\t1\t0\t%s\n' "$name" "$model" "$port" "$instance" >> "$HOME/.config/spark/test-launched-models.tsv"
       fi
     fi
     if [[ "$args" == *"--entrypoint"* && "$args" == *SPARK_BUNDLE_DIR=* && -n "${FAKE_INITIALIZER_CONFIG:-}" ]]; then
@@ -3712,6 +3716,204 @@ EOF
     [[ "$yaml" != *'model_name: "vllm/*"'* ]]
 }
 
+
+# --- Named instances: one model can run as several vLLM instances ---
+
+INSTANCE_MODEL="Qwen/Qwen3.5-9B"
+
+test_instance_names_generated_from_explicit_flags() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out units ok=0 expected
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "$INSTANCE_MODEL" "$KV_CONFIG"
+  instance_dry_run() {
+    HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+      "$SPARK" run "$INSTANCE_MODEL" --dry-run "$@" </dev/null 2>&1
+  }
+  out=$(instance_dry_run) || ok=1
+  [[ "$out" == *"--name spark-vllm-qwen3.5-9b "* && "$out" == *"spark.instance=qwen3.5-9b "* ]] || ok=1
+  out=$(instance_dry_run --max-len 16384) || ok=1
+  [[ "$out" == *"--name spark-vllm-qwen3.5-9b-16k "* && "$out" == *"spark.instance=qwen3.5-9b-16k "* ]] || ok=1
+  out=$(instance_dry_run --kv-cache-dtype fp8 --max-len 16384 -- \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":2}') || ok=1
+  [[ "$out" == *"spark.instance=qwen3.5-9b-kv8-16k-mtp2 "* ]] || ok=1
+  out=$(instance_dry_run --max-num-seqs 5 --max-len 53248) || ok=1
+  [[ "$out" == *"spark.instance=qwen3.5-9b-c5-52k "* ]] || ok=1
+  # Non-naming flags (memory, eager) keep the default instance.
+  out=$(instance_dry_run --mem 0.3 --enforce-eager) || ok=1
+  [[ "$out" == *"spark.instance=qwen3.5-9b "* ]] || ok=1
+  out=$(instance_dry_run --max-len 16384 --name chat-fast) || ok=1
+  [[ "$out" == *"--name spark-vllm-chat-fast "* && "$out" == *"spark.instance=chat-fast "* ]] || ok=1
+  if HOME="${tmp}/home" PATH="${fake_bin}:$PATH" "$SPARK" run "$INSTANCE_MODEL" --name 'bad/name' --dry-run \
+      </dev/null >/dev/null 2>&1; then ok=1; fi
+  units=$(HOME="${tmp}/home" bash -c '
+    source "$1"
+    instance_ctx_label 131072; printf " "
+    instance_ctx_label 16384; printf " "
+    printf "%s " "$(instance_generated_name Org/Model-8B fp8 4 32768 "$(instance_spec_label "{\"method\":\"dflash\",\"num_speculative_tokens\":3}")")"
+    instance_config_descriptor "[\"Org/M\",\"--kv-cache-dtype\",\"fp8\",\"--max-model-len\",\"16384\",\"--max-num-seqs\",\"5\",\"--speculative-config\",\"{\\\"method\\\":\\\"mtp\\\",\\\"num_speculative_tokens\\\":2}\"]"
+  ' _ "$SPARK") || ok=1
+  expected="128k 16k model-8b-kv8-c4-32k-dflash3 kv8 · c5 · 16k · mtp2"
+  [[ "$units" == "$expected" ]] || { printf 'units: %s\n' "$units" >&2; ok=1; }
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_alias_launch_uses_alias_instance_name_and_free_port() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out ok=0 managed
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "$INSTANCE_MODEL" "$KV_CONFIG"
+  mkdir -p "${tmp}/home/.config/spark"
+  jq -n --arg model "$INSTANCE_MODEL" '{
+    fast: {kind:"guided", backend:"vllm", model:$model, run_args:["--max-len","16384"]},
+    pinned: {kind:"captured-vllm", backend:"vllm", model:$model,
+      image:"eugr/spark-vllm:latest", image_id:("sha256:" + ("a" * 64)), vllm_entrypoint:true, env:{},
+      vllm_args:["vllm","serve",$model,"--gpu-memory-utilization","0.2","--max-model-len","4096","--port","8000"]}
+  }' > "${tmp}/home/.config/spark/aliases.json"
+  managed=$'spark-vllm-qwen3.5-9b\tQwen/Qwen3.5-9B\t8000\t10\t5\t5\n'
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run fast --dry-run </dev/null 2>&1) || ok=1
+  [[ "$out" == *"--name spark-vllm-fast "* && "$out" == *"spark.instance=fast "* ]] || ok=1
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run fast --name fast-b --dry-run </dev/null 2>&1) || ok=1
+  [[ "$out" == *"spark.instance=fast-b "* ]] || ok=1
+  # The captured alias's stored port belongs to a running instance: use the next free one.
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_MANAGED="$managed" \
+    "$SPARK" run pinned --dry-run </dev/null 2>&1) || ok=1
+  [[ "$out" == *"spark.instance=pinned "* && "$out" == *"--port 8001"* && "$out" != *"--port 8000"* ]] || ok=1
+  [[ "$out" == *"Port 8000 is used by another instance; using port 8001"* ]] || ok=1
+  # An explicit --port for this run still wins.
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_MANAGED="$managed" \
+    "$SPARK" run pinned --port 8000 --dry-run </dev/null 2>&1) || ok=1
+  [[ "$out" == *"--port 8000"* && "$out" != *"using port 8001"* ]] || ok=1
+  [[ "$ok" == "0" ]] || printf '%s\n' "$out" >&2
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_two_instances_of_one_model_coexist_and_force_replaces_one() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status=0 ok=0 tsv stops
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "$INSTANCE_MODEL" "$KV_CONFIG"
+  instance_run() {
+    HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_STOP_FILE="${tmp}/stops" \
+      "$SPARK" run "$INSTANCE_MODEL" "$@" --no-wait </dev/null 2>&1
+  }
+  out=$(instance_run) || ok=1
+  out=$(instance_run --max-len 16384) || ok=1
+  tsv="${tmp}/home/.config/spark/test-launched-models.tsv"
+  [[ "$(awk -F '\t' '$2 == "Qwen/Qwen3.5-9B"' "$tsv" | wc -l | tr -d ' ')" == "2" ]] || ok=1
+  [[ "$(cut -f1 "$tsv" | sort | tr '\n' ' ')" == "spark-vllm-qwen3.5-9b spark-vllm-qwen3.5-9b-16k " ]] || ok=1
+  [[ "$(cut -f7 "$tsv" | sort | tr '\n' ' ')" == "qwen3.5-9b qwen3.5-9b-16k " ]] || ok=1
+  [[ "$(cut -f3 "$tsv" | sort -u | wc -l | tr -d ' ')" == "2" ]] || ok=1
+  # Same instance name collides; the error names the instance and suggests --name.
+  out=$(instance_run --max-len 16384) || status=$?
+  [[ "$status" != "0" && "$out" == *"Instance 'qwen3.5-9b-16k' is already running"* && "$out" == *"--name"* ]] || ok=1
+  # --force replaces only that instance.
+  : > "${tmp}/stops"
+  out=$(instance_run --max-len 16384 --force) || ok=1
+  stops=$(cat "${tmp}/stops")
+  [[ "$stops" == *"spark-vllm-qwen3.5-9b-16k"* ]] || ok=1
+  ! grep -Eq '(^| )spark-vllm-qwen3.5-9b$' "${tmp}/stops" || ok=1
+  [[ "$(wc -l < "$tsv" | tr -d ' ')" == "2" ]] || ok=1
+  [[ "$ok" == "0" ]] || { printf '%s\n' "$out" >&2; cat "$tsv" "${tmp}/stops" >&2; }
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+INSTANCES_OF_ALPHA='spark-vllm-alpha\torg/Alpha\t8000\t10\t5\t5\nspark-vllm-alpha-16k\torg/Alpha\t8001\t10\t5\t5\talpha-16k\n'
+
+test_ambiguous_model_ref_lists_instances_and_legacy_resolves() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status=0 ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$INSTANCES_OF_ALPHA" \
+    FAKE_DOCKER_STOP_FILE="${tmp}/stops" "$SPARK" stop org/Alpha 2>&1) || status=$?
+  [[ "$status" != "0" && "$out" == *"several running instances"* ]] || ok=1
+  [[ "$out" == *"alpha (spark-vllm-alpha)"* && "$out" == *"alpha-16k (spark-vllm-alpha-16k)"* ]] || ok=1
+  [[ ! -s "${tmp}/stops" ]] || ok=1
+  # The unlabeled (legacy) container is the default instance of its model.
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$INSTANCES_OF_ALPHA" \
+    FAKE_DOCKER_STOP_FILE="${tmp}/stops" "$SPARK" stop alpha >/dev/null 2>&1 || ok=1
+  grep -Eq '(^| )spark-vllm-alpha$' "${tmp}/stops" || ok=1
+  ! grep -q 'spark-vllm-alpha-16k' "${tmp}/stops" || ok=1
+  : > "${tmp}/stops"
+  HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$INSTANCES_OF_ALPHA" \
+    FAKE_DOCKER_STOP_FILE="${tmp}/stops" "$SPARK" stop alpha-16k >/dev/null 2>&1 || ok=1
+  grep -q 'spark-vllm-alpha-16k' "${tmp}/stops" || ok=1
+  # Benchmark accepts an instance name and refuses an ambiguous model id.
+  status=0
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$INSTANCES_OF_ALPHA" \
+    "$SPARK" benchmark --model org/Alpha --dry-run 2>&1) || status=$?
+  [[ "$status" != "0" && "$out" == *"alpha-16k (spark-vllm-alpha-16k)"* ]] || ok=1
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$INSTANCES_OF_ALPHA" \
+    "$SPARK" benchmark --instance alpha-16k --dry-run 2>&1) || ok=1
+  [[ "$out" == *"Benchmark target: org/Alpha (spark-vllm-alpha-16k, port 8001)"* ]] || ok=1
+  [[ "$out" == *"Instance:        alpha-16k"* ]] || ok=1
+  [[ "$ok" == "0" ]] || printf '%s\n' "$out" >&2
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_gateway_yaml_routes_named_instances() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin yaml main_block ok=0 main
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  mkdir -p "${tmp}/home/.config/spark"
+  for main in alpha-16k org/Alpha; do
+    jq -n --arg main "$main" '{enabled:true, port:4000, main:{provider:"vllm", model:$main},
+      providers:{vllm:{enabled:true, port:8000}}}' > "${tmp}/home/.config/spark/gateway.json"
+    rm -f "${tmp}/home/.config/spark/litellm_config.yaml"
+    HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$INSTANCES_OF_ALPHA" \
+      "$SPARK" gateway start >/dev/null 2>&1 || true
+    yaml=$(cat "${tmp}/home/.config/spark/litellm_config.yaml" 2>/dev/null || echo "")
+    main_block=$(printf '%s\n' "$yaml" | awk '
+      /model_name: "main"/ { found=1; next }
+      found && /model_name:/ { exit }
+      found { print }')
+    [[ "$yaml" == *'model_name: "vllm/org/Alpha"'* && "$yaml" == *'model_name: "vllm/alpha-16k"'* ]] || ok=1
+    [[ -z "$(printf '%s\n' "$yaml" | sed -n 's/.*model_name: "\([^"]*\)".*/\1/p' | sort | uniq -d)" ]] || ok=1
+    if [[ "$main" == alpha-16k ]]; then
+      [[ "$main_block" == *'api_base: "http://localhost:8001/v1"'* ]] || ok=1
+    else
+      # Configurations that store a model id keep targeting its default instance.
+      [[ "$main_block" == *'api_base: "http://localhost:8000/v1"'* ]] || ok=1
+    fi
+    [[ "$main_block" == *'model: "openai/org/Alpha"'* ]] || ok=1
+  done
+  [[ "$ok" == "0" ]] || printf '%s\n' "$yaml" >&2
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_status_shows_instance_names_and_config() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin output json ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home/.config/spark"
+  printf '%s\n' '{"enabled":true,"port":4000,"providers":{"vllm":{"enabled":true}}}' > "${tmp}/home/.config/spark/gateway.json"
+  output=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 \
+    FAKE_DOCKER_INFO_EXIT=0 FAKE_NAMES='spark-litellm\n' FAKE_MANAGED="$INSTANCES_OF_ALPHA" \
+    FAKE_DOCKER_CMD_JSON='["org/Alpha","--max-model-len","16384","--max-num-seqs","5","--kv-cache-dtype","fp8"]' \
+    FAKE_LITELLM_MODELS='{"data":[{"id":"vllm/org/Alpha"},{"id":"vllm/alpha-16k"}]}' \
+    "$SPARK" status 2>&1) || true
+  [[ "$output" == *"alpha-16k"* && "$output" == *"Model:   org/Alpha · kv8 · c5 · 16k"* ]] || ok=1
+  [[ "$output" == *"model vllm/alpha-16k · routed"* && "$output" == *"model vllm/org/Alpha · routed"* ]] || ok=1
+  json=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_DOCKER_INFO_EXIT=0 FAKE_NAMES='spark-litellm\n' \
+    FAKE_MANAGED="$INSTANCES_OF_ALPHA" \
+    FAKE_DOCKER_CMD_JSON='["org/Alpha","--max-model-len","16384","--max-num-seqs","5","--kv-cache-dtype","fp8"]' \
+    FAKE_LITELLM_MODELS='{"data":[{"id":"vllm/org/Alpha"},{"id":"vllm/alpha-16k"}]}' \
+    "$SPARK" status --json 2>/dev/null) || true
+  printf '%s' "$json" | jq -e '
+    ([.models[] | select(.instance == "alpha-16k" and .model == "org/Alpha" and .gateway_model == "vllm/alpha-16k"
+      and .container == "spark-vllm-alpha-16k" and .config == "kv8 · c5 · 16k")] | length == 1) and
+    ([.models[] | select(.instance == "alpha" and .gateway_model == "vllm/org/Alpha")] | length == 1)
+  ' >/dev/null || ok=1
+  [[ "$ok" == "0" ]] || printf '%s\n%s\n' "$output" "$json" >&2
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
 test_missing_model_no_pull_errors() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin output status
@@ -4952,7 +5154,7 @@ test_repair_starts_model_with_requested_policy() {
     cmd_repair --model Org/Model --yes --tools --max-len 65536 --no-mtp
   ' _ "$SPARK")
   rm -rf "$tmp"
-  [[ "$out" == *"Org/Model --no-mtp --tools --max-len 65536"* ]] && [[ "$out" != *"--no-wait"* ]]
+  [[ "$out" == *"Org/Model --no-mtp --tools --max-len 65536 --name model"* ]] && [[ "$out" != *"--no-wait"* ]]
 }
 
 test_repair_defaults_to_litellm_main_model() {
@@ -4987,7 +5189,7 @@ test_repair_restarts_model_without_tool_calling() {
     cmd_repair --model Org/Model --yes --tools --max-len 65536 --no-mtp
   ' _ "$SPARK")
   rm -rf "$tmp"
-  [[ "$out" == *"Org/Model --no-mtp --tools --max-len 65536 --force"* ]]
+  [[ "$out" == *"Org/Model --no-mtp --tools --max-len 65536 --force --name model"* ]]
 }
 
 test_repair_model_tool_calling_requires_expected_parser() {
@@ -10707,6 +10909,12 @@ run_test "missing KV fields warns without aborting" test_missing_kv_fields_warns
 run_test "capacity verification aborts when it does not fit" test_capacity_verification_aborts
 run_test "port auto-assignment skips a busy port" test_port_auto_skips_busy
 run_test "gateway YAML has isolated per-model entries" test_gateway_yaml_per_model
+run_test "instance names come from explicit naming flags" test_instance_names_generated_from_explicit_flags
+run_test "alias launch uses alias instance name and a free port" test_alias_launch_uses_alias_instance_name_and_free_port
+run_test "two instances of one model coexist; --force replaces one" test_two_instances_of_one_model_coexist_and_force_replaces_one
+run_test "ambiguous model ref lists instances; legacy resolves" test_ambiguous_model_ref_lists_instances_and_legacy_resolves
+run_test "gateway YAML routes named instances uniquely" test_gateway_yaml_routes_named_instances
+run_test "status shows instance names and config" test_status_shows_instance_names_and_config
 run_test "missing model with --no-pull errors clearly" test_missing_model_no_pull_errors
 run_test "missing model with --dry-run errors clearly" test_missing_model_dry_run_errors
 run_test "auto-pull: fits → downloads and starts" test_autopull_fits_downloads_and_starts

@@ -1050,10 +1050,9 @@ setup_summary() {
 }
 
 model_server_state() {
-  local model="$1" name m rest running=0 route_ok=0
-  while IFS=$'\t' read -r name m rest; do
-    [[ "$m" == "$model" ]] && running=1
-  done < <(list_managed_containers)
+  local model="$1" running=0 route_ok=0
+  # A route name: the model id of a default instance, or an instance name.
+  main_ref_row "$model" >/dev/null && running=1
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     route_ok=1
   fi
@@ -1066,7 +1065,7 @@ model_server_tool_calling_ready() {
   local model="$1" container args parser profile_file expected=""
   [[ "$BACKEND" == "vllm" ]] || return 0
   [[ -n "$model" ]] || return 1
-  container=$(container_for_ref "$model" 2>/dev/null || true)
+  container=$(container_for_route "$model" 2>/dev/null || true)
   [[ -n "$container" ]] || return 1
   args=$(docker inspect -f '{{json .Config.Cmd}}' "$container" 2>/dev/null || true)
   parser=$(printf '%s\n' "$args" | jq -er '
@@ -1089,7 +1088,7 @@ model_server_tool_calling_ready() {
 model_server_context_ready() {
   local model="$1" minimum="$2" container max_len
   [[ "$BACKEND" == "vllm" ]] || return 0
-  container=$(container_for_ref "$model" 2>/dev/null || true)
+  container=$(container_for_route "$model" 2>/dev/null || true)
   [[ -n "$container" ]] || return 1
   max_len=$(docker inspect -f '{{index .Config.Labels "spark.max_model_len"}}' "$container" 2>/dev/null || true)
   [[ "$max_len" =~ ^[0-9]+$ && "$max_len" -ge "$minimum" ]]
@@ -1133,10 +1132,22 @@ model_server_resolve_repair_model() {
 
 model_server_repair() {
   local check_only="$1" auto_yes="$2" model="$3" require_tools="$4" minimum_context="$5" disable_mtp="$6"
-  local provider="vllm" state restart=0 configured_provider configured_model args=("$model")
+  local provider="vllm" state restart=0 configured_provider configured_model args=("$model") row
+  local -a name_args=()
   [[ "$BACKEND" == "ollama" ]] && provider="ollama"
   model_server_ensure_gateway_config "$check_only" "$provider" || return 1
   state=$(model_server_state "$model")
+  # The main reference is a route name. Relaunch the instance that serves it
+  # (or the model's default instance) instead of a name generated from the
+  # repair flags below.
+  if [[ "$BACKEND" == "vllm" ]]; then
+    row=$(main_ref_row "$model" || true)
+    if [[ -n "$row" ]]; then
+      args=("$(cut -f2 <<<"$row")"); name_args=(--name "$(cut -f7 <<<"$row")")
+    elif ! alias_exists "$model"; then
+      name_args=(--name "$(default_instance_name "$model")")
+    fi
+  fi
   [[ "$disable_mtp" == "1" ]] && args+=(--no-mtp)
   [[ "$require_tools" == "1" ]] && args+=(--tools)
   [[ -n "$minimum_context" ]] && args+=(--max-len "$minimum_context")
@@ -1150,7 +1161,7 @@ model_server_repair() {
         return 1
       fi
       info "Restarting ${model} with the requested model-server policy"
-      cmd_run "${args[@]}" --force
+      cmd_run "${args[@]}" --force ${name_args[@]+"${name_args[@]}"}
     fi
   else
     if [[ "$check_only" == "1" ]]; then
@@ -1163,9 +1174,10 @@ model_server_repair() {
     if [[ "${SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL:-}" == "$model" && \
           -n "${SPARK_WORKSPACE_RESTART_VLLM_DEFINITION:-}" ]]; then
       run_captured_vllm_definition "$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION" \
-        "workspace restart" --force
+        "workspace restart" --force --name "${SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_INSTANCE:-$(default_instance_name \
+          "$(jq -r '.model' <<<"$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION")")}"
     else
-      cmd_run "${args[@]}"
+      cmd_run "${args[@]}" ${name_args[@]+"${name_args[@]}"}
     fi
   fi
 

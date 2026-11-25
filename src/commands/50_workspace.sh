@@ -319,10 +319,9 @@ workspace_url_for() {
 }
 
 workspace_model_state() {
-  local model="$1" name m rest running=0 route_ok=0
-  while IFS=$'\t' read -r name m rest; do
-    [[ "$m" == "$model" ]] && running=1
-  done < <(list_managed_containers)
+  local model="$1" running=0 route_ok=0
+  # A route name: the model id of a default instance, or an instance name.
+  main_ref_row "$model" >/dev/null && running=1
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     route_ok=1
   fi
@@ -335,7 +334,7 @@ workspace_model_tool_calling_ready() {
   local model="$1" container args parser profile_file expected=""
   [[ "$BACKEND" == "vllm" ]] || return 0
   [[ -n "$model" ]] || return 1
-  container=$(container_for_ref "$model" 2>/dev/null || true)
+  container=$(container_for_route "$model" 2>/dev/null || true)
   [[ -n "$container" ]] || return 1
   args=$(docker inspect -f '{{json .Config.Cmd}}' "$container" 2>/dev/null || true)
   parser=$(printf '%s\n' "$args" | jq -er '
@@ -368,7 +367,7 @@ workspace_hermes_setting() {
 workspace_model_context_limit() {
   local model="$1" container max_len
   [[ "$BACKEND" == "vllm" ]] || return 1
-  container=$(container_for_ref "$model" 2>/dev/null || true)
+  container=$(container_for_route "$model" 2>/dev/null || true)
   [[ -n "$container" ]] || return 1
   max_len=$(docker inspect -f '{{index .Config.Labels "spark.max_model_len"}}' "$container" 2>/dev/null || true)
   [[ "$max_len" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -566,18 +565,24 @@ workspace_repair_model_server() {
 
 SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
 SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
+SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_INSTANCE=""
 
 workspace_capture_restart_model() {
-  local model cname definition
+  local model cname definition row served=""
   SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
   SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_INSTANCE=""
   [[ "$BACKEND" == "vllm" ]] || return 0
   model=$(workspace_main_model 2>/dev/null || true)
   [[ -n "$model" ]] || return 0
-  cname=$(container_for_ref "$model" 2>/dev/null || true)
+  # main.model is a route name; capture the instance that serves it.
+  row=$(main_ref_row "$model" 2>/dev/null || true)
+  cname=$(cut -f1 <<<"$row")
+  served=$(cut -f2 <<<"$row")
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_INSTANCE=$(cut -f7 <<<"$row")
   [[ -n "$cname" ]] || cname=$(container_name_for_model "$model" 2>/dev/null || true)
   [[ -n "$cname" ]] || return 0
-  definition=$(alias_capture_definition "$cname" "$model" 2>/dev/null || true)
+  definition=$(alias_capture_definition "$cname" "${served:-$model}" 2>/dev/null || true)
   [[ -n "$definition" ]] || {
     warn "Could not capture the running vLLM launch; restart will use the workspace defaults"
     return 0
