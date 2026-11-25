@@ -24,6 +24,7 @@ MODULES=(
   "src/commands/40_setup.sh"
   "src/commands/50_workspace.sh"
   "src/commands/55_dsh.sh"
+  "src/commands/57_metrics.sh"
   "src/commands/60_product.sh"
   "src/lib/70_gateway_update.sh"
   "src/lib/72_gateway_models.sh"
@@ -86,6 +87,13 @@ for module in "${MODULES[@]}"; do
       printf "spark_builtin_dsh_access() { cat <<'__SPARK_DSH_ACCESS__'\n"
       cat "$ROOT_DIR/src/assets/dsh-access.mjs"
       printf '\n__SPARK_DSH_ACCESS__\n}\n'
+    } >> "$tmp"
+  fi
+  if [[ "$module" == "src/commands/57_metrics.sh" ]]; then
+    {
+      printf "spark_builtin_metrics_server() { cat <<'__SPARK_METRICS_SERVER__'\n"
+      cat "$ROOT_DIR/src/assets/spark-metrics.py"
+      printf '__SPARK_METRICS_SERVER__\n}\n'
     } >> "$tmp"
   fi
   cat "$path" >> "$tmp"
