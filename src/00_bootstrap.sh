@@ -1314,6 +1314,27 @@ instances_for_model() {
   list_managed_containers | awk -F '\t' -v ref="$1" '$2 == ref { printf "%s (%s)\n", $7, $1 }'
 }
 
+# All running instances, one "<instance> (<container>)" per line.
+running_instances() {
+  list_managed_containers | awk -F '\t' '{ printf "%s (%s)\n", $7, $1 }'
+}
+
+# Exit when a user reference matches no running instance. Never fall back to
+# the slug of the reference: "demo-9b-mtp" slugifies to "demo-9b", which is
+# another instance.
+die_no_running_instance() {
+  local ref="$1" rows
+  err "No running instance matches '${ref}'"
+  rows=$(running_instances)
+  if [[ -n "$rows" ]]; then
+    printf "    Running instances:\n" >&2
+    printf '%s\n' "$rows" | sed 's/^/      /' >&2
+  else
+    printf "    No instances are running\n" >&2
+  fi
+  exit 1
+}
+
 # Resolve a managed container from an instance name, a container name, or a
 # model id. A model id with several running instances is ambiguous: return 2
 # without picking one (callers list the candidates with instances_for_model).

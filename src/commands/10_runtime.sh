@@ -2608,20 +2608,17 @@ cmd_stop() {
     local n
     for n in "${names[@]}"; do stop_one_container "$n"; done
   elif [[ -n "$target" ]]; then
-    local name cand n
-    # An instance name, container name, or a model id with one running instance.
+    local name n
+    # Exact match only: an instance name, a container name, or a model id with
+    # one running instance. Never the slug of the target: it can name another
+    # instance of the same model.
     die_if_ambiguous_ref "$target"
     name=$(container_for_ref "$target" || true)
     if [[ -z "$name" ]]; then
-      # Fall back to matching the derived container name.
-      cand=$(container_name_for_model "$target")
-      for n in "${names[@]}"; do [[ "$n" == "$cand" || "$n" == "$target" ]] && name="$n"; done
+      # The legacy unlabelled container, by its exact name.
+      for n in "${names[@]}"; do [[ "$n" == "$target" ]] && name="$n"; done
     fi
-    if [[ -z "$name" ]]; then
-      err "No running model matches '${target}'"
-      printf "    Running: %s\n" "$(IFS=', '; echo "${names[*]}")"
-      exit 1
-    fi
+    [[ -n "$name" ]] || die_no_running_instance "$target"
     stop_one_container "$name"
   else
     # No argument: only safe when exactly one model is running.
