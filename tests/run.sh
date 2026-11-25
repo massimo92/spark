@@ -287,10 +287,20 @@ ${stdin_payload}"
       *State.Running*) echo "${FAKE_STATE_RUNNING:-true}" ;;
       *State.StartedAt*) echo "${FAKE_STARTED_AT:-}" ;;
       *State.Status*)
-        if [[ -n "${FAKE_RETRY:-}" && "${_att}" -le 1 ]]; then echo "restarting"
-        else echo "${FAKE_STATE_STATUS:-running}"; fi ;;
+        # FAKE_RESTART_COUNT simulates a crash loop Docker keeps restarting: the container reads as
+        # "running" between crashes and only RestartCount gives it away. FAKE_RETRY_VIA=restartcount
+        # makes a FAKE_RETRY failure show up that way instead of as a "restarting" state.
+        _st="${FAKE_STATE_STATUS:-running}" _rc="${FAKE_RESTART_COUNT:-0}"
+        if [[ -n "${FAKE_RETRY:-}" ]]; then
+          if [[ "${_att}" -gt 1 ]]; then _rc=0
+          elif [[ "${FAKE_RETRY_VIA:-}" == restartcount ]]; then _st=running _rc="${FAKE_RESTART_COUNT:-1}"
+          else _st=restarting; fi
+        fi
+        if [[ "$args" == *RestartCount* ]]; then echo "${_st} ${_rc}"; else echo "${_st}"; fi ;;
+      *RestartCount*) echo "${FAKE_RESTART_COUNT:-0}" ;;
       *State.OOMKilled*)
-        if [[ "${FAKE_RETRY:-}" == "oom" && "${_att}" -le 1 ]]; then echo "true"
+        # Docker clears OOMKilled once it has restarted the container.
+        if [[ "${FAKE_RETRY:-}" == "oom" && "${_att}" -le 1 && -z "${FAKE_RETRY_VIA:-}" ]]; then echo "true"
         else echo "${FAKE_OOMKILLED:-false}"; fi ;;
       *spark.max_model_len*) echo "${FAKE_DOCKER_MAX_MODEL_LEN:-65536}" ;;
       *Config.Cmd*) echo "${FAKE_DOCKER_CMD_JSON:-[\"Org/Model\",\"--enable-auto-tool-choice\",\"--tool-call-parser\",\"qwen3_coder\"]}" ;;
@@ -307,6 +317,14 @@ ${stdin_payload}"
       echo "ValueError: No available memory for the cache blocks. Try increasing gpu_memory_utilization."
     else
       [[ -n "${FAKE_DOCKER_LOGS:-}" ]] && echo "${FAKE_DOCKER_LOGS}"
+    fi
+    ;;
+  events)
+    # The OOM of a container Docker already restarted is only visible in the event stream.
+    _att=0
+    [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run .*--label spark.managed=1' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
+    if [[ "${FAKE_RETRY:-}" == "oom" && "${FAKE_RETRY_VIA:-}" == restartcount && "${_att}" -le 1 && "$args" == *"event=oom"* ]]; then
+      echo "oom"
     fi
     ;;
   exec)
@@ -1209,6 +1227,10 @@ test_suite_includes() {
     test_numeric_output_ignores_comma_decimal_locale|\
     test_alias_capture_replays_image_env_and_operational_overrides|\
     test_alias_capture_rejects_secret_flags|\
+    test_alias_capture_refuses_unhealthy_run|\
+    test_startup_crash_loop_fails_fast|\
+    test_startup_timeout_exits_nonzero|\
+    test_startup_success_and_no_wait_exit_zero|\
     test_alias_backend_mismatch_fails_closed|\
     test_bundle_catalog_embeds_and_validates_builtin|\
     test_bundle_revision_hash_tracks_permissions|\
@@ -9670,6 +9692,180 @@ test_startup_no_wait() {
   [[ "$out" == *"started"* ]] && [[ "$out" != *"waiting for it to serve"* ]]
 }
 
+# A launch Docker keeps restarting looks "running" between crashes. The wait must notice the
+# restarts, fail fast with the root cause, and stop the container instead of reporting success.
+test_startup_crash_loop_fails_fast() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status=0 stops started elapsed ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  started=$SECONDS
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    FAKE_DOCKER_STOP_FILE="${tmp}/stops.log" SPARK_STARTUP_TIMEOUT=600 \
+    FAKE_VLLM_READY=0 FAKE_STATE_STATUS=running FAKE_RESTART_COUNT=3 \
+    FAKE_DOCKER_LOGS=$'INFO 11-25 10:00:01 [api_server.py:1] vLLM API server version 0.11\n(EngineCore_DP0 pid=77) ValueError: No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine.\n(APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above.\nINFO 11-25 10:00:40 [api_server.py:1] vLLM API server version 0.11' \
+    "$SPARK" run Qwen/Qwen3-30B --mem 0.13 --name demo-9b --port 8000 </dev/null 2>&1) || status=$?
+  elapsed=$((SECONDS - started))
+  stops=$(cat "${tmp}/stops.log" 2>/dev/null || true)
+  [[ "$status" -ne 0 ]] || ok=1
+  [[ "$elapsed" -lt 120 ]] || ok=1
+  [[ "$(grep -c '^run .*--label spark.managed=1' "${tmp}/d.txt" 2>/dev/null || echo 0)" -eq 1 ]] || ok=1
+  [[ "$out" == *"could not reserve KV cache memory"* && "$out" == *"Raise --mem above 0.13"* ]] || ok=1
+  [[ "$out" == *"ValueError: No available memory for the cache blocks."* ]] || ok=1
+  [[ "$out" == *"restarted it 3 times"* ]] || ok=1
+  [[ "$out" == *"Stopped spark-vllm-demo-9b"* && "$out" == *"spark logs spark-vllm-demo-9b"* ]] || ok=1
+  [[ "$stops" == *"stop spark-vllm-demo-9b"* ]] || ok=1
+  [[ "$out" != *"backend ready"* && "$out" != *"' started."* ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+# Same crash loop with an error Spark has no lever for: generic failure, same guarantees.
+test_startup_crash_loop_unknown_error_reports_cause() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status=0 stops ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    FAKE_DOCKER_STOP_FILE="${tmp}/stops.log" SPARK_STARTUP_TIMEOUT=600 \
+    FAKE_VLLM_READY=0 FAKE_STATE_STATUS=running FAKE_RESTART_COUNT=2 \
+    FAKE_DOCKER_LOGS=$'Traceback (most recent call last):\nRuntimeError: CUDA driver exploded\nINFO starting again' \
+    "$SPARK" run Qwen/Qwen3-30B --name broken </dev/null 2>&1) || status=$?
+  stops=$(cat "${tmp}/stops.log" 2>/dev/null || true)
+  [[ "$status" -ne 0 && "$out" == *"failed to start"* ]] || ok=1
+  [[ "$out" == *"RuntimeError: CUDA driver exploded"* && "$out" == *"spark logs spark-vllm-broken"* ]] || ok=1
+  [[ "$out" == *"Stopped spark-vllm-broken"* && "$stops" == *"stop spark-vllm-broken"* ]] || ok=1
+  [[ "$out" != *"backend ready"* ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+# The adaptive retries must also fire when the crash is only visible as a restart count, and a
+# cgroup OOM that Docker already restarted (OOMKilled cleared) is recovered from the event stream.
+test_startup_retries_survive_docker_restart() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status mode last nruns ok=0
+  for mode in kv-memory mamba oom; do
+    tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+    make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+    status=0
+    out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+      FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+      FAKE_RETRY="$mode" FAKE_RETRY_VIA=restartcount FAKE_MAMBA_N=2 \
+      "$SPARK" run Qwen/Qwen3-30B </dev/null 2>&1) || status=$?
+    last=$(grep '^run .*--label spark.managed=1' "${tmp}/d.txt" 2>/dev/null | tail -1 || true)
+    nruns=$(grep -c '^run .*--label spark.managed=1' "${tmp}/d.txt" 2>/dev/null || echo 0)
+    rm -rf "$tmp"
+    [[ "$status" -eq 0 && "$nruns" -eq 2 && "$out" == *"backend ready"* ]] || ok=1
+    case "$mode" in
+      kv-memory) [[ "$out" == *"KV cache reservation too small"* ]] || ok=1 ;;
+      mamba) [[ "$last" == *"--max-num-seqs 2"* ]] || ok=1 ;;
+      oom) [[ "$last" == *"--enforce-eager"* ]] || ok=1 ;;
+    esac
+  done
+  [[ "$ok" == "0" ]]
+}
+
+test_await_startup_detects_restart_count() {
+  local tmp out status=0
+  tmp=$(mktemp -d)
+  out=$(STOP_LOG="${tmp}/stopped" bash -c '
+    source "$1"
+    model_api_ready() { return 1; }
+    docker() {
+      case "$*" in
+        *State.Status*) printf "running 4\n" ;;
+        *State.OOMKilled*) printf "false\n" ;;
+        logs*) printf "ValueError: No available memory for the cache blocks.\n" ;;
+        stop*) printf "%s\n" "$2" > "$STOP_LOG" ;;
+        *) return 1 ;;
+      esac
+    }
+    if await_startup spark-vllm-loop 8000 600; then :; else exit 1; fi
+  ' _ "$SPARK") || status=$?
+  [[ "$out" == "exit:kv-memory" && "$(cat "${tmp}/stopped" 2>/dev/null)" == "spark-vllm-loop" ]] || status=1
+  rm -rf "$tmp"
+  return "$status"
+}
+
+# A container that stays up but never answers until the timeout is a failed launch, not a success.
+test_startup_timeout_exits_nonzero() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status=0 stops ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_DOCKER_ARGS_FILE="${tmp}/d.txt" \
+    FAKE_DOCKER_STOP_FILE="${tmp}/stops.log" SPARK_STARTUP_TIMEOUT=2 SPARK_STARTUP_POLL_INTERVAL=1 \
+    FAKE_VLLM_READY=0 FAKE_DOCKER_LOGS="INFO Loading safetensors checkpoint shards" \
+    "$SPARK" run Qwen/Qwen3-30B --name slow </dev/null 2>&1) || status=$?
+  stops=$(cat "${tmp}/stops.log" 2>/dev/null || true)
+  [[ "$status" -ne 0 ]] || ok=1
+  [[ "$out" == *"did not become ready within 2s"* && "$out" == *"spark logs slow"* ]] || ok=1
+  [[ "$out" == *"left running"* && "$out" == *"spark stop slow"* ]] || ok=1
+  [[ "$out" != *"backend ready"* && "$out" != *"' started."* ]] || ok=1
+  [[ "$stops" != *"stop spark-vllm-slow"* ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+# The success and --no-wait contracts stay as they were: exit 0, with and without the ready mark.
+test_startup_success_and_no_wait_exit_zero() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status=0 ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Qwen/Qwen3-30B" "$KV_CONFIG"
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" \
+    "$SPARK" run Qwen/Qwen3-30B --name fine </dev/null 2>&1) || status=$?
+  [[ "$status" -eq 0 && "$out" == *"waiting for it to serve"* ]] || ok=1
+  [[ "$out" == *"Container 'spark-vllm-fine' started. ✓ backend ready"* ]] || ok=1
+  status=0
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 SPARK_ACCEL=cuda-unified \
+    FAKE_DOCKER_IMAGE="nvcr.io/nvidia/vllm:26.04-py3" FAKE_VLLM_READY=0 FAKE_RESTART_COUNT=5 \
+    "$SPARK" run Qwen/Qwen3-30B --name later --port 8011 --no-wait </dev/null 2>&1) || status=$?
+  [[ "$status" -eq 0 && "$out" == *"Container 'spark-vllm-later' started."* ]] || ok=1
+  [[ "$out" != *"waiting for it to serve"* && "$out" != *"backend ready"* ]] || ok=1
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+# Capturing a run that does not serve would save a launch that reproduces the failure.
+test_alias_capture_refuses_unhealthy_run() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin inspect managed out status aliases ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Captured" "$KV_CONFIG"
+  aliases="${tmp}/home/.config/spark/aliases.json"
+  managed=$'spark-vllm-demo-9b\tOrg/Captured\t8000\t78\t14\t24\tdemo-9b\n'
+  inspect=$(jq -nc '[{
+    State:{Running:true}, Path:"vllm", Args:["serve","Org/Captured","--gpu-memory-utilization","0.13"],
+    Config:{Entrypoint:["vllm","serve"], Cmd:["Org/Captured","--gpu-memory-utilization","0.13"],
+      Image:"eugr/spark-vllm:latest", Env:[]},
+    Image:("sha256:" + ("a" * 64))
+  }]')
+  capture() {
+    printf '1\n' | env HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
+      FAKE_MANAGED="$managed" FAKE_CONTAINER_INSPECT_JSON="$inspect" "$@" "$SPARK" alias capture demo 2>&1
+  }
+
+  status=0; out=$(capture FAKE_STATE_STATUS=restarting FAKE_RESTART_COUNT=7 FAKE_VLLM_READY=0) || status=$?
+  [[ "$status" -ne 0 && "$out" == *"restarting"* && "$out" == *"spark logs demo-9b"* && ! -f "$aliases" ]] || ok=1
+  status=0; out=$(capture FAKE_RESTART_COUNT=7 FAKE_VLLM_READY=0) || status=$?
+  [[ "$status" -ne 0 && "$out" == *"crash-looping"* && "$out" == *"restarted 7x"* && ! -f "$aliases" ]] || ok=1
+  status=0; out=$(capture FAKE_VLLM_READY=0) || status=$?
+  [[ "$status" -ne 0 && "$out" == *"not ready"* && ! -f "$aliases" ]] || ok=1
+  # A run that crashed once but serves now is healthy, and so is a plain healthy one.
+  status=0; out=$(capture FAKE_RESTART_COUNT=1) || status=$?
+  [[ "$status" -eq 0 && "$out" == *"Captured 'demo'"* ]] || ok=1
+  jq -e '.demo.vllm_args[0:3] == ["vllm","serve","Org/Captured"]' "$aliases" >/dev/null 2>&1 || ok=1
+  unset -f capture
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
 # A MoE model (vLLM under-profiles these → big startup peak) gets --enforce-eager auto on the first
 # launch (no measured peak yet); a dense model does not.
 MOE_CONFIG='{ "model_type":"qwen3_moe", "architectures":["Qwen3MoeForCausalLM"],
@@ -11324,6 +11520,13 @@ run_test "startup retries insufficient KV cache reservation" test_startup_retry_
 run_test "startup retries warmup OOM with more headroom" test_startup_retry_oom
 run_test "unrecoverable startup aborts without retry" test_startup_unrecoverable_aborts
 run_test "--no-wait launches without supervising" test_startup_no_wait
+run_test "crash-looping launch fails fast with root cause and stops the container" test_startup_crash_loop_fails_fast
+run_test "crash-looping launch with an unknown error reports its cause" test_startup_crash_loop_unknown_error_reports_cause
+run_test "startup retries still fire after Docker restarted the container" test_startup_retries_survive_docker_restart
+run_test "startup wait detects a growing restart count" test_await_startup_detects_restart_count
+run_test "never-ready launch exits non-zero at the timeout" test_startup_timeout_exits_nonzero
+run_test "ready and --no-wait launches still exit zero" test_startup_success_and_no_wait_exit_zero
+run_test "alias capture refuses a run that is not serving" test_alias_capture_refuses_unhealthy_run
 run_test "enforce-eager auto for MoE, not for dense" test_enforce_eager_auto_for_moe
 run_test "HF MoE NVFP4 emits Marlin + atomic add" test_hf_moe_nvfp4_emits_marlin_atomic
 run_test "HF inspector maps compressed-tensors NVFP4" test_hf_inspector_compressed_tensors_nvfp4_tag

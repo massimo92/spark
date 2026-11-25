@@ -979,12 +979,27 @@ alias_capture_definition() {
   printf '%s\n' "$definition"
 }
 
+# A capture is replayed as-is, so the run must be serving: a container that is restarting, has
+# crashed without recovering, or does not answer its model API would save a launch that fails again.
+alias_capture_require_serving() {
+  local cname="$1" port="$2" instance="$3" st="" restarts=""
+  read -r st restarts _ < <(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$cname" 2>/dev/null || true) || true
+  [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
+  [[ "$st" == "running" ]] || die "Cannot capture '${instance}': container ${cname} is ${st:-not running}" \
+    "Only a run that is serving can be captured. Check: spark logs ${instance}"
+  [[ "$port" =~ ^[0-9]+$ ]] && model_api_ready "$port" "$(model_api_kind "$cname")" && return 0
+  [[ "$restarts" -eq 0 ]] || die "Cannot capture '${instance}': ${cname} is crash-looping (restarted ${restarts}x, model API not ready)" \
+    "Replaying it would reproduce the broken launch. Check: spark logs ${instance}"
+  die "Cannot capture '${instance}': its model API is not ready${port:+ on port ${port}}" \
+    "Wait until 'spark status' shows it ready, or check: spark logs ${instance}"
+}
+
 cmd_alias_capture() {
   local name="$1" force="${2:-0}" cname model port need wt kv instance route choice definition
-  local -a names=() models=() instances=()
+  local -a names=() models=() instances=() ports=()
   while IFS=$'\t' read -r cname model port need wt kv instance route; do
     [[ -n "$cname" && -n "$model" ]] || continue
-    names+=("$cname"); models+=("$model"); instances+=("${instance:-$model}")
+    names+=("$cname"); models+=("$model"); instances+=("${instance:-$model}"); ports+=("${port:-}")
   done < <(list_managed_containers)
   [[ ${#names[@]} -gt 0 ]] || die "No live Spark vLLM runs to capture"
   printf '  Live runs:\n'
@@ -997,6 +1012,7 @@ cmd_alias_capture() {
   [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#names[@]} ]] \
     || die "Choose a run number from the list"
   i=$((choice - 1)); cname="${names[$i]}"; model="${models[$i]}"
+  alias_capture_require_serving "$cname" "${ports[$i]}" "${instances[$i]}"
   definition=$(alias_capture_definition "$cname" "$model")
   alias_save_definition "$name" "$definition" "$force"
   info "Captured '${name}' from ${cname}"
@@ -1796,19 +1812,68 @@ build_launch() {
   return 0
 }
 
+# Lines of a container log that name a failure (Python exception lines, CUDA/kernel kills), oldest
+# first, without exact repeats. Empty when the log has none.
+startup_error_lines() {
+  grep -E '[A-Za-z_][A-Za-z0-9_.]*(Error|Exception): |CUDA out of memory|Out of memory|Killed' <<<"$1" \
+    | awk '!seen[$0]++' | tail -n "${2:-4}" | cut -c1-400 || true
+}
+
+# Explain a launch whose container died or crash-looped, and leave it stopped: root-cause lines from
+# its log (else the last lines), what Spark did with the container, and where the full log is.
+# docker stop is a no-op on a container that already exited, so its status tells the truth. The
+# hints name the container: a stopped instance no longer resolves by its instance name.
+report_failed_startup() {
+  local cname="$1" logs cause restarts
+  logs=$(docker logs --tail 200 "$cname" 2>&1 || true)
+  restarts=$(docker inspect -f '{{.RestartCount}}' "$cname" 2>/dev/null || true)
+  if [[ "$restarts" =~ ^[0-9]+$ && "$restarts" -gt 0 ]]; then
+    printf "    The container kept crashing at startup: Docker restarted it %s time%s.\n" \
+      "$restarts" "$([[ "$restarts" -eq 1 ]] || printf s)" >&2
+  fi
+  cause=$(startup_error_lines "$logs")
+  if [[ -n "$cause" ]]; then
+    printf "    ${DIM}Root cause (container log):${NC}\n" >&2
+    printf '%s\n' "$cause" | sed 's/^/      /' >&2
+  elif [[ -n "$logs" ]]; then
+    printf "    ${DIM}Last logs:${NC}\n" >&2
+    tail -15 <<<"$logs" | sed 's/^/      /' >&2
+  fi
+  if docker stop "$cname" >/dev/null 2>&1; then
+    printf "    Stopped %s so it does not keep restarting; it is kept for inspection.\n" "$cname" >&2
+  else
+    printf "    Could not stop %s — stop it with: ${BOLD}spark stop %s${NC}\n" "$cname" "$cname" >&2
+  fi
+  printf "    Full log: ${BOLD}spark logs %s${NC}\n\n" "$cname" >&2
+}
+
 # Watch a just-launched vLLM container until it serves or stops. Echoes one of:
-#   ready | timeout | exit:oom | exit:mamba:<N> | exit:other
+#   ready | timeout | exit:oom | exit:kv-memory | exit:mamba:<N> | exit:other
 # Progress lines go to stderr so the caller can capture the verdict from stdout.
+# The launch uses --restart unless-stopped, so a container that dies at startup is "restarting" only
+# for the ~100 ms Docker waits before starting it again, and reads as "running" for the rest of every
+# crash cycle. A restart count above zero on this freshly created container is therefore the
+# reliable sign of a crash loop; without it the wait burns the whole timeout on a dead launch.
 await_startup() {
   local cname="$1" port="$2" timeout="$3"
-  local waited=0 interval=3 ticks=0 st oom logs n last
-  while [[ "$waited" -lt "$timeout" ]]; do
-    st=$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || echo "")
-    if [[ -n "$st" && "$st" != "running" && "$st" != "created" ]]; then
+  local interval="${STARTUP_POLL_INTERVAL:-3}" ticks=0 st restarts oom logs n last since deadline events
+  since=$(date +%s)
+  deadline=$((SECONDS + timeout))
+  while [[ "$SECONDS" -lt "$deadline" ]]; do
+    st="" restarts=""
+    read -r st restarts _ < <(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$cname" 2>/dev/null || true) || true
+    [[ "$restarts" =~ ^[0-9]+$ ]] || restarts=0
+    if [[ -n "$st" && ( ( "$st" != "running" && "$st" != "created" ) || "$restarts" -gt 0 ) ]]; then
       oom=$(docker inspect -f '{{.State.OOMKilled}}' "$cname" 2>/dev/null || echo "false")
-      logs=$(docker logs --tail 80 "$cname" 2>&1 || true)
+      if [[ "$oom" != "true" && "$restarts" -gt 0 ]]; then
+        # Docker clears OOMKilled when it restarts the container; the event stream keeps the kill.
+        events=$(docker events --since "$since" --until "$(( $(date +%s) + 1 ))" \
+          --filter "container=${cname}" --filter event=oom --format '{{.Action}}' 2>/dev/null || true)
+        [[ "$events" != *oom* ]] || oom=true
+      fi
+      logs=$(docker logs --tail 200 "$cname" 2>&1 || true)
       # Let Spark handle startup failures without Docker racing its adaptive retry.
-      [[ "$st" != "restarting" ]] || docker stop "$cname" >/dev/null 2>&1 || true
+      [[ "$st" == "exited" || "$st" == "dead" ]] || docker stop "$cname" >/dev/null 2>&1 || true
       [[ "$oom" == "true" ]] && { printf 'exit:oom\n'; return 0; }
       if grep -qiE 'No available memory for (the )?cache blocks|Available KV cache memory:[[:space:]]*-' <<< "$logs"; then
         printf 'exit:kv-memory\n'; return 0
@@ -1829,7 +1894,6 @@ await_startup() {
       [[ -n "$last" ]] && printf "    ${DIM}%s${NC}\n" "$last" >&2
     fi
     sleep "$interval"
-    waited=$((waited + interval))
   done
   printf 'timeout\n'
 }
@@ -2133,7 +2197,7 @@ run_backend_vllm() {
           continue
         fi
         err "vLLM couldn't start within the concurrency this size allows."
-        docker logs --tail 15 "$cname" 2>&1 | sed 's/^/    /'
+        report_failed_startup "$cname"
         exit 1 ;;
       exit:kv-memory)
         local next_util next_need retry_reserved retry_free
@@ -2156,6 +2220,7 @@ run_backend_vllm() {
         else
           printf "    Free memory, reduce --max-len, or use --text-only for a multimodal model.\n"
         fi
+        report_failed_startup "$cname"
         exit 1 ;;
       exit:oom)
         # The startup peak (torch.compile + CUDA-graph capture) overflowed the container cap. The
@@ -2168,10 +2233,11 @@ run_backend_vllm() {
         fi
         err "Startup peak exceeds the memory budget for ${model}, even with --enforce-eager."
         printf "    Reduce context (--max-len), free memory (spark stop <model>), or use a smaller model.\n"
+        report_failed_startup "$cname"
         exit 1 ;;
       *)
         err "vLLM failed to start."
-        docker logs --tail 15 "$cname" 2>&1 | sed 's/^/    /'
+        report_failed_startup "$cname"
         exit 1 ;;
     esac
   done
@@ -2185,12 +2251,27 @@ run_backend_vllm() {
     [[ -n "$measured" ]] && save_warmup_peak "$model" "$measured" "$enforce_eager" "$cudagraph_oomed"
   fi
 
+  # A launch that never served is a failure: scripts act on the exit status. The container is alive
+  # and not crash-looping (await_startup rules that out), so it may only be slow: leave it running,
+  # keep its gateway route pending, and say so.
+  if [[ "$serve_state" == "timeout" ]]; then
+    local last_log
+    printf "\n" >&2
+    err "${cname} did not become ready within ${STARTUP_TIMEOUT}s — the model API never answered."
+    last_log=$(docker logs --tail 1 "$cname" 2>&1 | tail -1 | cut -c1-200 || true)
+    [[ -z "$last_log" ]] || printf "    ${DIM}Last log line: %s${NC}\n" "$last_log" >&2
+    printf "    The container is still running (no crash, no restart) and was left running; it may still be loading.\n" >&2
+    printf "    Follow: ${BOLD}spark logs %s${NC}  ·  Stop: ${BOLD}spark stop %s${NC}  ·  Wait longer: SPARK_STARTUP_TIMEOUT=<seconds>\n\n" "$instance" "$instance" >&2
+    if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != 1 ]]; then
+      gateway_publish_model vllm "$route" 0 || true
+    fi
+    exit 1
+  fi
+
   printf "\n  Container '${BOLD}%s${NC}' started." "$cname"
   case "$serve_state" in
     ready)
       printf " ${GREEN}✓ backend ready${NC}\n" ;;
-    timeout)
-      printf "\n  ${YELLOW}⊘${NC} Still warming up after ${STARTUP_TIMEOUT}s — it may still come up. Follow: ${BOLD}spark logs %s${NC}\n\n" "$instance" ;;
     *)
       printf "\n  Logs: ${BOLD}spark logs %s${NC}  ·  Diagnose backend: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$instance" "$port" ;;
   esac

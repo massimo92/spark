@@ -63,8 +63,16 @@ spark dashboard              # web UI at http://127.0.0.1:8787
 Every `spark run` publishes its model through authenticated LiteLLM, including aliases
 and bundles. Spark creates a private token and starts the gateway when needed.
 A supervised run checks a real completion before reporting the gateway usable;
-`--no-wait` and backend startup timeouts report pending readiness. Publication
-failure returns an error and identifies the backend as still active.
+`--no-wait` reports pending readiness. Publication failure returns an error and
+identifies the backend as still active.
+
+`spark run` exits non-zero unless the model API became ready (`--no-wait` skips
+the check). A container that crashes at startup is detected while waiting, even
+when Docker keeps restarting it: Spark shows the error lines from its log, stops
+it so it does not restart forever, and keeps it for `spark logs <instance>`. A
+container that is still alive when the wait ends (`SPARK_STARTUP_TIMEOUT`,
+default 600 s) is left running with its route pending, and the run still fails.
+`spark alias capture` only captures a run whose model API answers.
 
 Use `http://localhost:4000/v1` with `vllm/<model>` (`vllm/<instance>` for named
 instances, see below) or `ollama_chat/<model>`.
