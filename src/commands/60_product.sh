@@ -731,6 +731,8 @@ cmd_architecture() {
   ${BOLD}Boundary rules:${NC}
     run_backend_* reads cmd_run locals via Bash dynamic scope.
     build_launch reads run_backend_vllm locals and rebuilds docker args.
+    a vLLM instance is identified by its spark.instance label, not its model;
+    the default instance keeps spark-vllm-<slug> and route vllm/<model>.
     setup steps must use ctx_* helpers so local and remote stay equivalent.
     workspace repair delegates model and LiteLLM recovery to spark repair.
     workspace setup --check and doctor must stay read-only.
@@ -770,11 +772,11 @@ cmd_help() {
     alias            Save, inspect, and restore launch aliases
     calibrate <model> Measure launch configs and save the fastest one
     benchmark         Benchmark a running vLLM model with GuideLLM
-    stop [<model>]   Stop a model (no arg: the only one; --all: every one)
+    stop [<instance>] Stop an instance or model (no arg: the only one; --all: every one)
     pull <model|bundle> Download a model or the pinned target of a bundle
     list             List downloaded models
     rm <model> [...] Remove downloaded model(s)
-    logs [<model>]   Show container logs (-f to follow)
+    logs [<instance>] Show container logs of an instance or model (-f to follow)
     gateway          Manage authenticated LiteLLM, providers, OAuth and private node access
     reinstall        Remove Spark state and run setup again
     uninstall        Remove Spark-managed runtime/config/data
@@ -814,7 +816,8 @@ cmd_help() {
     --explain              Explain the plan; implies --dry-run
     --no-wait              Start and return without health supervision
     --tail                 Follow logs after launch
-    --force                Replace an already running instance of this model
+    --name <name>          Instance name (default: generated from naming flags)
+    --force                Replace the running instance with the same name
     --regen-profile        Recompute the cached model memory profile
 
   ${BOLD}Setup flags:${NC}
@@ -850,6 +853,7 @@ cmd_help() {
     spark pull RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4   # second model, co-resident
+    spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4 --max-len 16384  # second instance: qwen3.6-35b-16k
     spark run --dry-run Qwen/Qwen3-30B-A3B
     spark benchmark --profile synchronous
     spark status

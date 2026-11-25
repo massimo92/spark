@@ -12,7 +12,9 @@ cmd_benchmark_help() {
   selected automatically; with several, Spark asks which one to test.
 
   ${BOLD}Flags:${NC}
-    --model <model>       Select an exact running model non-interactively.
+    --model <ref>         Select a running instance non-interactively: an
+                          instance name, or a model id with one instance.
+    --instance <name>     Same as --model.
     --profile <profile>   synchronous, throughput, sweep, or a GuideLLM config.
                           Default: sweep.
     --requests <int>      Requests per strategy. Default: 100.
@@ -33,42 +35,55 @@ cmd_benchmark_help() {
   ${BOLD}Examples:${NC}
     spark benchmark
     spark benchmark --model google/gemma-3-27b-it --profile synchronous
+    spark benchmark --model qwen3.5-9b-16k
     spark benchmark --duration 30 -- --metrics kind=generative,sample_size=0
 
 EOF
 }
 
 benchmark_select_model() {
-  local requested="$1" name model port rest choice i
-  local -a models=() ports=() names=()
+  local requested="$1" name model port need wt kv instance route choice i
+  local -a models=() ports=() names=() instances=() matches=()
 
-  while IFS=$'\t' read -r name model port rest; do
+  while IFS=$'\t' read -r name model port need wt kv instance route; do
     [[ -n "$name" && -n "$model" ]] || continue
     is_safe_model_ref "$model" || continue
     is_port "$port" || continue
     [[ "$(model_api_kind "$name")" != systemone ]] || continue
-    names+=("$name"); models+=("$model"); ports+=("$port")
+    names+=("$name"); models+=("$model"); ports+=("$port"); instances+=("${instance:-$name}")
   done < <(list_managed_containers)
 
   [[ ${#models[@]} -gt 0 ]] || die "No running Spark vLLM models found" \
     "Start one first: spark run <model>"
 
   if [[ -n "$requested" ]]; then
+    # An instance or container name is exact; a model id must be unambiguous.
     for i in "${!models[@]}"; do
-      if [[ "${models[$i]}" == "$requested" ]]; then
-        BENCHMARK_MODEL="${models[$i]}"
-        BENCHMARK_PORT="${ports[$i]}"
-        BENCHMARK_CONTAINER="${names[$i]}"
-        return 0
+      if [[ "${instances[$i]}" == "$requested" || "${names[$i]}" == "$requested" ]]; then
+        matches=("$i"); break
       fi
+      [[ "${models[$i]}" != "$requested" ]] || matches+=("$i")
     done
-    die "Model '${requested}' is not running" "Run 'spark status' to see active models."
+    [[ ${#matches[@]} -gt 0 ]] || die "Model or instance '${requested}' is not running" \
+      "Run 'spark status' to see active instances."
+    if [[ ${#matches[@]} -gt 1 ]]; then
+      err "Model '${requested}' has several running instances — choose one with --model <instance>"
+      for i in "${matches[@]}"; do printf '    %s (%s)\n' "${instances[$i]}" "${names[$i]}" >&2; done
+      exit 1
+    fi
+    i="${matches[0]}"
+    BENCHMARK_MODEL="${models[$i]}"
+    BENCHMARK_PORT="${ports[$i]}"
+    BENCHMARK_CONTAINER="${names[$i]}"
+    BENCHMARK_INSTANCE="${instances[$i]}"
+    return 0
   fi
 
   if [[ ${#models[@]} -eq 1 ]]; then
     BENCHMARK_MODEL="${models[0]}"
     BENCHMARK_PORT="${ports[0]}"
     BENCHMARK_CONTAINER="${names[0]}"
+    BENCHMARK_INSTANCE="${instances[0]}"
     return 0
   fi
 
@@ -76,7 +91,7 @@ benchmark_select_model() {
     "Run 'spark status' to see active models."
   printf '\n  Running models:\n'
   for i in "${!models[@]}"; do
-    printf '    %d) %s  (port %s)\n' "$((i + 1))" "${models[$i]}" "${ports[$i]}"
+    printf '    %d) %s  (instance %s, port %s)\n' "$((i + 1))" "${models[$i]}" "${instances[$i]}" "${ports[$i]}"
   done
   printf '  Model to benchmark: '
   IFS= read -r choice
@@ -86,6 +101,7 @@ benchmark_select_model() {
   BENCHMARK_MODEL="${models[$i]}"
   BENCHMARK_PORT="${ports[$i]}"
   BENCHMARK_CONTAINER="${names[$i]}"
+  BENCHMARK_INSTANCE="${instances[$i]}"
 }
 
 benchmark_profile_config() {
@@ -119,7 +135,7 @@ cmd_benchmark() {
     fi
     case "$1" in
       --) passthrough=1; shift ;;
-      --model) [[ $# -ge 2 ]] || die "Missing value for --model"; requested_model="$2"; shift 2 ;;
+      --model|--instance) [[ $# -ge 2 ]] || die "Missing value for $1"; requested_model="$2"; shift 2 ;;
       --profile) [[ $# -ge 2 ]] || die "Missing value for --profile"; profile="$2"; shift 2 ;;
       --requests) [[ $# -ge 2 ]] || die "Missing value for --requests"; requests="$2"; shift 2 ;;
       --duration) [[ $# -ge 2 ]] || die "Missing value for --duration"; duration="$2"; shift 2 ;;
@@ -164,7 +180,7 @@ cmd_benchmark() {
   target="http://${target_host}:${BENCHMARK_PORT}"
 
   timestamp=$(date -u '+%Y%m%dT%H%M%SZ')
-  slug=$(slugify_model "$BENCHMARK_MODEL")
+  slug="${BENCHMARK_INSTANCE:-$(slugify_model "$BENCHMARK_MODEL")}"
   output_dir="${output_dir:-${SPARK_DATA_DIR}/benchmarks/${timestamp}-${slug}}"
   if [[ "$output_dir" == /* ]]; then
     host_output_dir="$output_dir"
@@ -214,6 +230,7 @@ cmd_benchmark() {
   fi
 
   printf '\n  Benchmark target: %s (%s, port %s)\n' "$BENCHMARK_MODEL" "$BENCHMARK_CONTAINER" "$BENCHMARK_PORT"
+  printf '  Instance:        %s\n' "$BENCHMARK_INSTANCE"
   printf '  Dataset:         %s\n' "$data_config"
   printf '  Profile:         %s\n' "$profile_config"
   printf '  Thinking:        %s\n' "$thinking"
@@ -237,11 +254,11 @@ cmd_benchmark() {
   done
 
   manifest="${host_output_dir}/spark.json"
-  jq -n --arg timestamp "$timestamp" --arg model "$BENCHMARK_MODEL" --arg container "$BENCHMARK_CONTAINER" \
+  jq -n --arg timestamp "$timestamp" --arg model "$BENCHMARK_MODEL" --arg instance "$BENCHMARK_INSTANCE" --arg container "$BENCHMARK_CONTAINER" \
     --argjson port "$BENCHMARK_PORT" --arg image "$image" --arg dataset "$data_config" \
     --arg profile "$profile_config" --arg constraint "$constraint_config" --arg thinking "$thinking" \
     --argjson output_tokens "$output_tokens" \
-    '{timestamp:$timestamp,model:$model,container:$container,port:$port,image:$image,
+    '{timestamp:$timestamp,model:$model,instance:$instance,container:$container,port:$port,image:$image,
       data:$dataset,profile:$profile,constraint:$constraint,thinking:$thinking,
       output_tokens:$output_tokens,seed:42}' > "$manifest"
 

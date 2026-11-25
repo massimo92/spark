@@ -90,20 +90,34 @@ gateway_generate_litellm_yaml() {
   # no wildcard that could resurrect a stopped local model.
   if [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]]; then
     local primary_port="" primary_model="" primary_info="{}" model_info main_match=0 name model port rest
-    while IFS=$'\t' read -r name model port rest; do
+    local need wt kv instance route main_container="" seen_routes=$'\n'
+    # Instances of one model get distinct routes: vllm/<model> for the default
+    # instance, vllm/<instance> otherwise. Main follows the stored route name.
+    if [[ "$main_provider" == "vllm" && -n "$main_model" ]]; then
+      main_container=$(main_ref_row "$main_model" | cut -f1 || true)
+    fi
+    while IFS=$'\t' read -r name model port need wt kv instance route; do
       [[ -z "$model" ]] && continue
+      route="${route:-$model}"
+      # Never emit a duplicate model_name: LiteLLM would load-balance across
+      # different launches silently.
+      if [[ "$seen_routes" == *$'\n'"$route"$'\n'* ]]; then
+        warn "Skipping duplicate LiteLLM route for ${route} (container ${name})"
+        continue
+      fi
+      seen_routes+="${route}"$'\n'
       if [[ "$(model_api_kind "$name")" == systemone ]]; then
         # TypeSafe's transport implements the public System One wire contract;
         # api_base and the local placeholder key keep the call on this host.
         yaml+="
-  - $(jq -nc --arg model "$model" --arg base "http://localhost:${port}" \
-          '{model_name:("systemone/"+$model),litellm_params:{model:("typesafe/"+$model),api_base:$base,api_key:"dummy",drop_params:false},model_info:{mode:"decisions"}}')"
+  - $(jq -nc --arg route "$route" --arg model "$model" --arg base "http://localhost:${port}" \
+          '{model_name:("systemone/"+$route),litellm_params:{model:("typesafe/"+$model),api_base:$base,api_key:"dummy",drop_params:false},model_info:{mode:"decisions"}}')"
         has_models=1
         continue
       fi
       model_info=$(gateway_vllm_model_info "$name" "$model" "$port") || return 1
       yaml+="
-  - model_name: \"vllm/${model}\"
+  - model_name: \"vllm/${route}\"
     litellm_params:
       model: \"openai/${model}\"
       api_base: \"http://localhost:${port}/v1\"
@@ -120,7 +134,7 @@ gateway_generate_litellm_yaml() {
         primary_model="$model"
         primary_info="$model_info"
       fi
-      if [[ "$main_provider" == "vllm" && "$model" == "$main_model" ]]; then
+      if [[ "$main_provider" == "vllm" && -n "$main_container" && "$name" == "$main_container" ]]; then
         primary_port="$port"
         primary_model="$model"
         primary_info="$model_info"

@@ -100,6 +100,8 @@ cmd_logs() {
 
   local name=""
   if [[ -n "$target" ]]; then
+    # An instance name, container name, or a model id with one running instance.
+    die_if_ambiguous_ref "$target"
     name=$(container_for_ref "$target" 2>/dev/null || true)
     [[ -z "$name" ]] && name=$(container_name_for_model "$target")
   else

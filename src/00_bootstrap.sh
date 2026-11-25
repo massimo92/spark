@@ -1156,21 +1156,219 @@ container_name_for_model() {
   printf '%s-%s\n' "$CONTAINER_NAME" "$(slugify_model "$1")"
 }
 
-# List managed vLLM containers as TSV: name<TAB>model<TAB>port<TAB>need_gb<TAB>weights_gb<TAB>kv_gb.
-# Source of truth = docker labels on running containers (no state file).
-list_managed_containers() {
-  docker ps --filter label=spark.managed=1 \
-    --format '{{.Names}}	{{.Label "spark.model"}}	{{.Label "spark.port"}}	{{.Label "spark.need_gb"}}	{{.Label "spark.weights_gb"}}	{{.Label "spark.kv_gb"}}' \
-    2>/dev/null || true
+# --- Named instances ---
+# One model can run as several vLLM instances. An instance is identified by the
+# spark.instance label. The default instance of a model is named after its slug
+# and keeps the historical container name and LiteLLM route (vllm/<model>);
+# containers without the label are the default instance of their model.
+
+is_safe_instance_name() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
 }
 
-# Resolve a managed container name from a model ref (matches the spark.model label).
+default_instance_name() {
+  slugify_model "$1"
+}
+
+instance_is_default() {
+  local model="$1" instance="${2:-}"
+  [[ -z "$instance" || "$instance" == "$(slugify_model "$model")" ]]
+}
+
+# Container name: spark-vllm-<slug(model)> for the default instance (unchanged),
+# otherwise spark-vllm-<slug(instance)>.
+container_name_for_instance() {
+  local model="$1" instance="${2:-}" slug
+  if instance_is_default "$model" "$instance"; then
+    container_name_for_model "$model"
+    return 0
+  fi
+  slug=$(printf '%s' "$instance" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9._-]+/-/g; s/-+/-/g; s/^[-._]+//; s/[-._]+$//')
+  [[ -n "$slug" ]] || slug="instance"
+  printf '%s-%s\n' "$CONTAINER_NAME" "$slug"
+}
+
+# LiteLLM route name (after the provider prefix): the model id for the default
+# instance, the instance name otherwise.
+instance_route_name() {
+  local model="$1" instance="${2:-}"
+  if instance_is_default "$model" "$instance"; then printf '%s\n' "$model"; else printf '%s\n' "$instance"; fi
+}
+
+# Context length as a short label: 16384 -> 16k, 131072 -> 128k, 53248 -> 52k.
+instance_ctx_label() {
+  local value="${1:-}"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    awk -v n="$value" 'BEGIN{ if (n >= 1024) printf "%dk", int(n/1024 + 0.5); else if (n > 0) printf "%dt", n }'
+  elif [[ "$value" =~ ^[0-9]+[kK]$ ]]; then
+    printf '%sk' "${value%[kK]}"
+  fi
+}
+
+# Speculative decoding label from a --speculative-config JSON: <method><K>.
+instance_spec_label() {
+  local spec="${1:-}" label
+  [[ -n "$spec" ]] || return 0
+  label=$(jq -r '
+    (.method // "spec" | tostring | ascii_downcase | gsub("[^a-z0-9]"; "")) as $m
+    | (.num_speculative_tokens // "" | tostring | gsub("[^0-9]"; "")) as $k
+    | (if $m == "" then "spec" else $m end) + $k
+  ' <<<"$spec" 2>/dev/null || true)
+  printf '%s' "${label:-spec}"
+}
+
+# Config tokens shared by generated instance names and status descriptors.
+# Args: kv_dtype max_num_seqs max_len speculative_label [eager]
+instance_config_tokens() {
+  local kv="${1:-}" seqs="${2:-}" ctx="${3:-}" spec="${4:-}" eager="${5:-0}"
+  local -a tokens=()
+  case "$kv" in
+    ""|auto) ;;
+    fp8*) tokens+=(kv8) ;;
+    bfloat16) tokens+=(kvbf16) ;;
+    *) tokens+=("kv$(printf '%s' "$kv" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')") ;;
+  esac
+  [[ ! "$seqs" =~ ^[0-9]+$ ]] || tokens+=("c${seqs}")
+  ctx=$(instance_ctx_label "$ctx")
+  [[ -z "$ctx" ]] || tokens+=("$ctx")
+  [[ -z "$spec" ]] || tokens+=("$spec")
+  [[ "$eager" != "1" ]] || tokens+=(eager)
+  [[ ${#tokens[@]} -eq 0 ]] || printf '%s\n' "${tokens[@]}"
+}
+
+# Generated instance name: <slug>[-kv8][-c<N>][-<ctx>k][-<method><K>].
+instance_generated_name() {
+  local model="$1" kv="${2:-}" seqs="${3:-}" ctx="${4:-}" spec="${5:-}" name token
+  name=$(slugify_model "$model")
+  while IFS= read -r token; do
+    [[ -n "$token" ]] && name+="-${token}"
+  done < <(instance_config_tokens "$kv" "$seqs" "$ctx" "$spec")
+  name="${name:0:64}"
+  name=$(printf '%s' "$name" | sed -E 's/[-._]+$//')
+  printf '%s\n' "$name"
+}
+
+# Status descriptor from a container's real vLLM argv (JSON array):
+# e.g. "kv8 · 16k · c5 · mtp2".
+instance_config_descriptor() {
+  local args="${1:-[]}" kv seqs ctx spec eager=0 out="" values
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$args" || { printf 'unknown'; return 0; }
+  values=$(jq -r '
+    def value($flag):
+      . as $a | [range(0; length) as $i |
+        if $a[$i] == $flag then $a[$i+1]
+        elif ($a[$i] | tostring | startswith($flag + "=")) then ($a[$i] | split("=")[1:] | join("="))
+        else empty end] | last // "";
+    [value("--kv-cache-dtype"), value("--max-num-seqs"), value("--max-model-len"),
+     ([value("--speculative-config"), value("-sc")] | map(select(. != "")) | last // ""),
+     (if index("--enforce-eager") != null then "1" else "0" end)] | @tsv
+  ' <<<"$args" 2>/dev/null) || return 0
+  IFS=$'\x1f' read -r kv seqs ctx spec eager <<<"${values//$'\t'/$'\x1f'}" || true
+  [[ -z "$spec" ]] || spec=$(instance_spec_label "$spec")
+  local token
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    if [[ -n "$out" ]]; then out+=" · ${token}"; else out="$token"; fi
+  done < <(instance_config_tokens "$kv" "$seqs" "$ctx" "$spec" "$eager")
+  printf '%s' "${out:-default}"
+}
+
+container_config_descriptor() {
+  instance_config_descriptor "$(docker inspect -f '{{json .Config.Cmd}}' "$1" 2>/dev/null || printf '[]')"
+}
+
+# List managed vLLM containers as TSV:
+# name<TAB>model<TAB>port<TAB>need_gb<TAB>weights_gb<TAB>kv_gb<TAB>instance<TAB>route.
+# Source of truth = docker labels on running containers (no state file). The
+# instance falls back to the model slug for containers without the label; route
+# is the LiteLLM route name after the provider prefix.
+list_managed_containers() {
+  local line name model port need wt kv instance route rows=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    # A non-whitespace separator keeps empty label fields in place.
+    IFS=$'\x1f' read -r name model port need wt kv instance _ <<<"${line//$'\t'/$'\x1f'}" || true
+    [[ -n "$name" ]] || continue
+    route=""
+    if [[ -n "$model" ]]; then
+      [[ -n "$instance" ]] || instance=$(slugify_model "$model")
+      route=$(instance_route_name "$model" "$instance")
+    fi
+    rows+="${name}"$'\t'"${model}"$'\t'"${port}"$'\t'"${need}"$'\t'"${wt}"$'\t'"${kv}"$'\t'"${instance}"$'\t'"${route}"$'\n'
+  done < <(docker ps --filter label=spark.managed=1 \
+    --format '{{.Names}}	{{.Label "spark.model"}}	{{.Label "spark.port"}}	{{.Label "spark.need_gb"}}	{{.Label "spark.weights_gb"}}	{{.Label "spark.kv_gb"}}	{{.Label "spark.instance"}}' \
+    2>/dev/null || true)
+  # One write: readers that stop early (awk ... exit) never hit SIGPIPE mid-list,
+  # which would fail the pipeline under pipefail.
+  [[ -z "$rows" ]] || printf '%s' "$rows"
+}
+
+# Print column 1 (container) of the first managed row whose column $2 equals $1.
+managed_container_where() {
+  list_managed_containers | awk -F '\t' -v ref="$1" -v col="$2" '$col == ref { print $1; exit }'
+}
+
+# Running instances of a model, one "<instance> (<container>)" per line.
+instances_for_model() {
+  list_managed_containers | awk -F '\t' -v ref="$1" '$2 == ref { printf "%s (%s)\n", $7, $1 }'
+}
+
+# Resolve a managed container from an instance name, a container name, or a
+# model id. A model id with several running instances is ambiguous: return 2
+# without picking one (callers list the candidates with instances_for_model).
 container_for_ref() {
-  local ref="$1" name model rest
-  while IFS=$'\t' read -r name model rest; do
-    [[ "$model" == "$ref" ]] && { printf '%s\n' "$name"; return 0; }
-  done < <(list_managed_containers)
-  return 1
+  local ref="$1" match count
+  [[ -n "$ref" ]] || return 1
+  match=$(managed_container_where "$ref" 7)
+  [[ -n "$match" ]] || match=$(managed_container_where "$ref" 1)
+  [[ -z "$match" ]] || { printf '%s\n' "$match"; return 0; }
+  count=$(list_managed_containers | awk -F '\t' -v ref="$ref" '$2 == ref { n++ } END { print n + 0 }')
+  if [[ "$count" -eq 1 ]]; then managed_container_where "$ref" 2; return 0; fi
+  [[ "$count" -eq 0 ]] && return 1
+  return 2
+}
+
+# Resolve the container serving a LiteLLM route name (model id for a default
+# instance, instance name otherwise), falling back to container_for_ref.
+container_for_route() {
+  local ref="$1" match
+  [[ -n "$ref" ]] || return 1
+  match=$(managed_container_where "$ref" 8)
+  [[ -z "$match" ]] || { printf '%s\n' "$match"; return 0; }
+  container_for_ref "$ref"
+}
+
+# The managed row (TSV) serving a LiteLLM main reference: an exact route name
+# first (model id of a default instance, or an instance name), then the only
+# running instance of a model id stored by older configurations.
+main_ref_row() {
+  local ref="$1" rows
+  [[ -n "$ref" ]] || return 1
+  rows=$(list_managed_containers)
+  awk -F '\t' -v r="$ref" '$8 == r { print; found=1; exit } END { exit !found }' <<<"$rows" && return 0
+  awk -F '\t' -v r="$ref" '$7 == r { print; found=1; exit } END { exit !found }' <<<"$rows" && return 0
+  [[ "$(awk -F '\t' -v r="$ref" '$2 == r { n++ } END { print n + 0 }' <<<"$rows")" == 1 ]] || return 1
+  awk -F '\t' -v r="$ref" '$2 == r { print; exit }' <<<"$rows"
+}
+
+# Exit with the candidate list when a model id matches several instances.
+# Call it in the current shell (not in a command substitution) before resolving.
+die_if_ambiguous_ref() {
+  local ref="$1" rc=0
+  container_for_ref "$ref" >/dev/null || rc=$?
+  [[ "$rc" -eq 2 ]] || return 0
+  err "Model '${ref}' has several running instances — choose one by instance name"
+  instances_for_model "$ref" | sed 's/^/    /' >&2
+  exit 1
+}
+
+# The managed container running an exact instance name.
+container_for_instance() {
+  local match
+  match=$(managed_container_where "$1" 7)
+  [[ -n "$match" ]] || return 1
+  printf '%s\n' "$match"
 }
 
 # Sum of reserved need (GB) across live managed containers, optionally excluding one name.
@@ -1421,12 +1619,16 @@ verify_capacity() {
     printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
       "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
   fi
-  local any=0 name m port need _
-  while IFS=$'\t' read -r name m port need _; do
+  local any=0 name m port need wt kv inst _
+  while IFS=$'\t' read -r name m port need wt kv inst _; do
     [[ -z "$m" ]] && continue
     [[ "$name" == "$exclude" ]] && continue
     [[ "$any" -eq 0 ]] && { printf "    In use:\n"; any=1; }
-    printf "      %-32s %s GB  (port %s)\n" "$m" "${need:-?}" "${port:-?}"
+    if instance_is_default "$m" "$inst"; then
+      printf "      %-32s %s GB  (port %s)\n" "$m" "${need:-?}" "${port:-?}"
+    else
+      printf "      %-32s %s GB  (port %s, instance %s)\n" "$m" "${need:-?}" "${port:-?}" "$inst"
+    fi
   done < <(list_managed_containers)
 
   # Manual --mem fixes the reservation. A smaller reservation may not fit the

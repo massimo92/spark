@@ -1156,21 +1156,219 @@ container_name_for_model() {
   printf '%s-%s\n' "$CONTAINER_NAME" "$(slugify_model "$1")"
 }
 
-# List managed vLLM containers as TSV: name<TAB>model<TAB>port<TAB>need_gb<TAB>weights_gb<TAB>kv_gb.
-# Source of truth = docker labels on running containers (no state file).
-list_managed_containers() {
-  docker ps --filter label=spark.managed=1 \
-    --format '{{.Names}}	{{.Label "spark.model"}}	{{.Label "spark.port"}}	{{.Label "spark.need_gb"}}	{{.Label "spark.weights_gb"}}	{{.Label "spark.kv_gb"}}' \
-    2>/dev/null || true
+# --- Named instances ---
+# One model can run as several vLLM instances. An instance is identified by the
+# spark.instance label. The default instance of a model is named after its slug
+# and keeps the historical container name and LiteLLM route (vllm/<model>);
+# containers without the label are the default instance of their model.
+
+is_safe_instance_name() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
 }
 
-# Resolve a managed container name from a model ref (matches the spark.model label).
+default_instance_name() {
+  slugify_model "$1"
+}
+
+instance_is_default() {
+  local model="$1" instance="${2:-}"
+  [[ -z "$instance" || "$instance" == "$(slugify_model "$model")" ]]
+}
+
+# Container name: spark-vllm-<slug(model)> for the default instance (unchanged),
+# otherwise spark-vllm-<slug(instance)>.
+container_name_for_instance() {
+  local model="$1" instance="${2:-}" slug
+  if instance_is_default "$model" "$instance"; then
+    container_name_for_model "$model"
+    return 0
+  fi
+  slug=$(printf '%s' "$instance" | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9._-]+/-/g; s/-+/-/g; s/^[-._]+//; s/[-._]+$//')
+  [[ -n "$slug" ]] || slug="instance"
+  printf '%s-%s\n' "$CONTAINER_NAME" "$slug"
+}
+
+# LiteLLM route name (after the provider prefix): the model id for the default
+# instance, the instance name otherwise.
+instance_route_name() {
+  local model="$1" instance="${2:-}"
+  if instance_is_default "$model" "$instance"; then printf '%s\n' "$model"; else printf '%s\n' "$instance"; fi
+}
+
+# Context length as a short label: 16384 -> 16k, 131072 -> 128k, 53248 -> 52k.
+instance_ctx_label() {
+  local value="${1:-}"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    awk -v n="$value" 'BEGIN{ if (n >= 1024) printf "%dk", int(n/1024 + 0.5); else if (n > 0) printf "%dt", n }'
+  elif [[ "$value" =~ ^[0-9]+[kK]$ ]]; then
+    printf '%sk' "${value%[kK]}"
+  fi
+}
+
+# Speculative decoding label from a --speculative-config JSON: <method><K>.
+instance_spec_label() {
+  local spec="${1:-}" label
+  [[ -n "$spec" ]] || return 0
+  label=$(jq -r '
+    (.method // "spec" | tostring | ascii_downcase | gsub("[^a-z0-9]"; "")) as $m
+    | (.num_speculative_tokens // "" | tostring | gsub("[^0-9]"; "")) as $k
+    | (if $m == "" then "spec" else $m end) + $k
+  ' <<<"$spec" 2>/dev/null || true)
+  printf '%s' "${label:-spec}"
+}
+
+# Config tokens shared by generated instance names and status descriptors.
+# Args: kv_dtype max_num_seqs max_len speculative_label [eager]
+instance_config_tokens() {
+  local kv="${1:-}" seqs="${2:-}" ctx="${3:-}" spec="${4:-}" eager="${5:-0}"
+  local -a tokens=()
+  case "$kv" in
+    ""|auto) ;;
+    fp8*) tokens+=(kv8) ;;
+    bfloat16) tokens+=(kvbf16) ;;
+    *) tokens+=("kv$(printf '%s' "$kv" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')") ;;
+  esac
+  [[ ! "$seqs" =~ ^[0-9]+$ ]] || tokens+=("c${seqs}")
+  ctx=$(instance_ctx_label "$ctx")
+  [[ -z "$ctx" ]] || tokens+=("$ctx")
+  [[ -z "$spec" ]] || tokens+=("$spec")
+  [[ "$eager" != "1" ]] || tokens+=(eager)
+  [[ ${#tokens[@]} -eq 0 ]] || printf '%s\n' "${tokens[@]}"
+}
+
+# Generated instance name: <slug>[-kv8][-c<N>][-<ctx>k][-<method><K>].
+instance_generated_name() {
+  local model="$1" kv="${2:-}" seqs="${3:-}" ctx="${4:-}" spec="${5:-}" name token
+  name=$(slugify_model "$model")
+  while IFS= read -r token; do
+    [[ -n "$token" ]] && name+="-${token}"
+  done < <(instance_config_tokens "$kv" "$seqs" "$ctx" "$spec")
+  name="${name:0:64}"
+  name=$(printf '%s' "$name" | sed -E 's/[-._]+$//')
+  printf '%s\n' "$name"
+}
+
+# Status descriptor from a container's real vLLM argv (JSON array):
+# e.g. "kv8 · 16k · c5 · mtp2".
+instance_config_descriptor() {
+  local args="${1:-[]}" kv seqs ctx spec eager=0 out="" values
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$args" || { printf 'unknown'; return 0; }
+  values=$(jq -r '
+    def value($flag):
+      . as $a | [range(0; length) as $i |
+        if $a[$i] == $flag then $a[$i+1]
+        elif ($a[$i] | tostring | startswith($flag + "=")) then ($a[$i] | split("=")[1:] | join("="))
+        else empty end] | last // "";
+    [value("--kv-cache-dtype"), value("--max-num-seqs"), value("--max-model-len"),
+     ([value("--speculative-config"), value("-sc")] | map(select(. != "")) | last // ""),
+     (if index("--enforce-eager") != null then "1" else "0" end)] | @tsv
+  ' <<<"$args" 2>/dev/null) || return 0
+  IFS=$'\x1f' read -r kv seqs ctx spec eager <<<"${values//$'\t'/$'\x1f'}" || true
+  [[ -z "$spec" ]] || spec=$(instance_spec_label "$spec")
+  local token
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    if [[ -n "$out" ]]; then out+=" · ${token}"; else out="$token"; fi
+  done < <(instance_config_tokens "$kv" "$seqs" "$ctx" "$spec" "$eager")
+  printf '%s' "${out:-default}"
+}
+
+container_config_descriptor() {
+  instance_config_descriptor "$(docker inspect -f '{{json .Config.Cmd}}' "$1" 2>/dev/null || printf '[]')"
+}
+
+# List managed vLLM containers as TSV:
+# name<TAB>model<TAB>port<TAB>need_gb<TAB>weights_gb<TAB>kv_gb<TAB>instance<TAB>route.
+# Source of truth = docker labels on running containers (no state file). The
+# instance falls back to the model slug for containers without the label; route
+# is the LiteLLM route name after the provider prefix.
+list_managed_containers() {
+  local line name model port need wt kv instance route rows=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    # A non-whitespace separator keeps empty label fields in place.
+    IFS=$'\x1f' read -r name model port need wt kv instance _ <<<"${line//$'\t'/$'\x1f'}" || true
+    [[ -n "$name" ]] || continue
+    route=""
+    if [[ -n "$model" ]]; then
+      [[ -n "$instance" ]] || instance=$(slugify_model "$model")
+      route=$(instance_route_name "$model" "$instance")
+    fi
+    rows+="${name}"$'\t'"${model}"$'\t'"${port}"$'\t'"${need}"$'\t'"${wt}"$'\t'"${kv}"$'\t'"${instance}"$'\t'"${route}"$'\n'
+  done < <(docker ps --filter label=spark.managed=1 \
+    --format '{{.Names}}	{{.Label "spark.model"}}	{{.Label "spark.port"}}	{{.Label "spark.need_gb"}}	{{.Label "spark.weights_gb"}}	{{.Label "spark.kv_gb"}}	{{.Label "spark.instance"}}' \
+    2>/dev/null || true)
+  # One write: readers that stop early (awk ... exit) never hit SIGPIPE mid-list,
+  # which would fail the pipeline under pipefail.
+  [[ -z "$rows" ]] || printf '%s' "$rows"
+}
+
+# Print column 1 (container) of the first managed row whose column $2 equals $1.
+managed_container_where() {
+  list_managed_containers | awk -F '\t' -v ref="$1" -v col="$2" '$col == ref { print $1; exit }'
+}
+
+# Running instances of a model, one "<instance> (<container>)" per line.
+instances_for_model() {
+  list_managed_containers | awk -F '\t' -v ref="$1" '$2 == ref { printf "%s (%s)\n", $7, $1 }'
+}
+
+# Resolve a managed container from an instance name, a container name, or a
+# model id. A model id with several running instances is ambiguous: return 2
+# without picking one (callers list the candidates with instances_for_model).
 container_for_ref() {
-  local ref="$1" name model rest
-  while IFS=$'\t' read -r name model rest; do
-    [[ "$model" == "$ref" ]] && { printf '%s\n' "$name"; return 0; }
-  done < <(list_managed_containers)
-  return 1
+  local ref="$1" match count
+  [[ -n "$ref" ]] || return 1
+  match=$(managed_container_where "$ref" 7)
+  [[ -n "$match" ]] || match=$(managed_container_where "$ref" 1)
+  [[ -z "$match" ]] || { printf '%s\n' "$match"; return 0; }
+  count=$(list_managed_containers | awk -F '\t' -v ref="$ref" '$2 == ref { n++ } END { print n + 0 }')
+  if [[ "$count" -eq 1 ]]; then managed_container_where "$ref" 2; return 0; fi
+  [[ "$count" -eq 0 ]] && return 1
+  return 2
+}
+
+# Resolve the container serving a LiteLLM route name (model id for a default
+# instance, instance name otherwise), falling back to container_for_ref.
+container_for_route() {
+  local ref="$1" match
+  [[ -n "$ref" ]] || return 1
+  match=$(managed_container_where "$ref" 8)
+  [[ -z "$match" ]] || { printf '%s\n' "$match"; return 0; }
+  container_for_ref "$ref"
+}
+
+# The managed row (TSV) serving a LiteLLM main reference: an exact route name
+# first (model id of a default instance, or an instance name), then the only
+# running instance of a model id stored by older configurations.
+main_ref_row() {
+  local ref="$1" rows
+  [[ -n "$ref" ]] || return 1
+  rows=$(list_managed_containers)
+  awk -F '\t' -v r="$ref" '$8 == r { print; found=1; exit } END { exit !found }' <<<"$rows" && return 0
+  awk -F '\t' -v r="$ref" '$7 == r { print; found=1; exit } END { exit !found }' <<<"$rows" && return 0
+  [[ "$(awk -F '\t' -v r="$ref" '$2 == r { n++ } END { print n + 0 }' <<<"$rows")" == 1 ]] || return 1
+  awk -F '\t' -v r="$ref" '$2 == r { print; exit }' <<<"$rows"
+}
+
+# Exit with the candidate list when a model id matches several instances.
+# Call it in the current shell (not in a command substitution) before resolving.
+die_if_ambiguous_ref() {
+  local ref="$1" rc=0
+  container_for_ref "$ref" >/dev/null || rc=$?
+  [[ "$rc" -eq 2 ]] || return 0
+  err "Model '${ref}' has several running instances — choose one by instance name"
+  instances_for_model "$ref" | sed 's/^/    /' >&2
+  exit 1
+}
+
+# The managed container running an exact instance name.
+container_for_instance() {
+  local match
+  match=$(managed_container_where "$1" 7)
+  [[ -n "$match" ]] || return 1
+  printf '%s\n' "$match"
 }
 
 # Sum of reserved need (GB) across live managed containers, optionally excluding one name.
@@ -1421,12 +1619,16 @@ verify_capacity() {
     printf "    Free:       %s GB  (budget %s GB = %s total − %s OS-reserved)\n" \
       "$free" "$BUDGET_GB" "$TOTAL_MEM_GB" "$OS_RESERVE_GB"
   fi
-  local any=0 name m port need _
-  while IFS=$'\t' read -r name m port need _; do
+  local any=0 name m port need wt kv inst _
+  while IFS=$'\t' read -r name m port need wt kv inst _; do
     [[ -z "$m" ]] && continue
     [[ "$name" == "$exclude" ]] && continue
     [[ "$any" -eq 0 ]] && { printf "    In use:\n"; any=1; }
-    printf "      %-32s %s GB  (port %s)\n" "$m" "${need:-?}" "${port:-?}"
+    if instance_is_default "$m" "$inst"; then
+      printf "      %-32s %s GB  (port %s)\n" "$m" "${need:-?}" "${port:-?}"
+    else
+      printf "      %-32s %s GB  (port %s, instance %s)\n" "$m" "${need:-?}" "${port:-?}" "$inst"
+    fi
   done < <(list_managed_containers)
 
   # Manual --mem fixes the reservation. A smaller reservation may not fit the
@@ -2737,7 +2939,7 @@ gateway_model_prefix() {
     ollama) printf 'ollama_chat' ;;
     systemone) printf 'systemone' ;;
     vllm)
-      name=$(container_for_ref "$model" 2>/dev/null || true)
+      name=$(container_for_route "$model" 2>/dev/null || true)
       if [[ -n "$name" && "$(model_api_kind "$name")" == systemone ]]; then
         printf 'systemone'
       else
@@ -2802,9 +3004,21 @@ cmd_run_help() {
     --explain              Explain the dry-run plan; implies --dry-run.
     --no-wait              Start container and return without health supervision.
     --tail                 Follow logs after launch.
-    --force                Replace an already running instance of the model.
+    --name <name>          Instance name; run the same model several times at once.
+    --force                Replace the running instance with the same name.
     --regen-profile        Recompute cached model memory profile.
     -- <vLLM args...>      Forward all remaining arguments to vLLM unchanged.
+
+  ${BOLD}Instances:${NC} one model can run as several instances. The name is
+  --name, else the alias name (spark run <alias>), else generated from the
+  naming flags given on the command line: <slug>[-kv8][-c<N>][-<ctx>k][-<method><K>]
+  from --kv-cache-dtype fp8, --max-num-seqs, --max-len, and --speculative-config
+  (or --mtp). Without them it is the model's default instance (e.g. qwen3.5-9b).
+    spark run Qwen/Qwen3.5-9B                     -> qwen3.5-9b      vllm/Qwen/Qwen3.5-9B
+    spark run Qwen/Qwen3.5-9B --max-len 16384     -> qwen3.5-9b-16k  vllm/qwen3.5-9b-16k
+  The default instance keeps the route vllm/<model>; other instances use
+  vllm/<instance>. Only an instance with the same name collides; --force
+  replaces just that one. Stop or follow one with: spark stop|logs <instance>.
 
   Unknown flags after the model are also forwarded to vLLM unchanged. Spark
   applies its defaults first, then forwarded arguments, so vLLM owns validation
@@ -2816,6 +3030,9 @@ cmd_run_help() {
   save a change with: spark alias set <alias> ... Launch policy flags stay
   fixed (--tools, --text-only, --no-reasoning, --mtp, --no-mtp,
   --no-mem-limit, --regen-profile, --no-pull); change them with alias edit.
+  An alias runs as the instance named after it (route vllm/<alias>). When its
+  saved port is taken by another instance, Spark picks the next free port;
+  an explicit --port still wins.
 
   Bundles declare their target, drafter, Docker build, defaults, and extra
   flags. Example: spark run qwen38-dflash2-lookup --lookup false
@@ -2831,6 +3048,7 @@ cmd_run() {
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" alias_frozen_flags=0
   local publish_main=0 vllm_speculation_passthrough=0 arg
+  local RUN_INSTANCE_NAME="" RUN_PORT_SOFT="${RUN_ALIAS_PORT_SOFT:-0}" port_explicit=0
   local ALIAS_VLLM_ARGS_JSON="" ALIAS_VLLM_IMAGE="" ALIAS_VLLM_IMAGE_ID="" ALIAS_VLLM_ENTRYPOINT="" ALIAS_VLLM_ENV_JSON=""
   local bundle_candidate="" bundle_name="" bundle_path="" bundle_manifest=""
   local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_OPTIONS_JSON='{}' BUNDLE_ACTIVE_RUN_ARGS_JSON='[]'
@@ -2858,7 +3076,10 @@ cmd_run() {
       --no-wait)   no_wait=1; alias_override_args+=(--no-wait); shift ;;
       --max-num-seqs) [[ $# -ge 2 ]] || die "Missing value for --max-num-seqs"; max_num_seqs="$2"; alias_setting_args+=(--max-num-seqs "$2"); bundle_explicit_run_args+=(--max-num-seqs "$2"); shift 2 ;;
       --max-len)   [[ $# -ge 2 ]] || die "Missing value for --max-len"; max_len="$2"; alias_setting_args+=(--max-len "$2"); bundle_explicit_run_args+=(--max-len "$2"); shift 2 ;;
-      --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; alias_override_args+=(--port "$2"); bundle_explicit_run_args+=(--port "$2"); shift 2 ;;
+      --port)      [[ $# -ge 2 ]] || die "Missing value for --port"; port="$2"; port_explicit=1; alias_override_args+=(--port "$2"); bundle_explicit_run_args+=(--port "$2"); shift 2 ;;
+      --name)      [[ $# -ge 2 ]] || die "Missing value for --name"
+                   is_safe_instance_name "$2" || die "Invalid --name value: $2" "Use 1-64 letters, numbers, dots, underscores, or hyphens."
+                   RUN_INSTANCE_NAME="$2"; alias_override_args+=(--name "$2"); shift 2 ;;
       --kv-cache-dtype) [[ $# -ge 2 ]] || die "Missing value for --kv-cache-dtype"; kv_dtype="$2"; alias_setting_args+=(--kv-cache-dtype "$2"); bundle_explicit_run_args+=(--kv-cache-dtype "$2"); shift 2 ;;
       --mtp)       mtp_flag=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--mtp); shift ;;
       --no-mtp)    mtp_flag=0; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-mtp); shift ;;
@@ -2898,6 +3119,23 @@ cmd_run() {
       esac
     done
   fi
+  # Instance name: --name wins; aliases pass their own name; otherwise it is
+  # generated from the naming flags given on this command line only.
+  local name_kv name_seqs name_ctx name_spec=""
+  name_kv=$(run_passthrough_value --kv-cache-dtype); name_kv="${name_kv:-$kv_dtype}"
+  name_seqs=$(run_passthrough_value --max-num-seqs); name_seqs="${name_seqs:-$max_num_seqs}"
+  name_ctx=$(run_passthrough_value --max-model-len); name_ctx="${name_ctx:-$max_len}"
+  name_spec=$(run_passthrough_value --speculative-config)
+  [[ -n "$name_spec" ]] || name_spec=$(run_passthrough_value -sc)
+  if [[ -n "$name_spec" ]]; then
+    name_spec=$(instance_spec_label "$name_spec")
+  elif [[ "$vllm_speculation_passthrough" == "1" ]]; then
+    name_spec=spec
+  elif [[ "$mtp_flag" == "1" ]]; then
+    name_spec=mtp
+    [[ -z "${SPARK_MTP_SPECULATIVE_CONFIG:-}" ]] || name_spec=$(instance_spec_label "$SPARK_MTP_SPECULATIVE_CONFIG")
+  fi
+  [[ -n "$(run_passthrough_value --port)" ]] && port_explicit=1
   if [[ "$publish_main" == "1" ]]; then
     [[ "$dry_run" == "0" ]] || die "Cannot combine --main with --dry-run/--explain"
     [[ "$no_wait" == "0" ]] || die "Cannot combine --main with --no-wait"
@@ -2935,6 +3173,12 @@ cmd_run() {
     fi
   fi
   validate_model_ref_for_backend "$model"
+  if [[ -z "$RUN_INSTANCE_NAME" && "$BACKEND" == "vllm" ]]; then
+    RUN_INSTANCE_NAME=$(instance_generated_name "$model" "$name_kv" "$name_seqs" "$name_ctx" "$name_spec")
+  fi
+  # A port that comes from a bundle default, not this command line, moves to a
+  # free one when another instance already uses it.
+  [[ -z "$bundle_name" || "$port_explicit" == "1" ]] || RUN_PORT_SOFT=1
 
   # Pick the engine from the detected hardware (vLLM on NVIDIA, Ollama elsewhere).
   # cmd_run's flag locals are visible to the backend functions via dynamic scoping.
@@ -2960,6 +3204,19 @@ cmd_run() {
   esac
 }
 
+# Last value of a flag in cmd_run's forwarded vLLM arguments (`--f v` or `--f=v`).
+run_passthrough_value() {
+  local flag="$1" value="" previous="" arg
+  [[ ${#vllm_passthrough_args[@]} -gt 0 ]] || return 0
+  for arg in "${vllm_passthrough_args[@]}"; do
+    if [[ "$previous" == "$flag" ]]; then value="$arg"
+    elif [[ "$arg" == "${flag}="* ]]; then value="${arg#*=}"
+    fi
+    previous="$arg"
+  done
+  printf '%s' "$value"
+}
+
 confirm_rollback_main() {
   local answer=""
   printf "  Rollback previous main model? [Y/n] "
@@ -2968,7 +3225,9 @@ confirm_rollback_main() {
 }
 
 rollback_main_vllm() {
-  local definition="$1" model="$2" old_config="$3" gateway_was_running="$4"
+  local definition="$1" model="$2" old_config="$3" gateway_was_running="$4" instance="${5:-}"
+  local -a name_args=()
+  [[ -z "$instance" ]] || name_args=(--name "$instance")
 
   if is_interactive; then
     confirm_rollback_main || {
@@ -2980,9 +3239,9 @@ rollback_main_vllm() {
   fi
 
   if ! (if [[ "$(jq -r '.kind' <<<"$definition")" == "bundle" ]]; then
-      SPARK_SKIP_GATEWAY_REFRESH=1 run_bundle_alias_definition "$definition" --force
+      SPARK_SKIP_GATEWAY_REFRESH=1 run_bundle_alias_definition "$definition" --force ${name_args[@]+"${name_args[@]}"}
     else
-      SPARK_SKIP_GATEWAY_REFRESH=1 run_captured_vllm_definition "$definition" "main rollback" --force
+      SPARK_SKIP_GATEWAY_REFRESH=1 run_captured_vllm_definition "$definition" "main rollback" --force ${name_args[@]+"${name_args[@]}"}
     fi); then
     err "Rollback failed: could not restart previous main model '${model}'"
     return 1
@@ -2993,14 +3252,18 @@ rollback_main_vllm() {
     err "Rollback incomplete: previous model restarted but LiteLLM could not be restarted"
     return 1
   fi
-  info "Rolled back LiteLLM main to vllm/${model}"
+  info "Rolled back LiteLLM main to vllm/$(instance_route_name "$model" "$instance")"
   return 0
 }
 
 run_main_replacement_vllm() {
   local target_model="$1" config old_config old_provider old_model
-  local old_name="" old_definition="" gateway_was_running=0
-  local name scan_model port rest
+  local old_name="" old_definition="" old_row="" old_instance="" old_served="" gateway_was_running=0
+  local target_instance target_route
+
+  target_instance="${RUN_INSTANCE_NAME:-}"
+  [[ -n "$target_instance" ]] || target_instance=$(default_instance_name "$target_model")
+  target_route=$(instance_route_name "$target_model" "$target_instance")
 
   config=$(gateway_load_config)
   old_config="$config"
@@ -3013,72 +3276,71 @@ run_main_replacement_vllm() {
   # Publishing a target that already serves needs no replacement or memory
   # allocation. It is also safe when the previous route names a stopped server.
   if [[ "${force:-0}" != "1" ]]; then
-    while IFS=$'\t' read -r name scan_model port rest; do
-      if [[ "$scan_model" == "$target_model" && "$port" =~ ^[0-9]+$ ]] && model_api_ready "$port"; then
-        run_publish_main "$target_model"
-        return 0
-      fi
-    done < <(list_managed_containers)
+    local row port
+    row=$(list_managed_containers | awk -F '\t' -v r="$target_route" '$8 == r { print; exit }')
+    port=$(cut -f3 <<<"$row")
+    if [[ -n "$row" && "$port" =~ ^[0-9]+$ ]] && model_api_ready "$port"; then
+      run_publish_main "$target_route"
+      return 0
+    fi
   fi
 
   # A vLLM main target is replaceable only when it maps to a live, managed
   # container. Refuse to stop anything when the route is stale or unmanaged.
   if [[ "$old_provider" == "vllm" && -n "$old_model" ]]; then
-    while IFS=$'\t' read -r name scan_model port rest; do
-      if [[ "$scan_model" == "$old_model" ]]; then
-        old_name="$name"
-        break
-      fi
-    done < <(list_managed_containers)
+    old_row=$(main_ref_row "$old_model" || true)
+    old_name=$(cut -f1 <<<"$old_row")
+    old_served=$(cut -f2 <<<"$old_row")
+    old_instance=$(cut -f7 <<<"$old_row")
     [[ -n "$old_name" ]] || die "Cannot replace LiteLLM main safely" \
       "Current main vllm/${old_model} has no live managed container"
 
-    if [[ "$old_model" == "$target_model" && "${force:-0}" != "1" ]]; then
-      run_publish_main "$target_model"
+    if [[ "$(cut -f8 <<<"$old_row")" == "$target_route" && "${force:-0}" != "1" ]]; then
+      run_publish_main "$target_route"
       return 0
     fi
 
-    old_definition=$(alias_capture_definition "$old_name" "$old_model") || \
+    old_definition=$(alias_capture_definition "$old_name" "$old_served") || \
       die "Cannot capture the current main model before stopping it"
-    info "Stopping current LiteLLM main '${old_model}' before checking capacity for '${target_model}'"
+    info "Stopping current LiteLLM main '${old_model}' before checking capacity for '${target_route}'"
     SPARK_SKIP_GATEWAY_REFRESH=1 stop_one_container "$old_name" || \
       die "Could not stop current main model '${old_model}'"
   fi
 
   if [[ -z "$old_definition" ]]; then
     SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm
-    run_publish_main "$target_model"
+    run_publish_main "$target_route"
     return 0
   fi
 
   # Run in a subshell because backend failures call die/exit. This lets the
   # parent restore the captured launch without losing the original shell.
-  if (SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm && run_publish_main "$target_model"); then
+  if (SPARK_SKIP_GATEWAY_REFRESH=1 run_backend_vllm && run_publish_main "$target_route"); then
     return 0
   fi
 
-  if rollback_main_vllm "$old_definition" "$old_model" "$old_config" "$gateway_was_running"; then
-    die "Could not replace LiteLLM main with ${target_model}" \
+  if rollback_main_vllm "$old_definition" "$old_served" "$old_config" "$gateway_was_running" "$old_instance"; then
+    die "Could not replace LiteLLM main with ${target_route}" \
       "The previous main model was restored."
   fi
-  die "Could not replace LiteLLM main with ${target_model}" \
-    "The previous main model is unavailable; start it with: spark run ${old_model} --main"
+  die "Could not replace LiteLLM main with ${target_route}" \
+    "The previous main model is unavailable; start it with: spark run ${old_served}${old_instance:+ --name ${old_instance}} --main"
 }
 
+# Publish a running server as LiteLLM main. vLLM targets are route names:
+# the model id of a default instance, or an instance name.
 run_publish_main() {
-  local model="$1" config old_config port name running rest
+  local model="$1" config old_config port name row
+
   config=$(gateway_load_config)
   old_config="$config"
 
   if [[ "$BACKEND" == "vllm" ]]; then
-    port=""
-    while IFS=$'\t' read -r name running port rest; do
-      if [[ "$running" == "$model" ]]; then
-        [[ "$(model_api_kind "$name")" != systemone ]] || die "System One models cannot be the chat main model"
-        break
-      fi
-      port=""
-    done < <(list_managed_containers)
+    row=$(main_ref_row "$model" || true)
+    name=$(cut -f1 <<<"$row")
+    port=$(cut -f3 <<<"$row")
+    [[ -z "$name" || "$(model_api_kind "$name")" != systemone ]] || die "System One models cannot be the chat main model"
+    [[ -n "$row" ]] && model=$(cut -f8 <<<"$row")
     [[ "$port" =~ ^[0-9]+$ ]] && model_api_ready "$port" || \
       die "Cannot publish ${model} as main: model API is not ready"
   fi
@@ -3335,7 +3597,7 @@ alias_apply_settings() {
         ;;
       *) die "Unexpected argument: $1" "Pass arguments as --flag value, --flag=value, or --flag" ;;
     esac
-    if alias_run_only_flag "$flag"; then
+    if alias_run_only_flag "$flag" || [[ "$flag" == "--name" ]]; then
       die "${flag} only applies to one launch" "Use it with: spark run <alias> ${flag}"
     fi
     if alias_policy_flag "$flag"; then
@@ -3687,16 +3949,19 @@ alias_capture_definition() {
 }
 
 cmd_alias_capture() {
-  local name="$1" force="${2:-0}" cname model port rest choice definition
-  local -a names=() models=()
-  while IFS=$'\t' read -r cname model port rest; do
+  local name="$1" force="${2:-0}" cname model port need wt kv instance route choice definition
+  local -a names=() models=() instances=()
+  while IFS=$'\t' read -r cname model port need wt kv instance route; do
     [[ -n "$cname" && -n "$model" ]] || continue
-    names+=("$cname"); models+=("$model")
+    names+=("$cname"); models+=("$model"); instances+=("${instance:-$model}")
   done < <(list_managed_containers)
   [[ ${#names[@]} -gt 0 ]] || die "No live Spark vLLM runs to capture"
   printf '  Live runs:\n'
   local i
-  for i in "${!names[@]}"; do printf '    %d) %s  (%s)\n' "$((i + 1))" "${models[$i]}" "${names[$i]}"; done
+  for i in "${!names[@]}"; do
+    printf '    %d) %s  (%s · %s)\n' "$((i + 1))" "${instances[$i]}" "${models[$i]}" \
+      "$(container_config_descriptor "${names[$i]}")"
+  done
   choice=$(alias_prompt_value "Run to capture")
   [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#names[@]} ]] \
     || die "Choose a run number from the list"
@@ -3713,6 +3978,9 @@ run_captured_vllm_definition() {
   local model port mem max_len kv_dtype tools=0 text_only=0 no_reasoning=0 dry_run=0 explain=0 tail_logs=0
   local force=0 regen=0 no_pull=0 no_mem_limit=0 no_wait=0 max_num_seqs="" enforce_eager_flag="0" mtp_flag="auto" publish_main=0
   local ALIAS_VLLM_ARGS_JSON ALIAS_VLLM_IMAGE ALIAS_VLLM_IMAGE_ID ALIAS_VLLM_ENTRYPOINT ALIAS_VLLM_ENV_JSON override_port=""
+  # Captured launches replay every flag, so none of them names the instance:
+  # it is the default instance of the model unless --name (or an alias) says so.
+  local RUN_INSTANCE_NAME="" RUN_PORT_SOFT="${RUN_ALIAS_PORT_SOFT:-0}"
   local BUNDLE_ACTIVE=0 BUNDLE_ACTIVE_NAME="" BUNDLE_ACTIVE_HASH="" BUNDLE_TARGET_REVISION=""
   local BUNDLE_MODEL_PATH="" BUNDLE_MODEL_LOAD_PATH="" BUNDLE_ARTIFACT_KEY=""
   local BUNDLE_KV_ESTIMATOR="" BUNDLE_WEIGHTS_GB="" BUNDLE_RUNTIME_OVERHEAD_GB=""
@@ -3750,7 +4018,11 @@ run_captured_vllm_definition() {
       --dry-run) dry_run=1; shift ;;
       --explain) explain=1; dry_run=1; shift ;;
       --force) force=1; shift ;;
-      --port) [[ $# -ge 2 ]] || die "Missing value for --port"; override_port="$2"; shift 2 ;;
+      --port) [[ $# -ge 2 ]] || die "Missing value for --port"; override_port="$2"; RUN_PORT_SOFT=0; shift 2 ;;
+      --name)
+        [[ $# -ge 2 ]] || die "Missing value for --name"
+        is_safe_instance_name "$2" || die "Invalid --name value: $2" "Use 1-64 letters, numbers, dots, underscores, or hyphens."
+        RUN_INSTANCE_NAME="$2"; shift 2 ;;
       --tail) tail_logs=1; shift ;;
       --no-wait) no_wait=1; shift ;;
       --main) publish_main=1; shift ;;
@@ -3763,6 +4035,7 @@ run_captured_vllm_definition() {
       || die "Captured launch has an invalid --port argument"
   fi
   validate_model_ref_for_backend "$model"
+  [[ -n "$RUN_INSTANCE_NAME" ]] || RUN_INSTANCE_NAME=$(default_instance_name "$model")
   if [[ "$publish_main" == "1" ]]; then
     run_main_replacement_vllm "$model"
   else
@@ -3788,7 +4061,10 @@ run_bundle_alias_definition() {
 }
 
 cmd_alias_run() {
-  local name="$1" definition backend kind
+  local name="$1" definition backend kind instance=""
+  # The alias's stored port yields to a free one when another instance uses it;
+  # an explicit --port for this run still wins.
+  local RUN_ALIAS_PORT_SOFT=1
   shift
   local -a overrides=() settings=()
   # Operational flags drive this launch; every other argument changes the
@@ -3797,12 +4073,19 @@ cmd_alias_run() {
     case "$1" in
       --port)
         [[ $# -ge 2 ]] || die "Missing value for --port"
+        RUN_ALIAS_PORT_SOFT=0
         overrides+=("$1" "$2"); shift 2 ;;
+      --name)
+        [[ $# -ge 2 ]] || die "Missing value for --name"
+        instance="$2"; shift 2 ;;
       *)
         if alias_run_only_flag "$1"; then overrides+=("$1"); else settings+=("$1"); fi
         shift ;;
     esac
   done
+  # The instance (and its LiteLLM route) is named after the alias, so clients
+  # keep a stable route even when the alias is edited.
+  overrides+=(--name "${instance:-$name}")
   definition=$(alias_definition "$name") || die "Alias '${name}' does not exist"
   alias_validate_definition "$definition" || die "Alias '${name}' has an invalid or unsafe definition" \
     "Recreate it with: spark alias edit ${name}"
@@ -4408,6 +4691,7 @@ build_launch() {
     --name "$cname"
     --label spark.managed=1
     --label "spark.model=${model}"
+    --label "spark.instance=${instance:-$(default_instance_name "$model")}"
     --label "spark.api=${BUNDLE_API_KIND:-chat}"
     --label "spark.port=${port}"
     --label "spark.need_gb=${NEED_GB}"
@@ -4511,21 +4795,36 @@ run_backend_vllm() {
     0) MTP_ENABLED=0; MTP_DECIDED=1 ;;
   esac
 
-  local cname CAPACITY_RECLAIM_GB=0
-  cname=$(container_name_for_model "$model")
+  local cname CAPACITY_RECLAIM_GB=0 instance route
+  instance="${RUN_INSTANCE_NAME:-}"
+  [[ -n "$instance" ]] || instance=$(default_instance_name "$model")
+  is_safe_instance_name "$instance" || die "Invalid instance name: ${instance}"
+  cname=$(container_name_for_instance "$model" "$instance")
+  route=$(instance_route_name "$model" "$instance")
 
-  # Is this model already running? (matched by label, not just by name)
-  local existing
-  existing=$(container_for_ref "$model" 2>/dev/null || true)
+  # Is this instance already running? One model may run as several instances;
+  # only the same instance name (or its container name) collides.
+  local existing existing_row existing_model="" existing_instance=""
+  existing_row=$(list_managed_containers | awk -F'\t' -v i="$instance" -v c="$cname" \
+    '$7 == i || $1 == c {print; exit}')
+  existing=$(cut -f1 <<<"$existing_row")
+  existing_model=$(cut -f2 <<<"$existing_row")
+  existing_instance=$(cut -f7 <<<"$existing_row")
   [[ -z "$existing" ]] && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${cname}$" && existing="$cname"
   if [[ -n "$existing" && "$dry_run" != "1" ]]; then
     if [[ "$force" == "1" ]]; then
       CAPACITY_RECLAIM_GB=$(list_managed_containers | awk -F'\t' -v c="$existing" '$1 == c {print $4; exit}')
       CAPACITY_RECLAIM_GB="${CAPACITY_RECLAIM_GB:-0}"
     else
-      err "Model '${model}' is already running (container '${existing}')"
-      printf "    Stop it first with: spark stop %s\n" "$model"
-      printf "    Or replace it with: spark run --force %s\n" "$model"
+      if [[ -n "$existing_instance" && "$existing_instance" != "$instance" ]]; then
+        err "Instance '${instance}' needs container '${cname}', already used by instance '${existing_instance}'"
+      else
+        err "Instance '${instance}' is already running (model '${existing_model:-$model}', container '${existing}')"
+      fi
+      printf "    Run another instance:  add --name <new-name> (e.g. spark run %s --name %s-2)\n" \
+        "${RUN_REQUESTED_REF:-$model}" "$instance"
+      printf "    Replace this instance: rerun the same command with --force\n"
+      printf "    Stop it first:         spark stop %s\n" "${existing_instance:-$existing}"
       exit 1
     fi
   fi
@@ -4656,7 +4955,12 @@ run_backend_vllm() {
   if [[ -z "$port" ]]; then
     port=$(next_free_port "$DEFAULT_PORT")
   elif list_managed_containers | awk -F'\t' -v p="$port" -v c="$existing" '$3 == p && $1 != c {found=1} END {exit !found}'; then
-    if [[ "$dry_run" == "1" ]]; then
+    if [[ "${RUN_PORT_SOFT:-0}" == "1" ]]; then
+      # A stored (alias) or bundle-default port is a preference, not a demand.
+      local wanted_port="$port"
+      port=$(next_free_port "$wanted_port")
+      warn "Port ${wanted_port} is used by another instance; using port ${port}. Override with --port."
+    elif [[ "$dry_run" == "1" ]]; then
       warn "Port ${port} is currently used; a real launch would require a free port."
     else
       die "Port ${port} is already used by another model" "Pick a free port or omit --port to auto-assign"
@@ -4828,13 +5132,13 @@ run_backend_vllm() {
     ready)
       printf " ${GREEN}✓ backend ready${NC}\n" ;;
     timeout)
-      printf "\n  ${YELLOW}⊘${NC} Still warming up after ${STARTUP_TIMEOUT}s — it may still come up. Follow: ${BOLD}spark logs %s${NC}\n\n" "$model" ;;
+      printf "\n  ${YELLOW}⊘${NC} Still warming up after ${STARTUP_TIMEOUT}s — it may still come up. Follow: ${BOLD}spark logs %s${NC}\n\n" "$instance" ;;
     *)
-      printf "\n  Logs: ${BOLD}spark logs %s${NC}  ·  Diagnose backend: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$model" "$port" ;;
+      printf "\n  Logs: ${BOLD}spark logs %s${NC}  ·  Diagnose backend: ${DIM}curl localhost:%s/v1/models${NC}\n\n" "$instance" "$port" ;;
   esac
 
   if [[ "${SPARK_SKIP_GATEWAY_REFRESH:-0}" != 1 ]]; then
-    gateway_publish_model vllm "$model" "$([[ "$serve_state" == ready ]] && printf 1 || printf 0)" || return 1
+    gateway_publish_model vllm "$route" "$([[ "$serve_state" == ready ]] && printf 1 || printf 0)" || return 1
   fi
 
   if [[ "$tail_logs" == "1" ]]; then
@@ -4961,11 +5265,14 @@ cmd_calibrate() {
   [[ -z "$port" ]] || is_port "$port" || die "Invalid --port value: $port"
   [[ -z "$kv_dtype" || "$kv_dtype" =~ ^(auto|bfloat16|fp8)$ ]] || die "Invalid --kv-cache-dtype value: $kv_dtype" "Expected: auto, bfloat16, or fp8"
 
-  local cname existing model_path base_seqs candidates
+  # Calibration launches (and finally removes) the model's default instance;
+  # other named instances of the model are left alone.
+  local cname existing model_path base_seqs candidates calibration_instance
+  calibration_instance=$(default_instance_name "$model")
   cname=$(container_name_for_model "$model")
-  existing=$(container_for_ref "$model" 2>/dev/null || true)
+  existing=$(container_for_instance "$calibration_instance" 2>/dev/null || true)
   if [[ -n "$existing" && "$force" != "1" ]]; then
-    die "Model '${model}' is already running" "Stop it first, or rerun calibration with --force"
+    die "Model '${model}' is already running as instance '${calibration_instance}'" "Stop it first, or rerun calibration with --force"
   fi
   model_path=$(resolve_model_path "$model") || die "Model '${model}' not found in HF cache" "Download it first: spark pull ${model}"
 
@@ -4998,9 +5305,9 @@ cmd_calibrate() {
       [[ -n "$stream" ]] && export SPARK_STREAM_INTERVAL="$stream"
       [[ -n "$batched" ]] && export SPARK_MAX_NUM_BATCHED_TOKENS="$batched" SPARK_MTP_MAX_NUM_BATCHED_TOKENS="$batched"
       if [[ -n "$kv_dtype" ]]; then
-        cmd_run "$model" --force --port "$port" --max-num-seqs "$seqs" --kv-cache-dtype "$kv_dtype"
+        cmd_run "$model" --name "$calibration_instance" --force --port "$port" --max-num-seqs "$seqs" --kv-cache-dtype "$kv_dtype"
       else
-        cmd_run "$model" --force --port "$port" --max-num-seqs "$seqs"
+        cmd_run "$model" --name "$calibration_instance" --force --port "$port" --max-num-seqs "$seqs"
       fi
     ); then
       docker rm -f "$cname" >/dev/null 2>&1 || true
@@ -5244,7 +5551,9 @@ cmd_stop() {
     for n in "${names[@]}"; do stop_one_container "$n"; done
   elif [[ -n "$target" ]]; then
     local name cand n
-    name=$(container_for_ref "$target" 2>/dev/null || true)
+    # An instance name, container name, or a model id with one running instance.
+    die_if_ambiguous_ref "$target"
+    name=$(container_for_ref "$target" || true)
     if [[ -z "$name" ]]; then
       # Fall back to matching the derived container name.
       cand=$(container_name_for_model "$target")
@@ -5261,7 +5570,7 @@ cmd_stop() {
     if [[ ${#names[@]} -gt 1 ]]; then
       err "Multiple models running — specify which to stop"
       printf "    %s\n" "$(IFS=', '; echo "${names[*]}")"
-      printf "    Stop one: ${BOLD}spark stop <model>${NC}   ·   Stop all: ${BOLD}spark stop --all${NC}\n"
+      printf "    Stop one: ${BOLD}spark stop <instance|model>${NC}   ·   Stop all: ${BOLD}spark stop --all${NC}\n"
       exit 1
     fi
     stop_one_container "${names[0]}"
@@ -5554,14 +5863,15 @@ status_operational() {
     [[ "$ready" == "1" ]]
     return $?
   fi
-  while IFS=$'\t' read -r name model port rest; do
-    [[ -n "$name" ]] && model_api_ready "$port" "$(model_api_kind "$name")" && gateway_model_routed vllm "$model" && ready=1
+  local need wt kv instance route
+  while IFS=$'\t' read -r name model port need wt kv instance route; do
+    [[ -n "$name" ]] && model_api_ready "$port" "$(model_api_kind "$name")" && gateway_model_routed vllm "${route:-$model}" && ready=1
   done < <(list_managed_containers)
   [[ "$ready" == "1" ]]
 }
 
 status_models_json() {
-  local first=1 name model port need wt kv state now pk routed loaded_ollama api prefix
+  local first=1 name model port need wt kv instance route state now pk routed loaded_ollama api prefix
   printf '['
   if [[ "$BACKEND" == "ollama" ]]; then
     loaded_ollama=$(ollama ps 2>/dev/null | awk 'NR>1{print $1}' || true)
@@ -5576,18 +5886,22 @@ status_models_json() {
         "$(status_json_escape "$model")" "$state" "$(status_json_escape "$model")" "$routed"
     done < <({ printf '%s\n' "$loaded_ollama"; gateway_load_config | jq -r '.providers.ollama.models[]?'; } | sed '/^$/d' | sort -u)
   else
-    while IFS=$'\t' read -r name model port need wt kv; do
+    while IFS=$'\t' read -r name model port need wt kv instance route; do
       [[ -n "$name" ]] || continue
       [[ "$first" == "1" ]] || printf ','
       first=0
+      route="${route:-$model}"
       state=$(status_model_runtime_state "$name" "$port" || true)
-      if gateway_model_routed vllm "$model"; then routed=true; else routed=false; fi
+      if gateway_model_routed vllm "$route"; then routed=true; else routed=false; fi
       now=$(container_current_gb "$name"); pk=$(container_peak_gb "$name")
       api=$(model_api_kind "$name"); prefix=vllm
       [[ "$api" != systemone ]] || prefix=systemone
-      printf '{"name":"%s","engine":"vllm","api":"%s","state":"%s","endpoint":"http://localhost:%s%s","gateway_model":"%s/%s","gateway_routed":%s,"reserved_gb":%s,"live_gb":%s,"peak_gb":%s,"live_memory_scope":"cgroup","engine_memory":%s}' \
-        "$(status_json_escape "${model:-unknown}")" "$api" "$state" "$(status_json_escape "$port")" "$(model_api_path "$api")" "$prefix" \
-        "$(status_json_escape "${model:-unknown}")" "$routed" "$(status_json_number "$need")" \
+      printf '{"name":"%s","model":"%s","instance":"%s","container":"%s","config":"%s","engine":"vllm","api":"%s","state":"%s","endpoint":"http://localhost:%s%s","gateway_model":"%s/%s","gateway_routed":%s,"reserved_gb":%s,"live_gb":%s,"peak_gb":%s,"live_memory_scope":"cgroup","engine_memory":%s}' \
+        "$(status_json_escape "${model:-unknown}")" "$(status_json_escape "${model:-unknown}")" \
+        "$(status_json_escape "${instance:-}")" "$(status_json_escape "$name")" \
+        "$(status_json_escape "$(container_config_descriptor "$name")")" \
+        "$api" "$state" "$(status_json_escape "$port")" "$(model_api_path "$api")" "$prefix" \
+        "$(status_json_escape "${route:-unknown}")" "$routed" "$(status_json_number "$need")" \
         "$(status_json_number "$now")" "$(status_json_number "$pk")" "$(engine_memory_json "$name")"
     done < <(list_managed_containers)
   fi
@@ -5666,13 +5980,14 @@ print_services_overview() {
 }
 
 print_vllm_model_table() {
-  local models=() needs=() wts=() kvs=() ports=() ups=() cnames=()
-  local reserved=0 name model port need wt kv
-  while IFS=$'\t' read -r name model port need wt kv; do
+  local models=() needs=() wts=() kvs=() ports=() ups=() cnames=() instances=() routes=()
+  local reserved=0 name model port need wt kv instance route
+  while IFS=$'\t' read -r name model port need wt kv instance route; do
     [[ -z "$name" ]] && continue
     model="${model:-unknown}"
     models+=("$model"); needs+=("${need:-?}"); wts+=("${wt:-?}"); kvs+=("${kv:-?}")
     ports+=("${port:-?}"); ups+=("$(container_uptime "$name")"); cnames+=("$name")
+    instances+=("${instance:-$name}"); routes+=("${route:-$model}")
     [[ "${need:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] && reserved=$(awk -v a="$reserved" -v b="$need" 'BEGIN{printf "%.1f", a+b}')
   done < <(list_managed_containers)
 
@@ -5688,11 +6003,12 @@ print_vllm_model_table() {
     [[ "$api" != systemone ]] || prefix=systemone
     state=$(status_model_runtime_state "${cnames[$i]}" "${ports[$i]}" || true)
     case "$state" in ready) state_color="$GREEN" ;; starting) state_color="$YELLOW" ;; *) state_color="$RED" ;; esac
-    printf "  ${state_color}●${NC} ${BOLD}%s${NC}  %s%s%s\n" "${models[$i]}" "$state_color" "$state" "$NC"
+    printf "  ${state_color}●${NC} ${BOLD}%s${NC}  %s%s%s\n" "${instances[$i]}" "$state_color" "$state" "$NC"
+    printf "    Model:   %s · %s\n" "${models[$i]}" "$(container_config_descriptor "${cnames[$i]}")"
     printf "    Direct:  http://localhost:%s%s · up %s\n" "${ports[$i]}" "$(model_api_path "$api")" "${ups[$i]}"
-    if gateway_model_routed vllm "${models[$i]}"; then route_state="routed"; else route_state="not routed"; fi
+    if gateway_model_routed vllm "${routes[$i]}"; then route_state="routed"; else route_state="not routed"; fi
     printf "    Gateway: http://localhost:%s%s · model %s/%s · %s\n" \
-      "$(gateway_configured_port)" "$(model_api_path "$api")" "$prefix" "${models[$i]}" "$route_state"
+      "$(gateway_configured_port)" "$(model_api_path "$api")" "$prefix" "${routes[$i]}" "$route_state"
     printf "    Memory:  %s GB weights · %s GB KV cache · %s GB reserved\n" \
       "${wts[$i]}" "${kvs[$i]}" "${needs[$i]}"
     now=$(container_current_gb "${cnames[$i]}"); pk=$(container_peak_gb "${cnames[$i]}")
@@ -5783,7 +6099,9 @@ cmd_benchmark_help() {
   selected automatically; with several, Spark asks which one to test.
 
   ${BOLD}Flags:${NC}
-    --model <model>       Select an exact running model non-interactively.
+    --model <ref>         Select a running instance non-interactively: an
+                          instance name, or a model id with one instance.
+    --instance <name>     Same as --model.
     --profile <profile>   synchronous, throughput, sweep, or a GuideLLM config.
                           Default: sweep.
     --requests <int>      Requests per strategy. Default: 100.
@@ -5804,42 +6122,55 @@ cmd_benchmark_help() {
   ${BOLD}Examples:${NC}
     spark benchmark
     spark benchmark --model google/gemma-3-27b-it --profile synchronous
+    spark benchmark --model qwen3.5-9b-16k
     spark benchmark --duration 30 -- --metrics kind=generative,sample_size=0
 
 EOF
 }
 
 benchmark_select_model() {
-  local requested="$1" name model port rest choice i
-  local -a models=() ports=() names=()
+  local requested="$1" name model port need wt kv instance route choice i
+  local -a models=() ports=() names=() instances=() matches=()
 
-  while IFS=$'\t' read -r name model port rest; do
+  while IFS=$'\t' read -r name model port need wt kv instance route; do
     [[ -n "$name" && -n "$model" ]] || continue
     is_safe_model_ref "$model" || continue
     is_port "$port" || continue
     [[ "$(model_api_kind "$name")" != systemone ]] || continue
-    names+=("$name"); models+=("$model"); ports+=("$port")
+    names+=("$name"); models+=("$model"); ports+=("$port"); instances+=("${instance:-$name}")
   done < <(list_managed_containers)
 
   [[ ${#models[@]} -gt 0 ]] || die "No running Spark vLLM models found" \
     "Start one first: spark run <model>"
 
   if [[ -n "$requested" ]]; then
+    # An instance or container name is exact; a model id must be unambiguous.
     for i in "${!models[@]}"; do
-      if [[ "${models[$i]}" == "$requested" ]]; then
-        BENCHMARK_MODEL="${models[$i]}"
-        BENCHMARK_PORT="${ports[$i]}"
-        BENCHMARK_CONTAINER="${names[$i]}"
-        return 0
+      if [[ "${instances[$i]}" == "$requested" || "${names[$i]}" == "$requested" ]]; then
+        matches=("$i"); break
       fi
+      [[ "${models[$i]}" != "$requested" ]] || matches+=("$i")
     done
-    die "Model '${requested}' is not running" "Run 'spark status' to see active models."
+    [[ ${#matches[@]} -gt 0 ]] || die "Model or instance '${requested}' is not running" \
+      "Run 'spark status' to see active instances."
+    if [[ ${#matches[@]} -gt 1 ]]; then
+      err "Model '${requested}' has several running instances — choose one with --model <instance>"
+      for i in "${matches[@]}"; do printf '    %s (%s)\n' "${instances[$i]}" "${names[$i]}" >&2; done
+      exit 1
+    fi
+    i="${matches[0]}"
+    BENCHMARK_MODEL="${models[$i]}"
+    BENCHMARK_PORT="${ports[$i]}"
+    BENCHMARK_CONTAINER="${names[$i]}"
+    BENCHMARK_INSTANCE="${instances[$i]}"
+    return 0
   fi
 
   if [[ ${#models[@]} -eq 1 ]]; then
     BENCHMARK_MODEL="${models[0]}"
     BENCHMARK_PORT="${ports[0]}"
     BENCHMARK_CONTAINER="${names[0]}"
+    BENCHMARK_INSTANCE="${instances[0]}"
     return 0
   fi
 
@@ -5847,7 +6178,7 @@ benchmark_select_model() {
     "Run 'spark status' to see active models."
   printf '\n  Running models:\n'
   for i in "${!models[@]}"; do
-    printf '    %d) %s  (port %s)\n' "$((i + 1))" "${models[$i]}" "${ports[$i]}"
+    printf '    %d) %s  (instance %s, port %s)\n' "$((i + 1))" "${models[$i]}" "${instances[$i]}" "${ports[$i]}"
   done
   printf '  Model to benchmark: '
   IFS= read -r choice
@@ -5857,6 +6188,7 @@ benchmark_select_model() {
   BENCHMARK_MODEL="${models[$i]}"
   BENCHMARK_PORT="${ports[$i]}"
   BENCHMARK_CONTAINER="${names[$i]}"
+  BENCHMARK_INSTANCE="${instances[$i]}"
 }
 
 benchmark_profile_config() {
@@ -5890,7 +6222,7 @@ cmd_benchmark() {
     fi
     case "$1" in
       --) passthrough=1; shift ;;
-      --model) [[ $# -ge 2 ]] || die "Missing value for --model"; requested_model="$2"; shift 2 ;;
+      --model|--instance) [[ $# -ge 2 ]] || die "Missing value for $1"; requested_model="$2"; shift 2 ;;
       --profile) [[ $# -ge 2 ]] || die "Missing value for --profile"; profile="$2"; shift 2 ;;
       --requests) [[ $# -ge 2 ]] || die "Missing value for --requests"; requests="$2"; shift 2 ;;
       --duration) [[ $# -ge 2 ]] || die "Missing value for --duration"; duration="$2"; shift 2 ;;
@@ -5935,7 +6267,7 @@ cmd_benchmark() {
   target="http://${target_host}:${BENCHMARK_PORT}"
 
   timestamp=$(date -u '+%Y%m%dT%H%M%SZ')
-  slug=$(slugify_model "$BENCHMARK_MODEL")
+  slug="${BENCHMARK_INSTANCE:-$(slugify_model "$BENCHMARK_MODEL")}"
   output_dir="${output_dir:-${SPARK_DATA_DIR}/benchmarks/${timestamp}-${slug}}"
   if [[ "$output_dir" == /* ]]; then
     host_output_dir="$output_dir"
@@ -5985,6 +6317,7 @@ cmd_benchmark() {
   fi
 
   printf '\n  Benchmark target: %s (%s, port %s)\n' "$BENCHMARK_MODEL" "$BENCHMARK_CONTAINER" "$BENCHMARK_PORT"
+  printf '  Instance:        %s\n' "$BENCHMARK_INSTANCE"
   printf '  Dataset:         %s\n' "$data_config"
   printf '  Profile:         %s\n' "$profile_config"
   printf '  Thinking:        %s\n' "$thinking"
@@ -6008,11 +6341,11 @@ cmd_benchmark() {
   done
 
   manifest="${host_output_dir}/spark.json"
-  jq -n --arg timestamp "$timestamp" --arg model "$BENCHMARK_MODEL" --arg container "$BENCHMARK_CONTAINER" \
+  jq -n --arg timestamp "$timestamp" --arg model "$BENCHMARK_MODEL" --arg instance "$BENCHMARK_INSTANCE" --arg container "$BENCHMARK_CONTAINER" \
     --argjson port "$BENCHMARK_PORT" --arg image "$image" --arg dataset "$data_config" \
     --arg profile "$profile_config" --arg constraint "$constraint_config" --arg thinking "$thinking" \
     --argjson output_tokens "$output_tokens" \
-    '{timestamp:$timestamp,model:$model,container:$container,port:$port,image:$image,
+    '{timestamp:$timestamp,model:$model,instance:$instance,container:$container,port:$port,image:$image,
       data:$dataset,profile:$profile,constraint:$constraint,thinking:$thinking,
       output_tokens:$output_tokens,seed:42}' > "$manifest"
 
@@ -6163,7 +6496,7 @@ dashboard_models_html() {
   fi
 
   printf '<table><thead><tr><th>Model</th><th>Need</th><th>Weights</th><th>KV</th><th>Port</th><th>Up</th></tr></thead><tbody>\n'
-  while IFS=$'\t' read -r name model port need wt kv; do
+  while IFS=$'\t' read -r name model port need wt kv _; do
     [[ -z "$name" ]] && continue
     rows=$((rows + 1))
     [[ "${need:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] && reserved=$(awk -v a="$reserved" -v b="$need" 'BEGIN{printf "%.1f", a+b}')
@@ -6472,6 +6805,8 @@ cmd_logs() {
 
   local name=""
   if [[ -n "$target" ]]; then
+    # An instance name, container name, or a model id with one running instance.
+    die_if_ambiguous_ref "$target"
     name=$(container_for_ref "$target" 2>/dev/null || true)
     [[ -z "$name" ]] && name=$(container_name_for_model "$target")
   else
@@ -7967,10 +8302,9 @@ setup_summary() {
 }
 
 model_server_state() {
-  local model="$1" name m rest running=0 route_ok=0
-  while IFS=$'\t' read -r name m rest; do
-    [[ "$m" == "$model" ]] && running=1
-  done < <(list_managed_containers)
+  local model="$1" running=0 route_ok=0
+  # A route name: the model id of a default instance, or an instance name.
+  main_ref_row "$model" >/dev/null && running=1
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     route_ok=1
   fi
@@ -7983,7 +8317,7 @@ model_server_tool_calling_ready() {
   local model="$1" container args parser profile_file expected=""
   [[ "$BACKEND" == "vllm" ]] || return 0
   [[ -n "$model" ]] || return 1
-  container=$(container_for_ref "$model" 2>/dev/null || true)
+  container=$(container_for_route "$model" 2>/dev/null || true)
   [[ -n "$container" ]] || return 1
   args=$(docker inspect -f '{{json .Config.Cmd}}' "$container" 2>/dev/null || true)
   parser=$(printf '%s\n' "$args" | jq -er '
@@ -8006,7 +8340,7 @@ model_server_tool_calling_ready() {
 model_server_context_ready() {
   local model="$1" minimum="$2" container max_len
   [[ "$BACKEND" == "vllm" ]] || return 0
-  container=$(container_for_ref "$model" 2>/dev/null || true)
+  container=$(container_for_route "$model" 2>/dev/null || true)
   [[ -n "$container" ]] || return 1
   max_len=$(docker inspect -f '{{index .Config.Labels "spark.max_model_len"}}' "$container" 2>/dev/null || true)
   [[ "$max_len" =~ ^[0-9]+$ && "$max_len" -ge "$minimum" ]]
@@ -8050,10 +8384,22 @@ model_server_resolve_repair_model() {
 
 model_server_repair() {
   local check_only="$1" auto_yes="$2" model="$3" require_tools="$4" minimum_context="$5" disable_mtp="$6"
-  local provider="vllm" state restart=0 configured_provider configured_model args=("$model")
+  local provider="vllm" state restart=0 configured_provider configured_model args=("$model") row
+  local -a name_args=()
   [[ "$BACKEND" == "ollama" ]] && provider="ollama"
   model_server_ensure_gateway_config "$check_only" "$provider" || return 1
   state=$(model_server_state "$model")
+  # The main reference is a route name. Relaunch the instance that serves it
+  # (or the model's default instance) instead of a name generated from the
+  # repair flags below.
+  if [[ "$BACKEND" == "vllm" ]]; then
+    row=$(main_ref_row "$model" || true)
+    if [[ -n "$row" ]]; then
+      args=("$(cut -f2 <<<"$row")"); name_args=(--name "$(cut -f7 <<<"$row")")
+    elif ! alias_exists "$model"; then
+      name_args=(--name "$(default_instance_name "$model")")
+    fi
+  fi
   [[ "$disable_mtp" == "1" ]] && args+=(--no-mtp)
   [[ "$require_tools" == "1" ]] && args+=(--tools)
   [[ -n "$minimum_context" ]] && args+=(--max-len "$minimum_context")
@@ -8067,7 +8413,7 @@ model_server_repair() {
         return 1
       fi
       info "Restarting ${model} with the requested model-server policy"
-      cmd_run "${args[@]}" --force
+      cmd_run "${args[@]}" --force ${name_args[@]+"${name_args[@]}"}
     fi
   else
     if [[ "$check_only" == "1" ]]; then
@@ -8080,9 +8426,10 @@ model_server_repair() {
     if [[ "${SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL:-}" == "$model" && \
           -n "${SPARK_WORKSPACE_RESTART_VLLM_DEFINITION:-}" ]]; then
       run_captured_vllm_definition "$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION" \
-        "workspace restart" --force
+        "workspace restart" --force --name "${SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_INSTANCE:-$(default_instance_name \
+          "$(jq -r '.model' <<<"$SPARK_WORKSPACE_RESTART_VLLM_DEFINITION")")}"
     else
-      cmd_run "${args[@]}"
+      cmd_run "${args[@]}" ${name_args[@]+"${name_args[@]}"}
     fi
   fi
 
@@ -8621,10 +8968,9 @@ workspace_url_for() {
 }
 
 workspace_model_state() {
-  local model="$1" name m rest running=0 route_ok=0
-  while IFS=$'\t' read -r name m rest; do
-    [[ "$m" == "$model" ]] && running=1
-  done < <(list_managed_containers)
+  local model="$1" running=0 route_ok=0
+  # A route name: the model id of a default instance, or an instance name.
+  main_ref_row "$model" >/dev/null && running=1
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${GATEWAY_CONTAINER}$"; then
     route_ok=1
   fi
@@ -8637,7 +8983,7 @@ workspace_model_tool_calling_ready() {
   local model="$1" container args parser profile_file expected=""
   [[ "$BACKEND" == "vllm" ]] || return 0
   [[ -n "$model" ]] || return 1
-  container=$(container_for_ref "$model" 2>/dev/null || true)
+  container=$(container_for_route "$model" 2>/dev/null || true)
   [[ -n "$container" ]] || return 1
   args=$(docker inspect -f '{{json .Config.Cmd}}' "$container" 2>/dev/null || true)
   parser=$(printf '%s\n' "$args" | jq -er '
@@ -8670,7 +9016,7 @@ workspace_hermes_setting() {
 workspace_model_context_limit() {
   local model="$1" container max_len
   [[ "$BACKEND" == "vllm" ]] || return 1
-  container=$(container_for_ref "$model" 2>/dev/null || true)
+  container=$(container_for_route "$model" 2>/dev/null || true)
   [[ -n "$container" ]] || return 1
   max_len=$(docker inspect -f '{{index .Config.Labels "spark.max_model_len"}}' "$container" 2>/dev/null || true)
   [[ "$max_len" =~ ^[1-9][0-9]*$ ]] || return 1
@@ -8868,18 +9214,24 @@ workspace_repair_model_server() {
 
 SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
 SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
+SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_INSTANCE=""
 
 workspace_capture_restart_model() {
-  local model cname definition
+  local model cname definition row served=""
   SPARK_WORKSPACE_RESTART_VLLM_DEFINITION=""
   SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_MODEL=""
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_INSTANCE=""
   [[ "$BACKEND" == "vllm" ]] || return 0
   model=$(workspace_main_model 2>/dev/null || true)
   [[ -n "$model" ]] || return 0
-  cname=$(container_for_ref "$model" 2>/dev/null || true)
+  # main.model is a route name; capture the instance that serves it.
+  row=$(main_ref_row "$model" 2>/dev/null || true)
+  cname=$(cut -f1 <<<"$row")
+  served=$(cut -f2 <<<"$row")
+  SPARK_WORKSPACE_RESTART_VLLM_DEFINITION_INSTANCE=$(cut -f7 <<<"$row")
   [[ -n "$cname" ]] || cname=$(container_name_for_model "$model" 2>/dev/null || true)
   [[ -n "$cname" ]] || return 0
-  definition=$(alias_capture_definition "$cname" "$model" 2>/dev/null || true)
+  definition=$(alias_capture_definition "$cname" "${served:-$model}" 2>/dev/null || true)
   [[ -n "$definition" ]] || {
     warn "Could not capture the running vLLM launch; restart will use the workspace defaults"
     return 0
@@ -18267,6 +18619,8 @@ cmd_architecture() {
   ${BOLD}Boundary rules:${NC}
     run_backend_* reads cmd_run locals via Bash dynamic scope.
     build_launch reads run_backend_vllm locals and rebuilds docker args.
+    a vLLM instance is identified by its spark.instance label, not its model;
+    the default instance keeps spark-vllm-<slug> and route vllm/<model>.
     setup steps must use ctx_* helpers so local and remote stay equivalent.
     workspace repair delegates model and LiteLLM recovery to spark repair.
     workspace setup --check and doctor must stay read-only.
@@ -18306,11 +18660,11 @@ cmd_help() {
     alias            Save, inspect, and restore launch aliases
     calibrate <model> Measure launch configs and save the fastest one
     benchmark         Benchmark a running vLLM model with GuideLLM
-    stop [<model>]   Stop a model (no arg: the only one; --all: every one)
+    stop [<instance>] Stop an instance or model (no arg: the only one; --all: every one)
     pull <model|bundle> Download a model or the pinned target of a bundle
     list             List downloaded models
     rm <model> [...] Remove downloaded model(s)
-    logs [<model>]   Show container logs (-f to follow)
+    logs [<instance>] Show container logs of an instance or model (-f to follow)
     gateway          Manage authenticated LiteLLM, providers, OAuth and private node access
     reinstall        Remove Spark state and run setup again
     uninstall        Remove Spark-managed runtime/config/data
@@ -18350,7 +18704,8 @@ cmd_help() {
     --explain              Explain the plan; implies --dry-run
     --no-wait              Start and return without health supervision
     --tail                 Follow logs after launch
-    --force                Replace an already running instance of this model
+    --name <name>          Instance name (default: generated from naming flags)
+    --force                Replace the running instance with the same name
     --regen-profile        Recompute the cached model memory profile
 
   ${BOLD}Setup flags:${NC}
@@ -18386,6 +18741,7 @@ cmd_help() {
     spark pull RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4
     spark run nvidia/Llama-4-Scout-17B-16E-Instruct-NVFP4   # second model, co-resident
+    spark run RedHatAI/Qwen3.6-35B-A3B-NVFP4 --max-len 16384  # second instance: qwen3.6-35b-16k
     spark run --dry-run Qwen/Qwen3-30B-A3B
     spark benchmark --profile synchronous
     spark status
@@ -18490,20 +18846,34 @@ gateway_generate_litellm_yaml() {
   # no wildcard that could resurrect a stopped local model.
   if [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]]; then
     local primary_port="" primary_model="" primary_info="{}" model_info main_match=0 name model port rest
-    while IFS=$'\t' read -r name model port rest; do
+    local need wt kv instance route main_container="" seen_routes=$'\n'
+    # Instances of one model get distinct routes: vllm/<model> for the default
+    # instance, vllm/<instance> otherwise. Main follows the stored route name.
+    if [[ "$main_provider" == "vllm" && -n "$main_model" ]]; then
+      main_container=$(main_ref_row "$main_model" | cut -f1 || true)
+    fi
+    while IFS=$'\t' read -r name model port need wt kv instance route; do
       [[ -z "$model" ]] && continue
+      route="${route:-$model}"
+      # Never emit a duplicate model_name: LiteLLM would load-balance across
+      # different launches silently.
+      if [[ "$seen_routes" == *$'\n'"$route"$'\n'* ]]; then
+        warn "Skipping duplicate LiteLLM route for ${route} (container ${name})"
+        continue
+      fi
+      seen_routes+="${route}"$'\n'
       if [[ "$(model_api_kind "$name")" == systemone ]]; then
         # TypeSafe's transport implements the public System One wire contract;
         # api_base and the local placeholder key keep the call on this host.
         yaml+="
-  - $(jq -nc --arg model "$model" --arg base "http://localhost:${port}" \
-          '{model_name:("systemone/"+$model),litellm_params:{model:("typesafe/"+$model),api_base:$base,api_key:"dummy",drop_params:false},model_info:{mode:"decisions"}}')"
+  - $(jq -nc --arg route "$route" --arg model "$model" --arg base "http://localhost:${port}" \
+          '{model_name:("systemone/"+$route),litellm_params:{model:("typesafe/"+$model),api_base:$base,api_key:"dummy",drop_params:false},model_info:{mode:"decisions"}}')"
         has_models=1
         continue
       fi
       model_info=$(gateway_vllm_model_info "$name" "$model" "$port") || return 1
       yaml+="
-  - model_name: \"vllm/${model}\"
+  - model_name: \"vllm/${route}\"
     litellm_params:
       model: \"openai/${model}\"
       api_base: \"http://localhost:${port}/v1\"
@@ -18520,7 +18890,7 @@ gateway_generate_litellm_yaml() {
         primary_model="$model"
         primary_info="$model_info"
       fi
-      if [[ "$main_provider" == "vllm" && "$model" == "$main_model" ]]; then
+      if [[ "$main_provider" == "vllm" && -n "$main_container" && "$name" == "$main_container" ]]; then
         primary_port="$port"
         primary_model="$model"
         primary_info="$model_info"

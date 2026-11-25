@@ -16,7 +16,7 @@ gateway_model_prefix() {
     ollama) printf 'ollama_chat' ;;
     systemone) printf 'systemone' ;;
     vllm)
-      name=$(container_for_ref "$model" 2>/dev/null || true)
+      name=$(container_for_route "$model" 2>/dev/null || true)
       if [[ -n "$name" && "$(model_api_kind "$name")" == systemone ]]; then
         printf 'systemone'
       else
