@@ -1,0 +1,11 @@
+Mica v0.5 4B
+Copyright 2026 akivet
+
+This model is a fine-tune of Qwen/Qwen3.5-4B (revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a),
+Copyright Alibaba Cloud, licensed under the Apache License 2.0.
+
+The serving runtime binds to llama.cpp (https://github.com/ggml-org/llama.cpp, tag b11700),
+Copyright The ggml authors, licensed under the MIT License. llama.cpp is built or downloaded by the user and is not
+part of this repository; scripts/patches holds changes to it under the same MIT License. The release assets
+ggml-vulkan.dll and llama.dll (tags vulkan-b11700-r1 and b11700-r2) are llama.cpp b11700 built with those patches; the
+llama.cpp MIT license ships beside them as LICENSE-llama.cpp.
