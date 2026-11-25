@@ -81,6 +81,21 @@ cmd_status() {
   status_operational
 }
 
+# A container that is no longer running (e.g. crashed), by exact reference only:
+# its container name, or a model id whose default container has that exact
+# spark.model label. Never the slug of an arbitrary reference.
+stopped_container_for_ref() {
+  local ref="$1" cand
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq -- "$ref"; then
+    printf '%s\n' "$ref"
+    return 0
+  fi
+  [[ "$ref" == */* ]] || return 0
+  cand=$(container_name_for_model "$ref")
+  [[ "$(docker inspect -f '{{ index .Config.Labels "spark.model" }}' "$cand" 2>/dev/null || true)" == "$ref" ]] || return 0
+  printf '%s\n' "$cand"
+}
+
 # spark logs [<model>] [-f] — logs of a model, or the only one running.
 cmd_logs() {
   local follow=0 target=""
@@ -103,7 +118,8 @@ cmd_logs() {
     # An instance name, container name, or a model id with one running instance.
     die_if_ambiguous_ref "$target"
     name=$(container_for_ref "$target" 2>/dev/null || true)
-    [[ -z "$name" ]] && name=$(container_name_for_model "$target")
+    [[ -n "$name" ]] || name=$(stopped_container_for_ref "$target")
+    [[ -n "$name" ]] || die_no_running_instance "$target"
   else
     # No model given: pick the only running managed container, or the legacy name.
     local names=()

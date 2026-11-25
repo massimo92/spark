@@ -1314,6 +1314,27 @@ instances_for_model() {
   list_managed_containers | awk -F '\t' -v ref="$1" '$2 == ref { printf "%s (%s)\n", $7, $1 }'
 }
 
+# All running instances, one "<instance> (<container>)" per line.
+running_instances() {
+  list_managed_containers | awk -F '\t' '{ printf "%s (%s)\n", $7, $1 }'
+}
+
+# Exit when a user reference matches no running instance. Never fall back to
+# the slug of the reference: "demo-9b-mtp" slugifies to "demo-9b", which is
+# another instance.
+die_no_running_instance() {
+  local ref="$1" rows
+  err "No running instance matches '${ref}'"
+  rows=$(running_instances)
+  if [[ -n "$rows" ]]; then
+    printf "    Running instances:\n" >&2
+    printf '%s\n' "$rows" | sed 's/^/      /' >&2
+  else
+    printf "    No instances are running\n" >&2
+  fi
+  exit 1
+}
+
 # Resolve a managed container from an instance name, a container name, or a
 # model id. A model id with several running instances is ambiguous: return 2
 # without picking one (callers list the candidates with instances_for_model).
@@ -5608,20 +5629,17 @@ cmd_stop() {
     local n
     for n in "${names[@]}"; do stop_one_container "$n"; done
   elif [[ -n "$target" ]]; then
-    local name cand n
-    # An instance name, container name, or a model id with one running instance.
+    local name n
+    # Exact match only: an instance name, a container name, or a model id with
+    # one running instance. Never the slug of the target: it can name another
+    # instance of the same model.
     die_if_ambiguous_ref "$target"
     name=$(container_for_ref "$target" || true)
     if [[ -z "$name" ]]; then
-      # Fall back to matching the derived container name.
-      cand=$(container_name_for_model "$target")
-      for n in "${names[@]}"; do [[ "$n" == "$cand" || "$n" == "$target" ]] && name="$n"; done
+      # The legacy unlabelled container, by its exact name.
+      for n in "${names[@]}"; do [[ "$n" == "$target" ]] && name="$n"; done
     fi
-    if [[ -z "$name" ]]; then
-      err "No running model matches '${target}'"
-      printf "    Running: %s\n" "$(IFS=', '; echo "${names[*]}")"
-      exit 1
-    fi
+    [[ -n "$name" ]] || die_no_running_instance "$target"
     stop_one_container "$name"
   else
     # No argument: only safe when exactly one model is running.
@@ -6847,6 +6865,21 @@ cmd_status() {
   status_operational
 }
 
+# A container that is no longer running (e.g. crashed), by exact reference only:
+# its container name, or a model id whose default container has that exact
+# spark.model label. Never the slug of an arbitrary reference.
+stopped_container_for_ref() {
+  local ref="$1" cand
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq -- "$ref"; then
+    printf '%s\n' "$ref"
+    return 0
+  fi
+  [[ "$ref" == */* ]] || return 0
+  cand=$(container_name_for_model "$ref")
+  [[ "$(docker inspect -f '{{ index .Config.Labels "spark.model" }}' "$cand" 2>/dev/null || true)" == "$ref" ]] || return 0
+  printf '%s\n' "$cand"
+}
+
 # spark logs [<model>] [-f] — logs of a model, or the only one running.
 cmd_logs() {
   local follow=0 target=""
@@ -6869,7 +6902,8 @@ cmd_logs() {
     # An instance name, container name, or a model id with one running instance.
     die_if_ambiguous_ref "$target"
     name=$(container_for_ref "$target" 2>/dev/null || true)
-    [[ -z "$name" ]] && name=$(container_name_for_model "$target")
+    [[ -n "$name" ]] || name=$(stopped_container_for_ref "$target")
+    [[ -n "$name" ]] || die_no_running_instance "$target"
   else
     # No model given: pick the only running managed container, or the legacy name.
     local names=()

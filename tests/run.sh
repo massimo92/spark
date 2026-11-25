@@ -298,6 +298,7 @@ ${stdin_payload}"
     esac
     ;;
   logs)
+    [[ -z "${FAKE_DOCKER_LOGS_FILE:-}" ]] || printf '%s\n' "$args" >> "${FAKE_DOCKER_LOGS_FILE}"
     _att=0
     [[ -n "${FAKE_DOCKER_ARGS_FILE:-}" && -f "${FAKE_DOCKER_ARGS_FILE}" ]] && _att=$(grep -c '^run .*--label spark.managed=1' "${FAKE_DOCKER_ARGS_FILE}" 2>/dev/null || echo 0)
     if [[ "${FAKE_RETRY:-}" == "mamba" && "${_att}" -le 1 ]]; then
@@ -3983,6 +3984,79 @@ test_ambiguous_model_ref_lists_instances_and_legacy_resolves() {
   [[ "$out" == *"Benchmark target: org/Alpha (spark-vllm-alpha-16k, port 8001)"* ]] || ok=1
   [[ "$out" == *"Instance:        alpha-16k"* ]] || ok=1
   [[ "$ok" == "0" ]] || printf '%s\n' "$out" >&2
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+DEMO_INSTANCES='spark-vllm-demo-9b\torg/demo-9b\t8000\t10\t5\t5\tdemo-9b\nspark-vllm-demo-9b-kv8\torg/demo-9b\t8001\t10\t5\t5\tdemo-9b-kv8\n'
+DEMO_NAMES='spark-vllm-demo-9b\nspark-vllm-demo-9b-kv8\n'
+
+# Regression: "demo-9b-mtp" slugifies to "demo-9b"; stop/logs of a missing
+# instance must not act on the running demo-9b instance.
+test_stop_and_logs_never_resolve_by_slug() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status ref ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
+  for ref in demo-9b-mtp org/demo-9b-mtp; do
+    status=0
+    out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$DEMO_INSTANCES" FAKE_NAMES="$DEMO_NAMES" \
+      FAKE_DOCKER_INSPECT='org/demo-9b' FAKE_DOCKER_STOP_FILE="${tmp}/stops" "$SPARK" stop "$ref" 2>&1) || status=$?
+    [[ "$status" != "0" && "$out" == *"No running instance matches '${ref}'"* ]] || ok=1
+    [[ "$out" == *"demo-9b (spark-vllm-demo-9b)"* && "$out" == *"demo-9b-kv8 (spark-vllm-demo-9b-kv8)"* ]] || ok=1
+    [[ "$out" != *"Stopped"* ]] || ok=1
+    status=0
+    out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="$DEMO_INSTANCES" FAKE_NAMES="$DEMO_NAMES" \
+      FAKE_DOCKER_INSPECT='org/demo-9b' FAKE_DOCKER_LOGS_FILE="${tmp}/logs" "$SPARK" logs "$ref" 2>&1) || status=$?
+    [[ "$status" != "0" && "$out" == *"No running instance matches '${ref}'"* ]] || ok=1
+  done
+  [[ ! -s "${tmp}/stops" && ! -s "${tmp}/logs" ]] || ok=1
+  [[ "$ok" == "0" ]] || { printf '%s\n' "$out" >&2; cat "${tmp}/stops" "${tmp}/logs" >&2 2>/dev/null || true; }
+  rm -rf "$tmp"
+  [[ "$ok" == "0" ]]
+}
+
+test_stop_and_logs_resolve_exact_refs() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin out status=0 ok=0 legacy
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"; mkdir -p "${tmp}/home"
+  run_demo() {
+    HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_MANAGED="${managed:-$DEMO_INSTANCES}" \
+      FAKE_NAMES="${names:-$DEMO_NAMES}" FAKE_DOCKER_STOP_FILE="${tmp}/stops" \
+      FAKE_DOCKER_LOGS=log-line FAKE_DOCKER_LOGS_FILE="${tmp}/logs" "$SPARK" "$@" 2>&1
+  }
+  # Exact instance name.
+  run_demo stop demo-9b-kv8 >/dev/null || ok=1
+  grep -Eq '^stop spark-vllm-demo-9b-kv8$' "${tmp}/stops" || ok=1
+  ! grep -Eq ' spark-vllm-demo-9b$' "${tmp}/stops" || ok=1
+  : > "${tmp}/stops"
+  # Exact container name.
+  run_demo stop spark-vllm-demo-9b >/dev/null || ok=1
+  grep -Eq '^stop spark-vllm-demo-9b$' "${tmp}/stops" || ok=1
+  ! grep -q 'kv8' "${tmp}/stops" || ok=1
+  : > "${tmp}/stops"
+  run_demo logs demo-9b-kv8 >/dev/null || ok=1
+  grep -Eq '^logs spark-vllm-demo-9b-kv8$' "${tmp}/logs" || ok=1
+  # Ambiguous model id lists the instances and stops nothing.
+  out=$(run_demo stop org/demo-9b) && ok=1
+  [[ "$out" == *"several running instances"* && "$out" == *"demo-9b-kv8 (spark-vllm-demo-9b-kv8)"* ]] || ok=1
+  [[ ! -s "${tmp}/stops" ]] || ok=1
+  # A model id with one running instance.
+  managed='spark-vllm-demo-9b-kv8\torg/demo-9b\t8001\t10\t5\t5\tdemo-9b-kv8\n' run_demo stop org/demo-9b >/dev/null || ok=1
+  grep -Eq '^stop spark-vllm-demo-9b-kv8$' "${tmp}/stops" || ok=1
+  : > "${tmp}/stops"; : > "${tmp}/logs"
+  # Legacy unlabeled default container: its exact model id.
+  legacy='spark-vllm-qwen3.8-27b\tQwen/Qwen3.8-27B-FP8\t8000\t10\t5\t5\n'
+  managed="$legacy" names='spark-vllm-qwen3.8-27b\n' run_demo logs Qwen/Qwen3.8-27B-FP8 >/dev/null || ok=1
+  grep -Eq '^logs spark-vllm-qwen3.8-27b$' "${tmp}/logs" || ok=1
+  managed="$legacy" names='spark-vllm-qwen3.8-27b\n' run_demo stop Qwen/Qwen3.8-27B-FP8 >/dev/null || ok=1
+  grep -Eq '^stop spark-vllm-qwen3.8-27b$' "${tmp}/stops" || ok=1
+  : > "${tmp}/logs"
+  # A crashed (exited) default container: logs by its exact model id label.
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" FAKE_NAMES='spark-vllm-demo-9b\n' \
+    FAKE_DOCKER_INSPECT=org/demo-9b FAKE_DOCKER_LOGS=log-line FAKE_DOCKER_LOGS_FILE="${tmp}/logs" "$SPARK" logs org/demo-9b 2>&1) || ok=1
+  grep -Eq '^logs spark-vllm-demo-9b$' "${tmp}/logs" || ok=1
+  unset -f run_demo
+  [[ "$ok" == "0" ]] || { printf '%s\n' "$out" >&2; cat "${tmp}/stops" "${tmp}/logs" >&2 2>/dev/null || true; }
   rm -rf "$tmp"
   [[ "$ok" == "0" ]]
 }
@@ -10538,7 +10612,7 @@ test_logs_vllm_no_container() {
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_BACKEND=vllm "$SPARK" logs Org/Model </dev/null 2>&1) || true
   rm -rf "$tmp"
-  [[ "$out" == *"No container found"* ]]
+  [[ "$out" == *"No running instance matches 'Org/Model'"* ]]
 }
 
 test_config_set_and_show() {
@@ -11156,6 +11230,8 @@ run_test "instance names come from explicit naming flags" test_instance_names_ge
 run_test "alias launch uses alias instance name and a free port" test_alias_launch_uses_alias_instance_name_and_free_port
 run_test "two instances of one model coexist; --force replaces one" test_two_instances_of_one_model_coexist_and_force_replaces_one
 run_test "ambiguous model ref lists instances; legacy resolves" test_ambiguous_model_ref_lists_instances_and_legacy_resolves
+run_test "stop/logs never resolve a missing instance by its slug" test_stop_and_logs_never_resolve_by_slug
+run_test "stop/logs resolve exact instance, container, model id, legacy" test_stop_and_logs_resolve_exact_refs
 run_test "gateway YAML routes named instances uniquely" test_gateway_yaml_routes_named_instances
 run_test "status shows instance names and config" test_status_shows_instance_names_and_config
 run_test "missing model with --no-pull errors clearly" test_missing_model_no_pull_errors
