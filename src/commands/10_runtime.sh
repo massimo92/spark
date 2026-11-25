@@ -18,7 +18,8 @@ cmd_run_help() {
     --enforce-eager        Disable CUDA graphs; lower startup peak, slower inference.
     --no-enforce-eager     Force CUDA graphs on.
     --port <int>           Direct model API port; default auto-selects from 8000.
-    --tools                Enable tool-calling parser when supported.
+    --no-tools             Disable tool calling (on by default when supported).
+    --tools                Require tool calling; fail if no tool-call parser is known.
     --text-only            Disable vision input for multimodal models.
     --no-reasoning         Disable reasoning parser.
     --no-pull              Fail if model is missing; do not offer download.
@@ -30,6 +31,11 @@ cmd_run_help() {
     --force                Replace the running instance with the same name.
     --regen-profile        Recompute cached model memory profile.
     -- <vLLM args...>      Forward all remaining arguments to vLLM unchanged.
+
+  ${BOLD}Capabilities:${NC} tool calling, vision and reasoning are on by default
+  when the model supports them (tools need a known tool-call parser; otherwise
+  Spark launches without tools and says so). Disable them with --no-tools,
+  --text-only, or --no-reasoning. Bundles keep their declared vLLM arguments.
 
   ${BOLD}Instances:${NC} one model can run as several instances. The name is
   --name, else the alias name (spark run <alias>), else generated from the
@@ -50,8 +56,10 @@ cmd_run_help() {
   --max-len, --max-num-seqs, --kv-cache-dtype, --enforce-eager) or any vLLM
   argument, e.g. --kv-cache-memory-bytes 12G. The saved alias is unchanged;
   save a change with: spark alias set <alias> ... Launch policy flags stay
-  fixed (--tools, --text-only, --no-reasoning, --mtp, --no-mtp,
+  fixed (--tools, --no-tools, --text-only, --no-reasoning, --mtp, --no-mtp,
   --no-mem-limit, --regen-profile, --no-pull); change them with alias edit.
+  Captured aliases replay their recorded vLLM arguments, tool flags included;
+  recapture one to change its tool calling.
   An alias runs as the instance named after it (route vllm/<alias>). When its
   saved port is taken by another instance, Spark picks the next free port;
   an explicit --port still wins.
@@ -66,7 +74,7 @@ EOF
 
 cmd_run() {
   local RUN_REQUESTED_REF="${RUN_REQUESTED_REF:-}"
-  local model="" port="" mem="" max_len="" kv_dtype="" tools=0 text_only=0
+  local model="" port="" mem="" max_len="" kv_dtype="" tools=auto text_only=0
   local no_reasoning=0 dry_run=0 explain=0 tail_logs=0 force=0 regen=0 no_pull=0 no_mem_limit=0
   local no_wait=0 max_num_seqs="" enforce_eager_flag="auto" mtp_flag="auto" alias_frozen_flags=0
   local publish_main=0 vllm_speculation_passthrough=0 arg
@@ -106,6 +114,7 @@ cmd_run() {
       --mtp)       mtp_flag=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--mtp); shift ;;
       --no-mtp)    mtp_flag=0; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-mtp); shift ;;
       --tools)     tools=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--tools); shift ;;
+      --no-tools)  tools=0; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-tools); shift ;;
       --text-only) text_only=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--text-only); shift ;;
       --no-reasoning) no_reasoning=1; alias_frozen_flags=1; bundle_explicit_run_args+=(--no-reasoning); shift ;;
       --no-pull)   no_pull=1; alias_frozen_flags=1; shift ;;
@@ -169,7 +178,7 @@ cmd_run() {
   fi
   if [[ "${SPARK_ALIAS_BYPASS:-0}" != "1" ]] && alias_exists "$model"; then
     [[ "$alias_frozen_flags" == "0" ]] || die "Alias launch policy is fixed" \
-      "--tools, --text-only, --no-reasoning, --mtp, --no-mtp, --no-mem-limit, --regen-profile, and --no-pull need: spark alias edit ${model}"
+      "--tools, --no-tools, --text-only, --no-reasoning, --mtp, --no-mtp, --no-mem-limit, --regen-profile, and --no-pull need: spark alias edit ${model}"
     cmd_alias_run "$model" \
       ${alias_setting_args[@]+"${alias_setting_args[@]}"} \
       ${vllm_passthrough_args[@]+"${vllm_passthrough_args[@]}"} \
@@ -473,7 +482,7 @@ alias_vllm_set_value_json() {
 # keep them fixed; recreate the alias with `spark alias edit` to change them.
 alias_policy_flag() {
   case "$1" in
-    --tools|--text-only|--no-reasoning|--mtp|--no-mtp|--no-mem-limit|--regen-profile|--no-pull) return 0 ;;
+    --tools|--no-tools|--text-only|--no-reasoning|--mtp|--no-mtp|--no-mem-limit|--regen-profile|--no-pull) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -862,7 +871,7 @@ alias_guided_definition() {
   [[ "$eager" != "off" ]] || args+=(--no-enforce-eager)
   port=$(alias_prompt_value "Model API port (blank = auto)")
   [[ -z "$port" ]] || args+=(--port "$port")
-  alias_prompt_yes "Enable tool calling" && args+=(--tools)
+  alias_prompt_yes "Disable tool calling" && args+=(--no-tools)
   alias_prompt_yes "Disable vision input" && args+=(--text-only)
   alias_prompt_yes "Disable reasoning parser" && args+=(--no-reasoning)
   alias_prompt_yes "Do not download a missing model" && args+=(--no-pull)
@@ -1556,12 +1565,36 @@ ask_runtime_tradeoffs() {
       recompute_memory "${model_path}/config.json"
     fi
   fi
+}
 
-  if [[ "${SUPPORTS_TOOLS:-false}" == "true" && "$tools" != "1" ]]; then
-    printf "  Enable tool calling? Adds parser/tool protocol; only needed for agents. [y/N] "
-    read -r ans || ans=""
-    [[ "$ans" =~ ^[Yy] ]] && tools=1
+# Tool calling is on by default when Spark knows the model's tool-call parser:
+# --tools requires a parser, --no-tools turns it off, and a parser forwarded to
+# vLLM (-- --tool-call-parser X) is left to the user. Captured and bundle
+# launches keep the tool flags they recorded; --tools still adds Spark's parser.
+resolve_tool_calling() {
+  if [[ -n "${ALIAS_VLLM_ARGS_JSON:-}" ]]; then
+    [[ "$tools" != "auto" ]] || tools=0
+    return 0
   fi
+  local user_parser=0
+  [[ -z "$(run_passthrough_value --tool-call-parser)" ]] || user_parser=1
+  case "$tools" in
+    0) ;;
+    1)
+      [[ -n "${TOOL_CALL_PARSER:-}" || "$user_parser" == "1" ]] || die "No tool-call parser known for ${model}; cannot use --tools" \
+        "Launch without --tools, or name one: spark run ${model} -- --enable-auto-tool-choice --tool-call-parser <parser>"
+      ;;
+    *)
+      if [[ "$user_parser" == "1" ]]; then
+        tools=0
+      elif [[ -n "${TOOL_CALL_PARSER:-}" ]]; then
+        tools=1
+      else
+        tools=0
+        warn "Tool calling off: no tool-call parser known for ${model}. Add one with: -- --enable-auto-tool-choice --tool-call-parser <parser>"
+      fi
+      ;;
+  esac
 }
 
 print_launch_explain() {
@@ -1572,6 +1605,11 @@ print_launch_explain() {
   printf "    Features:  family=%s arch=%s quant=%s moe=%s mtp=%s tools=%s\n" \
     "${MODEL_FAMILY:-unknown}" "${MODEL_ARCHITECTURE:-unknown}" "${MODEL_QUANTIZATION:-unknown}" \
     "${IS_MOE:-0}" "${HAS_MTP:-false}" "${SUPPORTS_TOOLS:-false}"
+  if [[ "$tools" == "1" ]]; then
+    printf "    Tools:     on (parser %s); disable with --no-tools\n" "${TOOL_CALL_PARSER:-forwarded}"
+  else
+    printf "    Tools:     off\n"
+  fi
   printf "    Card:      runtime=%s context=%s kv_fp8=%s\n" \
     "${HF_RECOMMENDED_RUNTIME:-unknown}" "${HF_RECOMMENDED_CONTEXT:-none}" "${HF_KV_CACHE_FP8_RECOMMENDED:-false}"
   printf "    Hardware:  accel=%s gpu=%s cc=%s driver=%s image=%s\n" \
@@ -1594,9 +1632,6 @@ print_launch_explain() {
   if [[ "${HAS_MTP:-false}" == "true" ]]; then
     printf "      - MTP: auto-enable%s\n" \
       "$([[ "${MTP_DECIDED:-0}" == "1" && "${MTP_ENABLED:-0}" == "0" ]] && printf ' disabled by override')"; any=1
-  fi
-  if [[ "${SUPPORTS_TOOLS:-false}" == "true" && "$tools" != "1" ]]; then
-    printf "      - Tool calling: ask, default no\n"; any=1
   fi
   [[ "$any" == "0" ]] && printf "      - none\n"
   return 0
@@ -1901,6 +1936,7 @@ run_backend_vllm() {
   [[ "$no_reasoning" == "1" ]] && REASONING_PARSER=""
 
   validate_profile_values
+  resolve_tool_calling
 
   # Capacity check BEFORE touching anything (and before pulling weights).
   if [[ "$needs_download" == "1" ]]; then

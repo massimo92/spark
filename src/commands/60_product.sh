@@ -811,7 +811,8 @@ cmd_help() {
     --enforce-eager        Disable CUDA graphs; lower startup peak, slower inference
     --no-enforce-eager     Force CUDA graphs on
     --port <int>           Direct model API port; default auto-selects from 8000
-    --tools                Enable tool calling when supported
+    --no-tools             Disable tool calling (on by default when supported)
+    --tools                Require tool calling; fail if no parser is known
     --text-only            Disable vision input for multimodal models
     --no-reasoning         Disable the reasoning parser
     --no-pull              Fail if the model is missing; do not offer download
