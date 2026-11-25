@@ -3329,8 +3329,8 @@ test_bundle_sync_checks_git_catalog() {
   check_output=$(cd "$ROOT_DIR" && HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
     "$SPARK" bundle sync --check 2>&1)
   local ok=0
-  [[ "$output" == *"Synchronized 4 built-in bundle(s) into spark"* ]] || ok=1
-  [[ "$check_output" == *"Built-in bundles are synchronized (4)"* ]] || ok=1
+  [[ "$output" == *"Synchronized 5 built-in bundle(s) into spark"* ]] || ok=1
+  [[ "$check_output" == *"Built-in bundles are synchronized (5)"* ]] || ok=1
 
   standalone="${tmp}/standalone-spark"
   outside="${tmp}/outside"
@@ -3527,7 +3527,7 @@ test_alias_create_from_bundle_stores_bundle_and_adjustments() {
   local tmp fake_bin aliases output create_output
   tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
   make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
-  if ! create_output=$(printf 'b3\n\nn\n\n\n\n\n\nn\nfalse\n\n\n\n' | \
+  if ! create_output=$(printf 'b4\n\nn\n\n\n\n\n\nn\nfalse\n\n\n\n' | \
     HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_ASSUME_INTERACTIVE=1 \
     "$SPARK" alias create qwen-bundle-alias 2>&1); then
     printf '%s\n' "$create_output" >&2
