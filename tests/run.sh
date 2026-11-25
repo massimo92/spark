@@ -9740,6 +9740,113 @@ test_qwen35_uses_qwen3_coder_tool_parser() {
     [[ "$out" != *"--tool-call-parser qwen3_xml"* ]]
 }
 
+test_run_enables_tools_by_default_when_parser_known() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin meta out off forced named ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Tools" "$KV_CONFIG"
+  meta=$(hf_inspect_json false false null true)
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    "$SPARK" run Org/Tools --dry-run --no-mtp </dev/null 2>&1) || ok=1
+  off=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    "$SPARK" run Org/Tools --dry-run --no-mtp --no-tools </dev/null 2>&1) || ok=1
+  forced=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    "$SPARK" run Org/Tools --dry-run --no-mtp --tools </dev/null 2>&1) || ok=1
+  named=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    "$SPARK" run Org/Tools --dry-run --no-mtp --max-len 16384 </dev/null 2>&1) || ok=1
+  rm -rf "$tmp"
+  [[ "$out" == *"--enable-auto-tool-choice --tool-call-parser qwen3_xml"* ]] || ok=1
+  [[ "$out" == *"--reasoning-parser qwen3"* && "$out" != *"Tool calling off"* ]] || ok=1
+  [[ "$off" != *"--enable-auto-tool-choice"* && "$off" != *"--tool-call-parser"* ]] || ok=1
+  [[ "$off" == *"--reasoning-parser qwen3"* ]] || ok=1
+  [[ "$forced" == *"--enable-auto-tool-choice --tool-call-parser qwen3_xml"* ]] || ok=1
+  [[ "$(grep -o -- '--enable-auto-tool-choice' <<<"$out" | wc -l | tr -d ' ')" == "1" ]] || ok=1
+  # Tool calling never names the instance.
+  [[ "$out" == *"spark.instance=tools "* && "$off" == *"spark.instance=tools "* && "$forced" == *"spark.instance=tools "* ]] || ok=1
+  [[ "$named" == *"spark.instance=tools-16k "* && "$named" == *"--enable-auto-tool-choice"* ]] || ok=1
+  [[ "$ok" == "0" ]] || printf '%s\n---\n%s\n' "$out" "$off" >&2
+  [[ "$ok" == "0" ]]
+}
+
+test_run_without_tool_parser_launches_without_tools() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin meta out forced status=0 ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Plain" '{ "model_type":"llama", "architectures":["LlamaForCausalLM"],
+    "num_hidden_layers":32, "num_key_value_heads":8, "num_attention_heads":32, "head_dim":128,
+    "hidden_size":4096, "max_position_embeddings":32768, "num_parameters":8000000000 }'
+  meta=$(hf_inspect_json false false null true | jq -c '.features.family="llama" | .raw.model_type="llama" | .raw.architectures=["LlamaForCausalLM"]')
+  out=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    "$SPARK" run Org/Plain --dry-run --no-mtp </dev/null 2>&1) || ok=1
+  forced=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    "$SPARK" run Org/Plain --dry-run --no-mtp --tools </dev/null 2>&1) || status=$?
+  rm -rf "$tmp"
+  [[ "$out" == *"Tool calling off: no tool-call parser known for Org/Plain"* ]] || ok=1
+  [[ "$(grep -c '^docker run ' <<<"$out")" == "1" ]] || ok=1
+  [[ "$(grep '^docker run ' <<<"$out")" != *"--enable-auto-tool-choice"* ]] || ok=1
+  [[ "$status" -ne 0 && "$forced" == *"No tool-call parser known for Org/Plain; cannot use --tools"* ]] || ok=1
+  [[ "$forced" != *"Docker command that would be executed"* ]] || ok=1
+  [[ "$ok" == "0" ]] || printf '%s\n---\n%s\n' "$out" "$forced" >&2
+  [[ "$ok" == "0" ]]
+}
+
+test_tools_default_keeps_alias_and_bundle_args() {
+  command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
+  local tmp fake_bin aliases meta guided guided_off replay replay_tools clef lookup lookup_off ok=0
+  tmp=$(mktemp -d); fake_bin="${tmp}/bin"; make_fake_bin "$fake_bin"
+  make_model "${tmp}/home" "Org/Model" "$KV_CONFIG"
+  make_model "${tmp}/home" "Org/Captured" "$KV_CONFIG"
+  make_model "${tmp}/home" alpha-x-ai/clef-flash-NVFP4 "$KV_CONFIG" e676d8e6e14f5ee74830d33fa1fad643d8f53acf
+  make_model "${tmp}/home" "sakamakismile/Qwen3.8-27B-MTP-NVFP4" "$KV_CONFIG"
+  aliases="${tmp}/home/.config/spark/aliases.json"
+  meta=$(hf_inspect_json false false null true)
+
+  # Guided aliases store the default (nothing) unless tool calling is disabled.
+  printf 'Org/Model\n\n\n\n\n\n\n\n\n\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_ASSUME_INTERACTIVE=1 "$SPARK" alias create guided >/dev/null 2>&1 || ok=1
+  printf 'Org/Model\n\n\n\n\n\n\n\n\ny\n' | HOME="${tmp}/home" PATH="${fake_bin}:$PATH" \
+    SPARK_ASSUME_INTERACTIVE=1 "$SPARK" alias create guided-off >/dev/null 2>&1 || ok=1
+  jq -e '.guided.run_args == [] and .["guided-off"].run_args == ["--no-tools"]' "$aliases" >/dev/null || ok=1
+  guided=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    "$SPARK" run guided --dry-run </dev/null 2>&1) || ok=1
+  guided_off=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 SPARK_HF_MODEL_INSPECT_JSON="$meta" \
+    "$SPARK" run guided-off --dry-run </dev/null 2>&1) || ok=1
+  [[ "$guided" == *"--enable-auto-tool-choice --tool-call-parser qwen3_xml"* ]] || ok=1
+  [[ "$guided_off" == *"Docker command that would be executed"* && "$guided_off" != *"--enable-auto-tool-choice"* ]] || ok=1
+
+  # Captured aliases replay their recorded vLLM arguments unchanged.
+  jq '. + {
+    replay: {kind:"captured-vllm", backend:"vllm", model:"Org/Captured",
+      image:"eugr/spark-vllm:latest", image_id:("sha256:" + ("a" * 64)), vllm_entrypoint:true, env:{},
+      vllm_args:["vllm","serve","Org/Captured","--gpu-memory-utilization","0.65","--max-model-len","4096","--port","8000"]},
+    "replay-tools": {kind:"captured-vllm", backend:"vllm", model:"Org/Captured",
+      image:"eugr/spark-vllm:latest", image_id:("sha256:" + ("a" * 64)), vllm_entrypoint:true, env:{},
+      vllm_args:["vllm","serve","Org/Captured","--gpu-memory-utilization","0.65","--max-model-len","4096","--port","8000",
+        "--enable-auto-tool-choice","--tool-call-parser","hermes"]}
+  }' "$aliases" > "${aliases}.new" && mv "${aliases}.new" "$aliases"
+  replay=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 \
+    "$SPARK" run replay --dry-run </dev/null 2>&1) || ok=1
+  replay_tools=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 \
+    "$SPARK" run replay-tools --dry-run </dev/null 2>&1) || ok=1
+  [[ "$replay" == *"Docker command that would be executed"* && "$replay" != *"--enable-auto-tool-choice"* ]] || ok=1
+  [[ "$replay_tools" == *"--enable-auto-tool-choice --tool-call-parser hermes"* && "$replay_tools" != *"qwen3_xml"* ]] || ok=1
+
+  # Bundles keep their declared vLLM arguments; --no-tools removes tool flags.
+  clef=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 \
+    "$SPARK" run clef-flash-nvfp4 --dry-run --port 8007 --max-len 4096 </dev/null 2>&1) || ok=1
+  lookup=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 \
+    "$SPARK" run qwen38-dflash2-lookup --dry-run </dev/null 2>&1) || ok=1
+  lookup_off=$(HOME="${tmp}/home" PATH="${fake_bin}:$PATH" SPARK_TOTAL_MEM_GB=121 FAKE_DOCKER_IMAGE=nvcr.io/nvidia/vllm:26.04-py3 \
+    "$SPARK" run qwen38-dflash2-lookup --dry-run --no-tools </dev/null 2>&1) || ok=1
+  rm -rf "$tmp"
+  [[ "$clef" == *"Docker command that would be executed"* && "$clef" != *"--enable-auto-tool-choice"* && "$clef" != *"--tool-call-parser"* ]] || ok=1
+  [[ "$lookup" == *"--enable-auto-tool-choice --tool-call-parser qwen3_coder"* && "$lookup" != *"qwen3_xml"* ]] || ok=1
+  [[ "$(grep -o -- '--enable-auto-tool-choice' <<<"$lookup" | wc -l | tr -d ' ')" == "1" ]] || ok=1
+  [[ "$lookup_off" == *"Docker command that would be executed"* ]] || ok=1
+  [[ "$lookup_off" != *"--enable-auto-tool-choice"* && "$lookup_off" != *"--tool-call-parser"* ]] || ok=1
+  [[ "$ok" == "0" ]]
+}
+
 test_gemma4_uses_gemma4_tool_and_reasoning_parsers() {
   command -v jq >/dev/null 2>&1 || { printf "skip - jq not installed\n"; return 0; }
   local tmp fake_bin out meta
@@ -10036,7 +10143,8 @@ test_dry_run_explain_shows_hf_and_flags() {
   rm -rf "$tmp"
   [[ "$status" == "0" ]] && [[ "$out" == *"Explain"* ]] && [[ "$out" == *"HF:"* ]] && \
     [[ "$out" == *"Features:"* ]] && [[ "$out" == *"vLLM:"* ]] && \
-    [[ "$out" == *"--load-format fastsafetensors"* ]] && [[ "$out" == *"Tool calling: ask"* ]] && \
+    [[ "$out" == *"--load-format fastsafetensors"* ]] && [[ "$out" == *"Tools:     on (parser qwen3_xml)"* ]] && \
+    [[ "$out" == *"--enable-auto-tool-choice --tool-call-parser qwen3_xml"* ]] && \
     [[ "$out" == *"Docker command that would be executed"* ]] && \
     [[ "$out" != *"--privileged"* && "$out" != *"EVIL=1"* && "$out" != *"Evil/Model"* ]]
 }
@@ -11147,6 +11255,9 @@ run_test "HF inspector maps ModelOpt HF quant NVFP4" test_hf_inspector_modelopt_
 run_test "HF inspector prefers recommended multiline command" test_hf_inspector_prefers_recommended_multiline_command_from_readme
 run_test "HF inspector tools needs explicit tool-calling signal" test_hf_inspector_tools_requires_tool_calling_signal
 run_test "Qwen3.5 uses qwen3_coder tool parser" test_qwen35_uses_qwen3_coder_tool_parser
+run_test "run enables tool calling by default when a parser is known" test_run_enables_tools_by_default_when_parser_known
+run_test "run without a tool parser launches without tools" test_run_without_tool_parser_launches_without_tools
+run_test "tools default keeps alias and bundle arguments" test_tools_default_keeps_alias_and_bundle_args
 run_test "Gemma4 uses gemma4 reasoning and tool parsers" test_gemma4_uses_gemma4_tool_and_reasoning_parsers
 run_test "text-only uses vLLM JSON multimodal limit" test_text_only_uses_vllm_json_multimodal_limit
 run_test "HF card recommended context wins" test_hf_card_context_wins

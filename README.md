@@ -73,6 +73,13 @@ when explicitly selected with `--main`; stopping that model does not silently
 redirect `main`. New vLLM launches bind localhost. Benchmarks use local backend
 ports. `--dry-run` changes no services.
 
+Tool calling, vision and reasoning are on by default when the model supports
+them; use `--no-tools`, `--text-only` or `--no-reasoning` to disable them.
+Tools need a known tool-call parser: without one Spark launches without tools
+and says so, and `--tools` fails instead. Captured aliases replay their
+recorded vLLM arguments (recapture one to gain tools); bundles keep their
+declared arguments, and `--no-tools` removes their tool flags.
+
 ### Several instances of one model
 
 One vLLM model can run as several instances at once (memory admission still

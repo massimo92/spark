@@ -50,7 +50,7 @@ bundle_vllm_value() {
 
 bundle_core_flag_reserved() {
   case "${1:-}" in
-    mem|no-mem-limit|max-len|kv-cache-dtype|max-num-seqs|mtp|no-mtp|enforce-eager|no-enforce-eager|port|tools|text-only|no-reasoning|no-pull|dry-run|explain|no-wait|tail|force|regen-profile|help)
+    mem|no-mem-limit|max-len|kv-cache-dtype|max-num-seqs|mtp|no-mtp|enforce-eager|no-enforce-eager|port|tools|no-tools|text-only|no-reasoning|no-pull|dry-run|explain|no-wait|tail|force|regen-profile|help)
       return 0 ;;
     *) return 1 ;;
   esac
@@ -63,7 +63,7 @@ bundle_detect_run_ref() {
     case "$arg" in
       --mem|--max-len|--kv-cache-dtype|--max-num-seqs|--port)
         shift 2 2>/dev/null || return 1 ;;
-      --no-mem-limit|--mtp|--no-mtp|--enforce-eager|--no-enforce-eager|--tools|--text-only|--no-reasoning|--no-pull|--dry-run|--explain|--no-wait|--tail|--force|--regen-profile|-h|--help)
+      --no-mem-limit|--mtp|--no-mtp|--enforce-eager|--no-enforce-eager|--tools|--no-tools|--text-only|--no-reasoning|--no-pull|--dry-run|--explain|--no-wait|--tail|--force|--regen-profile|-h|--help)
         shift ;;
       --*)
         [[ $# -ge 2 ]] || return 1
@@ -396,6 +396,11 @@ bundle_prepare_run() {
     0) vllm_json=$(bundle_vllm_remove_switch_json "$vllm_json" --enforce-eager) ;;
   esac
   [[ "$no_reasoning" != "1" ]] || vllm_json=$(bundle_vllm_remove_flag_json "$vllm_json" --reasoning-parser)
+  # Bundles keep their declared tool flags; only --no-tools removes them.
+  if [[ "$tools" == "0" ]]; then
+    vllm_json=$(bundle_vllm_remove_flag_json "$vllm_json" --tool-call-parser)
+    vllm_json=$(bundle_vllm_remove_switch_json "$vllm_json" --enable-auto-tool-choice)
+  fi
 
   if [[ ${#vllm_passthrough_args[@]} -gt 0 ]]; then
     local extra effective flag value
