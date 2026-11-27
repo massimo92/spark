@@ -90,7 +90,7 @@ gateway_generate_litellm_yaml() {
   # no wildcard that could resurrect a stopped local model.
   if [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]]; then
     local primary_port="" primary_model="" primary_info="{}" model_info main_match=0 name model port rest
-    local need wt kv instance route main_container="" seen_routes=$'\n'
+    local need wt kv instance route served main_container="" seen_routes=$'\n'
     # Instances of one model get distinct routes: vllm/<model> for the default
     # instance, vllm/<instance> otherwise. Main follows the stored route name.
     if [[ "$main_provider" == "vllm" && -n "$main_model" ]]; then
@@ -115,28 +115,29 @@ gateway_generate_litellm_yaml() {
         has_models=1
         continue
       fi
-      model_info=$(gateway_vllm_model_info "$name" "$model" "$port") || return 1
+      served=$(gateway_vllm_served_name "$name" "$model")
+      model_info=$(gateway_vllm_model_info "$name" "$model" "$port" "$served") || return 1
       yaml+="
   - model_name: \"vllm/${route}\"
     litellm_params:
-      model: \"openai/${model}\"
+      model: \"openai/${served}\"
       api_base: \"http://localhost:${port}/v1\"
       api_key: \"dummy\"
     model_info: ${model_info}"
       has_models=1
       if [[ -z "$primary_port" ]]; then
         primary_port="$port"
-        primary_model="$model"
+        primary_model="$served"
         primary_info="$model_info"
       fi
       if [[ "$port" == "$vllm_port" && "$main_match" == "0" ]]; then
         primary_port="$port"
-        primary_model="$model"
+        primary_model="$served"
         primary_info="$model_info"
       fi
       if [[ "$main_provider" == "vllm" && -n "$main_container" && "$name" == "$main_container" ]]; then
         primary_port="$port"
-        primary_model="$model"
+        primary_model="$served"
         primary_info="$model_info"
         main_match=1
       fi

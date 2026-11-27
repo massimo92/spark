@@ -99,6 +99,27 @@ migrate() {
   private_mode "$SPARK_CONFIG_DIR/gateway-migration" 700
   [[ -s "$SPARK_CONFIG_DIR/gateway-migration/gateway.json" ]]
 }
+served_name_routes() {
+  gateway_prepare_runtime vllm
+  gateway_set_main_model vllm Org/Renamed
+  list_managed_containers() { printf 'renamed\tOrg/Renamed\t8000\nplain\tOrg/Plain\t8001\nunsafe\tOrg/Unsafe\t8002\n'; }
+  docker() {
+    [[ "$1" == inspect ]] || return 1
+    case "${@: -1}" in
+      renamed) printf '%s\n' '{"Entrypoint":["vllm","serve"],"Cmd":["Org/Renamed","--served-model-name","org/short","alias-two","--port","8000"]}' ;;
+      plain) printf '%s\n' '{"Entrypoint":["vllm","serve"],"Cmd":["Org/Plain","--port","8001"]}' ;;
+      unsafe) printf '%s\n' '{"Cmd":["Org/Unsafe","--served-model-name=bad\"name"]}' ;;
+      *) return 1 ;;
+    esac
+  }
+  local yaml
+  yaml=$(gateway_generate_litellm_yaml)
+  [[ "$yaml" == *'model_name: "vllm/Org/Renamed"'* && "$yaml" == *'model: "openai/org/short"'* ]]
+  [[ "$yaml" != *'openai/Org/Renamed'* && "$yaml" != *'alias-two'* ]]
+  [[ "$yaml" == *'model: "openai/Org/Plain"'* && "$yaml" == *'model: "openai/Org/Unsafe"'* ]]
+  # Main reaches the same renamed backend.
+  awk '/model_name: "main"/{getline; getline; print}' <<<"$yaml" | grep -q 'openai/org/short'
+}
 route_lifecycle() {
   gateway_prepare_runtime vllm
   gateway_set_main_model vllm Org/B
@@ -483,6 +504,7 @@ check 'database startup refuses foreign resources and network exposure' database
 check 'uninstall refuses foreign resources and retains hashes without purge' database_uninstall_scope
 check 'legacy API keys migrate privately with recoverable config' migrate
 check 'multiple model ports, stopped routes and main preservation' route_lifecycle
+check 'vLLM routes target the served model name' served_name_routes
 check 'API/OAuth selection, model preservation and capability rejection' provider_modes
 check 'Docker credentials are file based; OAuth wins over stale xAI key' container_secrets
 check 'failed synchronization restores routes and releases lock' sync_recovery

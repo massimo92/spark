@@ -65,13 +65,29 @@ gateway_vllm_template_reasoning() {
   ' 2>/dev/null
 }
 
+# The model name vLLM answers to. A launch can rename it with
+# --served-model-name (its first value is the reported name); requests that
+# use the Hugging Face id then fail with 404.
+gateway_vllm_served_name() {
+  local container="$1" model="$2" served
+  served=$(docker inspect --format '{{json .Config}}' "$container" 2>/dev/null | jq -r '
+    ((.Entrypoint // []) + (.Cmd // [])) as $args |
+    [range(0; $args | length) as $i |
+      if $args[$i] == "--served-model-name" then $args[$i+1]
+      elif ($args[$i] | startswith("--served-model-name=")) then $args[$i] | sub("^--served-model-name="; "")
+      else empty end] | map(select(type == "string")) | last // empty' 2>/dev/null || true)
+  # The name is written into LiteLLM YAML; refuse anything that could break it.
+  [[ "$served" =~ ^[A-Za-z0-9][A-Za-z0-9._/:-]*$ ]] || served="$model"
+  printf '%s\n' "$served"
+}
+
 gateway_vllm_model_info() {
-  local container="$1" model="$2" port="${3:-}" runtime profile known artifact detected='{}'
+  local container="$1" model="$2" port="${3:-}" served="${4:-$2}" runtime profile known artifact detected='{}'
   runtime=$(docker inspect --format '{{json .Config}}' "$container" 2>/dev/null || true)
   known=$(gateway_model_client_info "vllm/$model") || return 1
   if [[ -n "$port" ]] && jq -e 'any(.Cmd[]?; . == "--reasoning-parser" or startswith("--reasoning-parser="))' \
     <<<"$runtime" >/dev/null 2>&1; then
-    detected=$(gateway_vllm_template_reasoning "$model" "$port" 2>/dev/null) || detected='{}'
+    detected=$(gateway_vllm_template_reasoning "$served" "$port" 2>/dev/null) || detected='{}'
   fi
   artifact=$(jq -r '.Labels["spark.bundle.artifact"] // empty' <<<"$runtime" 2>/dev/null || true)
   [[ "$artifact" =~ ^[a-zA-Z0-9._-]+$ ]] || artifact=""

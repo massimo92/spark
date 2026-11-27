@@ -19681,7 +19681,7 @@ gateway_generate_litellm_yaml() {
   # no wildcard that could resurrect a stopped local model.
   if [[ "$(echo "$config" | jq -r '.providers.vllm.enabled // false')" == "true" ]]; then
     local primary_port="" primary_model="" primary_info="{}" model_info main_match=0 name model port rest
-    local need wt kv instance route main_container="" seen_routes=$'\n'
+    local need wt kv instance route served main_container="" seen_routes=$'\n'
     # Instances of one model get distinct routes: vllm/<model> for the default
     # instance, vllm/<instance> otherwise. Main follows the stored route name.
     if [[ "$main_provider" == "vllm" && -n "$main_model" ]]; then
@@ -19706,28 +19706,29 @@ gateway_generate_litellm_yaml() {
         has_models=1
         continue
       fi
-      model_info=$(gateway_vllm_model_info "$name" "$model" "$port") || return 1
+      served=$(gateway_vllm_served_name "$name" "$model")
+      model_info=$(gateway_vllm_model_info "$name" "$model" "$port" "$served") || return 1
       yaml+="
   - model_name: \"vllm/${route}\"
     litellm_params:
-      model: \"openai/${model}\"
+      model: \"openai/${served}\"
       api_base: \"http://localhost:${port}/v1\"
       api_key: \"dummy\"
     model_info: ${model_info}"
       has_models=1
       if [[ -z "$primary_port" ]]; then
         primary_port="$port"
-        primary_model="$model"
+        primary_model="$served"
         primary_info="$model_info"
       fi
       if [[ "$port" == "$vllm_port" && "$main_match" == "0" ]]; then
         primary_port="$port"
-        primary_model="$model"
+        primary_model="$served"
         primary_info="$model_info"
       fi
       if [[ "$main_provider" == "vllm" && -n "$main_container" && "$name" == "$main_container" ]]; then
         primary_port="$port"
-        primary_model="$model"
+        primary_model="$served"
         primary_info="$model_info"
         main_match=1
       fi
@@ -20167,13 +20168,29 @@ gateway_vllm_template_reasoning() {
   ' 2>/dev/null
 }
 
+# The model name vLLM answers to. A launch can rename it with
+# --served-model-name (its first value is the reported name); requests that
+# use the Hugging Face id then fail with 404.
+gateway_vllm_served_name() {
+  local container="$1" model="$2" served
+  served=$(docker inspect --format '{{json .Config}}' "$container" 2>/dev/null | jq -r '
+    ((.Entrypoint // []) + (.Cmd // [])) as $args |
+    [range(0; $args | length) as $i |
+      if $args[$i] == "--served-model-name" then $args[$i+1]
+      elif ($args[$i] | startswith("--served-model-name=")) then $args[$i] | sub("^--served-model-name="; "")
+      else empty end] | map(select(type == "string")) | last // empty' 2>/dev/null || true)
+  # The name is written into LiteLLM YAML; refuse anything that could break it.
+  [[ "$served" =~ ^[A-Za-z0-9][A-Za-z0-9._/:-]*$ ]] || served="$model"
+  printf '%s\n' "$served"
+}
+
 gateway_vllm_model_info() {
-  local container="$1" model="$2" port="${3:-}" runtime profile known artifact detected='{}'
+  local container="$1" model="$2" port="${3:-}" served="${4:-$2}" runtime profile known artifact detected='{}'
   runtime=$(docker inspect --format '{{json .Config}}' "$container" 2>/dev/null || true)
   known=$(gateway_model_client_info "vllm/$model") || return 1
   if [[ -n "$port" ]] && jq -e 'any(.Cmd[]?; . == "--reasoning-parser" or startswith("--reasoning-parser="))' \
     <<<"$runtime" >/dev/null 2>&1; then
-    detected=$(gateway_vllm_template_reasoning "$model" "$port" 2>/dev/null) || detected='{}'
+    detected=$(gateway_vllm_template_reasoning "$served" "$port" 2>/dev/null) || detected='{}'
   fi
   artifact=$(jq -r '.Labels["spark.bundle.artifact"] // empty' <<<"$runtime" 2>/dev/null || true)
   [[ "$artifact" =~ ^[a-zA-Z0-9._-]+$ ]] || artifact=""
