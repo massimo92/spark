@@ -1,0 +1,54 @@
+{
+  "schema_version": 2,
+  "name": "inkling2-mini-dflash2",
+  "description": "Inkling 2 Mini official NVFP4/MXFP8 with the Inco AI DFlash2 drafter (k7) and the Inkling loop-capture adapter on NVIDIA GB10.",
+  "defaults": {
+    "target_model": {
+      "id": "thinkingmachines/Inkling-2-Mini",
+      "revision": "c9d028302cd0f035fdf8e7e91f089a4ce94d2195"
+    },
+    "speculative_tokens": 7,
+    "vllm_args": [
+      "vllm",
+      "serve",
+      "thinkingmachines/Inkling-2-Mini",
+      "--revision",
+      "c9d028302cd0f035fdf8e7e91f089a4ce94d2195",
+      "--tokenizer-revision",
+      "c9d028302cd0f035fdf8e7e91f089a4ce94d2195",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "8000",
+      "--tensor-parallel-size",
+      "1",
+      "--max-model-len",
+      "262144",
+      "--gpu-memory-utilization",
+      "0.8",
+      "--max-num-seqs",
+      "4",
+      "--reasoning-parser",
+      "inkling",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser",
+      "inkling",
+      "--moe-backend",
+      "humming",
+      "--enable-prefix-caching",
+      "--speculative-config",
+      "{\"method\":\"dflash\",\"model\":\"incoai/Inkling-2-Mini-DFlash2\",\"revision\":\"4f9088ea66c21f2b99ed657d1941c306b03e84d2\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"probabilistic\"}"
+    ],
+    "draft_model": {
+      "id": "incoai/Inkling-2-Mini-DFlash2",
+      "revision": "4f9088ea66c21f2b99ed657d1941c306b03e84d2"
+    }
+  },
+  "options": {},
+  "patches": [
+    {
+      "file": "patches/inkling-dflash2-adapter.patch",
+      "description": "Captures Inkling loop visits 5/23/41/48, shares normalized target embeddings, bounds the vocabulary to unpadded rows, and soft-caps after selector correction (from Kaushalya/spark-vllm-docker#11)."
+    }
+  ]
+}

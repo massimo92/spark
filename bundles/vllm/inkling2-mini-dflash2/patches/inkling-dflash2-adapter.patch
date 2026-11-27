@@ -1,0 +1,114 @@
+diff -ruN a/model_executor/models/qwen3_dflash2.py b/model_executor/models/qwen3_dflash2.py
+--- a/model_executor/models/qwen3_dflash2.py	2026-11-27 16:02:15.560140036 +0000
++++ b/model_executor/models/qwen3_dflash2.py	2026-11-27 16:02:15.610022373 +0000
+@@ -472,6 +472,7 @@
+     ) -> None:
+         super().__init__()
+         self.top_k = top_k
++        self.post_softcap: float | None = None
+         self.predecessor_codebook = nn.Parameter(
+             torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+         )
+@@ -496,7 +497,7 @@
+         anchor_token_ids: torch.Tensor,
+     ) -> torch.Tensor:
+         hidden = self.hidden_projection(hidden_states)
+-        return _score_edges(
++        scores = _score_edges(
+             self.predecessor_codebook,
+             self.successor_codebook,
+             candidate_ids,
+@@ -505,6 +506,9 @@
+             anchor_token_ids,
+             self.top_k,
+         )
++        if self.post_softcap is not None:
++            scores = self.post_softcap * torch.tanh(scores / self.post_softcap)
++        return scores
+ 
+ 
+ class DFlash2Qwen3Model(DFlashQwen3Model):
+@@ -523,6 +527,7 @@
+             prefix=prefix,
+         )
+         draft_config = self.config.dflash_config
++        self.input_embedding_norm: nn.Module | None = None
+         self.input_embedding_scale = float(
+             draft_config.get("input_embedding_scale", 1.0)
+         )
+@@ -538,7 +543,10 @@
+             )
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+-        return super().embed_input_ids(input_ids) * self.input_embedding_scale
++        embeds = super().embed_input_ids(input_ids)
++        if self.input_embedding_norm is not None:
++            embeds = self.input_embedding_norm(embeds)
++        return embeds * self.input_embedding_scale
+ 
+ 
+ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+@@ -551,10 +559,20 @@
+         super().__init__(vllm_config=vllm_config, prefix=prefix)
+         draft_config = self.config.dflash_config
+         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
++        spec_config = vllm_config.speculative_config
++        assert spec_config is not None and spec_config.target_model_config is not None
++        target_text = spec_config.target_model_config.hf_text_config
++        vocab_size = vllm_config.model_config.get_vocab_size()
++        if target_text.model_type == "inkling2_loop_text":
++            # Inkling stores padded LM-head rows that cannot be sampled.
++            vocab_size = getattr(target_text, "unpadded_vocab_size", None) or vocab_size
++        if softcap > 0 and draft_config.get("selector_softcap_mode") == "after_correction":
++            self.model.candidate_selector.post_softcap = softcap
++            softcap = 0.0
+         # Candidates index the selector codebooks, which have the draft's
+         # vocabulary; the target's vocabulary can be larger.
+         self.candidate_logits_processor = LogitsProcessor(
+-            min(vllm_config.model_config.get_vocab_size(), self.config.vocab_size),
++            min(vocab_size, self.config.vocab_size),
+             scale=float(draft_config.get("output_multiplier", 1.0)),
+             soft_cap=softcap if softcap > 0 else None,
+         )
+diff -ruN a/v1/worker/gpu/spec_decode/dflash/utils.py b/v1/worker/gpu/spec_decode/dflash/utils.py
+--- a/v1/worker/gpu/spec_decode/dflash/utils.py	2026-11-27 16:02:15.562554581 +0000
++++ b/v1/worker/gpu/spec_decode/dflash/utils.py	2026-11-27 16:02:15.612842934 +0000
+@@ -58,6 +58,15 @@
+     draft_inner = dflash_model.model
+ 
+     maybe_share_target_embed(dflash_model, draft_inner, target_inner)
++    if (
++        vllm_config.model_config.hf_text_config.model_type == "inkling2_loop_text"
++        and hasattr(draft_inner, "input_embedding_norm")
++    ):
++        # The draft uses the target's normalized embedding for both the
++        # anchor token and masked slots, as in the training runtime.
++        if draft_inner.embed_tokens is not target_inner.embed_tokens:
++            raise ValueError("Inkling 2 Mini DFlash2 requires shared input embeddings")
++        draft_inner.input_embedding_norm = target_inner.embed_norm
+ 
+     target_lm_head = get_target_lm_head(target_model, target_language_model)
+     draft_lm_head = getattr(dflash_model, "lm_head", None)
+diff -ruN a/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py b/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+--- a/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py	2026-11-27 16:02:15.558012563 +0000
++++ b/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py	2026-11-27 16:02:15.607700277 +0000
+@@ -84,6 +84,19 @@
+     if not layer_ids:
+         dflash_config = getattr(hf_config, "dflash_config", None)
+         if dflash_config and isinstance(dflash_config, dict):
++            target = spec_config.target_model_config
++            if (
++                spec_config.method == "dflash"
++                and target is not None
++                and target.hf_text_config.model_type == "inkling2_loop_text"
++            ):
++                # Inkling captures raw loop visits and appends the final norm.
++                layer_ids = tuple(dflash_config.get("target_layer_ids") or ())
++                if layer_ids != (5, 23, 41, 48):
++                    raise ValueError(
++                        "Inkling 2 Mini DFlash2 requires capture visits [5, 23, 41, 48]"
++                    )
++                return layer_ids
+             # Add 1 to convert DFlash's aux layer id semantics
+             layer_ids = [i + 1 for i in (dflash_config.get("target_layer_ids") or [])]
+     if not layer_ids:
