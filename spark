@@ -20138,22 +20138,47 @@ gateway_vllm_template_tokens() {
   esac
 }
 
+gateway_vllm_detokenize() {
+  local model="$1" port="$2" tokens="$3"
+  jq -nc --arg model "$model" --argjson tokens "$tokens" '{model:$model,tokens:$tokens}' |
+    curl --noproxy '*' -fsS --connect-timeout 1 --max-time 2 \
+      -H 'Content-Type: application/json' -d @- "http://127.0.0.1:$port/detokenize" |
+    jq -er '.prompt | strings'
+}
+
 gateway_vllm_template_reasoning() {
-  local model="$1" port="$2" effort tokens
+  local model="$1" port="$2" effort tokens probe aliased texts='[]' text
   [[ "$port" =~ ^[1-9][0-9]{0,4}$ && "$port" -le 65535 ]] || return 1
   # An HTTP success is insufficient. Many templates silently ignore unknown
   # kwargs or fall back to their default when given an unknown effort.
-  {
+  probe=$({
     for effort in default enabled spark-unknown-effort off minimal low medium high xhigh max; do
       tokens=$(gateway_vllm_template_tokens "$model" "$port" "$effort") || return 1
       [[ "$effort" != default && "$effort" != enabled || "$tokens" != null ]] || return 1
       jq -nc --arg effort "$effort" --argjson tokens "$tokens" '{key:$effort,value:$tokens}'
     done
-  } | jq -sce '
-    select(length == 10) | from_entries as $probe |
+  } | jq -sce 'select(length == 10) | from_entries') || return 1
+  # Templates may normalize synonyms (minimal->low, high/max->xhigh). Such a
+  # group is kept only when its rendered prompt names exactly one member.
+  aliased=$(jq -c '
+    [to_entries[] | select(.key | IN("minimal","low","medium","high","xhigh","max")) |
+      select(.value != null)] | group_by(.value) | map(select(length > 1) | .[0].value) | .[]' <<<"$probe")
+  while IFS= read -r tokens; do
+    [[ -n "$tokens" ]] || continue
+    text=$(gateway_vllm_detokenize "$model" "$port" "$tokens" 2>/dev/null) || continue
+    texts=$(jq -c --argjson tokens "$tokens" --arg text "$text" '. + [{tokens:$tokens,text:$text}]' <<<"$texts")
+  done <<<"$aliased"
+  jq -nce --argjson probe "$probe" --argjson texts "$texts" '
     [$probe | to_entries[] | select(.key | IN("minimal","low","medium","high","xhigh","max")) |
-      select(.value != null and .value != $probe["spark-unknown-effort"])] as $positive |
-    ($positive | group_by(.value) | map(select(length == 1) | first)) as $distinct |
+      select(.value != null)] as $positive |
+    # A lone level that renders like an unknown effort is the template default.
+    ($positive | group_by(.value) | map(
+      if length == 1 then first
+      else . as $group | ([$texts[] | select(.tokens == $group[0].value) | .text] | first) as $text |
+        [$group[] | .key as $level |
+          select($text != null and ($text | test("(^|[^A-Za-z0-9_-])" + $level + "($|[^A-Za-z0-9_-])")))] |
+        if length == 1 then first else empty end
+      end)) as $distinct |
     (if $probe.off != null and $probe.off != $probe.enabled and
         all($positive[]; .value != $probe.off) then [{key:"off",value:$probe.off}] else [] end
     ) as $off |

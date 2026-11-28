@@ -19,6 +19,16 @@ model_api_kind() { printf 'chat\n'; }
 gateway_vllm_template_tokens() {
   [[ "$2" == 8012 ]] || return 1
   if [[ "${ignore_effort:-0}" == 1 ]]; then printf '[5]\n'; return; fi
+  if [[ "${aliased_effort:-0}" == 1 ]]; then
+    # Normalizing template: minimal=low, high/max=xhigh, unknown=medium.
+    case "$3" in
+      off) printf '[1]\n' ;;
+      minimal|low) printf '[2]\n' ;;
+      high|xhigh|max) printf '[4]\n' ;;
+      *) printf '[3]\n' ;;
+    esac
+    return
+  fi
   case "$3" in
     off) printf '[1]\n' ;;
     low) printf '[2]\n' ;;
@@ -43,9 +53,25 @@ jq -e '.spark_context_window == 32768 and .max_input_tokens == 32768 and .max_ou
   and .spark_reasoning_efforts == {off:null,low:"low",medium:"medium",xhigh:"xhigh"}
   and .spark_default_reasoning_effort == "xhigh"
   and .spark_dsh_compat.chatTemplateKwargs.preserve_thinking == true' <<<"$primary" >/dev/null
+gateway_vllm_detokenize() {
+  case "$3" in
+    '[2]') printf 'Reasoning effort is set to low.\n' ;;
+    '[4]') printf '%s\n' "${xhigh_text:-Reasoning effort is set to xhigh.}" ;;
+    *) printf 'no effort named here\n' ;;
+  esac
+}
 ignore_effort=1
 if gateway_vllm_template_reasoning "$FIXTURE_MODEL" 8012; then exit 1; fi
 ignore_effort=0
+aliased_effort=1
+gateway_vllm_template_reasoning "$FIXTURE_MODEL" 8012 | jq -e '
+  .spark_reasoning_efforts == {low:"low",medium:"medium",xhigh:"xhigh",off:null} and
+  .spark_default_reasoning_effort == "medium"' >/dev/null
+xhigh_text='high or max'
+gateway_vllm_template_reasoning "$FIXTURE_MODEL" 8012 |
+  jq -e '.spark_reasoning_efforts == {low:"low",medium:"medium",off:null}' >/dev/null
+unset xhigh_text
+aliased_effort=0
 printf 'ok - gateway publishes the effective runtime limits and capabilities for vLLM and main\n'
 
 mkdir -p "$DSH_DIR/state" "$DSH_DIR/secrets"
